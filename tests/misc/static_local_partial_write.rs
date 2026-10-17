@@ -269,6 +269,43 @@ const SRC: &str = r##"module top;
     end
   endtask
 
+  // A nonblocking select write keeps the static's own type when the
+  // task has returned to a caller with a two-state variable of the same
+  // name before the NBA region (§6.11.2, §10.4.2).
+  logic [7:0] r_type;
+  task automatic xnba(input bit read, output logic [7:0] q);
+    static logic [7:0] a;
+    if (read) begin
+      q = a;
+      return;
+    end
+    a = 8'h00;
+    a[0] <= 1'bx;
+  endtask
+  task automatic xcaller;
+    bit [7:0] a;
+    logic [7:0] q;
+    a = 8'hFF;
+    xnba(0, q);
+    #1 xnba(1, q);
+    r_type = q;
+  endtask
+
+  // Delayed nonblocking writes wait for their own time slot (§9.4.5).
+  logic [7:0] r_d_early, r_d_late, r_dw_early, r_dw_late;
+  task automatic dnba;
+    static logic [7:0] a, b;
+    a = 8'h00;
+    b = 8'h00;
+    a[0] <= #5 1'b1;
+    a[7:4] <= #5 4'hA;
+    b <= #5 8'h33;
+    #1 r_d_early = a;
+    r_dw_early = b;
+    #5 r_d_late = a;
+    r_dw_late = b;
+  endtask
+
   // Static locals of class methods.
   class C;
     function logic [7:0] m(input logic [3:0] x);
@@ -335,6 +372,10 @@ const SRC: &str = r##"module top;
     check("x index from a function, $sscanf and nonblocking", {r_calls, r_scan, r_nba_idx}, 32'h0101_0002);
     nba_frame;
     check("nonblocking writes commit in the NBA region", {r_early_b, r_late_b, r_early_c, r_late_c}, 32'h0004_0011);
+    xcaller;
+    check("nonblocking select write keeps the static's type", r_type, 8'b0000000x);
+    dnba;
+    check("delayed nonblocking writes", {r_d_early, r_d_late, r_dw_early, r_dw_late}, 32'h00A1_0033);
     o = new;
     check("class method static local", o.m(4'h5), 8'h45);
     check("static class method static local", C::sm(4'h5), 8'h35);

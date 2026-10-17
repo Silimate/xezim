@@ -1619,6 +1619,12 @@ struct NbaEntry {
     /// all while the other advanced at double rate, so its `forever` divider
     /// never reached its threshold and the clock it drove never toggled.
     static_key: Option<String>,
+    /// With `static_key`, for a select or member write (`a[3:0] <= v`): the
+    /// bits of the variable that the write replaces, resolved at schedule
+    /// time while the local's declared type and layout are in scope (names
+    /// can mean another variable by the NBA region). `value` then holds the
+    /// new values of those bits, at the same positions.
+    static_mask: Option<Value>,
     /// §8.3 + §4.9.4: the `this` handle in scope when the NBA was SCHEDULED.
     ///
     /// The slow path commits through `assign_value` in the NBA region, AFTER
@@ -6435,6 +6441,10 @@ pub struct Simulator {
     /// maturity): these commit in the target slot's NBA region, after that
     /// slot's Active reads.
     delayed_nba: Vec<(u64, usize, Value)>,
+    /// §6.21/§9.4.5: future-time nonblocking writes to `static` subroutine
+    /// locals (`a[0] <= #5 v`), as `(due time, entry)`. Their target is the
+    /// persistent store, not a signal, so `delayed_nba` cannot hold them.
+    delayed_static_nba: Vec<(u64, NbaEntry)>,
     /// NBA writes into PACKED-ARENA cells (issue #147). A packed cell has no
     /// `signal_table` slot, so it cannot ride `nba_fast` (apply indexes the
     /// per-signal tables) — and committing immediately gave NBAs into big
@@ -12955,6 +12965,7 @@ impl Simulator {
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
             delayed_nba: Vec::new(),
+            delayed_static_nba: Vec::new(),
             packed_nba: Vec::new(),
             udp_runtime: Vec::new(),
             has_udp: false,
@@ -48152,6 +48163,7 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
+                && self.delayed_static_nba.is_empty()
                 && !has_reactive
                 // A pending VPI timer (cbAfterDelay, a future cbReadWriteSynch,
                 // ...) is real future work even when the HDL side is idle — a
@@ -48175,6 +48187,7 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
+                && self.delayed_static_nba.is_empty()
                 && !self.vpi_timed_future()
             {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
@@ -57772,6 +57785,17 @@ impl Simulator {
                 }
             }
         }
+        if !self.delayed_static_nba.is_empty() {
+            let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.delayed_static_nba)
+                .into_iter()
+                .partition(|(t, _)| *t <= self.time);
+            self.delayed_static_nba = rest;
+            for (_, e) in due {
+                if let Some(key) = e.static_key {
+                    self.commit_static_nba(key, e.static_mask, e.value);
+                }
+            }
+        }
         // JIT Stage 4 Path C1: drain any JIT-emitted inline NBA writes
         // into nba_fast BEFORE clearing the per-window index, so
         // partial-bit follow-ups (NbaAssignRange) see them.
@@ -57796,16 +57820,7 @@ impl Simulator {
             // NBA was SCHEDULED; re-resolving here would consult whichever call
             // frame is current in the NBA region (see NbaEntry::static_key).
             if let Some(key) = entry.static_key {
-                // A select or member write (`a[3:0] <= v`) changes part of
-                // the cell; anything else replaces it.
-                match entry.lhs {
-                    Some(lhs) if self.static_select_target(&lhs).is_some() => {
-                        self.apply_static_select_nba(key, &lhs, &entry.value)
-                    }
-                    _ => {
-                        self.static_local_vars.insert(key, entry.value);
-                    }
-                }
+                self.commit_static_nba(key, entry.static_mask, entry.value);
                 continue;
             }
             if let Some(lhs) = entry.lhs {
@@ -58008,11 +58023,8 @@ impl Simulator {
     fn next_delayed_time(&self) -> Option<u64> {
         let a = self.delayed_updates.iter().map(|(t, _, _)| *t).min();
         let b = self.delayed_nba.iter().map(|(t, _, _)| *t).min();
-        match (a, b) {
-            (Some(x), Some(y)) => Some(x.min(y)),
-            (x, None) => x,
-            (None, y) => y,
-        }
+        let c = self.delayed_static_nba.iter().map(|(t, _)| *t).min();
+        [a, b, c].into_iter().flatten().min()
     }
 
     /// Next scheduler-visible timer: a VPI simulation-time callback (see
@@ -58039,6 +58051,7 @@ impl Simulator {
     /// Any future-time NBA matured at (or before) the current time?
     fn delayed_nba_due(&self) -> bool {
         self.delayed_nba.iter().any(|(t, _, _)| *t <= self.time)
+            || self.delayed_static_nba.iter().any(|(t, _)| *t <= self.time)
     }
 
     /// Schedule a delayed signal update (inertial delay model).
@@ -87428,42 +87441,26 @@ impl Simulator {
                         .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
                         .unwrap_or(0),
                 };
+                // A `static` subroutine local is checked BEFORE the signal
+                // resolution below: it is backed by a persistent store keyed
+                // per declaring subroutine, but `resolve_nba_target` finds a
+                // bare same-named SIGNAL, which every instance of an
+                // interface shares. Two instances each running
+                // `task Gen; static int count; … count <= count + 1;` then
+                // wrote one cell — one instance's counter never advanced and
+                // the divider it fed never reached its threshold. A delayed
+                // write waits for its own slot (§9.4.5).
+                if let Some(entry) = self.static_nba_entry(lvalue, &val, w) {
+                    if let Some(e) = entry {
+                        if d == 0 {
+                            self.nba_queue.push(e);
+                        } else {
+                            self.delayed_static_nba.push((self.time + d, e));
+                        }
+                    }
+                    return;
+                }
                 if d == 0 {
-                    // A `static` subroutine local is checked BEFORE the signal
-                    // resolution below: it is backed by a persistent store keyed
-                    // per declaring subroutine, but `resolve_nba_target` finds a
-                    // bare same-named SIGNAL, which every instance of an
-                    // interface shares. Two instances each running
-                    // `task Gen; static int count; … count <= count + 1;` then
-                    // wrote one cell — one instance's counter never advanced and
-                    // the divider it fed never reached its threshold.
-                    if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
-                        self.nba_queue.push(NbaEntry {
-                            lhs: None,
-                            value: val.resize_for_assign(w),
-                            resolved_id: None,
-                            static_key: Some(key),
-                            // No `lhs` to re-resolve, so no context needed.
-                            this_handle: None,
-                        });
-                        return;
-                    }
-                    // A select of one (`a[3:0] <= v`), for the same reason:
-                    // committed to the same cell, with its indices frozen
-                    // now. An x/z index selects nothing (§11.5.1).
-                    if let Some(key) = self.nba_static_select_key(lvalue) {
-                        let Some(frozen) = self.freeze_select_indices(lvalue, true) else {
-                            return;
-                        };
-                        self.nba_queue.push(NbaEntry {
-                            lhs: Some(frozen),
-                            value: val.resize_for_assign(w),
-                            resolved_id: None,
-                            static_key: Some(key),
-                            this_handle: None,
-                        });
-                        return;
-                    }
                     let id_opt = self.resolve_nba_target(lvalue);
                     if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
@@ -87508,6 +87505,7 @@ impl Simulator {
                             value: qval,
                             resolved_id: None,
                             static_key,
+                            static_mask: None,
                             this_handle,
                         });
                     }
@@ -87542,15 +87540,14 @@ impl Simulator {
                     } else {
                         val.resize_for_assign(w)
                     };
-                    let static_key = self
-                        .nba_static_key_for_lvalue(lvalue)
-                        .or_else(|| self.nba_static_select_key(lvalue));
+                    let static_key = self.nba_static_key_for_lvalue(lvalue);
                     let this_handle = self.this_stack.last().copied().flatten();
                     self.nba_queue.push(NbaEntry {
                         lhs: Some(frozen),
                         value: qval,
                         resolved_id: None,
                         static_key,
+                        static_mask: None,
                         this_handle,
                     });
                 }
@@ -145208,30 +145205,78 @@ impl Simulator {
         self.static_local_keys.contains(&k).then_some(k)
     }
 
-    /// §6.21/§10.4.2: commit a nonblocking select or member write to the
-    /// `static` local whose cell is `key`. The declaring call frame is gone
-    /// in the NBA region, so the write runs in a frame of its own that holds
-    /// the cell's current value, and `assign_value` writes the result back.
-    fn apply_static_select_nba(&mut self, key: String, lhs: &Expression, val: &Value) {
-        let Some(n) = self.static_select_target(lhs) else {
-            return;
+    /// §6.21/§10.4.2: the queue entry of a nonblocking write to a `static`
+    /// local of the current subroutine. None when `lvalue` is no such
+    /// variable; Some(None) when the write is discarded (an x/z index
+    /// selects nothing, §11.5.1). The key, the indices (§10.4.2) and, for a
+    /// select, the bits written are all resolved now.
+    fn static_nba_entry(
+        &mut self,
+        lvalue: &Expression,
+        val: &Value,
+        w: u32,
+    ) -> Option<Option<NbaEntry>> {
+        let entry = |key, value, mask| NbaEntry {
+            lhs: None,
+            value,
+            resolved_id: None,
+            static_key: Some(key),
+            static_mask: mask,
+            // No `lhs` to re-resolve, so no context needed.
+            this_handle: None,
         };
-        let Some(cur) = self.static_local_vars.get(&key).cloned() else {
-            return;
-        };
-        let mut f = self.take_pooled_frame();
-        f.insert(n.to_string(), cur);
-        self.push_local_frame(f);
-        let sub = self.sync_frame_name("");
-        self.static_local_syncs
-            .push((sub, vec![(n.to_string(), key)]));
-        self.assign_value(lhs, val);
-        if let Some((sub, _)) = self.static_local_syncs.pop()
-            && self.sync_name_pool.len() < 64
-        {
-            self.sync_name_pool.push(sub);
+        if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
+            return Some(Some(entry(key, val.resize_for_assign(w), None)));
         }
-        self.pop_local_frame();
+        let key = self.nba_static_select_key(lvalue)?;
+        let Some(frozen) = self.freeze_select_indices(lvalue, true) else {
+            return Some(None);
+        };
+        let (mask, bits) = self.static_select_bits(&frozen, &val.resize_for_assign(w))?;
+        Some(Some(entry(key, bits, Some(mask))))
+    }
+
+    /// What the select or member write `lhs = val` to a `static` local of
+    /// the current subroutine changes: the bits it writes (`mask`) and their
+    /// new values, both as wide as the local. Worked out by running the
+    /// write on a zero copy, so the local's declared type, layout and
+    /// two-state-ness all apply.
+    fn static_select_bits(&mut self, lhs: &Expression, val: &Value) -> Option<(Value, Value)> {
+        let n = self.static_select_target(lhs)?;
+        let orig = self.local_stack.last()?.get(n)?.clone();
+        let w = orig.width;
+        let pass = |sim: &mut Self, v: &Value| -> Option<Value> {
+            *sim.local_stack.last_mut()?.get_mut(n)? = Value::zero(w);
+            if v.has_xz() {
+                sim.assign_value_xz(lhs, v);
+            } else {
+                sim.assign_value_inner(lhs, v);
+            }
+            sim.local_stack.last()?.get(n).cloned()
+        };
+        let mask = pass(self, &Value::ones(val.width));
+        let bits = pass(self, val);
+        if let Some(c) = self.local_stack.last_mut().and_then(|f| f.get_mut(n)) {
+            *c = orig;
+        }
+        Some((mask?, bits?))
+    }
+
+    /// §6.21: commit a nonblocking write to the `static` local whose cell is
+    /// `key`: the bits `mask` selects, or the whole value without one.
+    fn commit_static_nba(&mut self, key: String, mask: Option<Value>, value: Value) {
+        let Some(mask) = mask else {
+            self.static_local_vars.insert(key, value);
+            return;
+        };
+        let Some(cell) = self.static_local_vars.get_mut(&key) else {
+            return;
+        };
+        for i in 0..cell.width.min(mask.width) as usize {
+            if mask.get_bit(i) == LogicBit::One {
+                cell.set_bit(i, value.get_bit(i));
+            }
+        }
     }
 
     /// A `static_local_syncs` frame name: a pooled buffer holding `name`.

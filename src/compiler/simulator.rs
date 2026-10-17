@@ -10886,6 +10886,7 @@ impl Simulator {
         Self::classify_typedef_collection_properties(&mut module);
         let contested_pkg_vars = Self::split_contested_package_vars(&mut module);
         Self::register_struct_member_packed_dims(&mut module);
+        Self::fold_named_sva_members(&mut module);
         // §9.2.2.2: give every dynamic array / queue a REAL `<q>.size` signal.
         // It doubles as the queue's change proxy in the comb dependency graph:
         // sensitivity registration resolves it to an id, and every mutation
@@ -94178,6 +94179,62 @@ impl Simulator {
             ExprKind::SvaClocked { body, .. } => (**body).clone(),
             _ => e.clone(),
         }
+    }
+
+    /// §16.5.1: the operands of a named property or sequence are sampled like
+    /// those of an assertion written inline. The parser spells `u.st` as a
+    /// member access, which the elaborator folds into a hierarchical name in
+    /// the top-level process bodies and in every declaration of an inlined
+    /// instance, but not in a top-level or package declaration. Unfolded, the
+    /// reference is not among the signals a concurrent assertion samples, so
+    /// it read the value the clock edge's nonblocking assignments had just
+    /// written. Fold those bodies the same way. A body without a member
+    /// access is left alone: rebuilding it changes nothing but where it lives
+    /// in memory, which cost 0.6% more instructions on a design with 288
+    /// named properties.
+    fn fold_named_sva_members(module: &mut ElaboratedModule) {
+        if !module.property_decls.values().any(Self::has_member_access) {
+            return;
+        }
+        // §3.12.1: keep `$unit::x` where the scope shadows `x`, as the
+        // elaborator's pass over the process bodies does.
+        let unit: std::collections::HashSet<String> = module
+            .signals
+            .keys()
+            .filter(|k| k.starts_with("$unit::"))
+            .cloned()
+            .collect();
+        for body in module.property_decls.values_mut() {
+            if Self::has_member_access(body) {
+                *body = super::elaborate::rewrite_expr(
+                    body,
+                    "",
+                    &HashMap::default(),
+                    &unit,
+                    &HashMap::default(),
+                );
+            }
+        }
+    }
+
+    /// Does `e` hold a member access (`u.st`), clocked bodies included?
+    fn has_member_access(e: &Expression) -> bool {
+        let mut hit = false;
+        Self::walk_operands(e, &mut |x| match &x.kind {
+            ExprKind::MemberAccess { .. } => hit = true,
+            ExprKind::SvaClocked {
+                clock, iff, body, ..
+            } => {
+                hit |= Self::has_member_access(clock)
+                    || Self::has_member_access(body)
+                    || iff.as_deref().is_some_and(Self::has_member_access)
+            }
+            ExprKind::NamedArg { expr, .. } => {
+                hit |= expr.as_deref().is_some_and(Self::has_member_access)
+            }
+            _ => {}
+        });
+        hit
     }
 
     fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {

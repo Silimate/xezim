@@ -27,6 +27,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   deferred to the end of the slot. A finish from a cbAfterDelay callback,
   or from a value-change callback on a clock that callback drives, also stops
   that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
+* A hierarchical reference (`u.st`) in a named property or sequence declared
+  in the top-level module is sampled in the Preponed region, as it is when
+  written inline in `assert property`. It was read after the clock edge's
+  NBAs, so an antecedent on a state that changes at that edge never matched
+  and the assertion passed only vacuously, and a consequent on such a state
+  failed. `$past` and `$rose` of such a reference also behave as they do
+  inline, and a hierarchical clock (`@(posedge u.clk)`) there ticks; it
+  named no signal, so the property never ran (§16.5.1). (Silimate/xezim#52)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

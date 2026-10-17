@@ -111,3 +111,30 @@ endmodule
         .collect();
     assert_eq!(reports, ["FIRST 5"], "report lines:\n{text}");
 }
+
+/// An assertion written inline in a procedure under a `wait` reads the same
+/// defaults. The scan that saves them before time 0 skipped the body of a
+/// `wait`, so `$past(b)` there read x at the first tick (§16.9.3, §16.14.6).
+#[test]
+fn inline_assertion_under_wait_uses_default_sampled_values() {
+    let text = run(
+        "wait_inline",
+        r#"
+module t;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  bit b = 0;
+  logic [3:0] v = 4'h9;
+  initial wait (1)
+    a_wb: assert property (@(posedge clk) $past(b) === 1'b0) else $display("FAIL wait_b %0t", $time);
+  initial fork
+    wait (clk == 0) a_wv: assert property (@(posedge clk) $past(v) === 4'h9 && !$rose(v[0])) else $display("FAIL wait_v %0t", $time);
+  join_none
+  initial begin repeat (3) @(negedge clk); $finish; end
+endmodule
+"#,
+    );
+    assert!(text.contains("$finish called"), "did not finish:\n{text}");
+    let fails: Vec<&str> = text.lines().map(str::trim).filter(|l| l.starts_with("FAIL")).collect();
+    assert!(fails.is_empty(), "report lines:\n{text}");
+}

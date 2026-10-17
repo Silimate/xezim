@@ -59416,7 +59416,9 @@ impl Simulator {
             SK::Case { items, .. } => items
                 .iter()
                 .for_each(|it| Self::sva_stmt_names(&it.stmt, out)),
-            SK::TimingControl { stmt, .. } => Self::sva_stmt_names(stmt, out),
+            SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => {
+                Self::sva_stmt_names(stmt, out)
+            }
             SK::For { body, .. }
             | SK::While { body, .. }
             | SK::DoWhile { body, .. }

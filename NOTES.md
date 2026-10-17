@@ -20,9 +20,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   or function, or to a `static` local of any subroutine or class method,
   update the one variable all calls share. They were lost, so a static
   function that built a value bit by bit returned its input and
-  `a[15:8] = v` left `a` all X. Member writes, increments, output arguments
-  and nonblocking select writes to such variables are fixed too (§6.21,
-  §11.5.1).
+  `a[15:8] = v` left `a` all X. Member writes, increments and output
+  arguments are fixed too (§6.21, §11.5.1). Nonblocking writes to a local
+  of a static task or function, whole or select, commit in the NBA region;
+  select writes were dropped and whole writes to a local the task wrote
+  first took effect at once (§10.4.2).
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

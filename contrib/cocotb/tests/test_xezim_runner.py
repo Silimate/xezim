@@ -123,16 +123,26 @@ def test_toplevel_comes_from_test(tmp_path):
 
 
 def test_fresh_runner_uses_the_build(tmp_path):
-    """test() on another runner uses what build() recorded."""
+    """test() on another runner uses what build() recorded, parameters too
+    unless test() replaces them."""
     build(
         get_runner("xezim"),
         tmp_path,
         defines={"FOO": None},
+        parameters={"W": 8, "P": "{3'd7,3'd5}"},
         build_args=["-DBAR"],
         timescale=("1ns", "1ps"),
     )
-    expect = {"foo": 1, "bar": 1, "fine": 1}
+    expect = {"foo": 1, "bar": 1, "fine": 1, "w": 8, "p": 61}
     run(get_runner("xezim"), tmp_path, expect, hdl_toplevel_lang="verilog")
+    expect.update(w=3, p=0)
+    run(
+        get_runner("xezim"),
+        tmp_path,
+        expect,
+        hdl_toplevel_lang="verilog",
+        parameters={"W": 3},
+    )
 
 
 def test_test_needs_a_build(tmp_path):

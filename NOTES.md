@@ -64,8 +64,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `build_args` and a `timescale` given to `build()` were dropped and now
   apply at run time. `elab_args` are passed too, and a `string` define becomes
   a string literal, as with the other runners. The toplevel comes from
-  `test()`, and VHDL sources are an error. `build()` records its arguments in
-  `xezim_build.json` instead of `xezim_sources.f`. The runner's tests are in
+  `test()`, and VHDL sources are an error. `build()` records its arguments,
+  parameters included, in `xezim_build.json` instead of `xezim_sources.f`, so
+  `test()` on another runner uses them too. The runner's tests are in
   `contrib/cocotb/tests`.
 
 **Maintenance**

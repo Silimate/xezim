@@ -52,11 +52,12 @@ class Xezim(Runner):
     .. admonition:: Simulator-specific usage
 
        * There is no compile step. ``build()`` records the sources, include
-         directories, defines, ``build_args`` and ``timescale`` in
-         ``xezim_build.json`` in the build directory, and ``test()`` runs
-         xezim with them. So ``build_args`` apply at run time, and ``always``
-         has no effect. ``hdl_library`` and ``hdl_toplevel_library`` are
-         ignored: xezim keeps no libraries.
+         directories, defines, ``parameters``, ``build_args`` and
+         ``timescale`` in ``xezim_build.json`` in the build directory, and
+         ``test()`` runs xezim with them, also from another runner. So
+         ``build_args`` apply at run time, and ``always`` has no effect.
+         ``hdl_library`` and ``hdl_toplevel_library`` are ignored: xezim keeps
+         no libraries.
        * ``parameters`` become ``-gNAME=VALUE``, which sets the default of
          parameter ``NAME`` in every module that declares it overridable, as
          other simulators' ``-g`` does; a value given at an instantiation
@@ -156,8 +157,12 @@ class Xezim(Runner):
         args += [str(arg.value) for arg in self._build_args]
         args += [str(source.value) for source in sources]
 
+        record = {
+            "args": args,
+            "parameters": self._get_parameter_options(self.parameters),
+        }
         self.build_dir.mkdir(parents=True, exist_ok=True)
-        self.build_file.write_text(json.dumps({"args": args}, indent=1) + "\n")
+        self.build_file.write_text(json.dumps(record, indent=1) + "\n")
 
         # Nothing to execute: xezim elaborates at run time, so the "build" is
         # the record above. Returning no commands keeps `build()` a no-op
@@ -165,6 +170,12 @@ class Xezim(Runner):
         return []
 
     # -- test --------------------------------------------------------------
+
+    def test(self, *args, parameters=None, **kwargs) -> Path:
+        # cocotb's Runner keeps build()'s parameters on the runner object, so
+        # a runner that did not run the build has none; the record has them.
+        self._replace_parameters = parameters is not None
+        return super().test(*args, parameters=parameters, **kwargs)
 
     def _test_command(self) -> List[_Command]:
         if self.pre_cmd is not None:
@@ -180,8 +191,9 @@ class Xezim(Runner):
         ld = self.env.get("LD_LIBRARY_PATH", os.environ.get("LD_LIBRARY_PATH", ""))
         self.env["LD_LIBRARY_PATH"] = f"{libs_dir}:{ld}" if ld else libs_dir
 
+        record = json.loads(self.build_file.read_text())
         cmd: _Command = [XEZIM_BIN, "--sv2017", "--vpi-lib", str(self._vpi_lib)]
-        cmd += json.loads(self.build_file.read_text())["args"]
+        cmd += record["args"]
         cmd += ["-s", self.sim_hdl_toplevel]
         # The last --module-timescale wins, so this replaces build()'s.
         if self.timescale is not None:
@@ -190,7 +202,11 @@ class Xezim(Runner):
             cmd += ["--fst", self._waves_file()]
         cmd += self.elab_args
         cmd += self.test_args
-        cmd += self._get_parameter_options(self.parameters)
+        # Parameters given to test() replace build()'s.
+        if self._replace_parameters:
+            cmd += self._get_parameter_options(self.parameters)
+        else:
+            cmd += record["parameters"]
         cmd += self.plusargs
         return [cmd]
 

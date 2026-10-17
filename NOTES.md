@@ -38,6 +38,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   different width. Unsupported variable-length strings are omitted with a
   warning naming them, preserving the rest of the waveform (§6.16, §10.8).
   (#339, reported by Lramseyer)
+* `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
+  adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
+  `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so
+  a cocotb test run with `-sv_seed random` starts instead of failing to parse
+  `+seed=random` as its seed. If both are given, `-sv_seed` wins over
+  `+seed=`. A `+seed=` you write is still a plusarg, and still seeds the RNG
+  (§21.6, §38.17). (Silimate/xezim#2)
 
 * Integer `inside` constraints evaluate size-cast bounds in the joint
   comparison context and sample uniformly over distinct legal values,

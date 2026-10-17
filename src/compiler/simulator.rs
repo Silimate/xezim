@@ -689,6 +689,25 @@ fn configured_vpi_libs() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn sv_seed_cell() -> &'static Mutex<Option<String>> {
+    static SV_SEED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SV_SEED.get_or_init(|| Mutex::new(None))
+}
+
+/// `-sv_seed <n|random>` (and `-svseed`/`-seed`): other simulators' seed
+/// option. It seeds the RNG as `+seed=` does, and wins over a `+seed=`
+/// plusarg, but it is a simulator option, not a plusarg: `$test$plusargs`,
+/// `$value$plusargs` and the argv `vpi_get_vlog_info` returns never see it.
+pub fn set_sv_seed(seed: Option<&str>) {
+    if let Ok(mut guard) = sv_seed_cell().lock() {
+        *guard = seed.map(str::to_string);
+    }
+}
+
+fn configured_sv_seed() -> Option<String> {
+    sv_seed_cell().lock().ok().and_then(|g| g.clone())
+}
+
 /// Open a `--dpi-lib` library with `RTLD_NOW | RTLD_GLOBAL` (see
 /// `load_dpi_libraries`).
 fn open_dpi_library(path: &str) -> Result<Library, libloading::Error> {
@@ -13960,27 +13979,42 @@ impl Simulator {
         // unless it asks not to be, so a failing random test can be re-run
         // bit-for-bit. `+seed=<n>` selects another stream; `+seed=random` draws
         // one from system entropy and PRINTS it, since a seed you cannot see is
-        // a run you cannot replay.
-        for a in &self.plusargs {
+        // a run you cannot replay. `-sv_seed` (see `set_sv_seed`) seeds the
+        // same way without being a plusarg, and wins over `+seed=`.
+        if let Some(v) = configured_sv_seed() {
+            self.seed_rng(&v, "-sv_seed ");
+            return;
+        }
+        for a in plusargs {
             if let Some(v) = a.strip_prefix("seed=").or_else(|| a.strip_prefix("+seed=")) {
-                let v = v.trim();
-                if v.eq_ignore_ascii_case("random") {
-                    use rand::Rng;
-                    let seed = rand::rngs::StdRng::from_entropy().r#gen::<u64>();
-                    eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
-                    self.rng = SvRng::from_seed(seed);
-                    self.run_seed = Some(seed);
-                } else if let Ok(seed) = v.parse::<u64>() {
-                    self.rng = SvRng::from_seed(seed);
-                    self.run_seed = Some(seed);
-                } else {
-                    eprintln!(
-                        "[xezim][warning] ignoring malformed +seed={} (want an integer or 'random')",
-                        v
-                    );
-                }
+                self.seed_rng(v, "+seed=");
             }
         }
+    }
+
+    /// Seed the RNG from `<flag><v>`: an integer, or `random` for a seed
+    /// drawn from entropy and printed so the run can be replayed.
+    fn seed_rng(&mut self, v: &str, flag: &str) {
+        let v = v.trim();
+        let seed = if v.eq_ignore_ascii_case("random") {
+            use rand::Rng;
+            let seed = rand::rngs::StdRng::from_entropy().r#gen::<u64>();
+            eprintln!(
+                "[xezim] random seed: {} (replay with {}{})",
+                seed, flag, seed
+            );
+            seed
+        } else if let Ok(seed) = v.parse::<u64>() {
+            seed
+        } else {
+            eprintln!(
+                "[xezim][warning] ignoring malformed {}{} (want an integer or 'random')",
+                flag, v
+            );
+            return;
+        };
+        self.rng = SvRng::from_seed(seed);
+        self.run_seed = Some(seed);
     }
 
     /// Reuse the runtime-neutral combinational worklist associated with an

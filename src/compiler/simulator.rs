@@ -59733,6 +59733,8 @@ impl Simulator {
             self.sample_edge_covergroups();
         }
         if waiters_first && !self.event_waiters.is_empty() {
+            // Only a finish these continuations raise is deferred below.
+            let finished_before = self.finished;
             let _t_w = self.profile_timing.then(std::time::Instant::now);
             // Drain and run triggered waiters, then RE-DRAIN: a resumed
             // continuation may `-> ev` or write a signal that triggers ANOTHER
@@ -59777,7 +59779,7 @@ impl Simulator {
             // this edge delivery completes: the same edge's always blocks
             // still fire once (reference-simulator behavior — a final-cycle
             // `$display` monitor racing the testbench's `$finish` prints).
-            if self.finished {
+            if self.finished && !finished_before {
                 self.finish_deferred = true;
                 self.finished = false;
             }
@@ -61181,6 +61183,10 @@ impl Simulator {
         // post-#0 write executed — losing exactly the event this exists for.
         let __prev_edge_cont = self.in_edge_cont;
         self.in_edge_cont = true;
+        // A finish raised before the continuations below (by an always block
+        // of this pass, an earlier process, or a VPI routine) stays a finish:
+        // only one the continuations raise is deferred to the end of the slot.
+        let finished_before_conts = self.finished;
         let mut triggered_conts = triggered_conts;
         for (pid, stmts) in triggered_conts.drain(..) {
             if self.finished {
@@ -61267,7 +61273,7 @@ impl Simulator {
             }
         }
         self.in_edge_cont = __prev_edge_cont;
-        if !waiters_first && active_region && self.finished {
+        if !waiters_first && active_region && self.finished && !finished_before_conts {
             // A `$finish` from a continuation resumed AFTER this edge's
             // blocks stops the run once the slot completes: its SVA ticks
             // (tick_sva_sites runs after this pass returns) and postponed

@@ -2,10 +2,12 @@
 //! time slot either runs whole before the finish or not at all. Compiled
 //! block code used to ignore the finish: the block's compiled statements ran
 //! (counters, NBAs) while its interpreted ones (`$display`) were skipped, so
-//! the `final` block reported a value the log never showed.
+//! the `final` block reported a value the log never showed. And a finish
+//! from an always block or a process was deferred to the end of the slot
+//! like a resumed waiter's, so later passes ran more blocks.
 //!
-//! The reference simulator runs no woken block after the finish in either
-//! shape below.
+//! The reference simulator runs no block after the finish in any shape
+//! below.
 
 use xezim::simulate;
 
@@ -42,6 +44,27 @@ endmodule
         last.trim_start_matches("RAN"),
         "{got:?}"
     );
+}
+
+/// An always block writes `q` and calls `$finish`. The block woken by `q`
+/// must not run in a later pass of the same slot: the finish of an always
+/// block is not the deferred finish of a resumed waiter (reference
+/// simulator: hits=0).
+#[test]
+fn finish_from_edge_block_stops_later_passes() {
+    let got = lines(
+        r#"
+module top;
+  reg clk = 0, q = 0;
+  int hits = 0;
+  always #5 clk = ~clk;
+  always @(posedge clk) if ($time > 10) begin q = 1; $finish; end
+  always @(posedge q) begin hits++; $display("RAN hits=%0d", hits); end
+  final $display("FINAL hits=%0d", hits);
+endmodule
+"#,
+    );
+    assert_eq!(got, ["FINAL hits=0"]);
 }
 
 /// A process writes the clock and calls `$finish` without suspending: the

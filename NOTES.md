@@ -23,8 +23,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   resumed, by an always block, an earlier process or a VPI routine, was also
   deferred to the end of the slot like one of theirs, so later passes ran
   more blocks. `final` blocks and coverage then counted a clock edge the log
-  never showed. Only a finish from a resumed waiting process still lets the
-  slot's assertions and monitors run. A finish from a cbAfterDelay callback,
+  never showed. Only a finish from a resumed waiting process is still
+  deferred to the end of the slot. A finish from a cbAfterDelay callback,
   or from a value-change callback on a clock that callback drives, also stops
   that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
 

@@ -897,7 +897,7 @@ fn process_command_file(
         let mut i = 0usize;
         while i < toks.len() {
             let t = toks[i].as_str();
-            let used = cli_compat::handle_flag(&toks, i, compat, plusargs)
+            let used = cli_compat::handle_flag(&toks, i, base, compat, plusargs)
                 .map_err(|e| format!("{} (in args file '{}')", e, path))?;
             if used > 0 {
                 i += used;
@@ -1910,7 +1910,7 @@ fn run_main() -> i32 {
         let arg = &args[i];
         // Other simulators' spellings first: several (`-sv_seed`, `-suppress`,
         // `-lib`) would otherwise read as the glued `-s<top>` / `-l<file>`.
-        match cli_compat::handle_flag(&args, i, &mut compat, &mut plusargs) {
+        match cli_compat::handle_flag(&args, i, Path::new("."), &mut compat, &mut plusargs) {
             Ok(0) => {}
             Ok(n) => {
                 i += n;

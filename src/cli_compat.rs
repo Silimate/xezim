@@ -147,10 +147,13 @@ pub(crate) fn resolve_sv_libs(cx: &CompatArgs) -> Vec<String> {
 }
 
 /// One of the spellings above at `toks[i]`: apply it and return how many
-/// tokens it used, or 0 when `toks[i]` is not one of them.
+/// tokens it used, or 0 when `toks[i]` is not one of them. `base` is where
+/// a relative source file name is also looked up: the args file's directory,
+/// or `.` on the command line.
 pub(crate) fn handle_flag(
     toks: &[String],
     i: usize,
+    base: &Path,
     cx: &mut CompatArgs,
     plusargs: &mut Vec<String>,
 ) -> Result<usize, String> {
@@ -210,7 +213,7 @@ pub(crate) fn handle_flag(
             cx.coverage = true;
             let types = toks
                 .get(i + 1)
-                .filter(|n| !Path::new(n.as_str()).exists())
+                .filter(|n| !Path::new(n.as_str()).exists() && !base.join(n.as_str()).exists())
                 .and_then(|n| coverage_types(n).map(|k| (n.clone(), k)));
             match types {
                 Some(types) => {

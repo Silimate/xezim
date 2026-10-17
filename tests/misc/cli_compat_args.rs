@@ -187,6 +187,31 @@ fn coverage_type_lists() {
     }
 }
 
+/// A source file whose name reads as coverage types stays a source file
+/// after `-coverage`: in the working directory, and in an args file, where
+/// a relative name is also looked up beside the args file.
+#[test]
+fn coverage_types_never_take_a_source_file() {
+    let d = scratch("covsrc");
+    std::fs::create_dir_all(d.join("cfg")).unwrap();
+    std::fs::write(
+        d.join("cfg/all"),
+        "module tb; initial $display(\"ALL\"); endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("cfg/files.f"), "-coverage all\n").unwrap();
+    for (dir, args) in [
+        (d.clone(), &["-f", "cfg/files.f"][..]),
+        (d.join("cfg"), &["-coverage", "all"][..]),
+    ] {
+        let _ = std::fs::remove_file(dir.join("xezim_cov.json"));
+        let out = ok_stdout(&dir, args);
+        assert!(out.contains("ALL"), "{:?}: {}", args, out);
+        let cov = std::fs::read_to_string(dir.join("xezim_cov.json")).unwrap_or_default();
+        assert!(cov.contains("\"code_coverage\""), "{:?}: {}", args, cov);
+    }
+}
+
 /// `--version` and `-version` print what `-V` prints, the version and the
 /// git revision, and exit 0.
 #[test]

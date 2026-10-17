@@ -477,6 +477,9 @@ const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
 /// Ticks of history a concurrent assertion keeps per `$past` operand
 /// (`SvaClockedSite::past_snapshots`).
 const SVA_PAST_DEPTH: usize = 16;
+/// Ends a deferred declaration initializer: `(<target>, ...)` records the
+/// values it gave as their default sampled values (see `sampled_defaults`).
+const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
 /// §16.3: the message of the `$error` a failed assertion with no `else`
 /// clause reports (the reference simulator's wording).
 const ASSERT_DEFAULT_ERROR: &str = "Assertion error.";
@@ -19268,6 +19271,9 @@ impl Simulator {
         // blocks are consumed into scheduled processes, so clock-edge
         // history accumulates from the first edge.
         self.register_sampled_watches();
+        if !self.sampled_defaults.is_empty() || !self.sampled_watches.is_empty() {
+            self.mark_deferred_inits();
+        }
         // IEEE 1800: at time 0, always_comb blocks execute unconditionally.
         // always @* blocks do NOT execute at time 0 unless inputs change.
         // Only seed dirty IDs that have combinational dependents. Large
@@ -59398,6 +59404,93 @@ impl Simulator {
         self.sampled_defaults.get(id).cloned()
     }
 
+    /// §16.5.1: a declaration initializer the elaborator could not fold runs
+    /// as a time-0 process: a static initializer, or at the top level a
+    /// synthesized initial block (dummy spans, as `cov_synthesized_initial`
+    /// tells them apart). What it assigns is still the default sampled
+    /// value, so end each such process with `SAMPLED_DEFAULT_MARKER`.
+    fn mark_deferred_inits(&mut self) {
+        let dummy = |sp: crate::ast::Span| sp.start == 0 && sp.end == 0;
+        let blocks = self.module.static_init_blocks.iter_mut().map(|b| (b, true));
+        let synthesized = self.module.initial_blocks.iter_mut().filter_map(|b| {
+            let s = &b.stmt;
+            let ok = dummy(s.span)
+                || matches!(&s.kind, StatementKind::BlockingAssign { lvalue, .. } if dummy(lvalue.span));
+            ok.then_some((b, false))
+        });
+        for (b, any) in blocks.chain(synthesized) {
+            let mut targets = Vec::new();
+            if !Self::init_targets(&b.stmt, any, &mut targets) || targets.is_empty() {
+                continue;
+            }
+            let span = crate::ast::Span::dummy();
+            let marker = Statement::new(
+                StatementKind::Expr(Expression::new(
+                    ExprKind::SystemCall {
+                        name: SAMPLED_DEFAULT_MARKER.to_string(),
+                        args: targets,
+                    },
+                    span,
+                )),
+                span,
+            );
+            if let StatementKind::SeqBlock { stmts, .. } = &mut b.stmt.kind {
+                stmts.push(marker);
+                continue;
+            }
+            let st = std::mem::replace(&mut b.stmt, Statement::new(StatementKind::Null, span));
+            b.stmt = Statement::new(
+                StatementKind::SeqBlock {
+                    name: None,
+                    stmts: vec![st, marker],
+                },
+                span,
+            );
+        }
+    }
+
+    /// The targets of the blocking assignments in a deferred declaration
+    /// initializer. With `any` false (a synthesized initial block), false
+    /// unless the block holds nothing else.
+    fn init_targets(st: &Statement, any: bool, out: &mut Vec<Expression>) -> bool {
+        match &st.kind {
+            StatementKind::BlockingAssign { lvalue, .. } => {
+                out.push(lvalue.clone());
+                true
+            }
+            StatementKind::SeqBlock { stmts, .. } => {
+                // Every statement is visited: `all` would stop at the first
+                // miss and leave the later targets out.
+                stmts
+                    .iter()
+                    .fold(true, |ok, s| Self::init_targets(s, any, out) && ok)
+            }
+            _ => any,
+        }
+    }
+
+    /// `SAMPLED_DEFAULT_MARKER`: a deferred declaration initializer has run,
+    /// so its targets now hold their default sampled values (§16.5.1).
+    /// Update the ones a concurrent assertion or a procedural watch keeps.
+    fn record_sampled_defaults(&mut self, targets: &[Expression]) {
+        for t in targets {
+            let Some(id) = self.get_lhs_signal_id(t) else {
+                continue;
+            };
+            let Some(v) = self.signal_table.get(id).cloned() else {
+                continue;
+            };
+            for w in &mut self.sampled_watches {
+                if w.sig_id == Some(id) && w.default.is_some() {
+                    w.default = Some(v.clone());
+                }
+            }
+            if let Some(d) = self.sampled_defaults.get_mut(&id) {
+                *d = v;
+            }
+        }
+    }
+
     /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
     /// $changed/$past` call in procedural code, so their clock-edge history
     /// accumulates from time 0 (lazy registration at first eval would miss
@@ -91057,6 +91150,10 @@ impl Simulator {
             if let Some(id) = args.first().and_then(|a| self.eval_expr(a).to_u64()) {
                 self.sync_wakes.insert(id);
             }
+            return;
+        }
+        if name == SAMPLED_DEFAULT_MARKER {
+            self.record_sampled_defaults(args);
             return;
         }
         // §21.7: every waveform task is inert without `--wave`, which is what

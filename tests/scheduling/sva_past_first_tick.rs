@@ -5,7 +5,8 @@
 //! `$fell`, `$stable` and `$changed` compare the sampled value with it.
 //! §16.5.1 defines that value as the one before time 0: a static variable's
 //! declaration initializer, else its type's default (x for `logic`, 0 for
-//! `bit`), and the type's default for a net. A write at time 0 does not count.
+//! `bit`), and the type's default for a net. A write at time 0 does not count,
+//! but an initializer xezim runs as a time-0 process (`fv` below) does.
 //!
 //! A concurrent assertion read x there for every operand and treated the
 //! value-change functions as "no change", so an unguarded
@@ -56,6 +57,8 @@ module t;
   logic r = 0, f = 1, i;           // all three written at time 0 below
   wire w; assign w = r;            // a net: its type's default, x
   logic en = 0;
+  function automatic logic [7:0] triple(input int x); return 8'(x * 3); endfunction
+  logic [7:0] fv = triple(3);      // an initializer run as a time-0 process
   int k = 0;                       // sampled as the number of earlier ticks
   logic t1 = 0;                    // sampled as 1 from the second tick on
   always_ff @(posedge clk) begin k <= k + 1; t1 <= 1; end
@@ -70,6 +73,7 @@ module t;
   // The unguarded check of the report.
   a_q:  assert property (@(posedge clk) q == $past(d)) else $display("FAIL q %0t", $time);
   a_v:  assert property (@(posedge clk) $past(v) === 8'hA5) else $display("FAIL v %0t", $time);
+  a_fv: assert property (@(posedge clk) $past(fv) === 8'd9 && $stable(fv)) else $display("FAIL fv %0t", $time);
   a_u:  assert property (@(posedge clk) $past(u) === 1'bx) else $display("FAIL u %0t", $time);
   a_b:  assert property (@(posedge clk) $past(b) === 1'b0) else $display("FAIL b %0t", $time);
   a_n:  assert property (@(posedge clk) $past(n) == -7) else $display("FAIL n %0t", $time);
@@ -90,9 +94,12 @@ module t;
   a_rt: assert property (@(posedge clk) $rose(t1) === (k == 1)) else $display("FAIL rose_t1 %0t", $time);
   a_pt: assert property (@(posedge clk) $past(t1) === (k >= 2)) else $display("FAIL past_t1 %0t", $time);
   // Procedural calls read the same default as the assertions.
-  always @(posedge clk)
+  always @(posedge clk) begin
     if ($past(w) !== (first ? 1'bx : 1'b1) || $rose(w) !== first)
       $display("FAIL proc_w %0t", $time);
+    if ($past(fv) !== 8'd9 || $changed(fv))
+      $display("FAIL proc_fv %0t", $time);
+  end
 endmodule
 "#,
     );

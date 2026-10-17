@@ -260,3 +260,38 @@ endmodule
     );
     assert_eq!(report(&text), ["PASS"], "report:\n{text}");
 }
+
+/// A streaming concatenation in an operand, around a nested call and in the
+/// property body: the variables it streams are sampled, and the call inside
+/// it keeps its history. Here `q` is a flop written on the property's clock.
+#[test]
+fn streaming_concatenations_are_sampled() {
+    let text = run(
+        "streams",
+        "t",
+        r#"
+module t;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  typedef logic [3:0] nib_t;
+  logic [3:0] d = 0, q = 0, q1 = 0;
+  int ticks = 0, fails = 0;
+  // q is a flop written on the property's clock; q1 holds q one tick back.
+  always @(posedge clk) begin ticks <= ticks + 1; q <= d; q1 <= q; end
+  initial begin
+    repeat (8) begin @(negedge clk); d = d * 5 + 3; end
+    @(negedge clk);
+    if (fails == 0) $display("PASS"); else $display("FAIL %0d", fails);
+    $finish;
+  end
+  a_op: assert property (@(posedge clk) ticks < 2 || $past(nib_t'({<<{q}})) == {q1[0], q1[1], q1[2], q1[3]})
+    else begin fails++; $display("FAIL a_op %0t", $time); end
+  a_in: assert property (@(posedge clk) ticks < 2 || nib_t'({<<{$past(q[3:0])}}) == {q1[0], q1[1], q1[2], q1[3]})
+    else begin fails++; $display("FAIL a_in %0t", $time); end
+  a_body: assert property (@(posedge clk) ticks < 1 || nib_t'({<<{q}}) == $past({d[0], d[1], d[2], d[3]}))
+    else begin fails++; $display("FAIL a_body %0t", $time); end
+endmodule
+"#,
+    );
+    assert_eq!(report(&text), ["PASS"], "report:\n{text}");
+}

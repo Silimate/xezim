@@ -95438,6 +95438,13 @@ impl Simulator {
                     self.collect_sva_signal_ids(r, out);
                 }
             }
+            ExprKind::StreamOp {
+                slice_size, exprs, ..
+            } => {
+                for e in slice_size.iter().map(|s| &**s).chain(exprs) {
+                    self.collect_sva_signal_ids(e, out);
+                }
+            }
             ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
             _ => {}
         }
@@ -96287,6 +96294,12 @@ impl Simulator {
                 } => {
                     sub(x.as_mut());
                     xs.iter_mut().for_each(&mut sub);
+                }
+                ExprKind::StreamOp {
+                    slice_size, exprs, ..
+                } => {
+                    slice_size.iter_mut().for_each(|s| sub(s.as_mut()));
+                    exprs.iter_mut().for_each(&mut sub);
                 }
                 _ => {}
             }

@@ -96185,7 +96185,10 @@ impl Simulator {
     /// the call needs: N + 1 (the value-change functions read one tick
     /// back). Used to refresh per-site snapshots once per clock fire.
     fn collect_past_arg_names(&mut self, expr: &Expression, out: &mut Vec<(String, usize)>) {
-        match &expr.kind {
+        // Every container counts (a concatenation, a select, a match item, a
+        // clocked subproperty): a call the walk missed would read a history
+        // sized for the operand's other calls only.
+        Self::walk_operands(expr, &mut |x| match &x.kind {
             ExprKind::SystemCall { name, args }
                 if matches!(
                     name.as_str(),
@@ -96197,44 +96200,19 @@ impl Simulator {
                     let sig = self.resolve_hier_name(h).into_owned();
                     out.push((sig, ticks.max(1).saturating_add(1)));
                 }
-                for a in args {
-                    self.collect_past_arg_names(a, out);
-                }
             }
-            ExprKind::SystemCall { args, .. } => {
-                for a in args {
-                    self.collect_past_arg_names(a, out);
-                }
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                self.collect_past_arg_names(lvalue, out);
+                self.collect_past_arg_names(rvalue, out);
             }
-            ExprKind::Binary { left, right, .. } => {
-                self.collect_past_arg_names(left, out);
-                self.collect_past_arg_names(right, out);
-            }
-            ExprKind::Unary { operand, .. } => {
-                self.collect_past_arg_names(operand, out);
-            }
-            ExprKind::Paren(inner) => {
-                self.collect_past_arg_names(inner, out);
-            }
-            ExprKind::Conditional {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                self.collect_past_arg_names(condition, out);
-                self.collect_past_arg_names(then_expr, out);
-                self.collect_past_arg_names(else_expr, out);
-            }
-            ExprKind::Call { args, .. } => {
-                for a in args {
-                    self.collect_past_arg_names(a, out);
-                }
-            }
-            ExprKind::SvaClocked { body, .. } => {
+            ExprKind::SvaClocked { body, iff, .. } => {
                 self.collect_past_arg_names(body, out);
+                if let Some(g) = iff {
+                    self.collect_past_arg_names(g, out);
+                }
             }
             _ => {}
-        }
+        });
     }
 
     /// LRM §14.3 clocking-block input snapshot. Each registered cb

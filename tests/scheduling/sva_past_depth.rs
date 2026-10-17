@@ -95,6 +95,39 @@ endmodule
     );
 }
 
+/// A `$past` inside a concatenation, a replication or a sequence match item
+/// sizes its operand's history too. Inside a concatenation it shared a
+/// two-sample history with the `$changed` of the same operand.
+#[test]
+fn past_in_any_container_sizes_the_history() {
+    let text = run(
+        "containers",
+        r#"
+module t;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  logic [31:0] st = 0;
+  int k = 0;
+  always_ff @(posedge clk) begin st <= st + 1; k <= k + 1; end
+  int hc = 0, hn = 0, hv = 0;
+  cc: cover property (@(posedge clk) k >= 5 && {$past(st, 5)} == st - 5 && $changed(st)) hc++;
+  cn: cover property (@(posedge clk) k >= 20 && {2{$past(st, 20)}} == {2{st - 20}} && !$stable(st)) hn++;
+  property mi;
+    logic [31:0] v;
+    @(posedge clk) (k >= 25, v = $past(st, 25)) ##0 (v == st - 25);
+  endproperty
+  cv: cover property (mi) hv++;
+  initial begin
+    #1000;
+    $display("RESULT hc=%0d hn=%0d hv=%0d", hc, hn, hv);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert_eq!(result(&text), "RESULT hc=95 hn=80 hv=75", "{text}");
+}
+
 /// A procedural `$past` first evaluated at the 71st tick reads 20 (or N)
 /// ticks back all the same.
 #[test]

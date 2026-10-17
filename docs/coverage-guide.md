@@ -4,8 +4,8 @@ xezim collects **functional coverage** (covergroups, IEEE 1800 clause 19) and
 **assertion coverage** (`cover` statements, plus pass/fail counts of assertions,
 clause 16) in every simulation, and writes the results to a JSON file when the run
 ends. When asked (`--code-coverage`), it also collects **code coverage**:
-statement, branch and toggle counts, in the same file. There is no condition,
-expression or FSM coverage.
+statement, branch, toggle and FSM (state machine) counts, in the same file.
+There is no condition or expression coverage.
 
 This guide covers what is supported, how to write coverage that xezim collects, and
 how to read the results. Code coverage has [its own section](#code-coverage).
@@ -24,7 +24,7 @@ how to read the results. Code coverage has [its own section](#code-coverage).
 | Options | `option.at_least`, `option.weight`, `option.auto_bin_max`, `type_option.merge_instances`, `type_option.weight` |
 | Queries | `get_inst_coverage()` and `get_coverage()` on a covergroup, a coverpoint or a cross, with or without `(covered, total)`; `cg_type::get_coverage()`; `$get_coverage()`; `start()` and `stop()` |
 | Assertion coverage | Counts for `cover property`, `cover sequence`, `assert property`, `assume property` and the immediate `cover`, `assert` and `assume` |
-| Code coverage | Statement, branch and toggle coverage with `--code-coverage` (or `+cover`). See [Code coverage](#code-coverage) |
+| Code coverage | Statement, branch, toggle and FSM coverage with `--code-coverage` (or `+cover`). See [Code coverage](#code-coverage) |
 | Results | The `xezim_cov.json` file, and `[COV]` summary lines with `--verbose` |
 
 ---
@@ -539,19 +539,20 @@ hit, so a combined percentage can't be worked out from them alone.
 ## Code coverage
 
 With `--code-coverage`, xezim also counts which statements ran, which way each
-branch went and which bits of each signal toggled, and writes the counts to
+branch went, which bits of each signal toggled, and which states and
+transitions of each state machine the run visited, and writes the counts to
 `xezim_cov.json` next to the functional coverage.
 
 ### Enabling code coverage
 
 | Spelling | Collects |
 |---|---|
-| `--code-coverage` | Statement, branch and toggle coverage |
-| `--code-coverage=<kinds>` | The kinds listed, separated by commas: `stmt` (or `statement`), `branch`, `toggle`, `all` |
+| `--code-coverage` | Statement, branch, toggle and FSM coverage |
+| `--code-coverage=<kinds>` | The kinds listed, separated by commas: `stmt` (or `statement`), `branch`, `toggle`, `fsm`, `all` |
 | `XEZIM_CODE_COVERAGE=<kinds>` | The same, for scripts that cannot add a flag. `--code-coverage` wins |
-| `+cover` | All three |
-| `+cover=<letters>` | `s` statement, `b` branch, `t` toggle. Other simulators' other letters (`c` condition, `e` expression, `f` FSM, `x` extended toggle) are ignored with one warning, for example `Warning: +cover=sbcf: xezim has no condition (c), FSM (f) coverage; collecting statement, branch coverage` |
-| `-coverage` | All three, unless a `+cover=<letters>` names fewer |
+| `+cover` | All four |
+| `+cover=<letters>` | `s` statement, `b` branch, `t` toggle, `f` FSM. Other simulators' other letters (`c` condition, `e` expression, `x` extended toggle) are ignored with one warning, for example `Warning: +cover=sbcf: xezim has no condition (c) coverage; collecting statement, branch, FSM coverage` |
+| `-coverage` | All four, unless a `+cover=<letters>` names fewer |
 
 `--code-coverage-scope=<path>[,<path>...]` (repeatable) limits every kind to the
 instances at or below the given paths (`tb.dut`, or `dut` for the instance of that
@@ -572,7 +573,7 @@ bytecode, so every execution path (compiled blocks, the two-state executors and
 the interpreter) counts the same way, and the simulation's results do not
 change. The instrumented run is slower, most of all for RTL:
 
-| Run | Without | `--code-coverage` | `=stmt,branch` | `=toggle` |
+| Run | Without | `=stmt,branch,toggle` | `=stmt,branch` | `=toggle` |
 |---|---|---|---|---|
 | C906 RISC-V CPU running one CoreMark iteration (RTL) | 112 s | 298 s; 2.36x the instructions | 2.17x the instructions | 1.23x the instructions |
 | AXI4 UVM testbench (`axi4_base_test`) | 7.0 s | 7.2 s; +0.1% instructions | - | - |
@@ -611,9 +612,9 @@ $ xezim --code-coverage cnt_cov.sv
 q = 3
 Simulation finished at time 40 ($finish called)
 $ xezim --code-coverage --verbose cnt_cov.sv 2>&1 | grep '^\[COV\] code\|^\[COV\]  '
-[COV] code coverage: statement 12/12 (100.00%), branch 2/3 (66.67%), toggle 14/24 (58.33%)
-[COV]   tb (tb): statement 9/9 (100.00%), branch 0/0, toggle 7/12 (58.33%)
-[COV]   tb.u_cnt (counter): statement 3/3 (100.00%), branch 2/3 (66.67%), toggle 7/12 (58.33%)
+[COV] code coverage: statement 12/12 (100.00%), branch 2/3 (66.67%), toggle 14/24 (58.33%), fsm 0/0
+[COV]   tb (tb): statement 9/9 (100.00%), branch 0/0, toggle 7/12 (58.33%), fsm 0/0
+[COV]   tb.u_cnt (counter): statement 3/3 (100.00%), branch 2/3 (66.67%), toggle 7/12 (58.33%), fsm 0/0
 ```
 
 The first line is the design's totals, then one line per scope with its design
@@ -629,9 +630,11 @@ The counter's entry in `xezim_cov.json`:
         "statement": {"covered": 3, "total": 3, "percent": 100.00},
         "branch": {"covered": 2, "total": 3, "percent": 66.67},
         "toggle": {"covered": 7, "total": 12, "percent": 58.33},
+        "fsm": {"covered": 0, "total": 0, "percent": null, "states": {"covered": 0, "total": 0, "percent": null}, "transitions": {"covered": 0, "total": 0, "percent": null}},
         "statements": [{"file": "cnt_cov.sv", "line": 2, "kind": "always_ff", "count": 4}, {"file": "cnt_cov.sv", "line": 4, "kind": "statement", "count": 1}, {"file": "cnt_cov.sv", "line": 6, "kind": "statement", "count": 3}],
         "branches": [{"file": "cnt_cov.sv", "line": 3, "kind": "if", "arms": [{"line": 4, "arm": "if", "count": 1}, {"line": 6, "arm": "else if", "count": 3}, {"line": 3, "arm": "else (implicit)", "count": 0}]}],
-        "toggles": [{"signal": "clk", "width": 1, "rise": [4], "fall": [4]}, {"signal": "en", "width": 1, "rise": [1], "fall": [0]}, {"signal": "q", "width": 3, "rise": [2, 1, 0], "fall": [1, 0, 0]}, {"signal": "rst", "width": 1, "rise": [0], "fall": [1]}]
+        "toggles": [{"signal": "clk", "width": 1, "rise": [4], "fall": [4]}, {"signal": "en", "width": 1, "rise": [1], "fall": [0]}, {"signal": "q", "width": 3, "rise": [2, 1, 0], "fall": [1, 0, 0]}, {"signal": "rst", "width": 1, "rise": [0], "fall": [1]}],
+        "fsms": []
       }
 ```
 
@@ -640,7 +643,8 @@ came with both `rst` and `en` low, so the implicit `else` of the `if` chain was
 never taken. `q` went 0, 1, 2, 3: bit 2 never toggled and bit 1 never fell, so
 3 of its 6 bins are covered. The inputs count in the counter too, with the
 testbench signals' counts: `clk` rose and fell four times, `rst` only fell and
-`en` only rose, so 7 of the counter's 12 toggle bins are covered.
+`en` only rose, so 7 of the counter's 12 toggle bins are covered. `q` is no
+state machine: nothing tests it (see [FSMs](#fsms)).
 
 ### What counts
 
@@ -716,6 +720,144 @@ testbench signals' counts: `clk` rose and fell four times, `rst` only fell and
   blocks, and class properties.
 - Counts are exact: they do not stop at 1.
 
+#### FSMs
+
+xezim finds the design's finite state machines the way the commercial simulator
+does, and counts their states and transitions. For example:
+
+```systemverilog
+module door (input logic clk, rst, open_req, close_req, output logic busy);
+  typedef enum logic [1:0] {CLOSED, OPENING, OPEN, CLOSING} state_t;
+  state_t state, next;
+  always_ff @(posedge clk)
+    if (rst) state <= CLOSED;
+    else     state <= next;
+  always_comb begin
+    next = state;
+    case (state)
+      CLOSED:  if (open_req)  next = OPENING;
+      OPENING: next = OPEN;
+      OPEN:    if (close_req) next = CLOSING;
+      CLOSING: if (open_req)  next = OPENING;
+               else           next = CLOSED;
+    endcase
+  end
+  assign busy = state == OPENING || state == CLOSING;
+endmodule
+
+module tb;
+  logic clk = 0, rst = 1, open_req = 0, close_req = 0, busy;
+  door u_door (.*);
+  always #5 clk = ~clk;
+  initial begin
+    @(negedge clk) rst = 0;
+    open_req = 1;  @(negedge clk) open_req = 0;
+    repeat (3) @(negedge clk);
+    close_req = 1; @(negedge clk) close_req = 0;
+    repeat (2) @(negedge clk);
+    $finish;
+  end
+endmodule
+```
+
+```text
+$ xezim --code-coverage=fsm --verbose door_fsm.sv 2>&1 | grep '^\[COV\] code\|^\[COV\]  '
+[COV] code coverage: fsm 8/11 (72.73%)
+[COV]   tb.u_door (door): fsm 8/11 (72.73%)
+```
+
+The door's entry in `xezim_cov.json` (spread over several lines here):
+
+```json
+        "fsm": {"covered": 8, "total": 11, "percent": 72.73, "states": {"covered": 4, "total": 4, "percent": 100.00}, "transitions": {"covered": 4, "total": 7, "percent": 57.14}},
+        "fsms": [{"variable": "state", "next": "next", "file": "door_fsm.sv", "line": 4, "reset": ["CLOSED"],
+          "states": [{"name": "CLOSED", "value": 0, "line": 10, "count": 3}, {"name": "OPENING", "value": 1, "line": 11, "count": 1},
+                     {"name": "OPEN", "value": 2, "line": 12, "count": 2}, {"name": "CLOSING", "value": 3, "line": 13, "count": 1}],
+          "transitions": [{"from": "CLOSED", "to": "OPENING", "line": 10, "count": 1}, {"from": "OPENING", "to": "CLOSED", "line": 5, "count": 0},
+                          {"from": "OPENING", "to": "OPEN", "line": 11, "count": 1}, {"from": "OPEN", "to": "CLOSED", "line": 5, "count": 0},
+                          {"from": "OPEN", "to": "CLOSING", "line": 12, "count": 1}, {"from": "CLOSING", "to": "CLOSED", "line": 14, "count": 1},
+                          {"from": "CLOSING", "to": "OPENING", "line": 13, "count": 0}],
+          "unreachable": [], "illegal": 0}]
+```
+
+The commercial simulator reports the same states, transitions, lines and counts
+for this design.
+
+**What is an FSM.** A variable is a state machine's state when all of these hold:
+
+- It is a variable of 2 to 64 bits (a vector, an `int` or `integer`, an enum)
+  that one edge-triggered always block, the *state process*
+  (`always_ff @(posedge clk)`, `always @(posedge clk or negedge rst_n)`),
+  assigns as a whole, and no other always block assigns. An initial block or a
+  declaration may give it a first value.
+- The state process, or the block that computes its next value, tests it: a
+  `case (state)`, or an `if` or `?:` that compares it with constants
+  (`state == IDLE`, `state != IDLE`, `&&`, `||` and `!` of those,
+  `state inside {...}`).
+- Every assignment of it yields constants: a parameter or `localparam`, an enum
+  member (a package's too), a literal or a `` `define `` of one, a cast of one
+  (`state_t'(IDLE)`), the variable itself, a `?:` of those, or an expression
+  of the variable in a branch that fixes its value (`2'd1: cnt <= cnt + 1` under
+  `case (cnt)`; such a counter is an FSM, as in the commercial simulator).
+- Or the state process loads a next-state variable (`state <= next`), which one
+  combinational block (`always_comb`, `always @*`, `always @(a or b)`), the
+  state process itself, or one continuous assignment computes, under the same
+  rule. That is the two-process style of the example.
+
+A register that nothing tests (`mode <= 2'd1;` under unrelated conditions), a
+state loaded from an input or any other variable, and a cast of a `?:`
+(`state_t'(sel ? A : B)`) do not make an FSM; neither does a 1-bit variable.
+
+**States.** The states are the values the assignments yield and the constants
+the tests compare with. An enum member that no assignment or test names is not a
+state. Each state is named after the parameter or enum member that gives it, or
+`st0`, `st1`, ... in value order when none has a name. Its `line` is that of
+the first transition out of it (preferring one inside a test of the variable),
+as in the commercial simulator's report.
+
+**Transitions.** A transition from S to T is an assignment that yields T in a
+branch where the variable can be S. An assignment outside every test of the
+variable, such as the reset `state <= CLOSED` or a `next = IDLE` default, is a
+transition from every state but its own: the example's reset adds
+OPENING -> CLOSED and OPEN -> CLOSED. A `default` case item applies to the
+states the other items do not list. Assignments that keep the state
+(`next = state`, `IDLE: next = IDLE`) are not transitions. A transition's `line`
+is the assignment that makes it: one inside a test of the variable before a
+reset or default, then one in the state process before one in the next-state
+logic, then the last in the source.
+
+**Counting.** A state counts when the state process assigns the variable and
+leaves it in that state at the end of the time slot, but only on a run in which
+something the process reads (or the state variable itself) changed since its
+previous clock edge. That is the commercial simulator's count: it skips a
+clocked process whose inputs have not changed. So a state held by
+`state <= next` counts on the clock that enters it and on the next one (when
+`state` has just changed), not on every clock: the example's OPEN, held three
+clocks, counts 2, and CLOSED counts the reset clock, the clock after it and two
+after CLOSING. A one-process FSM that assigns the state only to change it counts
+each visit. A run that an asynchronous reset starts (`posedge rst` in the event
+control) counts by the same rule, comparing with the last clock edge's run, and
+the next clock edge's run compares with that clock run too. Several assignments
+in one time slot count once, as the final value.
+
+A transition counts when a sample finds a state other than that of the previous
+sample. The previous sample is the state process's last assignment, or the
+variable's value at the end of time 0 (from a declaration's initializer or an
+initial block): a value written elsewhere, such as by the testbench or by an
+assignment to part of the variable, is not seen.
+
+**Unreachable and illegal states.** A state that no transition reaches from a
+reset state is still a state: it counts in the totals, stays uncovered and is
+listed in `unreachable`, as in the commercial simulator. A value outside the
+state set that the state process leaves in the variable (one the testbench
+forced in, held by `next = state`) counts in `illegal`, not in the coverage, and
+no transition is counted into or out of it. A value with x or z bits (before
+reset) is neither.
+
+FSM coverage is the states and transitions together: `fsm` in the results has
+the covered and total counts of both, and `states` and `transitions` apart, the
+commercial simulator's "FSM States" and "FSM Transitions".
+
 #### Scopes
 
 Code in a module body (generate blocks included) belongs to its instance. The
@@ -756,6 +898,14 @@ differences:
   into that net, and then lists it under the parent only; with full signal
   visibility it lists the port in the instance, as xezim does.
 - Toggle counts are not capped at 1.
+- A state process's input check compares values at its runs and at the end of
+  each time slot. An input that changes and changes back within one time slot
+  goes unseen, so a held state can count once less than in the commercial
+  simulator. The clock is the edge in the event control on a signal the body
+  does not read; with none or several, every run counts as a clock run. An
+  assignment to part of the state variable (`state[1] <= 1'b1`) is not a state
+  assignment; the commercial simulator counts a visit of the current state for
+  it.
 
 ### The code coverage results
 
@@ -763,17 +913,18 @@ The results file gains a `code_coverage` member:
 
 | Field | Meaning |
 |---|---|
-| `code_coverage.kinds` | The kinds collected: `statement`, `branch`, `toggle` |
-| `code_coverage.statement`, `.branch`, `.toggle` | Totals over the design: `covered`, `total` and `percent` (two decimals; `null` when `total` is 0). Toggle totals count bins, two per bit |
+| `code_coverage.kinds` | The kinds collected: `statement`, `branch`, `toggle`, `fsm` |
+| `code_coverage.statement`, `.branch`, `.toggle`, `.fsm` | Totals over the design: `covered`, `total` and `percent` (two decimals; `null` when `total` is 0). Toggle totals count bins, two per bit. FSM totals count states and transitions, and `fsm` also has `states` and `transitions`, each with its own `covered`, `total` and `percent` |
 | `code_coverage.scopes[]` | One entry per scope that has code: the instances by path, then the packages, `$unit` and the modules that declare classes |
 | `scopes[].scope` | The instance path from the top (`tb.u_cnt`), or the package, `$unit` or module name |
 | `scopes[].design_unit` | The module or interface of the instance; the scope's own name otherwise |
 | `scopes[].kind` | `instance`, `package`, `unit` or `module` (see [Scopes](#scopes)) |
-| `scopes[].statement`, `.branch`, `.toggle` | The scope's totals, like the design totals |
+| `scopes[].statement`, `.branch`, `.toggle`, `.fsm` | The scope's totals, like the design totals |
 | `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait` |
 | `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count` |
 | `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first |
-| `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches` and `toggles` with the counts of all its instances added up. A statement, arm or bin is covered when any instance covered it |
+| `scopes[].fsms[]` | Every FSM (see [FSMs](#fsms)): `variable` (the state variable's name within the scope, `gen[0].state` in a generate block), `next` (the next-state variable, or `null` for a one-process FSM), `file` and `line` of the state process, `reset` (the states it is reset to), `states[]` (`name`, `value`, `line`, `count`) in value order, `transitions[]` (`from`, `to`, `line`, `count`) by source state and then target, `unreachable` (state names) and `illegal` |
+| `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches`, `toggles` and `fsms` with the counts of all its instances added up (FSMs of different parameterizations stay apart). A statement, arm, bin, state or transition is covered when any instance covered it |
 
 Only the kinds collected appear. Several statements on one line are separate
 entries with the same `line`.
@@ -783,8 +934,8 @@ With `--verbose`, the end of the run prints the `[COV]` lines of the
 
 ### Adding code coverage runs together
 
-Each run's file lists every statement, arm and bit, hit or not, in the same order
-for the same design, so the files of several runs add up. For example, one
+Each run's file lists every statement, arm, bit, state and transition, hit or
+not, in the same order for the same design, so the files of several runs add up. For example, one
 random `case` selector per run:
 
 ```systemverilog
@@ -844,12 +995,19 @@ $ jq -s '[.[] | .code_coverage.scopes[] | .scope as $s | .branches | to_entries[
 ```
 
 Only `1: acc = 2;` never ran. Toggles add up per bit in the same way, from
-`.toggles[] | .rise` and `.fall`.
+`.toggles[] | .rise` and `.fall`, and FSMs per state and transition, from
+`.fsms[] | .states` and `.transitions`.
 
 ### Code coverage limits
 
-- No condition, expression or FSM coverage, and no exclusions: every statement,
-  arm and tracked bit counts.
+- No condition or expression coverage, and no exclusions: every statement, arm,
+  tracked bit, state and transition counts.
+- FSMs that are not recognized: one-hot machines written as `case (1'b1)` over
+  the state bits, `casez`/`casex` items with wildcards, a state variable wider
+  than 64 bits or of one bit, an element of an array or a member of a struct, a
+  state computed by a function call, next-state logic spread over several
+  blocks, and assignments made in a task or function the state process calls.
+  The FSM extraction of the commercial simulator recognizes some of these.
 - Instrumented code leaves some of xezim's fast paths: the optional native code
   generators, gate fusion for instrumented continuous assignments, table
   lookups for `case` statements, skipping a flop's clock edge when its inputs
@@ -873,8 +1031,8 @@ Only `1: acc = 2;` never ran. Toggles add up per bit in the same way, from
 
 **Not supported at all:**
 
-- Condition, expression and FSM coverage. Code coverage is statement, branch
-  and toggle only; see [Code coverage limits](#code-coverage-limits).
+- Condition and expression coverage. Code coverage is statement, branch, toggle
+  and FSM only; see [Code coverage limits](#code-coverage-limits).
 - Coverage databases in other formats (such as UCIS), text or HTML coverage
   reports, and merging results across runs (the files can be added up with
   `jq`: see [Several runs](#several-runs) and
@@ -921,9 +1079,9 @@ it.
 | `--verbose`, `XEZIM_VERBOSE=1` | Print the `[COV]` summary lines on stderr, along with the other engine lines |
 | `+seed=<n>` | Seed the random generator, for reproducible random stimulus and coverage |
 | `--error-exit` | Exit nonzero after any `$error`, including one from an assertion's action block, and after an `illegal_bins` hit |
-| `--code-coverage[=<kinds>]`, `XEZIM_CODE_COVERAGE=<kinds>` | Collect code coverage: `stmt`, `branch`, `toggle` or `all` (the default). See [Code coverage](#code-coverage) |
+| `--code-coverage[=<kinds>]`, `XEZIM_CODE_COVERAGE=<kinds>` | Collect code coverage: `stmt`, `branch`, `toggle`, `fsm` or `all` (the default). See [Code coverage](#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees and packages |
 | `--no-toggle-input-ports`, `XEZIM_TOGGLE_INPUT_PORTS=0` | Leave input and inout ports out of toggle coverage; by default each instance counts its own (`--toggle-input-ports`). See [Toggles](#toggles) |
-| `+cover`, `+cover=<letters>`, `-coverage` | Other simulators' spellings of `--code-coverage`: `s`, `b` and `t` select the kinds; other letters are ignored with a warning |
+| `+cover`, `+cover=<letters>`, `-coverage` | Other simulators' spellings of `--code-coverage`: `s`, `b`, `t` and `f` select the kinds; other letters are ignored with a warning |
 | `+fcover` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |

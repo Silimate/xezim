@@ -76,9 +76,9 @@ See the [UVM guide](uvm-guide.md).
   pass/fail counts for `cover property` and the assertions. A run with any of
   them writes the results to `xezim_cov.json` (`XEZIM_COV_DB=<path>` to move
   it).
-* **Code coverage**, off by default — statement, branch and toggle counts with
-  `--code-coverage` (or `+cover`), per instance and per design unit, in the
-  same `xezim_cov.json`. Instrumented at compile time, so a run without it pays
+* **Code coverage**, off by default — statement, branch, toggle and FSM
+  (state and transition) counts with `--code-coverage` (or `+cover`), per
+  instance and per design unit, in the same `xezim_cov.json`. Instrumented at compile time, so a run without it pays
   nothing.
 
 See the [coverage guide](coverage-guide.md).

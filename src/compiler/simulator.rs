@@ -3342,8 +3342,8 @@ struct SvaClockedSite {
     stat_loc: (Option<u32>, usize),
     /// Index of the site's per-instance tally in `assert_insts`.
     inst: usize,
-    /// Instance scope of the registering process: every instance of a
-    /// module or interface shares the assertion's span.
+    /// Instance scope the statement executed in (`running_instance_scope`):
+    /// every instance of a module or interface shares the assertion's span.
     dedup_scope: String,
     /// 0 assert, 1 assume, 2 cover (§16.5): a cover miss is not a failure
     /// and fires no else-action; a cover match fires the pass action.
@@ -46889,16 +46889,14 @@ impl Simulator {
                 let obj = obj.and_then(|h| self.heap.get(h)).and_then(|o| o.as_ref());
                 (2, obj.map_or("", |o| o.creation_scope.as_str()))
             }
-            None if self.m_block_active || self.current_scope.is_empty() => {
-                (0, self.m_block_scope.as_str())
-            }
-            None => (0, self.current_scope.as_str()),
+            None => (0, self.running_instance_scope()),
         };
         let sid = match self.assert_scope_ids.get(scope) {
             Some(&s) => s,
             None => {
+                let owned = scope.to_string();
                 let s = self.assert_scope_ids.len() as u32;
-                self.assert_scope_ids.insert(scope.to_string(), s);
+                self.assert_scope_ids.insert(owned, s);
                 s
             }
         };
@@ -89189,9 +89187,11 @@ impl Simulator {
                         };
                     if let Some((clock_signal, edge, iff, body)) = clocked {
                         let span_key = a.span.start;
-                        let existing = self.sva_sites.iter().position(|s| {
-                            s.span_key == span_key && s.dedup_scope == self.current_scope
-                        });
+                        let here = self.running_instance_scope();
+                        let existing = self
+                            .sva_sites
+                            .iter()
+                            .position(|s| s.span_key == span_key && s.dedup_scope == here);
                         let idx = match existing {
                             Some(i) => i,
                             None => {
@@ -95580,7 +95580,7 @@ impl Simulator {
             stat_key: self.assert_insts[inst].key,
             stat_loc: self.assert_insts[inst].loc,
             inst,
-            dedup_scope: self.current_scope.clone(),
+            dedup_scope: self.running_instance_scope().to_string(),
             kind,
             all_matches: a.is_sequence,
             clock_signal,
@@ -97476,6 +97476,17 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         None
+    }
+
+    /// The instance scope `%m` names the running statement after: a
+    /// sensitivity-driven block's, else the process's. `current_scope` alone
+    /// is the last process's while an edge block runs.
+    fn running_instance_scope(&self) -> &str {
+        if self.m_block_active || self.current_scope.is_empty() {
+            &self.m_block_scope
+        } else {
+            &self.current_scope
+        }
     }
 
     fn active_instance_scope(&self) -> String {

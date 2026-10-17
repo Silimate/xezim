@@ -462,3 +462,36 @@ fn or_settles_early_and_names_follow_declarations() {
         assert_eq!(counts(&json, inst, name), want, "{inst} {name}:\n{json}");
     }
 }
+
+const PROCEDURAL: &str = r#"module pm #(parameter int W = 1) (input logic clk, input logic [W-1:0] d, input logic go);
+  always @(posedge clk) begin
+    if (go) assert property (d == d);
+    assert property (d == d);
+  end
+  cover property (@(posedge clk) d == d);
+endmodule
+module top;
+  logic clk = 0;
+  logic [3:0] v = 0;
+  always #5 clk = ~clk;
+  pm #(.W(2)) u2 (.clk(clk), .d(v[1:0]), .go(1'b0));
+  pm #(.W(4)) u4 (.clk(clk), .d(v), .go(1'b0));
+  initial #22 $finish;
+endmodule
+"#;
+
+/// A concurrent assertion in an `always` block of a module instantiated
+/// twice gets an entry per instance: both instances' attempts used to go to
+/// the first instance's.
+#[test]
+fn procedural_assertions_count_per_instance() {
+    let (json, _) = run("procedural", &[("t.sv", PROCEDURAL)]);
+    for inst in ["top.u2", "top.u4"] {
+        assert_eq!(
+            counts(&json, inst, "assert__1"),
+            [2, 2, 0, 0, 0],
+            "{inst}:\n{json}"
+        );
+        assert_eq!(matches(&json, inst, "cover__0"), 2, "{inst}:\n{json}");
+    }
+}

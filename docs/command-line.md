@@ -58,6 +58,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
 | `--code-coverage[=<kinds>]` | Collect code coverage: `stmt`, `branch`, `toggle` (comma-separated) or `all` (the default). Results go to `xezim_cov.json` next to the functional coverage; `--verbose` adds a per-instance summary. See the [coverage guide](coverage-guide.md#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees (`tb.dut`) and packages (repeatable) |
+| `--no-toggle-input-ports` | Leave input and inout ports out of toggle coverage: the signal that drives one carries its toggles. By default each instance counts its own ports, as commercial simulators do (`--toggle-input-ports`). See the [coverage guide](coverage-guide.md#toggles) |
 | `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters) together with the `--verbose` engine lines. Same as `XEZIM_PROFILE_REPORT=1`. Adds overhead |
 | `--show-env-avail` | List every `XEZIM_*` environment variable with a one-line description, then exit |
 
@@ -97,6 +98,7 @@ unless noted.
 | `XEZIM_VERBOSE=1` | Same as `--verbose` (for scripts that grep `[PHASE]`/`[PROF]` lines without adding a flag) |
 | `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |
 | `XEZIM_COV_DB=<path>` | Write the coverage results somewhere other than `xezim_cov.json` |
+| `XEZIM_TOGGLE_INPUT_PORTS=0` | Same as `--no-toggle-input-ports`; the flag wins |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
 | `XEZIM_UVM_DIR=<dir>` | The UVM library `-uvm` adds: a `src` directory, a release root holding `src/`, or a checkout holding several releases (`1.1d`, `1.2`, `1800.2-2017`, `1800.2-2020`) |

@@ -812,6 +812,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Profiling: group compiled blocks by canonical shape; report repeated-template dynamic coverage (wants COMB_PATHS + EDGE_BLOCK_STATS)",
     ),
     (
+        "XEZIM_TOGGLE_INPUT_PORTS",
+        "Coverage: =0 leaves input and inout ports out of toggle coverage, like --no-toggle-input-ports (default: each instance counts its own); the flag wins",
+    ),
+    (
         "XEZIM_TOGGLE_INTEGERS",
         "Coverage: =0 leaves int, integer, shortint, longint and byte variables out of toggle coverage, like --no-toggle-integers; the flag wins",
     ),

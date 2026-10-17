@@ -34,13 +34,17 @@ const LIBRARY_PACKAGES: [&str; 2] = ["std", "uvm_pkg"];
 
 /// What the command line asked for. `scopes` limits every kind to the
 /// instances at or below the listed paths and to the listed packages (empty:
-/// the whole design). `integers` keeps the signals declared with an integer
-/// atom type (`TOGGLE_INTEGER_TYPES`) in toggle coverage; on by default,
+/// the whole design). `exclude_input_ports` leaves input and inout ports out
+/// of toggle coverage, so the net that drives one carries its toggles
+/// (`--no-toggle-input-ports`); by default each instance counts its own.
+/// `integers` keeps the signals declared with an integer atom type
+/// (`TOGGLE_INTEGER_TYPES`) in toggle coverage; on by default,
 /// `--no-toggle-integers` turns it off.
 #[derive(Clone, Debug)]
 pub struct CodeCoverage {
     pub kinds: u8,
     pub scopes: Vec<String>,
+    pub exclude_input_ports: bool,
     pub integers: bool,
 }
 
@@ -49,6 +53,7 @@ impl Default for CodeCoverage {
         CodeCoverage {
             kinds: 0,
             scopes: Vec::new(),
+            exclude_input_ports: false,
             integers: true,
         }
     }
@@ -1699,11 +1704,16 @@ impl Simulator {
 
     /// Nets and variables toggle coverage tracks, by name, taken while the
     /// elaboration signal table still holds their declarations: the integral
-    /// ones of instances, without input and inout ports (the parent's signal
-    /// carries those toggles), unpacked arrays, `time` variables, subroutine
-    /// variables and class properties; nor, when the run leaves integers
-    /// out, the signals declared with an integer atom type. Each comes with
-    /// its data type (`ToggleTypes::of`).
+    /// ones of instances, ports included, without unpacked arrays, `time`
+    /// variables, subroutine variables and class properties. An input or
+    /// inout port is a net of its instance holding the value its connection
+    /// gives it (§23.3.3): a whole-net connection collapsed onto the actual
+    /// shares the actual's counts, an expression or select toggles as its
+    /// value, and a constant or open port never toggles.
+    /// `exclude_input_ports` leaves input and inout ports to the signal that
+    /// drives them. When the run leaves integers out, the signals declared
+    /// with an integer atom type are left out too. Each comes with its data
+    /// type (`ToggleTypes::of`).
     pub(super) fn cov_toggle_candidates(module: &ElaboratedModule) -> Vec<(String, &'static str)> {
         let Some(cfg) = code_coverage().filter(|c| c.kinds & KIND_TOGGLE != 0) else {
             return Vec::new();
@@ -1731,10 +1741,11 @@ impl Simulator {
                 if sig.is_const
                     || sig.is_real
                     || sig.width == 0
-                    || matches!(
-                        sig.direction,
-                        Some(PortDirection::Input) | Some(PortDirection::Inout)
-                    )
+                    || (cfg.exclude_input_ports
+                        && matches!(
+                            sig.direction,
+                            Some(PortDirection::Input) | Some(PortDirection::Inout)
+                        ))
                 {
                     return false;
                 }

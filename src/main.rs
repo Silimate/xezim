@@ -233,6 +233,10 @@ fn print_usage() {
     eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
     eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
     eprintln!("                   subtrees (tb.dut) and packages. Repeatable.");
+    eprintln!("  --no-toggle-input-ports  Leave input and inout ports out of toggle coverage:");
+    eprintln!("                   the signal that drives one carries its toggles. By default");
+    eprintln!("                   each instance counts its own ports (--toggle-input-ports).");
+    eprintln!("                   XEZIM_TOGGLE_INPUT_PORTS=0 too.");
     eprintln!("  --no-toggle-integers  Leave variables of an integer type (int, integer,");
     eprintln!("                   shortint, longint, byte) out of toggle coverage, as some");
     eprintln!("                   simulators do by default. --toggle-integers keeps them (the");
@@ -1861,9 +1865,11 @@ fn run_main() -> i32 {
     let mut xtrace_profile: Option<String> = None;
     let mut xtrace_compress: Option<String> = None;
     let mut wave = false;
-    // `--code-coverage[=<kinds>]` / `--code-coverage-scope`.
+    // `--code-coverage[=<kinds>]` / `--code-coverage-scope` /
+    // `--[no-]toggle-input-ports`.
     let mut code_cov_kinds: Option<u8> = None;
     let mut code_cov_scopes: Vec<String> = Vec::new();
+    let mut toggle_input_ports: Option<bool> = None;
     // `--[no-]toggle-integers`.
     let mut code_cov_integers: Option<bool> = None;
     let mut fst_file: Option<String> = None;
@@ -2475,6 +2481,12 @@ fn run_main() -> i32 {
                         .map(String::from),
                 );
             }
+            "--toggle-input-ports" => {
+                toggle_input_ports = Some(true);
+            }
+            "--no-toggle-input-ports" => {
+                toggle_input_ports = Some(false);
+            }
             "--toggle-integers" => {
                 code_cov_integers = Some(true);
             }
@@ -2841,6 +2853,11 @@ fn run_main() -> i32 {
         .or(env_cov)
         .or(cover_request.map(|(k, _)| k))
         .unwrap_or(0);
+    // Input and inout ports count in their own instance's toggle coverage
+    // unless `--no-toggle-input-ports` (or XEZIM_TOGGLE_INPUT_PORTS=0; the
+    // flag wins) leaves them to the signal that drives them.
+    let input_ports = toggle_input_ports
+        .unwrap_or_else(|| env::var("XEZIM_TOGGLE_INPUT_PORTS").ok().as_deref() != Some("0"));
     // Integer variables are toggle-tracked unless `--no-toggle-integers` or
     // XEZIM_TOGGLE_INTEGERS=0 leaves them out; the flag wins.
     let integers = match code_cov_integers {
@@ -2867,6 +2884,7 @@ fn run_main() -> i32 {
             xezim::compiler::simulator::CodeCoverage {
                 kinds: code_cov,
                 scopes: code_cov_scopes,
+                exclude_input_ports: !input_ports,
                 integers,
             },
         ));

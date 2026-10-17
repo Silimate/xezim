@@ -29,6 +29,7 @@ fn run(dir: &Path, src: &str, args: &[&str]) -> Output {
         .current_dir(dir)
         .env("XEZIM_COV_DB", dir.join("cov.json"))
         .env_remove("XEZIM_CODE_COVERAGE")
+        .env_remove("XEZIM_TOGGLE_INPUT_PORTS")
         .env_remove("XEZIM_TOGGLE_INTEGERS")
         .env_remove("XEZIM_VERBOSE")
         .args(args)
@@ -262,9 +263,9 @@ endmodule
 }
 
 /// Toggles: per bit, 0->1 and 1->0 between the ends of time slots, never to
-/// or from x; input ports, memories and reals untracked. As in the reference
-/// simulator's report, a 0-1-0 within one time slot is no toggle and the
-/// leaf's input port is not listed.
+/// or from x; memories and reals untracked, and input ports too under
+/// `--no-toggle-input-ports`. As in the reference simulator's report, a
+/// 0-1-0 within one time slot is no toggle.
 #[test]
 fn toggle_counts() {
     let d = scratch("toggle");
@@ -291,7 +292,11 @@ module tb;
   end
 endmodule
 ";
-    let out = run(&d, src, &["--code-coverage=toggle"]);
+    let out = run(
+        &d,
+        src,
+        &["--code-coverage=toggle", "--no-toggle-input-ports"],
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -320,6 +325,273 @@ endmodule
         json.contains("\"toggle\": {\"covered\": 7, \"total\": 74, \"percent\": 9.46}"),
         "{json}"
     );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The entry of scope `name` in the results file, up to the next scope's.
+fn scope<'a>(json: &'a str, name: &str) -> &'a str {
+    let key = format!("\"scope\": \"{}\",", name);
+    let start = json
+        .find(&key)
+        .unwrap_or_else(|| panic!("no scope {name}: {json}"));
+    let rest = &json[start + key.len()..];
+    let end = rest
+        .find("\"scope\": ")
+        .or_else(|| rest.find("\"design_units\""))
+        .unwrap_or(rest.len());
+    &json[start..start + key.len() + end]
+}
+
+fn toggle(signal: &str, rise: &[u32], fall: &[u32]) -> String {
+    format!(
+        "{{\"signal\": \"{}\", \"width\": {}, \"type\": \"logic\", \"rise\": {:?}, \"fall\": {:?}}}",
+        signal,
+        rise.len(),
+        rise,
+        fall
+    )
+}
+
+fn toggle_total(covered: u32, total: u32, percent: &str) -> String {
+    format!(
+        "\"toggle\": {{\"covered\": {}, \"total\": {}, \"percent\": {}}}",
+        covered, total, percent
+    )
+}
+
+/// A child with one input port per kind of connection, an inout, an
+/// unpacked port array and an interface port.
+const PORTS: &str = "\
+interface bus_if;
+  logic [1:0] req;
+  modport mp (input req);
+endinterface
+module leaf (input logic [1:0] l, output logic [1:0] q);
+  assign q = l;
+endmodule
+module child (
+  input  logic       clk,
+  input  logic [3:0] a,
+  input  logic [3:0] b,
+  input  logic [3:0] c,
+  input  logic [3:0] d,
+  input  logic [1:0] e,
+  input  logic [3:0] f,
+  input  logic [3:0] g,
+  input  logic [1:0] arr [2],
+  inout  wire  [1:0] io,
+  bus_if.mp          bi,
+  output logic [3:0] y
+);
+  logic [1:0] lq;
+  leaf u_leaf (.l(e), .q(lq));
+  always_ff @(posedge clk)
+    y <= a ^ b ^ c ^ {e, e} ^ f ^ g ^ {arr[0], arr[1]} ^ {io, io} ^ {bi.req, bi.req};
+endmodule
+module tb;
+  logic clk = 0;
+  logic [3:0] a = 0;
+  logic [1:0] n = 0;
+  logic [1:0] m [2];
+  logic [1:0] drv = 0;
+  wire  [1:0] io;
+  logic [3:0] y;
+  assign io = drv;
+  bus_if bif();
+  child u (.clk, .a(a), .b(~a), .c(4'd5), .d(), .e(a[2:1]), .f({n, a[1:0]}),
+           .g(n), .arr(m), .io(io), .bi(bif.mp), .y);
+  always #5 clk = ~clk;
+  initial begin
+    m[0] = 0; m[1] = 0; bif.req = 0;
+    #12 a = 4'b0011; n = 2'b01; drv = 2'b01; m[0] = 2'b11; bif.req = 2'b01;
+    #10 a = 4'b0000; n = 2'b00; drv = 2'b00; m[0] = 2'b00; bif.req = 2'b00;
+    #10 a = 4'b1000;
+    #10 $finish;
+  end
+endmodule
+";
+
+/// §23.3.3: a port connection is a continuous assignment into the port's
+/// own net, so an instance's toggle coverage counts its input and inout
+/// ports like its outputs, with the value the connection gives them: a
+/// whole net's counts (`a`, `clk`, `io`, and `u_leaf.l` through the
+/// parent's port `e`), an expression's (`b = ~a`), a select's or
+/// concatenation's (`e`, `f`), a narrower actual's low bit (`g`). A constant
+/// (`c`) or open (`d`) port never toggles. The unpacked port array and the
+/// interface port are not tracked. Which bins are hit, and every scope's
+/// totals, are the reference simulator's with full signal visibility.
+#[test]
+fn input_ports_toggle_in_their_instance() {
+    let d = scratch("ports");
+    let out = run(&d, PORTS, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let u = scope(&json, "tb.u");
+    for row in [
+        toggle("a", &[1, 1, 0, 1], &[1, 1, 0, 0]),
+        toggle("b", &[1, 1, 0, 0], &[1, 1, 0, 1]),
+        toggle("c", &[0, 0, 0, 0], &[0, 0, 0, 0]),
+        toggle("clk", &[4], &[4]),
+        toggle("d", &[0, 0, 0, 0], &[0, 0, 0, 0]),
+        toggle("e", &[1, 0], &[1, 0]),
+        toggle("f", &[1, 1, 1, 0], &[1, 1, 1, 0]),
+        toggle("g", &[1, 0, 0, 0], &[1, 0, 0, 0]),
+        toggle("io", &[1, 0], &[1, 0]),
+        toggle("y", &[1, 1, 1, 1], &[1, 1, 1, 1]),
+    ] {
+        assert!(u.contains(&row), "{row}: {u}");
+    }
+    for name in ["arr", "bi"] {
+        assert!(!u.contains(&format!("\"signal\": \"{name}")), "{name}: {u}");
+    }
+    assert!(u.contains(&toggle_total(34, 70, "48.57")), "{u}");
+    let leaf = scope(&json, "tb.u.u_leaf");
+    assert!(leaf.contains(&toggle("l", &[1, 0], &[1, 0])), "{leaf}");
+    assert!(leaf.contains(&toggle_total(4, 8, "50.00")), "{leaf}");
+    assert!(
+        scope(&json, "tb").contains(&toggle_total(21, 30, "70.00")),
+        "{json}"
+    );
+    assert!(
+        scope(&json, "tb.bif").contains(&toggle_total(2, 4, "50.00")),
+        "{json}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// More port shapes, against the same reference report: an interface's own
+/// input ports count in the interface instance (`id` is tied to a
+/// constant), each element of an instance array has its slice of the
+/// connection, and packed-array, packed-struct, truncated and net ports
+/// toggle bit by bit.
+#[test]
+fn port_shapes_toggle_in_their_instance() {
+    let d = scratch("port_shapes");
+    let src = "\
+typedef struct packed { logic [1:0] hi; logic lo; } st_t;
+interface clk_if (input logic clk, input logic [1:0] id);
+  logic v = 0;
+  always @(posedge clk) v <= ~v;
+endinterface
+module leaf (input logic [1:0] l, output logic [1:0] q);
+  assign q = l;
+endmodule
+module pk (input logic [1:0][1:0] p2, input st_t s, input logic [1:0] t,
+           input wire [1:0] wn, output logic o);
+  assign o = ^p2 ^ ^s ^ ^t ^ ^wn;
+endmodule
+module tb;
+  logic clk = 0;
+  logic [3:0] bus = 0;
+  logic [1:0][1:0] pp = 0;
+  st_t ss = 0;
+  logic [3:0] wide = 0;
+  wire [1:0] net;
+  logic [3:0] qa;
+  logic o;
+  assign net = bus[3:2];
+  clk_if ci (.clk(clk), .id(2'd2));
+  leaf ua [1:0] (.l(bus), .q(qa));
+  pk up (.p2(pp), .s(ss), .t(wide), .wn(net), .o);
+  always #5 clk = ~clk;
+  initial begin
+    #12 bus = 4'b0110; pp = 4'b1001; ss = 3'b101; wide = 4'b1110;
+    #10 bus = 4'b1100; pp = 4'b0000; ss = 3'b000; wide = 4'b0000;
+    #10 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let expect: [(&str, &[String], (u32, u32, &str)); 4] = [
+        (
+            "tb.ci",
+            &[toggle("clk", &[3], &[3]), toggle("id", &[0, 0], &[0, 0])],
+            (4, 8, "50.00"),
+        ),
+        (
+            "tb.ua[0]",
+            &[toggle("l", &[0, 1], &[0, 1])],
+            (4, 8, "50.00"),
+        ),
+        (
+            "tb.ua[1]",
+            &[toggle("l", &[1, 1], &[0, 0])],
+            (4, 8, "50.00"),
+        ),
+        (
+            "tb.up",
+            &[
+                toggle("p2", &[1, 0, 0, 1], &[1, 0, 0, 1]),
+                toggle("s", &[1, 0, 1], &[1, 0, 1]),
+                toggle("t", &[0, 1], &[0, 1]),
+                toggle("wn", &[1, 1], &[0, 0]),
+            ],
+            (12, 24, "50.00"),
+        ),
+    ];
+    for (name, rows, (covered, total, percent)) in expect {
+        let s = scope(&json, name);
+        for row in rows {
+            assert!(s.contains(row.as_str()), "{row}: {s}");
+        }
+        assert!(s.contains(&toggle_total(covered, total, percent)), "{s}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `--no-toggle-input-ports` and XEZIM_TOGGLE_INPUT_PORTS=0 leave input and
+/// inout ports to the signal that drives them, as before they were counted;
+/// `--toggle-input-ports` wins over the variable.
+#[test]
+fn input_ports_opt_out() {
+    let d = scratch("ports_off");
+    std::fs::write(d.join("t.sv"), PORTS).unwrap();
+    let child = |args: &[&str], var: Option<&str>| {
+        let mut cmd = Command::new(xezim());
+        cmd.current_dir(&d)
+            .env("XEZIM_COV_DB", d.join("cov.json"))
+            .env_remove("XEZIM_CODE_COVERAGE")
+            .env_remove("XEZIM_TOGGLE_INPUT_PORTS")
+            .env_remove("XEZIM_TOGGLE_INTEGERS");
+        if let Some(v) = var {
+            cmd.env("XEZIM_TOGGLE_INPUT_PORTS", v);
+        }
+        let out = cmd
+            .arg("--code-coverage=toggle")
+            .args(args)
+            .arg("t.sv")
+            .output()
+            .expect("run xezim");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        scope(&results(&d), "tb.u").to_string()
+    };
+    let off = child(&["--no-toggle-input-ports"], None);
+    for name in ["a", "b", "c", "clk", "d", "e", "f", "g", "io"] {
+        assert!(
+            !off.contains(&format!("\"signal\": \"{name}\"")),
+            "{name}: {off}"
+        );
+    }
+    // The output `y` and the net `lq` are left.
+    assert!(off.contains(&toggle_total(10, 12, "83.33")), "{off}");
+    assert_eq!(child(&[], Some("0")), off);
+    let on = toggle_total(34, 70, "48.57");
+    assert!(child(&[], Some("1")).contains(&on));
+    assert!(child(&["--toggle-input-ports"], Some("0")).contains(&on));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -473,6 +745,40 @@ fn toggle_integers_left_out() {
         String::from_utf8_lossy(&stmt.stderr)
             .contains("Warning: --no-toggle-integers has no effect without toggle coverage")
     );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// An input port of an integer type is typed by its declaration like any
+/// other signal, so `--no-toggle-integers` leaves it out of its instance
+/// too, while a vector input stays (§6.11, §23.2.2.3).
+#[test]
+fn toggle_integers_left_out_of_input_ports() {
+    let d = scratch("integer-inputs");
+    let src = "\
+module child(input int k, input logic [1:0] l);
+endmodule
+module tb;
+  int a = 0;
+  logic [1:0] b = 0;
+  child c(.k(a), .l(b));
+  initial begin #1 a = 3; b = 3; #1 $finish; end
+endmodule
+";
+    let k = "{\"signal\": \"k\", \"width\": 32, \"type\": \"int\", ";
+    let l = "{\"signal\": \"l\", \"width\": 2, \"type\": \"logic\", ";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let all = results(&d);
+    let c = scope(&all, "tb.c");
+    assert!(c.contains(k) && c.contains(l), "{c}");
+    assert!(c.contains(&toggle_total(4, 68, "5.88")), "{c}");
+
+    let out = run(&d, src, &["--code-coverage=toggle", "--no-toggle-integers"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let some = results(&d);
+    let c = scope(&some, "tb.c");
+    assert!(!c.contains(k) && c.contains(l), "{c}");
+    assert!(c.contains(&toggle_total(2, 4, "50.00")), "{c}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

@@ -3412,6 +3412,13 @@ struct SvaClockedSite {
     /// and swapped in while this site's predicate is evaluated, so the
     /// property samples pre-edge values through the sampled-value overlay.
     sampled_ids: Vec<usize>,
+    /// §16.5.1: the selects of unpacked arrays in `body` whose indices read
+    /// signals (`a[k]`), each with its array's (first cell id, low index,
+    /// high index) when it selects an element of a 1-D array. The cells they
+    /// name are renamed in each Preponed region and kept in `sampled_ids`
+    /// after its first `fixed` entries.
+    sels: Vec<(Expression, Option<(usize, i64, i64)>)>,
+    fixed: usize,
     /// §16.10: the initial values of the attempt's local variable slots
     /// (empty when the property has none).
     lv_init: SvaEnv,
@@ -95138,14 +95145,46 @@ impl Simulator {
         // when the assertion fires using the sampled-value overlay.
         let mut sampled_ids = Vec::new();
         self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
+        // §16.5.1: an element of an unpacked array is sampled too. A select
+        // with constant indices names its cell now; one whose indices read
+        // signals names it again in each Preponed region, from their sampled
+        // values (`sva_sel_cells`), so only the cells read are copied, never
+        // a whole memory. An index the Preponed region cannot evaluate (a
+        // local variable, a sampled-value function, a call) samples every
+        // cell of its array.
+        let mut sels = Vec::new();
+        self.collect_sva_sels(&body_expanded, &mut sels);
+        let mut var_sels = Vec::new();
+        for mut e in sels {
+            match Self::sva_sel_kind(&e) {
+                Some(true) => {
+                    self.sva_cells(&e, &mut sampled_ids);
+                }
+                Some(false) => {
+                    self.sva_resolve_signals(&mut e);
+                    let dims = Self::sva_elem(&e).and_then(|(h, _)| {
+                        let n = self.resolve_hier_name(h);
+                        self.array_first_id.get(n.as_ref()).copied()
+                    });
+                    var_sels.push((e, dims));
+                }
+                None => self.sva_all_cells(&e, &mut sampled_ids),
+            }
+        }
         sampled_ids.sort_unstable();
         sampled_ids.dedup();
+        let fixed = sampled_ids.len();
+        for (e, _) in &var_sels {
+            self.sva_cells(e, &mut sampled_ids);
+        }
         // A site registered mid-slot (a procedural assertion, while its
         // procedure runs in the Active region) has no slot-entry samples yet:
         // take the values now, before this slot's nonblocking updates.
         for &id in &sampled_ids {
-            if id < self.signal_table.len() && !self.sva_preponed.contains_key(&id) {
-                self.sva_preponed.insert(id, self.signal_table[id].clone());
+            if !self.sva_preponed.contains_key(&id) {
+                if let Some(v) = self.sva_cell_value(id) {
+                    self.sva_preponed.insert(id, v);
+                }
             }
         }
         let mut past_names = Vec::new();
@@ -95222,6 +95261,8 @@ impl Simulator {
             action_pid,
             m_chain,
             sampled_ids,
+            sels: var_sels,
+            fixed,
             lv_init,
             procedural,
             captured,
@@ -95307,6 +95348,221 @@ impl Simulator {
         self.m_block_scope = saved_block_scope;
         self.m_block_active = saved_block_active;
         self.m_scope_stack = saved_m_scope;
+    }
+
+    /// The root identifier of select chain `e` (`m` of `m[1][j][3:0]`, `sa`
+    /// of `sa[2].x`), when it is a plain name.
+    fn sva_sel_root(e: &Expression) -> Option<&HierarchicalIdentifier> {
+        match &e.kind {
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::MemberAccess { expr, .. } => Self::sva_sel_root(expr),
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// §16.5.1: collect the selects of fixed-size unpacked arrays in a
+    /// concurrent assertion's body, outermost only (`p[1][2][3:0]`, not
+    /// `p[1]` as well), and those in their indices (`b[0]` of `a[b[0]]`).
+    fn collect_sva_sels(&self, e: &Expression, out: &mut Vec<Expression>) {
+        let chain = matches!(
+            e.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        );
+        if chain
+            && Self::sva_sel_root(e).is_some_and(|h| {
+                let n = self.resolve_hier_name(h);
+                self.array_first_id.contains_key(n.as_ref())
+                    || self.module.arrays.contains_key(n.as_ref())
+                    || self.module.arrays_2d.contains_key(n.as_ref())
+                    || self.module.arrays_nd.contains_key(n.as_ref())
+            })
+        {
+            out.push(e.clone());
+            let mut cur = e;
+            loop {
+                match &cur.kind {
+                    ExprKind::Index { expr, index } => {
+                        self.collect_sva_sels(index, out);
+                        cur = expr;
+                    }
+                    ExprKind::RangeSelect {
+                        expr, left, right, ..
+                    } => {
+                        self.collect_sva_sels(left, out);
+                        self.collect_sva_sels(right, out);
+                        cur = expr;
+                    }
+                    ExprKind::MemberAccess { expr, .. } => cur = expr,
+                    _ => return,
+                }
+            }
+        }
+        let mut sub = |x: &Expression| self.collect_sva_sels(x, out);
+        match &e.kind {
+            ExprKind::Unary { operand: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::MemberAccess { expr: x, .. } => sub(x),
+            ExprKind::Binary { left, right, .. } => {
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                sub(condition);
+                sub(then_expr);
+                sub(else_expr);
+            }
+            ExprKind::Index { expr, index } => {
+                sub(expr);
+                sub(index);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                sub(expr);
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Concatenation(v)
+            | ExprKind::SystemCall { args: v, .. }
+            | ExprKind::Call { args: v, .. } => v.iter().for_each(&mut sub),
+            ExprKind::Replication { count, exprs } => {
+                sub(count);
+                exprs.iter().for_each(&mut sub);
+            }
+            ExprKind::Inside { expr, ranges } => {
+                sub(expr);
+                ranges.iter().for_each(&mut sub);
+            }
+            ExprKind::SvaClocked { body, .. } => sub(body),
+            _ => {}
+        }
+    }
+
+    /// The indices of select chain `e`: constant (`Some(true)`), reading
+    /// signals the Preponed region can evaluate (`Some(false)`), or reading
+    /// something it cannot, such as a local variable, a sampled-value
+    /// function or a call (`None`).
+    fn sva_sel_kind(e: &Expression) -> Option<bool> {
+        let mut konst = true;
+        let mut ok = true;
+        let mut check = |x: &Expression| {
+            Self::walk_operands(x, &mut |y| match &y.kind {
+                ExprKind::Number(_)
+                | ExprKind::Paren(_)
+                | ExprKind::Unary { .. }
+                | ExprKind::Binary { .. }
+                | ExprKind::Conditional { .. } => {}
+                ExprKind::Ident(_)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::MemberAccess { .. } => konst = false,
+                _ => ok = false,
+            })
+        };
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    check(index);
+                    cur = expr;
+                }
+                ExprKind::RangeSelect {
+                    expr, left, right, ..
+                } => {
+                    check(left);
+                    check(right);
+                    cur = expr;
+                }
+                ExprKind::MemberAccess { expr, .. } => cur = expr,
+                _ => break,
+            }
+        }
+        ok.then_some(konst)
+    }
+
+    /// The storage name select chain `e` reads (`m[1][2]`, `sa[2].x`), its
+    /// indices evaluated now; pushes the id of every cell on the way (`p[1]`
+    /// for `p[1][2]` of an array of packed vectors; `sa[2]` and `sa[2].x`;
+    /// each cell of a slice).
+    fn sva_cells(&mut self, e: &Expression, out: &mut Vec<usize>) -> Option<String> {
+        let name = match &e.kind {
+            ExprKind::Ident(h) => return Some(self.resolve_hier_name(h).into_owned()),
+            ExprKind::Index { expr, index } => {
+                let base = self.sva_cells(expr, out)?;
+                let i = self.eval_expr(index);
+                if i.has_xz() {
+                    return None;
+                }
+                Self::name_with_index(&base, i.to_i64()?)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut base = self.sva_cells(expr, out)?;
+                base.push('.');
+                base.push_str(&member.name);
+                base
+            }
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
+                let base = self.sva_cells(expr, out)?;
+                // A part-select of a cell reads that cell.
+                if self.resolve_signal_id(&base).is_some() {
+                    return Some(base);
+                }
+                // A slice of an unpacked array (an array port's connection,
+                // `a[1:2]`) reads the cells in it; no single name follows.
+                let (l, r) = (self.eval_expr(left), self.eval_expr(right));
+                let (Some(l), Some(r)) = (l.to_i64(), r.to_i64()) else {
+                    return None;
+                };
+                let (lo, hi) = match kind {
+                    RangeKind::Constant => (l.min(r), l.max(r)),
+                    RangeKind::IndexedUp => (l, l + r - 1),
+                    RangeKind::IndexedDown => (l - r + 1, l),
+                };
+                for i in lo..=hi {
+                    if let Some(id) = self.resolve_signal_id(&Self::name_with_index(&base, i)) {
+                        out.push(id);
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        if let Some(id) = self.resolve_signal_id(&name) {
+            out.push(id);
+        }
+        Some(name)
+    }
+
+    /// Every cell of the array select chain `e` reads, for an index the
+    /// Preponed region cannot evaluate.
+    fn sva_all_cells(&self, e: &Expression, out: &mut Vec<usize>) {
+        let Some(h) = Self::sva_sel_root(e) else {
+            return;
+        };
+        let root = self.resolve_hier_name(h);
+        if let Some(&(first, lo, hi)) = self.array_first_id.get(root.as_ref()) {
+            if hi >= lo {
+                out.extend(first..=first + (hi - lo) as usize);
+            }
+        }
+        let pre = Self::name_with_suffix(&root, "[");
+        out.extend(
+            self.signal_name_to_id
+                .iter()
+                .filter(|(n, _)| n.starts_with(&pre))
+                .map(|(_, &id)| id),
+        );
     }
 
     /// LRM §16.5.1 — walk an SVA property body and collect the ids of every
@@ -95485,12 +95741,65 @@ impl Simulator {
         }
         self.sva_preponed.clear();
         for i in 0..self.sva_sites.len() {
+            if !self.sva_sites[i].sels.is_empty() {
+                self.sva_sel_cells(i);
+            }
             for j in 0..self.sva_sites[i].sampled_ids.len() {
                 let id = self.sva_sites[i].sampled_ids[j];
-                if id < self.signal_table.len() {
-                    self.sva_preponed.insert(id, self.signal_table[id].clone());
+                if let Some(v) = self.sva_cell_value(id) {
+                    self.sva_preponed.insert(id, v);
                 }
             }
+        }
+    }
+
+    /// The value of cell `id`, in the signal table or the packed arena.
+    fn sva_cell_value(&self, id: usize) -> Option<Value> {
+        if is_packed_id(id) {
+            return Some(self.packed.read(id));
+        }
+        self.signal_table.get(id).cloned()
+    }
+
+    /// §16.5.1: rename the cells site `i`'s variable selects read, from
+    /// their indices' values now, which are the sampled ones.
+    #[inline(never)]
+    fn sva_sel_cells(&mut self, i: usize) {
+        let sels = std::mem::take(&mut self.sva_sites[i].sels);
+        let mut ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
+        ids.truncate(self.sva_sites[i].fixed);
+        // No class context, as at a tick (`tick_sva_sites`).
+        let this = std::mem::take(&mut self.this_stack);
+        let cls = std::mem::take(&mut self.class_context_stack);
+        for (e, dims) in &sels {
+            // An element of a 1-D array, the shape of nearly every select:
+            // its cell by arithmetic.
+            if let (Some((first, lo, hi)), Some((_, idx))) = (*dims, Self::sva_elem(e)) {
+                let i = self.eval_expr(idx);
+                if let Some(i) = i.to_i64().filter(|_| !i.has_xz())
+                    && (lo..=hi).contains(&i)
+                {
+                    ids.push(first + (i - lo) as usize);
+                }
+                continue;
+            }
+            self.sva_cells(e, &mut ids);
+        }
+        self.this_stack = this;
+        self.class_context_stack = cls;
+        self.sva_sites[i].sels = sels;
+        self.sva_sites[i].sampled_ids = ids;
+    }
+
+    /// The array and the index of `mem[k]`, or of a part-select of it.
+    fn sva_elem(e: &Expression) -> Option<(&HierarchicalIdentifier, &Expression)> {
+        match &e.kind {
+            ExprKind::RangeSelect { expr, .. } => Self::sva_elem(expr),
+            ExprKind::Index { expr, index } => match &expr.kind {
+                ExprKind::Ident(h) => Some((h, index)),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -95499,11 +95808,13 @@ impl Simulator {
     fn install_preponed(&mut self, ids: &[usize]) -> Vec<(usize, Value)> {
         let mut saved: Vec<(usize, Value)> = Vec::new();
         for &id in ids {
-            if id >= self.signal_table.len() {
+            let Some(pre) = self.sva_preponed.get(&id).cloned() else {
                 continue;
-            }
-            if let Some(pre) = self.sva_preponed.get(&id) {
-                let pre = pre.clone();
+            };
+            if is_packed_id(id) {
+                saved.push((id, self.packed.read(id)));
+                self.packed.write(id, &pre);
+            } else if id < self.signal_table.len() {
                 saved.push((id, std::mem::replace(&mut self.signal_table[id], pre)));
             }
         }
@@ -95513,6 +95824,10 @@ impl Simulator {
     /// Restore the live values swapped out by `install_preponed`.
     fn restore_preponed(&mut self, saved: Vec<(usize, Value)>) {
         for (id, v) in saved.into_iter().rev() {
+            if is_packed_id(id) {
+                self.packed.write(id, &v);
+                continue;
+            }
             self.signal_table[id] = v;
             self.sync_mirror(id);
         }

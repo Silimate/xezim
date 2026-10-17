@@ -31,6 +31,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   deferred to the end of the slot. A finish from a cbAfterDelay callback,
   or from a value-change callback on a clock that callback drives, also stops
   that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
+* Concurrent assertions sample the elements of unpacked arrays in the
+  Preponed region like other variables. They read the value an element took
+  in the NBA region of the edge being evaluated, so `a[0] == $past(s)` with
+  `a[0] <= s` failed at every edge. This covers multidimensional arrays,
+  unpacked arrays of packed vectors, arrays of structs, arrays in interfaces,
+  array ports, and dynamic arrays and queues up to index 63. A select with
+  constant indices samples its element. One whose indices read variables
+  samples the element their sampled values name, found again in each time
+  slot, so a large memory is never copied. An index read from a sequence
+  local variable, a procedure's loop variable, a sampled-value function or a
+  call samples the whole array (§16.5.1). (#27)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

@@ -474,6 +474,9 @@ const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
+/// Ticks of history a concurrent assertion keeps per `$past` operand
+/// (`SvaClockedSite::past_snapshots`).
+const SVA_PAST_DEPTH: usize = 16;
 /// §16.3: the message of the `$error` a failed assertion with no `else`
 /// clause reports (the reference simulator's wording).
 const ASSERT_DEFAULT_ERROR: &str = "Assertion error.";
@@ -8966,6 +8969,11 @@ pub struct Simulator {
     /// the operand sampled (preponed) at each matching clock edge. hist[0]
     /// is the sample at the most recent edge, hist[1] one edge earlier, …
     sampled_watches: Vec<SampledWatch>,
+    /// §16.5.1 default sampled values by signal id: what each signal a
+    /// concurrent assertion can name held before time 0 (its declaration
+    /// initializer, else its type's default). §16.9.3 reads it for a clock
+    /// tick before the first one. Filled by `capture_sampled_defaults`.
+    sampled_defaults: HashMap<usize, Value>,
     /// §9.2.2.2 timing: `-> ev` fired from a comb block during the PRE-process
     /// time-0 settle (compile) happens before any `always @(ev)` process has
     /// registered its waiter — the trigger would be lost. Queue them and
@@ -13732,6 +13740,7 @@ impl Simulator {
             has_modclass: std::cell::Cell::new(None),
             assoc_static_keys_cache: RefCell::new(HashMap::default()),
             sampled_watches: Vec::new(),
+            sampled_defaults: HashMap::default(),
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),
@@ -19249,6 +19258,16 @@ impl Simulator {
             "build edge and dependency indexes",
             &mut compile_phase_start,
         );
+        // §16.5.1: a sampled-value function's default sampled values are the
+        // values before time 0 — declaration initializers, else type
+        // defaults — so take them before the time-0 settle drives any net or
+        // continuously assigned variable. The procedural watches read theirs
+        // when they register.
+        self.capture_sampled_defaults();
+        // §16.9.3: pre-register sampled-value watches BEFORE the initial
+        // blocks are consumed into scheduled processes, so clock-edge
+        // history accumulates from the first edge.
+        self.register_sampled_watches();
         // IEEE 1800: at time 0, always_comb blocks execute unconditionally.
         // always @* blocks do NOT execute at time 0 unless inputs change.
         // Only seed dirty IDs that have combinational dependents. Large
@@ -19338,10 +19357,6 @@ impl Simulator {
         // #7 lazy-prefix path: also drain `pending_initial` one-at-a-time.
         // A pending block is materialized just before scheduling and dropped
         // after, so peak memory is at most one materialized InitialBlock.
-        // §16.9.3: pre-register sampled-value watches BEFORE the initial
-        // blocks are consumed into scheduled processes, so clock-edge
-        // history accumulates from the first edge.
-        self.register_sampled_watches();
         // §6.18: reject assigning a non-class value (an enum member or integer
         // literal) to a class-handle variable. The reference elaborator flags
         // this at compile time; surface a compile error so simulation never
@@ -59291,6 +59306,98 @@ impl Simulator {
         (cur, past)
     }
 
+    /// Fill `sampled_defaults` before the time-0 settle, while every variable
+    /// still holds its declaration value or its type's default (§16.5.1). A
+    /// concurrent assertion registers only when its process first runs, so
+    /// its operands are found here by name: every signal whose last name
+    /// segment a concurrent assertion or a named property or sequence
+    /// spells. That needs no scope resolution, and an extra match only costs
+    /// its entry.
+    fn capture_sampled_defaults(&mut self) {
+        let mut names: HashSet<String> = HashSet::default();
+        for b in &self.module.initial_blocks {
+            Self::sva_stmt_names(&b.stmt, &mut names);
+        }
+        for p in &self.module.pending_initial {
+            Self::sva_stmt_names(&p.source, &mut names);
+        }
+        for b in self.edge_blocks.iter() {
+            Self::sva_stmt_names(&b.stmt, &mut names);
+        }
+        for (st, ..) in &self.proc_sampled_blocks {
+            Self::sva_stmt_names(st, &mut names);
+        }
+        for body in self.module.property_decls.values() {
+            Self::sva_expr_names(body, &mut names);
+        }
+        if names.is_empty() {
+            return;
+        }
+        for (name, &id) in self.signal_name_to_id.iter() {
+            if !names.contains(name.rsplit(['.', ':']).next().unwrap_or_default()) {
+                continue;
+            }
+            if let Some(v) = self.signal_table.get(id) {
+                self.sampled_defaults.insert(id, v.clone());
+            }
+        }
+    }
+
+    /// The name segments the concurrent assertions in `st` spell.
+    fn sva_stmt_names(st: &Statement, out: &mut HashSet<String>) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::Assertion(a) if a.is_property || a.is_sequence => {
+                Self::sva_expr_names(&a.expr, out)
+            }
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                stmts.iter().for_each(|s| Self::sva_stmt_names(s, out))
+            }
+            SK::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::sva_stmt_names(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    Self::sva_stmt_names(e, out);
+                }
+            }
+            SK::Case { items, .. } => items
+                .iter()
+                .for_each(|it| Self::sva_stmt_names(&it.stmt, out)),
+            SK::TimingControl { stmt, .. } => Self::sva_stmt_names(stmt, out),
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::Foreach { body, .. } => Self::sva_stmt_names(body, out),
+            _ => {}
+        }
+    }
+
+    /// Every name segment `e` spells, clocked bodies included.
+    fn sva_expr_names(e: &Expression, out: &mut HashSet<String>) {
+        Self::walk_operands(e, &mut |x| match &x.kind {
+            ExprKind::Ident(h) => out.extend(h.path.iter().map(|s| s.name.name.clone())),
+            ExprKind::SvaClocked { body, iff, .. } => {
+                Self::sva_expr_names(body, out);
+                if let Some(g) = iff {
+                    Self::sva_expr_names(g, out);
+                }
+            }
+            _ => {}
+        });
+    }
+
+    /// §16.9.3: the default sampled value of signal `name`, for a clock tick
+    /// before the first one (see `sampled_defaults`).
+    fn sampled_default(&self, name: &str) -> Option<Value> {
+        let id = self.signal_name_to_id.get(name)?;
+        self.sampled_defaults.get(id).cloned()
+    }
+
     /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
     /// $changed/$past` call in procedural code, so their clock-edge history
     /// accumulates from time 0 (lazy registration at first eval would miss
@@ -71257,8 +71364,14 @@ impl Simulator {
                         if let Some(v) = ring.get(n_cycles) {
                             return v.clone();
                         }
-                        // §16.9.3: no such tick yet (before the first clock):
-                        // the expression's default value, not its current one.
+                        // §16.9.3: fewer than N ticks so far: the operand's
+                        // default sampled value (§16.5.1), not its current
+                        // one. A full ring has lost the older ticks instead.
+                        if ring.len() < SVA_PAST_DEPTH {
+                            if let Some(v) = self.sampled_default(&sig_name) {
+                                return v;
+                            }
+                        }
                         let w = args.first().map(|a| self.infer_width(a)).unwrap_or(1);
                         return Value::new(w.max(1));
                     }
@@ -71333,11 +71446,13 @@ impl Simulator {
                 let cur = self
                     .get_signal_value_by_name(&sig_name)
                     .unwrap_or_else(|| Value::zero(32));
+                // §16.9.3: at the first tick the sampled value is compared
+                // with the default sampled value (§16.5.1).
                 let prev_opt = self.active_sva_site.and_then(|si| {
-                    self.sva_sites
-                        .get(si)
-                        .and_then(|s| s.past_snapshots.get(&*sig_name))
-                        .and_then(|r| r.get(1).cloned())
+                    let ring = self.sva_sites.get(si)?.past_snapshots.get(&*sig_name)?;
+                    ring.get(1)
+                        .cloned()
+                        .or_else(|| self.sampled_default(&sig_name))
                 });
                 if Self::sampled_change_fn(&name, &cur, prev_opt.as_ref()) {
                     Value::ones(1)
@@ -95306,23 +95421,11 @@ impl Simulator {
                     self.collect_sva_signal_ids(e, out);
                 }
             }
-            ExprKind::SystemCall { name, args } => {
-                // `$past/$rose/$fell/$stable/$changed` already read from the
-                // per-site ring buffers; their bare argument must NOT be
-                // preponed here (that would double-sample). Skip a leading
-                // bare-Ident argument to those calls; still walk the rest.
-                let skip_first = matches!(
-                    name.as_str(),
-                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
-                );
-                for (i, a) in args.iter().enumerate() {
-                    if skip_first && i == 0 && matches!(a.kind, ExprKind::Ident(_)) {
-                        continue;
-                    }
-                    self.collect_sva_signal_ids(a, out);
-                }
-            }
-            ExprKind::Call { args, .. } => {
+            // The operand of `$past`/`$rose`/`$fell`/`$stable`/`$changed` is
+            // sampled too (§16.9.3): its history (`past_snapshots`) and the
+            // current value a value-change function compares are the
+            // Preponed values, not the ones this tick's NBAs wrote.
+            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
                 for a in args {
                     self.collect_sva_signal_ids(a, out);
                 }
@@ -95623,7 +95726,6 @@ impl Simulator {
     /// max depth. Each unique signal gets its own ring; index 0 = this
     /// cycle, index N = N cycles ago.
     fn refresh_sva_past_snapshots(&mut self, site_idx: usize, sampled_ids: &[usize]) {
-        const PAST_MAX_DEPTH: usize = 16;
         // Deduplicated at registration: a duplicate name would make ring[1]
         // another copy of the current cycle instead of the prior one.
         if self.sva_sites[site_idx].past_names.is_empty() {
@@ -95647,7 +95749,7 @@ impl Simulator {
                 None => snaps.entry(name.clone()).or_default(),
             };
             ring.push_front(v);
-            while ring.len() > PAST_MAX_DEPTH {
+            while ring.len() > SVA_PAST_DEPTH {
                 ring.pop_back();
             }
         }

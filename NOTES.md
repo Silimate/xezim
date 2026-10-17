@@ -16,6 +16,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* In concurrent assertions, `$past` with fewer past clock ticks than asked
+  for returns its operand's default sampled value instead of x, and `$rose`,
+  `$fell`, `$stable` and `$changed` compare the first tick's sample with it.
+  The default sampled value is the value before time 0: a variable's
+  declaration initializer, else its type's default, and a net's type default.
+  Procedural calls now take the same value; they used to take it after the
+  time-0 settle, so a net or a continuously assigned variable read its
+  driver's value. An operand that a property reads only through these
+  functions is now sampled in the Preponed region like the others; it was
+  read after the tick's NBAs, so `$rose(q)` of a flop fired one tick early
+  and `$past(q)` returned the current tick's value (§16.5.1, §16.9.3).
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

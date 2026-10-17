@@ -706,9 +706,12 @@ is left out of the instance's totals (*excluded*):
   constant, such as `case (1'b1)` over signals, keeps all of its arms, and so
   does a `case inside`, as in other simulators.
 - `?:` whose condition is a constant: the branch is excluded, and so is any
-  `?:` in the operand it never yields.
+  `?:` in the operand it never yields, or in the right operand of an `&&`
+  whose left operand is constantly false (an `||`, constantly true), which
+  is never evaluated.
 - The statements of an excluded arm are excluded, and so are the branches
-  inside it.
+  inside it, and the `?:`s in the conditions of the `else if`s after a
+  constantly true one.
 
 Constants are literals (strings included), parameters and `localparam`s, enum
 constants, package parameters (`pkg::P`), the genvar of a generate loop, and an

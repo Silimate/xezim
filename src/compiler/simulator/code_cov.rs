@@ -262,9 +262,10 @@ enum Choice {
     Case(CaseKind, Expression, Vec<CaseItem>),
     /// A `?:` condition.
     Ternary(Cond),
-    /// An `&&`, `||`, `&` or `|` with a `?:` inside: a constant result
-    /// leaves the `?:` out.
-    Operand(Cond),
+    /// The left operand of an `&&` (`||` when `true`) with a `?:` in its
+    /// right operand, which never runs when the left one is constantly
+    /// false (true).
+    Operand(Cond, bool),
 }
 
 /// A decision a constant may make, recorded while the design is
@@ -1153,10 +1154,21 @@ impl<'a> Instr<'a> {
     /// condition constants can decide makes a `Choice::Ternary`, and an
     /// `&&`, `||`, `&` or `|` with a `?:` inside a `Choice::Operand`.
     fn expr(&mut self, e: &mut Expression) {
-        if self.kinds & KIND_BRANCH == 0 {
+        if self.kinds & KIND_BRANCH == 0 || !has_ternary(e) {
             return;
         }
         let espan = e.span;
+        // An `&&` (`||`) never evaluates its right operand when the left one
+        // is false (true). Taken before the `?:`s inside are rewritten,
+        // which hides the constants among them.
+        let decider = match &e.kind {
+            ExprKind::Binary {
+                op: op @ (BinaryOp::LogAnd | BinaryOp::LogOr),
+                left,
+                right,
+            } if has_ternary(right) => Some((self.skeleton(left), *op == BinaryOp::LogOr)),
+            _ => None,
+        };
         let mut operand = None;
         match &mut e.kind {
             ExprKind::Conditional {
@@ -1165,7 +1177,7 @@ impl<'a> Instr<'a> {
                 else_expr,
             } => {
                 let cond = self.skeleton(condition);
-                let ((), (_, c)) = self.region(|me| me.expr(condition));
+                self.expr(condition);
                 let ((), t) = self.region(|me| me.expr(then_expr));
                 let ((), f) = self.region(|me| me.expr(else_expr));
                 let tc = self.counter();
@@ -1193,7 +1205,7 @@ impl<'a> Instr<'a> {
                     excluded: false,
                 });
                 if !matches!(cond, Cond::Unknown) {
-                    self.decide(Choice::Ternary(cond), Some(site), vec![t, f], vec![c]);
+                    self.decide(Choice::Ternary(cond), Some(site), vec![t, f], Vec::new());
                 }
                 let cspan = condition.span;
                 let cond =
@@ -1207,18 +1219,9 @@ impl<'a> Instr<'a> {
                 );
             }
             ExprKind::Unary { operand, .. } => self.expr(operand),
-            ExprKind::Binary { op, left, right } => {
-                let ((), r) = self.region(|me| {
-                    me.expr(left);
-                    me.expr(right);
-                });
-                if matches!(
-                    op,
-                    BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::BitAnd | BinaryOp::BitOr
-                ) && !r.1.is_empty()
-                {
-                    operand = Some(r);
-                }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr(left);
+                operand = Some(self.region(|me| me.expr(right)).1);
             }
             ExprKind::Paren(inner) => self.expr(inner),
             ExprKind::Concatenation(parts) => {
@@ -1242,14 +1245,28 @@ impl<'a> Instr<'a> {
             }
             _ => {}
         }
-        // Taken on the rewritten expression: a `?:` is no constant any more,
-        // but the parts that decide around it are unchanged.
-        if let Some(r) = operand {
-            let cond = self.skeleton(e);
-            if !matches!(cond, Cond::Unknown) {
-                self.decide(Choice::Operand(cond), None, vec![r], Vec::new());
-            }
+        if let (Some((cond, skip)), Some(r)) = (decider, operand)
+            && !r.1.is_empty()
+            && !matches!(cond, Cond::Unknown)
+        {
+            self.decide(Choice::Operand(cond, skip), None, vec![r], Vec::new());
         }
+    }
+}
+
+/// Whether `expr` would find a `?:` to instrument in `e`: it walks the same
+/// operands.
+fn has_ternary(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Conditional { .. } => true,
+        ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => has_ternary(operand),
+        ExprKind::Binary { left, right, .. } => has_ternary(left) || has_ternary(right),
+        ExprKind::Concatenation(parts) | ExprKind::Replication { exprs: parts, .. } => {
+            parts.iter().any(has_ternary)
+        }
+        ExprKind::Index { expr, index } => has_ternary(expr) || has_ternary(index),
+        ExprKind::Call { args, .. } => args.iter().any(has_ternary),
+        _ => false,
     }
 }
 
@@ -1993,9 +2010,11 @@ impl Simulator {
                 Choice::If(conds) => {
                     let truths: Vec<_> = conds.iter().map(|c| self.cov_truth(c)).collect();
                     let (fates, whole) = chain_fates(&truths);
-                    // A condition is evaluated only while the chain is open,
-                    // and a constant one is folded away.
-                    let dead = fates.iter().map(|&f| f != Fate::Live).collect();
+                    // A condition after a constantly true one is never
+                    // evaluated.
+                    let dead = (0..conds.len())
+                        .map(|i| fates[..i].contains(&Fate::Taken))
+                        .collect();
                     (fates, whole, dead)
                 }
                 Choice::Case(kind, sel, items) => match self.cov_case_fates(kind, sel, items) {
@@ -2009,13 +2028,13 @@ impl Simulator {
                         } else {
                             (Fate::Dead, Fate::Taken)
                         };
-                        (vec![yes, no], true, vec![true])
+                        (vec![yes, no], true, Vec::new())
                     }
                     None => continue,
                 },
-                Choice::Operand(c) => match self.cov_truth(c) {
-                    Some(_) => (vec![Fate::Dead], false, Vec::new()),
-                    None => continue,
+                Choice::Operand(c, skip) => match self.cov_truth(c) {
+                    Some(t) if t == *skip => (vec![Fate::Dead], false, Vec::new()),
+                    _ => continue,
                 },
             };
             let mut dead = |(s, b): &Region| {

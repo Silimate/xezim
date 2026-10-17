@@ -187,6 +187,8 @@ mod packed_assignment_patterns;
 mod packed_elem_shift_context_width;
 #[path = "types/packed_element_range_select.rs"]
 mod packed_element_range_select;
+#[path = "types/packed_local_nested_select.rs"]
+mod packed_local_nested_select;
 #[path = "types/packed_multidim_unpacked_select.rs"]
 mod packed_multidim_unpacked_select;
 #[path = "types/packed_struct_array_elem_write.rs"]

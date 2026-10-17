@@ -483,7 +483,7 @@ impl<'a> Instr<'a> {
     /// constants can decide of it (see `skeleton`), in one walk. A `&&` or
     /// `&` with a constantly false operand is false whatever the other
     /// operand is, and a `||` or `|` with a constantly true one true, as in
-    /// the reference simulator.
+    /// the commercial simulator.
     fn split(&self, e: &Expression) -> Result<(), Cond> {
         let Some(module) = self.consts else {
             return Err(Cond::Unknown);
@@ -610,9 +610,9 @@ impl<'a> Instr<'a> {
     }
 
     /// The choice a `case` makes when its selector and every item are
-    /// constants. `None` otherwise: as in the reference simulator, a `case`
-    /// with any item that is not a constant keeps all of its arms, and so
-    /// does a `case inside`.
+    /// constants. `None` otherwise: as in the commercial simulator, a
+    /// `case` with any item that is not a constant keeps all of its arms,
+    /// and so does a `case inside`.
     fn case_choice(&self, kind: CaseKind, expr: &Expression, items: &[CaseItem]) -> Option<Choice> {
         let constant = !matches!(kind, CaseKind::CaseInside)
             && self.constant(expr)

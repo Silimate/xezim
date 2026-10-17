@@ -595,13 +595,13 @@ endmodule
 
 /// Parameters are elaboration-time constants (IEEE 1800 §11.2.1), so in
 /// each instance the code a condition on them rules out (§12.4 `if`, §12.5
-/// `case`, §11.4.11 `?:`) can never run. Like the reference simulator,
+/// `case`, §11.4.11 `?:`) can never run. Like the commercial simulator,
 /// xezim leaves it out of the instance's totals: the arms that cannot be
 /// taken and their statements, and the whole branch when its decision is a
 /// constant (`s && W == 8` is one where `W` is 4). An `else if` chain with
 /// a constant condition after a run-time one keeps its other arms. The
-/// instances' totals are the reference simulator's. A design unit counts an
-/// item that any instance counts.
+/// instances' totals are the commercial simulator's. A design unit counts
+/// an item that any instance counts.
 #[test]
 fn constant_conditions_leave_code_out() {
     let d = scratch("constant");
@@ -733,7 +733,7 @@ fn constant_code_kept_on_request() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// Which constant decisions leave code out, each as in the reference
+/// Which constant decisions leave code out, each as in the commercial
 /// simulator (§12.5, §12.5.1, §11.4.7, §27.5):
 /// - a `case` with a constant selector is decided only when every item is
 ///   a constant too: `case (P)` with an item `a[1:0]` keeps all its arms;

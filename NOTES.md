@@ -29,10 +29,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (#339, reported by Lramseyer)
 
 * Code coverage leaves out what a constant condition rules out in an
-  instance, as the reference simulator does: a `case` whose selector and items
-  are constants, an `if` chain or `?:` on parameters, genvars or ports tied to
-  constants is no branch, and the arms that cannot run and their statements
-  are not counted. `xezim_cov.json` marks those rows `"excluded": "constant"`
+  instance, as the commercial simulator does: a `case` whose selector and
+  items are constants, an `if` chain or `?:` on parameters, genvars or ports
+  tied to literals is no branch, and the arms that cannot run and their
+  statements are not counted. `xezim_cov.json` marks those rows `"excluded": "constant"`
   and counts them in an `excluded` member of the totals; a design unit counts
   an item that any of its instances counts. `--code-coverage-constant=keep`
   (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`) counts them as before (§11.2.1,

@@ -409,11 +409,61 @@ static void start(void) {
 void (*vlog_startup_routines[])(void) = {start, 0};
 "#;
 
+/// Build the VPI client `c` in `d` and run `src` (top `top`) with it and
+/// toggle coverage, `T0_CASE` set to `case`; returns the output and the
+/// results file.
+fn vpi_toggles(d: &Path, c: &str, src: &str, case: &str) -> (String, String) {
+    let so = d.join("t0.so");
+    if !so.exists() {
+        std::fs::write(d.join("t0.c"), c).unwrap();
+        let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
+        let ok = Command::new("cc")
+            .args(["-shared", "-fPIC", "-I"])
+            .arg(&include)
+            .arg(d.join("t0.c"))
+            .arg("-o")
+            .arg(&so)
+            .status()
+            .expect("launch cc")
+            .success();
+        assert!(ok, "cc failed");
+    }
+    std::fs::write(d.join("t.sv"), src).unwrap();
+    let _ = std::fs::remove_file(d.join("cov.json"));
+    let out = Command::new(xezim())
+        .current_dir(d)
+        .env("XEZIM_COV_DB", d.join("cov.json"))
+        .env("T0_CASE", case)
+        .env_remove("XEZIM_CODE_COVERAGE")
+        .arg("--vpi-lib")
+        .arg(&so)
+        .args(["--code-coverage=toggle", "-s", "top", "t.sv"])
+        .output()
+        .expect("run xezim");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{case}: {text}");
+    (text, results(d))
+}
+
+/// Assert the (signal, rise, fall) rows of one-bit signals.
+fn toggle_rows(json: &str, rows: &[(&str, u32, u32)], what: &str) {
+    for (name, rise, fall) in rows {
+        let row = format!(
+            "{{\"signal\": \"{name}\", \"width\": 1, \"rise\": [{rise}], \"fall\": [{fall}]}}"
+        );
+        assert!(json.contains(&row), "{what}: {row}: {json}");
+    }
+}
+
 /// IEEE 1800-2017 §38.36.2, §38.36.3: a value a VPI client writes at time 0,
 /// from cbStartOfSimulation or from that slot's cbReadWriteSynch, is the
 /// toggle baseline, as one the testbench wrote at time 0 would be. Nothing
 /// in the design runs at time 0, so only the VPI writes make that slot. In
-/// both cases the reference simulator has settled `~a` or `~b` by the time-0
+/// both cases the commercial simulator has settled `~a` or `~b` by the time-0
 /// cbReadOnlySynch and counts one rise and one fall on each signal written
 /// at time 0, the counts below. xezim used to skip the time-0 slot: the
 /// cbStartOfSimulation write did not reach `na` until 10, the
@@ -422,32 +472,14 @@ void (*vlog_startup_routines[])(void) = {start, 0};
 #[test]
 fn toggle_baseline_from_vpi_at_time_0() {
     let d = scratch("vpi_time0");
-    let c = d.join("t0.c");
-    let so = d.join("t0.so");
-    std::fs::write(&c, TIME0_VPI).unwrap();
-    let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    let ok = Command::new("cc")
-        .args(["-shared", "-fPIC", "-I"])
-        .arg(&include)
-        .arg(&c)
-        .arg("-o")
-        .arg(&so)
-        .status()
-        .expect("launch cc")
-        .success();
-    assert!(ok, "cc failed");
-    std::fs::write(
-        d.join("t.sv"),
-        "\
+    let src = "\
 module top(input logic a, input logic b, output logic na, output logic nb);
   logic v;
   assign na = ~a;
   assign nb = ~b;
 endmodule
-",
-    )
-    .unwrap();
-    // (signal, rise, fall): the reference simulator's counts. A signal not
+";
+    // (signal, rise, fall): the commercial simulator's counts. A signal not
     // written at time 0 starts at x and loses its first change.
     for (case, ro, rows) in [
         (
@@ -461,32 +493,99 @@ endmodule
             [("na", 1, 0), ("nb", 1, 1), ("v", 1, 1)],
         ),
     ] {
-        let _ = std::fs::remove_file(d.join("cov.json"));
-        let out = Command::new(xezim())
-            .current_dir(&d)
-            .env("XEZIM_COV_DB", d.join("cov.json"))
-            .env("T0_CASE", case)
-            .env_remove("XEZIM_CODE_COVERAGE")
-            .args(["--vpi-lib"])
-            .arg(&so)
-            .args(["--code-coverage=toggle", "-s", "top", "t.sv"])
-            .output()
-            .expect("run xezim");
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success(),
-            "{case}: {text}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let (text, json) = vpi_toggles(&d, TIME0_VPI, src, case);
         assert!(text.contains(ro), "{case}: {text}");
-        let json = results(&d);
-        for (name, rise, fall) in rows {
-            let row = format!(
-                "{{\"signal\": \"{name}\", \"width\": 1, \"rise\": [{rise}], \"fall\": [{fall}]}}"
-            );
-            assert!(json.contains(&row), "{case}: {row}: {json}");
-        }
+        toggle_rows(&json, &rows, case);
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A client whose only routine is cbStartOfSimulation (§38.36.3), in a
+/// design whose first event is a clock edge at 5: `w` written there is the
+/// baseline of `w` and of `nw = ~w`, so `nw` falls at 5 and 25 and rises at
+/// 15, as in the commercial simulator. The routine is gone once it has run,
+/// so nothing VPI holds the scheduler at time 0.
+#[test]
+fn toggle_baseline_from_lone_start_routine() {
+    let d = scratch("vpi_start_only");
+    let c = r#"
+#include <string.h>
+#include "vpi_user.h"
+static PLI_INT32 cb(p_cb_data d) {
+    s_vpi_value v;
+    s_vpi_time t = {vpiSimTime, 0, 0, 0.0};
+    v.format = vpiIntVal;
+    v.value.integer = 0;
+    vpi_put_value(vpi_handle_by_name("top.w", NULL), &v, &t, vpiNoDelay);
+    return 0;
+}
+static void start(void) {
+    s_cb_data c;
+    memset(&c, 0, sizeof c);
+    c.reason = cbStartOfSimulation;
+    c.cb_rtn = cb;
+    vpi_register_cb(&c);
+}
+void (*vlog_startup_routines[])(void) = {start, 0};
+"#;
+    let src = "\
+module top;
+  logic clk, w, nw;
+  assign nw = ~w;
+  initial begin clk = 0; forever #5 clk = ~clk; end
+  always @(posedge clk) w <= ~w;
+  always @(negedge clk) if ($time > 25) $finish;
+endmodule
+";
+    let (_, json) = vpi_toggles(&d, c, src, "");
+    toggle_rows(&json, &[("w", 2, 1), ("nw", 1, 2)], "start only");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A slot can be sampled more than once: at the end of its tick and again
+/// at its end, after cbAtEndOfSimTime (§38.36.2). `x` goes to 1 at 10 and a
+/// cbAtEndOfSimTime routine puts it back to 0 in the same slot, so 10 is no
+/// toggle; the rise at 20 is the only one, as in the commercial simulator.
+#[test]
+fn toggle_change_undone_in_its_slot() {
+    let d = scratch("vpi_undo");
+    let c = r#"
+#include <string.h>
+#include "vpi_user.h"
+static PLI_INT32 cb(p_cb_data d) {
+    s_cb_data c;
+    s_vpi_time t = {vpiSimTime, 0, 10, 0.0};
+    if (d->reason == cbAtEndOfSimTime) {
+        s_vpi_value v;
+        v.format = vpiIntVal;
+        v.value.integer = 0;
+        vpi_put_value(vpi_handle_by_name("top.x", NULL), &v, &t, vpiNoDelay);
+        return 0;
+    }
+    memset(&c, 0, sizeof c);
+    c.reason = cbAtEndOfSimTime;
+    c.cb_rtn = cb;
+    c.time = &t;
+    vpi_register_cb(&c);
+    return 0;
+}
+static void start(void) {
+    s_cb_data c;
+    memset(&c, 0, sizeof c);
+    c.reason = cbStartOfSimulation;
+    c.cb_rtn = cb;
+    vpi_register_cb(&c);
+}
+void (*vlog_startup_routines[])(void) = {start, 0};
+"#;
+    let src = "\
+module top;
+  logic x;
+  initial begin x = 0; #10 x = 1; #10 x = 1; #10 $finish; end
+endmodule
+";
+    let (_, json) = vpi_toggles(&d, c, src, "");
+    toggle_rows(&json, &[("x", 1, 0)], "undone");
     let _ = std::fs::remove_dir_all(&d);
 }
 

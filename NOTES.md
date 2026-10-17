@@ -23,8 +23,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `cbStartOfSimulation` is evaluated in the time-0 slot even when nothing
   else runs there. cocotb writes its first values from both, so in a design
   with nothing of its own at time 0 every signal those values reached lost
-  its first toggle (§38.36.2, §38.36.3).
-  (Silimate/xezim#35)
+  its first toggle. A toggle is counted once per time slot from the slot's
+  net change, so a value changed and changed back in later deltas of the
+  same slot no longer counts (§38.36.2, §38.36.3). (Silimate/xezim#35)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

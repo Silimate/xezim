@@ -20629,13 +20629,16 @@ impl Simulator {
         // model was built before the VPI startup routines ran, so both come
         // here, before the time-0 slot. (cbStartOfReset/cbEndOfReset never
         // fire: xezim has no `$reset`.)
+        let mut start = false;
         if self.vpi_cb_mask != 0 {
             self.vpi_start_of_simulation();
+            // A value a routine wrote there left work for the time-0 slot.
+            start = self.dirty_any;
         }
         if !self.wake_rank_built {
             self.build_sig_wake_rank();
         }
-        self.event_loop();
+        self.event_loop(start);
         if self.ended_waiting_in_c {
             // Stopped, not finished: no `$finish` was called.
             self.finished = false;
@@ -47682,8 +47685,10 @@ impl Simulator {
         self.loop_iters += 1;
     }
 
-    fn event_loop(&mut self) {
-        self.event_loop_singlethread();
+    /// `start`: a `cbStartOfSimulation` routine wrote a value, so the time-0
+    /// slot runs even with nothing else due in it.
+    fn event_loop(&mut self, start: bool) {
+        self.event_loop_singlethread(start);
     }
 
     /// Ask the event loop to stop at the next slot boundary and finalize.
@@ -47725,7 +47730,7 @@ impl Simulator {
         self.finished = true;
     }
 
-    fn event_loop_singlethread(&mut self) {
+    fn event_loop_singlethread(&mut self, mut start: bool) {
         Self::install_interrupt_handler();
         let sim_start = std::time::Instant::now();
         // Realtime twin for the human-facing report (see crate::WallTimer).
@@ -47895,7 +47900,7 @@ impl Simulator {
         // time 0. With nothing else due at time 0 the loop used to skip that
         // slot, so the combinational logic read the old value until the next
         // one and toggle coverage never saw the written value as a baseline.
-        let mut start = self.vpi_cb_mask != 0 && self.dirty_any;
+        // `start` holds the loop at time 0 until that slot has run.
         while !self.finished && iters < max_iters {
             iters += 1;
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)

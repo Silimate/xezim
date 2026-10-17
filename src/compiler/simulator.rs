@@ -57668,7 +57668,16 @@ impl Simulator {
             // NBA was SCHEDULED; re-resolving here would consult whichever call
             // frame is current in the NBA region (see NbaEntry::static_key).
             if let Some(key) = entry.static_key {
-                self.static_local_vars.insert(key, entry.value);
+                // A select or member write (`a[3:0] <= v`) changes part of
+                // the cell; anything else replaces it.
+                match entry.lhs {
+                    Some(lhs) if self.static_select_target(&lhs).is_some() => {
+                        self.apply_static_select_nba(key, &lhs, &entry.value)
+                    }
+                    _ => {
+                        self.static_local_vars.insert(key, entry.value);
+                    }
+                }
                 continue;
             }
             if let Some(lhs) = entry.lhs {
@@ -65427,6 +65436,18 @@ impl Simulator {
         {
             return changed;
         }
+        // §6.21: a select or member write to a `static` subroutine local
+        // (`a[7:0] = v`) updates the frame copy in place, while reads come
+        // from the live shared cell. Bring the copy up to date first and
+        // write it back after, or the write is lost.
+        let cell = if self.static_local_names.is_empty() || self.in_const_param_eval {
+            None
+        } else {
+            self.static_select_target(lhs)
+        };
+        if let Some(n) = cell {
+            self.static_cell_sync(n, false);
+        }
         // §6.8/§6.11.1: a write to a 2-state procedural local drops X/Z
         // (whole, bit- or part-select). Probed only for an X/Z value.
         let changed = if val.has_xz() {
@@ -65434,6 +65455,9 @@ impl Simulator {
         } else {
             self.assign_value_inner(lhs, val)
         };
+        if let Some(n) = cell {
+            self.static_cell_sync(n, true);
+        }
         if changed && !self.condition_waiters.is_empty() {
             self.check_condition_waiters_for_write(lhs);
         }
@@ -87264,6 +87288,19 @@ impl Simulator {
                         });
                         return;
                     }
+                    // A select of one (`a[3:0] <= v`), for the same reason:
+                    // committed to the same cell, with its indices frozen.
+                    if let Some(key) = self.nba_static_select_key(lvalue) {
+                        let frozen = self.freeze_lvalue_indices(lvalue);
+                        self.nba_queue.push(NbaEntry {
+                            lhs: Some(frozen),
+                            value: val.resize_for_assign(w),
+                            resolved_id: None,
+                            static_key: Some(key),
+                            this_handle: None,
+                        });
+                        return;
+                    }
                     let id_opt = self.resolve_nba_target(lvalue);
                     if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
@@ -87342,7 +87379,9 @@ impl Simulator {
                     } else {
                         val.resize_for_assign(w)
                     };
-                    let static_key = self.nba_static_key_for_lvalue(lvalue);
+                    let static_key = self
+                        .nba_static_key_for_lvalue(lvalue)
+                        .or_else(|| self.nba_static_select_key(lvalue));
                     let this_handle = self.this_stack.last().copied().flatten();
                     self.nba_queue.push(NbaEntry {
                         lhs: Some(frozen),
@@ -144840,6 +144879,117 @@ impl Simulator {
             .iter()
             .find(|(n, _)| n == nm)
             .map(|(_, key)| key.clone())
+    }
+
+    /// §6.21/§11.5.1: the `static` subroutine local that a select or member
+    /// write changes in place: `a` in `a[i]`, `a[7:0]`, `a[i*8 +: 8]`,
+    /// `a.f` or `a.f[1:0]`. None for a write to the whole variable, which
+    /// reaches its shared cell by itself, and for any other target.
+    fn static_select_target<'a>(&self, lhs: &'a Expression) -> Option<&'a str> {
+        let mut e = lhs;
+        let mut sel = false;
+        loop {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => {
+                    e = expr;
+                    sel = true;
+                }
+                ExprKind::Paren(x) => e = x,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let seg = h.path.first()?;
+        if h.root.is_some() || !(sel || h.path.len() > 1 || !seg.selects.is_empty()) {
+            return None;
+        }
+        let n = seg.name.name.as_str();
+        let hit = n
+            .as_bytes()
+            .first()
+            .is_some_and(|&b| self.static_local_first[b as usize])
+            && self.static_local_names.contains(n);
+        hit.then_some(n)
+    }
+
+    /// §6.21: copy the `static` local `name` of the current subroutine
+    /// between its frame copy and its live shared cell: into the cell after
+    /// a write in place, out of it before one (an NBA or another activation
+    /// may have written the cell since the copy was taken). A fallback
+    /// frame's copy comes from a compiled method's register, which is
+    /// newer than the cell, so it is never overwritten.
+    fn static_cell_sync(&mut self, name: &str, to_cell: bool) {
+        let Some(key) = self
+            .static_local_syncs
+            .last()
+            .and_then(|(_, s)| s.iter().find(|(n, _)| n == name))
+            .map(|(_, k)| k)
+        else {
+            return;
+        };
+        if !self.static_local_keys.contains(key) {
+            return;
+        }
+        let depth = self.local_stack.len();
+        if !to_cell && depth > 0 && self.fb_frame_depths.last() == Some(&(depth - 1)) {
+            return;
+        }
+        let Some(copy) = self.local_stack.last_mut().and_then(|f| f.get_mut(name)) else {
+            return;
+        };
+        if !to_cell {
+            if let Some(v) = self.static_local_vars.get(key) {
+                *copy = v.clone();
+            }
+            return;
+        }
+        match self.static_local_vars.get_mut(key) {
+            Some(v) => *v = copy.clone(),
+            None => {
+                self.static_local_vars.insert(key.clone(), copy.clone());
+            }
+        }
+    }
+
+    /// The persistent-store key of the `static` local a nonblocking select
+    /// or member write targets (`a[3:0] <= v`), resolved at schedule time
+    /// like `nba_static_key_for_lvalue`.
+    fn nba_static_select_key(&self, lvalue: &Expression) -> Option<String> {
+        if self.in_const_param_eval || self.static_local_names.is_empty() {
+            return None;
+        }
+        let k = self.static_local_key_for(self.static_select_target(lvalue)?)?;
+        self.static_local_keys.contains(&k).then_some(k)
+    }
+
+    /// §6.21/§10.4.2: commit a nonblocking select or member write to the
+    /// `static` local whose cell is `key`. The declaring call frame is gone
+    /// in the NBA region, so the write runs in a frame of its own that holds
+    /// the cell's current value, and `assign_value` writes the result back.
+    fn apply_static_select_nba(&mut self, key: String, lhs: &Expression, val: &Value) {
+        let Some(n) = self.static_select_target(lhs) else {
+            return;
+        };
+        let Some(cur) = self.static_local_vars.get(&key).cloned() else {
+            return;
+        };
+        let mut f = self.take_pooled_frame();
+        f.insert(n.to_string(), cur);
+        self.push_local_frame(f);
+        let sub = self.sync_frame_name("");
+        self.static_local_syncs
+            .push((sub, vec![(n.to_string(), key)]));
+        self.assign_value(lhs, val);
+        if let Some((sub, _)) = self.static_local_syncs.pop()
+            && self.sync_name_pool.len() < 64
+        {
+            self.sync_name_pool.push(sub);
+        }
+        self.pop_local_frame();
     }
 
     /// A `static_local_syncs` frame name: a pooled buffer holding `name`.

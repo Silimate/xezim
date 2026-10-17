@@ -9,7 +9,7 @@
 //! never copied.
 //!
 //! Each design checks itself and prints its failure counts. The expected
-//! lines are the reference simulator's.
+//! lines are the commercial simulator's.
 
 use xezim::simulate;
 
@@ -151,7 +151,7 @@ endmodule
 /// An index read from a sequence local variable (§16.10) or a procedure's
 /// loop variable (§16.14.6.1) is only known when the property is evaluated,
 /// so the whole array is sampled. The `disable iff` condition reads current
-/// values (§16.12), the body sampled ones: the reference simulator reports
+/// values (§16.12), the body sampled ones: the commercial simulator reports
 /// the five failures below.
 #[test]
 fn indices_the_preponed_region_cannot_evaluate() {

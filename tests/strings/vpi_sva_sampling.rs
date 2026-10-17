@@ -9,21 +9,24 @@
 //! clock writes it from cbAfterDelay. Under the first, the assertions ticked
 //! in the next delta or the next slot and read every flop's new value; a
 //! value written in the edge's own cbAfterDelay counted as already sampled.
-//! The reference simulator reports no failure in any of these runs.
+//! The commercial simulator reports no failure in any of these runs.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Drives `top.clk`, `top.d` and `top.rst`. `SVA_CLK` picks the routine that
 /// writes the clock: `delay` (the cbAfterDelay timer), `rw` (the timer queues
-/// it for cbReadWriteSynch) or `vc` (a cbValueChange on `top.tick`).
-/// `SVA_DATA` picks where `d` changes: `rw` (cbReadWriteSynch after the
-/// falling edge), `delay` (the falling edge's timer), `vc` (a cbValueChange
-/// on the clock's fall) or `same` (the rising edge's own timer, before the
-/// clock). `SVA_FLAG` is the `vpi_put_value` flag: `nodelay`, `inertial` or
-/// `force`. With `SVA_FINISH=<t>`, a cbValueChange on the clock calls
-/// `vpi_control(vpiFinish)` at its first rise at or after `t`, as cocotb does
-/// when a test ends on `RisingEdge`.
+/// it for cbReadWriteSynch), `vc` (a cbValueChange on `top.tick`) or `none`
+/// (the design drives it). `SVA_DATA` picks where `d` changes: `rw`
+/// (cbReadWriteSynch after the falling edge), `delay` (the falling edge's
+/// timer), `vc` (a cbValueChange on the clock's fall) or `same` (the rising
+/// edge's own timer, before the clock). `SVA_FLAG` is the `vpi_put_value`
+/// flag: `nodelay`, `inertial` or `force`. With `SVA_FINISH=<t>`, a
+/// cbValueChange on the clock calls `vpi_control(vpiFinish)` at its first rise
+/// at or after `t`, as cocotb does when a test ends on `RisingEdge`. With
+/// `SVA_RST=<k>`, `rst` is released at the clock's k-th rise instead, from a
+/// cbReadWriteSynch its cbValueChange queues: a cocotb write after
+/// `RisingEdge`.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +37,7 @@ static int flag = vpiNoDelay;
 static const char *cmode = "delay", *dmode = "rw";
 static const int pat[] = {0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1};
 #define NPAT (int)(sizeof pat / sizeof pat[0])
-static int level, cyc, steps;
+static int level, cyc, steps, rst_edge, rises;
 
 static const char *env(const char *n, const char *dflt) {
     const char *v = getenv(n);
@@ -65,7 +68,7 @@ static void at(PLI_INT32 (*rtn)(p_cb_data), int reason, unsigned delay, vpiHandl
 
 static void data(void) {
     put(d, pat[cyc % NPAT]);
-    if (cyc == 3)
+    if (cyc == 3 && !rst_edge)
         put(rst, 0);
     cyc++;
 }
@@ -115,6 +118,14 @@ static PLI_INT32 clk_vc(p_cb_data cb) {
     return 0;
 }
 
+static PLI_INT32 rw_rst(p_cb_data cb) { (void)cb; put(rst, 0); return 0; }
+
+static PLI_INT32 rst_vc(p_cb_data cb) {
+    if ((cb->value->value.integer & 1) && ++rises == rst_edge)
+        at(rw_rst, cbReadWriteSynch, 0, NULL);
+    return 0;
+}
+
 static PLI_INT32 start(p_cb_data cb) {
     const char *f = env("SVA_FLAG", "nodelay");
     (void)cb;
@@ -124,14 +135,17 @@ static PLI_INT32 start(p_cb_data cb) {
     clk = vpi_handle_by_name("top.clk", NULL);
     d = vpi_handle_by_name("top.d", NULL);
     rst = vpi_handle_by_name("top.rst", NULL);
+    rst_edge = atoi(env("SVA_RST", "0"));
     if (!strcmp(cmode, "vc"))
         at(tick_vc, cbValueChange, 0, vpi_handle_by_name("top.tick", NULL));
-    else
+    else if (strcmp(cmode, "none"))
         at(timer, cbAfterDelay, 5, NULL);
     if (!strcmp(dmode, "vc"))
         at(clk_vc, cbValueChange, 0, clk);
     if (*env("SVA_FINISH", ""))
         at(fin_vc, cbValueChange, 0, clk);
+    if (rst_edge)
+        at(rst_vc, cbValueChange, 0, clk);
     return 0;
 }
 
@@ -183,15 +197,31 @@ module top;
 endmodule
 "#;
 
-/// A scratch directory holding the compiled driver and `top.sv`.
-fn setup(tag: &str) -> (PathBuf, PathBuf) {
+/// One attempt per rising edge (5, 15, ..., 95 ns), each passing at the next
+/// edge unless `disable iff (rst)` cancels it. The clock is the driver's, or
+/// with `+hdl` the design's own.
+const RST_SV: &str = r#"
+module top;
+  logic clk = 0, d = 0, rst = 1, tick = 0;
+  int passes = 0, fails = 0;
+  initial if ($test$plusargs("hdl")) begin #5 clk = 1; forever #5 clk = ~clk; end
+  always #5 tick = ~tick;
+  a_rel: assert property (@(posedge clk) disable iff (rst) 1'b1 |=> 1'b1) passes++;
+    else fails++;
+  initial #100 $finish;
+  final $display("RESULT passes=%0d fails=%0d", passes, fails);
+endmodule
+"#;
+
+/// A scratch directory holding the compiled driver and `sv` as `top.sv`.
+fn setup(tag: &str, sv: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!("xezim_vpi_sva_{}_{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let c = dir.join("drv.c");
     let so = dir.join("drv.so");
     std::fs::write(&c, DRIVER_C).unwrap();
-    std::fs::write(dir.join("top.sv"), TOP_SV).unwrap();
+    std::fs::write(dir.join("top.sv"), sv).unwrap();
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
     let ok = Command::new("cc")
         .args(["-shared", "-fPIC", "-Wall", "-I"])
@@ -230,7 +260,7 @@ fn run(dir: &Path, so: &Path, env: &[(&str, &str)], extra: &[&str]) -> String {
 /// with the immediate flags.
 #[test]
 fn vpi_driven_clock_samples_preponed_values() {
-    let (dir, so) = setup("matrix");
+    let (dir, so) = setup("matrix", TOP_SV);
     let mut bad = Vec::new();
     for clk in ["delay", "rw", "vc"] {
         for data in ["rw", "delay", "vc", "same"] {
@@ -253,15 +283,37 @@ fn vpi_driven_clock_samples_preponed_values() {
 
 /// A routine that ends the run from the clock's value-change callback, as
 /// cocotb does when a test returns on `RisingEdge`, ends it in that delta:
-/// the assertions do not tick at that edge. The reference simulator ticks
+/// the assertions do not tick at that edge. The commercial simulator ticks
 /// at 5 to 85 and not at 95, where the run ends.
 #[test]
 fn vpi_finish_at_an_edge_ticks_no_assertion() {
-    let (dir, so) = setup("finish");
+    let (dir, so) = setup("finish", TOP_SV);
     let env = [("SVA_CLK", "rw"), ("SVA_DATA", "rw"), ("SVA_FINISH", "95")];
     let text = run(&dir, &so, &env, &[]);
     let _ = std::fs::remove_dir_all(&dir);
     let ticks: Vec<&str> = text.lines().filter(|l| l.starts_with("E t=")).collect();
     let want: Vec<String> = (0..9).map(|k| format!("E t={}", 5 + 10 * k)).collect();
     assert_eq!(ticks, want, "{text}");
+}
+
+/// §16.12, §4.4.2: `disable iff` reads current values from the attempt's
+/// start in the Observed region, which follows the whole active region set,
+/// cbReadWriteSynch included. A reset released from a cbReadWriteSynch
+/// queued at the second rising edge (15 ns), as cocotb writes after
+/// `RisingEdge`, therefore does not cancel that edge's attempt: attempts from
+/// 15 to 85 ns pass. The commercial simulator agrees for each clock.
+#[test]
+fn vpi_reset_release_at_an_edge_keeps_its_attempt() {
+    let (dir, so) = setup("reset", RST_SV);
+    let mut bad = Vec::new();
+    for clk in ["delay", "rw", "vc", "none"] {
+        let env = [("SVA_CLK", clk), ("SVA_RST", "2")];
+        let extra: &[&str] = if clk == "none" { &["+hdl"] } else { &[] };
+        let text = run(&dir, &so, &env, extra);
+        if !text.contains("RESULT passes=8 fails=0") {
+            bad.push(format!("clk={clk}:\n{text}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

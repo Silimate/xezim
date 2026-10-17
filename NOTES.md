@@ -18,12 +18,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§11.4.5).
 * Concurrent assertions read a flop's value from before the clock edge that
   updates it when the clock is written from a VPI callback: an edge cocotb's
-  `Clock` writes from cbReadWriteSynch ticks the assertions in its own delta.
+  `Clock` writes from cbReadWriteSynch ticks the assertions in its own slot.
   Values are sampled once per time slot, before its cbAtStartOfSimTime and
   cbAfterDelay routines, and the arguments of `$past`, `$rose`, `$fell`,
   `$stable` and `$changed` are sampled there too, so `$past(q)` of a flop on
   the property's clock no longer returns the current sample (§16.5.1,
-  §16.9.3). (#11)
+  §16.9.3). Assertions tick only once the slot's cbNBASynch and
+  cbReadWriteSynch routines have run, whether a VPI routine or the design
+  drives the clock, so a reset a cocotb test releases after `RisingEdge` no
+  longer disables that edge's attempt (§4.4.2, §16.12). (#11, #56)
 * After `$finish` or a VPI `vpi_control(vpiFinish)`, which is how cocotb ends
   a test, no always block runs again in the finishing time slot. Compiled
   block code used to keep running, updating counters and NBAs while skipping

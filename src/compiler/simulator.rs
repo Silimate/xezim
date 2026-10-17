@@ -47642,7 +47642,12 @@ impl Simulator {
         self.drain_observed_region();
         // LRM §16.5 SVA clocked property evaluation. Detects edges on
         // each registered clock signal and ticks pending consequents.
-        self.tick_sva_sites();
+        // §4.4.2: not while a cbNBASynch/cbReadWriteSynch is still due now;
+        // the Observed region follows the whole active region set, and
+        // `vpi_open_delta` ticks the assertions after those routines.
+        if !self.vpi_synch_due() {
+            self.tick_sva_sites();
+        }
         // LRM §14.3 clocking-block input snapshot — refresh per-cycle
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).

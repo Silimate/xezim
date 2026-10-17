@@ -534,13 +534,16 @@ before a callback runs appears before the routine's `vpi_printf` output.
 
 Within one time step the simulation-time reasons run in the order of the
 table. A value written from any of them except `cbReadOnlySynch` opens a
-fresh delta in the same step, so edge-sensitive processes see it, and the
-concurrent assertions on a clock it moves are evaluated in that delta. They
-read the values the step began with (§16.5.1), sampled before even
-`cbNextSimTime`, `cbAtStartOfSimTime` and `cbAfterDelay` run, so a clock
-written from `cbReadWriteSynch`, as cocotb's `Clock` does, samples like one
-driven from HDL. A pending callback holds the scheduler at its time even when
-no HDL event is due there.
+fresh delta in the same step, so edge-sensitive processes see it. Concurrent
+assertions are evaluated once no `cbNBASynch` or `cbReadWriteSynch` is left
+to run in the step (the Observed region follows them, §4.4.2), so a reset a
+`cbReadWriteSynch` routine releases at a clock edge, as a cocotb test does
+after `RisingEdge`, no longer disables that edge's attempt (`disable iff`
+reads current values). They sample the values the step began with
+(§16.5.1), from before even `cbNextSimTime`, `cbAtStartOfSimTime` and
+`cbAfterDelay` run, so a clock written from `cbReadWriteSynch`, as cocotb's
+`Clock` does, samples like one driven from HDL. A pending callback holds the
+scheduler at its time even when no HDL event is due there.
 The time of `cbAfterDelay`, `cbNBASynch`, `cbReadWriteSynch` and
 `cbReadOnlySynch` is a delay (a NULL `time` is a zero delay); that of
 `cbAtStartOfSimTime`/`cbAtEndOfSimTime` is absolute, and a time already begun

@@ -56,6 +56,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Event-reference checks borrow ordinary names and alias targets, reducing
   temporary string allocation during procedural assignments.
 
+**cocotb**
+
+* The cocotb runner (`contrib/cocotb/xezim_runner.py`) applies the options
+  cocotb's other runners do. `parameters` were ignored and now become
+  `-gNAME=VALUE`; a value is any constant expression, such as `{3'd7,3'd5}`.
+  `build_args` and a `timescale` given to `build()` were dropped and now
+  apply at run time. `elab_args` are passed too, and a `string` define becomes
+  a string literal, as with the other runners. The toplevel comes from
+  `test()`, and VHDL sources are an error. `build()` records its arguments in
+  `xezim_build.json` instead of `xezim_sources.f`. The runner's tests are in
+  `contrib/cocotb/tests`.
+
 **Maintenance**
 
 * Expanded regression coverage for default-valued array arguments and nested

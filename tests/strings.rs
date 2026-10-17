@@ -115,6 +115,8 @@ mod uvm_dpi_driver_linkage;
 mod uvm_dpi_user_library_wins;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
+#[path = "strings/vpi_clocking_sampling.rs"]
+mod vpi_clocking_sampling;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
 mod vpi_mcd_and_time_queries;
 #[path = "strings/vpi_net_kinds.rs"]

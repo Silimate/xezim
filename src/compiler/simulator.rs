@@ -6283,18 +6283,21 @@ pub struct Simulator {
     /// `clocking_last_edge` entry to decide "already at the clocking event".
     default_clocking_cb: Option<String>,
     /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
-    /// clocking-block INPUT signal, keyed by signal name. Captured at the top
-    /// of each time slot BEFORE the active/NBA regions run (same point as
-    /// `sva_preponed`), so when a clock posedge fires later in the slot the
-    /// input snapshot is the value from *before* the edge, not the same-edge
-    /// NBA update. Without this, `cb.<in>` reads the post-edge value (off by
-    /// one clock relative to a reference simulator).
+    /// clocking-block INPUT signal, keyed by signal name. Captured once per
+    /// time slot, BEFORE its Pre-Active VPI callbacks and active/NBA regions
+    /// run (same point as `sva_preponed`), so when a clock edge fires later
+    /// in the slot the input snapshot is the value from *before* the edge,
+    /// not the same-edge NBA update. Without this, `cb.<in>` reads the
+    /// post-edge value (off by one clock relative to a reference simulator).
     clocking_preponed: HashMap<String, Value>,
     /// §14.4 `input #N` history per sampled net (see `ClockingHist`). Empty
     /// unless some clocking input has an explicit positive skew.
     clocking_hist: HashMap<String, ClockingHist>,
-    /// Time of the slot `refresh_clocking_preponed` last ran in.
-    clocking_hist_slot: Option<u64>,
+    /// The time slot `clocking_preponed` was captured for: the Preponed
+    /// region runs once per slot (§4.4.2.1), so a later delta of the slot (a
+    /// VPI write from cbReadWriteSynch reopening the Active region) keeps the
+    /// samples, as `sva_preponed_time` keeps the assertions'.
+    clocking_preponed_time: Option<u64>,
     /// §14.3 clocking-visible name of each `clocking_meta` signal, in the
     /// same order. Snapshots are keyed by it, so `input d; input #3 dl = d;`
     /// keeps two samples of one net.
@@ -12891,7 +12894,7 @@ impl Simulator {
             default_clocking_cb: None,
             clocking_preponed: HashMap::default(),
             clocking_hist: HashMap::default(),
-            clocking_hist_slot: None,
+            clocking_preponed_time: None,
             clocking_inouts: HashMap::default(),
             clocking_vis: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
@@ -47357,6 +47360,10 @@ impl Simulator {
         // the sampled one. Only once per slot: a later delta of the slot (a
         // cbReadWriteSynch write reopening the Active region) keeps them.
         self.refresh_sva_preponed();
+        // LRM §14.4/§14.13 `#1step` clocking-input skew: the clocking-block
+        // inputs are sampled at the same point and as rarely, so `cb.<in>`
+        // and the assertions read one set of values for each edge.
+        self.refresh_clocking_preponed();
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot
@@ -47378,10 +47385,6 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.fire_timing_timers();
-        // LRM §14.4 `#1step` clocking-input skew: capture the same Preponed
-        // (slot-entry) samples for clocking-block inputs, so `cb.<in>` read
-        // after a posedge later this slot sees the pre-edge value.
-        self.refresh_clocking_preponed();
 
         if self.sched_trace_on() {
             eprintln!("[sched] t={} +--- tick ---", self.time);
@@ -47602,16 +47605,7 @@ impl Simulator {
         // LRM §14.3 clocking-block input snapshot — refresh per-cycle
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).
-        self.tick_clocking_blocks();
-        // §14.13: deliver `@(cb.sig)` events for samples just published. The
-        // publish happens after this slot's edge pass, so run one more.
-        if self.clocking_mirror_dirty {
-            self.clocking_mirror_dirty = false;
-            self.edge_dispatch_phase = "clocking-mirror";
-            self.check_edges();
-            self.edge_dispatch_phase = "active";
-            let _ = self.drain_edge_cascade(cascade_limit);
-        }
+        self.tick_clocking_events(cascade_limit);
         // §14.13: now that this edge's NBA updates have committed and the
         // clocking input snapshots are refreshed, resume the clocking-event
         // waiters (`@(cb)` / `##N`) that fired this slot — in the Reactive
@@ -95356,14 +95350,18 @@ impl Simulator {
     /// before the active/NBA regions run, so `sva_preponed[id]` holds the
     /// value as of the start of the slot. No-op when no clocked sites exist.
     /// LRM §14.4 — capture the Preponed (slot-entry) value of every
-    /// clocking-block INPUT signal, keyed by name, before the active/NBA
-    /// regions run. `tick_clocking_blocks` reads these on a posedge so the
-    /// `#1step` input skew samples pre-edge values. No-op with no clocking
-    /// blocks.
+    /// clocking-block INPUT signal, keyed by name, before the slot's
+    /// Pre-Active VPI callbacks and active/NBA regions run.
+    /// `tick_clocking_blocks` reads these on a clock edge so the `#1step`
+    /// input skew samples pre-edge values. Once per slot: an edge a VPI
+    /// routine makes in a later delta (cocotb's `Clock` writes from
+    /// cbReadWriteSynch, after the NBA region) must still see the values the
+    /// slot began with. No-op with no clocking blocks.
     fn refresh_clocking_preponed(&mut self) {
-        if self.clocking_meta.is_empty() {
+        if self.clocking_meta.is_empty() || self.clocking_preponed_time == Some(self.time) {
             return;
         }
+        let prev = self.clocking_preponed_time.replace(self.time);
         let names: Vec<String> = self
             .clocking_meta
             .values()
@@ -95379,20 +95377,15 @@ impl Simulator {
             }
         }
         if !self.clocking_hist.is_empty() {
-            self.record_clocking_hist();
+            self.record_clocking_hist(prev);
         }
     }
 
     /// §14.4 `input #N`: at slot entry, the value of each tracked net is its
-    /// value at the end of the previous slot; record it against that slot
-    /// when it changed, and drop entries no skew can reach any more.
-    fn record_clocking_hist(&mut self) {
+    /// value at the end of the previous slot `prev`; record it against that
+    /// slot when it changed, and drop entries no skew can reach any more.
+    fn record_clocking_hist(&mut self, prev: Option<u64>) {
         let now = self.time;
-        let prev = self.clocking_hist_slot;
-        if prev == Some(now) {
-            return;
-        }
-        self.clocking_hist_slot = Some(now);
         let nets: Vec<String> = self.clocking_hist.keys().cloned().collect();
         for n in nets {
             let Some(v) = self.get_signal_value_by_name(&n) else {
@@ -96167,6 +96160,28 @@ impl Simulator {
                 self.collect_past_arg_names(body, out);
             }
             _ => {}
+        }
+    }
+
+    /// LRM §14.13: the clocking events of a delta, after its NBA region.
+    /// Each block whose clock edge fired samples its inputs and drives its
+    /// matured outputs (`tick_clocking_blocks`); then the `@(cb.sig)` events
+    /// of the samples just published are delivered. The publish happens
+    /// after the delta's edge pass, so that takes one more. Inline in both
+    /// callers (`run_one_tick`, `vpi_open_delta`), so a design without
+    /// clocking blocks pays one emptiness check per tick.
+    #[inline(always)]
+    fn tick_clocking_events(&mut self, limit: u32) {
+        if self.clocking_meta.is_empty() {
+            return;
+        }
+        self.tick_clocking_blocks();
+        if self.clocking_mirror_dirty {
+            self.clocking_mirror_dirty = false;
+            self.edge_dispatch_phase = "clocking-mirror";
+            self.check_edges();
+            self.edge_dispatch_phase = "active";
+            let _ = self.drain_edge_cascade(limit);
         }
     }
 

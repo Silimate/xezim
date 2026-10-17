@@ -24,6 +24,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `$stable` and `$changed` are sampled there too, so `$past(q)` of a flop on
   the property's clock no longer returns the current sample (§16.5.1,
   §16.9.3). (#11)
+* Clocking blocks process a clock edge written from a VPI callback in the
+  edge's own delta, like the assertions: under cocotb's `Clock`, which writes
+  the clock from cbReadWriteSynch, `#1step` inputs read the values from
+  before the edge, `@(cb)`, `@(cb iff ...)` and `##N` waits resume in the
+  edge's time slot after its NBA updates, and output drives mature at the
+  edge plus their skew. They used to land in the next slot, after the
+  samples had been retaken. Inputs are sampled once per time slot, at the
+  same point as the assertions' values (§14.4, §14.13). (#16)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

@@ -699,8 +699,21 @@ impl Simulator {
         // `finish_deferred`) nothing is evaluated: cocotb ends a test from the
         // value-change callback of the edge, and the reference simulator
         // reports no assertion at that edge.
-        if !self.finished && !self.finish_deferred && self.sva_preponed_time == Some(self.time) {
-            self.tick_sva_sites();
+        if !self.finished && !self.finish_deferred {
+            if self.sva_preponed_time == Some(self.time) {
+                self.tick_sva_sites();
+            }
+            // §14.13: the same for clocking blocks. The edge samples their
+            // inputs from the slot's Preponed values (`#1step`) and records
+            // the clocking event for output drives, and the `@(cb)` waiters
+            // it woke resume in this delta, after its NBA updates, as after
+            // an edge driven from HDL. Left to the scheduler's next pass, the
+            // block ticked in a later delta or in the next slot, from samples
+            // retaken there, and its waiters resumed at that time.
+            if self.clocking_preponed_time == Some(self.time) {
+                self.tick_clocking_events(self.cascade_limit);
+                self.drain_deferred_clocking_conts();
+            }
         }
         self.snapshot_edge_signals();
         self.vpi_same_time_work()

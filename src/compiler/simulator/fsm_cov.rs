@@ -476,6 +476,102 @@ fn constant(sim: &Simulator, e: &Expression) -> bool {
     ok
 }
 
+/// The variables `e` compares with something (`==`, `!=`, `===`, `!==`,
+/// `inside`), by name under `prefix`.
+fn tests(e: &Expression, prefix: &str, out: &mut HashSet<String>) {
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        match &x.kind {
+            ExprKind::Binary { op, left, right } => {
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                ) {
+                    for side in [left, right] {
+                        if let Some(n) = whole(strip(side)) {
+                            out.insert(format!("{}{}", prefix, n));
+                        }
+                    }
+                }
+                stack.push(left);
+                stack.push(right);
+            }
+            ExprKind::Inside { expr, ranges } => {
+                if let Some(n) = whole(strip(expr)) {
+                    out.insert(format!("{}{}", prefix, n));
+                }
+                stack.push(expr);
+                stack.extend(ranges.iter());
+            }
+            ExprKind::Unary { operand, .. } => stack.push(operand),
+            ExprKind::Paren(i) => stack.push(i),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                stack.push(condition);
+                stack.push(then_expr);
+                stack.push(else_expr);
+            }
+            ExprKind::Concatenation(v) => stack.extend(v.iter()),
+            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+                stack.extend(args.iter())
+            }
+            _ => {}
+        }
+    }
+}
+
+fn strip(e: &Expression) -> &Expression {
+    match &e.kind {
+        ExprKind::Paren(i) => strip(i),
+        _ => e,
+    }
+}
+
+/// `tests` of a statement, and the variables it selects a `case` on.
+fn stmt_tests(s: &Statement, out: &mut HashSet<String>) {
+    let mut exprs = Vec::new();
+    stmt_exprs(s, &mut exprs);
+    for e in exprs {
+        tests(e, "", out);
+    }
+    let mut stack = vec![s];
+    while let Some(x) = stack.pop() {
+        match &x.kind {
+            StatementKind::Case { expr, items, .. } => {
+                if let Some(n) = whole(strip(expr)) {
+                    out.insert(n.to_string());
+                }
+                stack.extend(items.iter().map(|it| &it.stmt));
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stack.extend(stmts.iter())
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                stack.push(then_stmt);
+                if let Some(e) = else_stmt {
+                    stack.push(e);
+                }
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => stack.push(body),
+            _ => {}
+        }
+    }
+}
+
 /// One walk of a block for the assignments of `target`, a state variable
 /// `var` or its next-state variable.
 struct Walk<'a> {
@@ -1211,9 +1307,12 @@ impl Simulator {
             }
         }
         let top = format!("{}.", self.module.name);
-        // Continuous assignments by target, built when a next-state
-        // variable has no always block.
-        let mut assigns: Option<HashMap<String, Vec<(Expression, Span)>>> = None;
+        // Continuous assignments by target, and every variable a test
+        // compares with something: one no test names is no state.
+        let (assigns, mut tested) = self.fsm_assigns();
+        for ab in always {
+            stmt_tests(&ab.stmt, &mut tested);
+        }
         for (i, ab) in always.iter().enumerate() {
             let Some((proc_body, true)) = body(ab) else {
                 continue;
@@ -1225,6 +1324,7 @@ impl Simulator {
             for var in full {
                 if writers.get(var).map(|w| w.as_slice()) != Some(&[i][..])
                     || parts.get(var).is_some_and(|p| p.iter().any(|&b| b != i))
+                    || !tested.contains(var)
                     || var.contains("__xz")
                     || self.module.parameters.contains_key(var)
                 {
@@ -1307,10 +1407,9 @@ impl Simulator {
                             if parts.contains_key(n.as_str()) {
                                 continue;
                             }
-                            let cas = assigns.get_or_insert_with(|| self.fsm_assigns());
-                            match cas.get(n.as_str()).map(|v| v.as_slice()) {
-                                Some([one]) => Some(one.clone()),
-                                _ => continue,
+                            match self.fsm_assign(&assigns, n) {
+                                Some(one) => Some(one),
+                                None => continue,
                             }
                         }
                     };
@@ -1549,30 +1648,55 @@ impl Simulator {
         out
     }
 
-    /// The design's continuous assignments of whole variables, by target:
-    /// right-hand side and source span. Lazily elaborated ones are
-    /// elaborated on a copy, leaving them for `build_comb_entries`.
-    fn fsm_assigns(&self) -> HashMap<String, Vec<(Expression, Span)>> {
-        let mut out: HashMap<String, Vec<(Expression, Span)>> = HashMap::default();
-        let pending = self
-            .module
-            .pending_cont_assign
-            .iter()
-            .map(|p| p.clone().materialize(&self.module.parameters));
-        for ca in self
-            .module
-            .continuous_assigns
-            .iter()
-            .cloned()
-            .chain(pending)
-        {
-            if let (Some(n), Some((span, _))) = (whole(&ca.lhs), &ca.origin) {
-                out.entry(n.to_string())
-                    .or_default()
-                    .push((ca.rhs.clone(), *span));
+    /// The design's continuous assignments of whole variables by target
+    /// (`None`: an elaborated one, else the index of a lazy one), and the
+    /// variables their right-hand sides compare with something. Lazy ones
+    /// are only named here, not elaborated: `build_comb_entries` takes them
+    /// later, one at a time.
+    fn fsm_assigns(&self) -> (HashMap<String, Vec<Option<usize>>>, HashSet<String>) {
+        let mut by: HashMap<String, Vec<Option<usize>>> = HashMap::default();
+        let mut tested = HashSet::default();
+        for ca in &self.module.continuous_assigns {
+            if let (Some(n), Some(_)) = (whole(&ca.lhs), &ca.origin) {
+                by.entry(n.to_string()).or_default().push(None);
             }
+            tests(&ca.rhs, "", &mut tested);
         }
-        out
+        for (k, p) in self.module.pending_cont_assign.iter().enumerate() {
+            if let (Some(n), Some(_)) = (whole(&p.lhs_source), p.origin_span) {
+                by.entry(format!("{}{}", p.ctx.prefix, n))
+                    .or_default()
+                    .push(Some(k));
+            }
+            tests(&p.rhs_source, &p.ctx.prefix, &mut tested);
+        }
+        (by, tested)
+    }
+
+    /// The right-hand side and span of the one continuous assignment of `n`,
+    /// elaborating a lazy one on a copy.
+    fn fsm_assign(
+        &self,
+        index: &HashMap<String, Vec<Option<usize>>>,
+        n: &str,
+    ) -> Option<(Expression, Span)> {
+        match index.get(n)?.as_slice() {
+            [None] => self
+                .module
+                .continuous_assigns
+                .iter()
+                .find(|ca| whole(&ca.lhs) == Some(n) && ca.origin.is_some())
+                .map(|ca| (ca.rhs.clone(), ca.origin.as_ref().unwrap().0)),
+            [Some(k)] => {
+                let ca = self.module.pending_cont_assign[*k]
+                    .clone()
+                    .materialize(&self.module.parameters);
+                (whole(&ca.lhs) == Some(n)).then_some(())?;
+                let span = ca.origin.as_ref()?.0;
+                Some((ca.rhs, span))
+            }
+            _ => None,
+        }
     }
 
     /// What a state process's input check reads: each variable its body

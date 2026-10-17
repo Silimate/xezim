@@ -395,7 +395,9 @@ fn print_usage() {
     );
     eprintln!("                   (instance values still win); -g/<top>/NAME=VAL: one module only");
     eprintln!("  -GNAME=VAL       Same, and it also replaces instance and defparam values");
-    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>");
+    eprintln!("  -sv_seed <n|random>  Seed the RNG like +seed=<n|random> (and wins over it),");
+    eprintln!("                   but add no +seed= plusarg ($test$plusargs and VPI argv");
+    eprintln!("                   don't see it). -svseed and -seed are the same");
     eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
     eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
     eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
@@ -879,7 +881,7 @@ fn process_command_file(
         let mut i = 0usize;
         while i < toks.len() {
             let t = toks[i].as_str();
-            let used = cli_compat::handle_flag(&toks, i, compat, plusargs)
+            let used = cli_compat::handle_flag(&toks, i, compat)
                 .map_err(|e| format!("{} (in args file '{}')", e, path))?;
             if used > 0 {
                 i += used;
@@ -1088,21 +1090,6 @@ fn process_command_file(
                         }
                     }
                 },
-                // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
-                // (and `-seed` likewise) lower onto the `+seed=` plusarg the
-                // simulator already consumes.
-                "-svseed" | "-seed" => {
-                    if i + 1 < toks.len() {
-                        i += 1;
-                        plusargs.push(format!("+seed={}", toks[i]));
-                    }
-                }
-                _ if t.starts_with("-svseed=") => {
-                    plusargs.push(format!("+seed={}", &t["-svseed=".len()..]));
-                }
-                _ if t.starts_with("-seed=") => {
-                    plusargs.push(format!("+seed={}", &t["-seed=".len()..]));
-                }
                 _ if t.starts_with("-s") && t.len() > 2 => {
                     top_modules.push(t[2..].to_string());
                 }
@@ -1909,7 +1896,7 @@ fn run_main() -> i32 {
         let arg = &args[i];
         // Other simulators' spellings first: several (`-sv_seed`, `-suppress`,
         // `-lib`) would otherwise read as the glued `-s<top>` / `-l<file>`.
-        match cli_compat::handle_flag(&args, i, &mut compat, &mut plusargs) {
+        match cli_compat::handle_flag(&args, i, &mut compat) {
             Ok(0) => {}
             Ok(n) => {
                 i += n;
@@ -2732,19 +2719,6 @@ fn run_main() -> i32 {
             _ if arg.starts_with("--timescale=") => {
                 module_timescale_args.push(arg["--timescale=".len()..].to_string());
             }
-            // commercial-simulator-compatible seed aliases (undocumented): lower onto `+seed=`.
-            "-svseed" | "-seed" => {
-                i += 1;
-                if i < args.len() {
-                    plusargs.push(format!("+seed={}", args[i]));
-                }
-            }
-            _ if arg.starts_with("-svseed=") => {
-                plusargs.push(format!("+seed={}", &arg["-svseed=".len()..]));
-            }
-            _ if arg.starts_with("-seed=") => {
-                plusargs.push(format!("+seed={}", &arg["-seed=".len()..]));
-            }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
@@ -2761,6 +2735,8 @@ fn run_main() -> i32 {
     // `--sv2017`/`--sv2023`, or a `-sv*compat` flag here or in an args file.
     let sv2023_mode = sv_parser::is_sv2023();
     dpi_libs.extend(cli_compat::resolve_sv_libs(&compat));
+    // `-sv_seed`: seeds the RNG without becoming a plusarg.
+    xezim::compiler::simulator::set_sv_seed(compat.seed.as_deref());
     if !compat.param_overrides.is_empty() {
         xezim_core::set_param_overrides(
             compat

@@ -5,6 +5,10 @@ dump.vcd
 xezim_cov.json
 *.pat
 
+# Python bytecode and pytest state (contrib/cocotb and its tests)
+__pycache__/
+.pytest_cache/
+
 # Third-party Accellera UVM source — kept as a local working copy,
 # not vendored into the repo (see tests/uvm_integration_tests.rs).
 uvm-1.2/

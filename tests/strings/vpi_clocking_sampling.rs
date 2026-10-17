@@ -265,7 +265,8 @@ fn setup(tag: &str) -> (PathBuf, PathBuf) {
     (dir, so)
 }
 
-/// Run `top.sv` with the driver under `env`; returns the combined output.
+/// Run `top.sv` with the driver under `env`; returns the combined output of
+/// a run that exited successfully.
 fn run(dir: &Path, so: &Path, env: &[(&str, &str)], extra: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--vpi-lib")
@@ -276,11 +277,17 @@ fn run(dir: &Path, so: &Path, env: &[(&str, &str)], extra: &[&str]) -> String {
         .current_dir(dir)
         .output()
         .expect("failed to run xezim");
-    format!(
+    let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    )
+    );
+    assert!(
+        out.status.success(),
+        "xezim exited with {} under {env:?}:\n{text}",
+        out.status
+    );
+    text
 }
 
 /// Every clock routine, data routine and write flag: 20 clocking events on

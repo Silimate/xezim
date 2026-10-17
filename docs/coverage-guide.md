@@ -714,12 +714,14 @@ Constants are literals (strings included), parameters and `localparam`s, enum
 constants, package parameters (`pkg::P`), the genvar of a generate loop, and an
 input port that the instantiation ties to a literal (`.en(1'b1)`), combined with
 operators, `?:`, concatenation, replication, bit and part selects of a
-parameter, and `$bits`, `$clog2`, `$signed` and `$unsigned`. An `&&` with a
-constantly false operand, or an `&` with an all-zero one, is constantly false
-whatever its other operand is; an `||` with a constantly true operand, or an `|`
-with a nonzero one, is constantly true. A condition with x or z bits and no 1
-bit is not decided. The methods of classes and the subroutines of packages are
-never excluded.
+parameter, and `$bits`, `$clog2`, `$signed`, `$unsigned`, `$countones`,
+`$onehot` and `$onehot0`. An `&&` with a constantly false operand, or an `&`
+with an all-zero one, is constantly false whatever its other operand is; an
+`||` with a constantly true operand, or an `|` with a nonzero one, is constantly
+true. Each constant is evaluated once the design is compiled, by the same
+evaluator as the run, so an excluded statement or arm is one the run can never
+reach. A condition with x or z bits and no 1 bit is not decided. The methods of
+classes and the subroutines of packages are never excluded.
 
 Generate constructs (`if`, `case` and `for` generate) are decided by
 elaboration: the blocks a generate condition leaves out are not part of the

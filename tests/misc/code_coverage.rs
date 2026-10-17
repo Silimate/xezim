@@ -864,3 +864,74 @@ endmodule
     assert!(!stmt_excluded(tb, 48) && !stmt_excluded(tb, 50), "{tb}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A constant condition is decided the way the run evaluates it, so no
+/// excluded statement or arm ever runs: operands sized by their context
+/// (§11.6.1: `4'hf + 4'h1 == 8'h10` adds in 8 bits and is true, `2'b11 +
+/// 2'b01 > 2'b11` in 2 bits and is false), signed arithmetic (§11.8.1) and
+/// string literals.
+#[test]
+fn constant_decisions_follow_the_run() {
+    let d = scratch("sizing");
+    let src = "\
+module leaf #(parameter [1:0] P = 2'b11, parameter int S = 0);
+  logic [3:0] a = 0;
+  logic [5:0] r;
+  always @(*) begin
+    if ((4'hf + 4'h1) == 8'h10) r[0] = a[0]; else r[0] = a[1];
+    if ((4'hf + 4'h1) == 4'h0) r[1] = a[0]; else r[1] = a[1];
+    if (2'b11 + 2'b01 > 2'b11) r[2] = a[0]; else r[2] = a[1];
+    if (~P == 0) r[3] = a[0]; else r[3] = a[1];
+    if (S - 1 < 0) r[4] = a[0]; else r[4] = a[1];
+    if (\"z\" < \"aa\") r[5] = a[0]; else r[5] = a[1];
+  end
+  initial begin
+    #1 a = 4'h3;
+    #1 a = 4'hc;
+  end
+endmodule
+module tb;
+  leaf #(.P(2'b11), .S(0)) u0 ();
+  leaf #(.P(2'b01), .S(5)) u1 ();
+  initial #5 $finish;
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=stmt,branch"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    for scope in ["tb.u0", "tb.u1"] {
+        let e = scope_entry(&json, scope);
+        assert_eq!(
+            e.matches("\"kind\": \"if\", \"excluded\": \"constant\"")
+                .count(),
+            6,
+            "{e}"
+        );
+        let arms = e.find("\"branches\"").unwrap();
+        for (line, taken_if) in [(5, true), (6, true), (7, false)] {
+            let key = format!("\"line\": {line}, \"arm\": \"if\", \"count\": ");
+            assert_eq!(
+                row_excluded(&e[arms..], &key),
+                !taken_if,
+                "line {line}: {e}"
+            );
+        }
+    }
+    // Whatever the run does, an excluded row never counts.
+    let mut rest = json.as_str();
+    let mut rows = 0;
+    while let Some(i) = rest.find(", \"excluded\": \"constant\"}") {
+        let row = &rest[rest[..i].rfind('{').unwrap()..i];
+        if let Some(c) = row.find("\"count\": ") {
+            assert_eq!(&row[c + "\"count\": ".len()..], "0", "{row}");
+            rows += 1;
+        }
+        rest = &rest[i + 1..];
+    }
+    assert!(rows > 0, "{json}");
+    let _ = std::fs::remove_dir_all(&d);
+}

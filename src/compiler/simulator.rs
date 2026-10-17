@@ -19592,6 +19592,8 @@ impl Simulator {
         self.auto_partition_by_clock();
         self.auto_partition_by_scope();
         mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
+        // Every block is instrumented now.
+        self.cov_resolve_constants();
         self.init_value_trace();
         self.rebuild_signal_commit_plans();
         self.compiled = true;
@@ -36997,11 +36999,7 @@ impl Simulator {
             // on a form that runs a counter (compiled, or interpreted).
             let cov_counter = if self.code_cov.is_some() {
                 Self::cov_contassign(
-                    code_cov::Consts::new(
-                        &self.module,
-                        &self.signal_name_to_id,
-                        &self.signal_widths,
-                    ),
+                    &self.module,
                     &mut self.code_cov,
                     &mut self.code_cov_hits,
                     &mut ca,

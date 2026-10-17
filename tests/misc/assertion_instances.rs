@@ -12,7 +12,7 @@
 //! - §16.12: a `disable iff` that holds cancels the attempts in flight and
 //!   the one the tick would start.
 //!
-//! Every count below is the reference simulator's (attempts, passes,
+//! Every count below is the commercial simulator's (attempts, passes,
 //! vacuous passes, failures and disabled attempts per directive; hits per
 //! cover), and so is every name: a label, `<kind>__<n>` for an unlabeled
 //! concurrent statement and `immed__<line>` / `i_cover__<line>` for an

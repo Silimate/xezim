@@ -11,7 +11,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 **Correctness**
 
 * The results file lists every assertion statement per instance in
-  `assertion_instances`: the instance path, the label (or the reference
+  `assertion_instances`: the instance path, the label (or the commercial
   simulator's name for an unlabeled statement), kind, file and line, and the
   attempts, nonvacuous passes, vacuous passes, failures, disabled attempts and
   cover matches (§16.14.3). The summed `assertions` list is unchanged.

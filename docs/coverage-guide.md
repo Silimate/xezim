@@ -501,7 +501,7 @@ A vacuous success runs no pass action, and a `cover` of an implication counts on
 its nonvacuous successes. The followed-by operators `#-#` and `#=#` are not
 supported yet.
 
-A statement without a label is named the way the reference simulator names it. A
+A statement without a label is named the way the commercial simulator names it. A
 concurrent one is `assert__<n>`, `assume__<n>` or `cover__<n>`, numbered by kind
 from 0 in source order among those its module declares, whether they run or not.
 An immediate or deferred one is `immed__<line>`, or `i_cover__<line>` for a cover.
@@ -511,7 +511,7 @@ Immediate statements, and concurrent ones in procedural code, have an entry once
 they have been reached. Other concurrent ones have one from the start, attempted
 or not.
 
-The reference simulator counts an `assert` or `assume` as covered once it has a
+The commercial simulator counts an `assert` or `assume` as covered once it has a
 nonvacuous success and no failure, and a `cover` once it has matched: for every
 entry, `pass > 0 && fail == 0`. An assertion that both passed and failed is not
 covered. With `jq`, the covered statements per instance:

@@ -3571,7 +3571,7 @@ enum SvaOutcome {
     /// whose antecedent never matched, or whose every consequent evaluation
     /// was itself vacuous. Fires no pass action (§16.12.1).
     Vacuous,
-    /// A failure, never vacuous: the reference simulator counts `not p` of a
+    /// A failure, never vacuous: the commercial simulator counts `not p` of a
     /// failing `p` as a nonvacuous success, whatever made `p` fail.
     Fail,
 }
@@ -49417,7 +49417,7 @@ impl Simulator {
 
     /// The results file's `assertion_instances`: one entry per statement and
     /// instance, sorted by instance, then by file and position. A statement
-    /// without a label is named the way the reference simulator names it: a
+    /// without a label is named the way the commercial simulator names it: a
     /// concurrent one `<kind>__<n>`, numbered by kind in source order among
     /// those its module declares (run or not), an immediate one
     /// `immed__<line>` (`i_cover__<line>` for a cover).
@@ -95428,7 +95428,7 @@ impl Simulator {
                 if rb.is_none() {
                     *rb = self.sva_advance(nb, b);
                 }
-                // Settled when an operand holds, as on the reference
+                // Settled when an operand holds, as on the commercial
                 // simulator: nonvacuous if that operand's success is, or if
                 // the other operand's evaluation is already known to be.
                 match (*ra, *rb) {

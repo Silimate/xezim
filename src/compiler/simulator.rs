@@ -55559,10 +55559,10 @@ impl Simulator {
                         && declarators.iter().any(|d| {
                             d.dimensions.is_empty()
                                 && d.init.is_none()
-                                && super::bytecode::BytecodeCompiler::static_local_carries(
+                                && (super::bytecode::BytecodeCompiler::static_local_carries(
                                     &d.name.name,
                                     rest,
-                                )
+                                ) || rest.iter().any(|r| Self::nba_writes(&d.name.name, r)))
                         })
                     {
                         *lifetime = Some(crate::ast::types::Lifetime::Static);
@@ -55598,6 +55598,48 @@ impl Simulator {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// §6.21/§10.4.2: is `name` the target, whole or in part, of a
+    /// nonblocking assignment in `s`? Such a variable changes in the NBA
+    /// region, after the statement, so it needs storage that outlives the
+    /// call frame even when every call writes it before reading it.
+    fn nba_writes(name: &str, s: &Statement) -> bool {
+        fn target(name: &str, e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Paren(expr) => target(name, expr),
+                ExprKind::Concatenation(parts) => parts.iter().any(|p| target(name, p)),
+                ExprKind::Ident(h) => {
+                    h.root.is_none() && h.path.first().is_some_and(|g| g.name.name == name)
+                }
+                _ => false,
+            }
+        }
+        let walk = |c: &Statement| Self::nba_writes(name, c);
+        match &s.kind {
+            StatementKind::NonblockingAssign { lvalue, .. } => target(name, lvalue),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(walk)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => walk(then_stmt) || else_stmt.as_deref().is_some_and(walk),
+            StatementKind::Case { items, .. } => items.iter().any(|it| walk(&it.stmt)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => walk(body),
+            _ => false,
         }
     }
 
@@ -87376,9 +87418,11 @@ impl Simulator {
                     } else if self.try_schedule_packed_index_nba(lvalue, &val) {
                         // The packed slice has already been merged into the
                         // pending whole-signal value.
-                    } else if self.nba_frame_local_target(lvalue) {
-                        // NBA to a task-FRAME local, whole or through a
-                        // select (`a[3:0] <= v`): the deferred queue
+                    } else if matches!(&lvalue.kind, ExprKind::Ident(h)
+                        if h.path.len() == 1
+                            && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))
+                    {
+                        // NBA to a bare task-FRAME local: the deferred queue
                         // commits in `apply_nba`, OUTSIDE the (possibly
                         // suspended) process's local frame, so the local would
                         // never update. Apply immediately — delta-vs-blocking
@@ -145088,18 +145132,6 @@ impl Simulator {
                 self.static_local_vars.insert(key.clone(), copy.clone());
             }
         }
-    }
-
-    /// Is `lvalue` a local of the current call frame, whole or through a
-    /// bit- or part-select (`a`, `a[i]`, `a[3:0]`)?
-    fn nba_frame_local_target(&self, lvalue: &Expression) -> bool {
-        let mut e = lvalue;
-        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &e.kind {
-            e = expr;
-        }
-        matches!(&e.kind, ExprKind::Ident(h)
-            if h.path.len() == 1
-                && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))
     }
 
     /// The persistent-store key of the `static` local a nonblocking select

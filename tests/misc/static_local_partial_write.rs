@@ -252,15 +252,20 @@ const SRC: &str = r##"module top;
     r_nba_idx = a;
   endtask
 
-  // A nonblocking select write to a local of a static task that the task
-  // writes whole first (so it need not keep its value between calls).
-  logic [7:0] r_nba_frame;
+  // Nonblocking writes to locals of a static task that the task writes
+  // whole first commit in the NBA region, not at once (§10.4.2).
+  logic [7:0] r_early_b, r_late_b, r_early_c, r_late_c;
   task nba_frame;
-    reg [7:0] b;
+    reg [7:0] b, c;
     begin
       b = 8'h00;
+      c = 8'h00;
       b[2] <= 1'b1;
-      #1 r_nba_frame = b;
+      c <= 8'h11;
+      r_early_b = b;
+      r_early_c = c;
+      #1 r_late_b = b;
+      r_late_c = c;
     end
   endtask
 
@@ -329,7 +334,7 @@ const SRC: &str = r##"module top;
     pick_nba;
     check("x index from a function, $sscanf and nonblocking", {r_calls, r_scan, r_nba_idx}, 32'h0101_0002);
     nba_frame;
-    check("nonblocking select write to a per-call local", r_nba_frame, 8'h04);
+    check("nonblocking writes commit in the NBA region", {r_early_b, r_late_b, r_early_c, r_late_c}, 32'h0004_0011);
     o = new;
     check("class method static local", o.m(4'h5), 8'h45);
     check("static class method static local", C::sm(4'h5), 8'h35);

@@ -145254,8 +145254,15 @@ impl Simulator {
             }
             sim.local_stack.last()?.get(n).cloned()
         };
+        // The trial writes must not reach the shared cell, and their reads
+        // must see the zero copy: a member write can come back through
+        // `assign_value`, which would copy the cell in and the result out.
+        // Statics are kept out of this window as they are while a constant
+        // function is evaluated.
+        let shared = std::mem::replace(&mut self.in_const_param_eval, true);
         let mask = pass(self, &Value::ones(val.width));
         let bits = pass(self, val);
+        self.in_const_param_eval = shared;
         if let Some(c) = self.local_stack.last_mut().and_then(|f| f.get_mut(n)) {
             *c = orig;
         }

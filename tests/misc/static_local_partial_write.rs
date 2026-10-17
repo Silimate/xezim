@@ -22,7 +22,7 @@
 //! applied (§11.4.1).
 //!
 //! The design checks itself. Every expected value follows the LRM and
-//! matches the reference simulator. It runs with the default method tiering,
+//! matches the commercial simulator. It runs with the default method tiering,
 //! with every method and function compiled on its first call, and with none
 //! compiled, so the interpreted and compiled bodies and the switch from one
 //! to the other are all covered.
@@ -291,6 +291,19 @@ const SRC: &str = r##"module top;
     r_type = q;
   endtask
 
+  // A nonblocking member select of a static packed struct, read in the
+  // same time slot, after it, and after a delayed member write.
+  logic [7:0] r_m_now, r_m_next, r_m_late;
+  task automatic member_nba;
+    static pair_t s;
+    s = 8'h00;
+    s.hi[3:2] <= 2'b01;
+    s.lo <= #2 4'h5;
+    r_m_now = s;
+    #1 r_m_next = s;
+    #2 r_m_late = s;
+  endtask
+
   // Delayed nonblocking writes wait for their own time slot (§9.4.5).
   logic [7:0] r_d_early, r_d_late, r_dw_early, r_dw_late;
   task automatic dnba;
@@ -376,6 +389,8 @@ const SRC: &str = r##"module top;
     check("nonblocking select write keeps the static's type", r_type, 8'b0000000x);
     dnba;
     check("delayed nonblocking writes", {r_d_early, r_d_late, r_dw_early, r_dw_late}, 32'h00A1_0033);
+    member_nba;
+    check("nonblocking member select", {r_m_now, r_m_next, r_m_late}, 24'h004045);
     o = new;
     check("class method static local", o.m(4'h5), 8'h45);
     check("static class method static local", C::sm(4'h5), 8'h35);

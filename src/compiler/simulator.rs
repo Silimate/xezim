@@ -11025,6 +11025,14 @@ impl Simulator {
             // redeclared. Collections have no frame of their own outside
             // class methods and automatic tasks: under its bare name a local
             // `int fa [3]` was the module's `fa`.
+            //
+            // §6.21/§23.9: in a process body, a nested block's local of any
+            // kind is renamed (tag `p`). It is a static variable, which a
+            // process has no frame to hold, so a scalar `begin logic [7:0]
+            // v; ... end` shadowing module `v` was that `v` when the block
+            // suspended, and otherwise lived in a frame pushed for the
+            // block, which made it automatic and kept its selects (`v[3:0]
+            // = ...`) on the module variable.
             {
                 let mut n = 0usize;
                 let claims = |nm: &str| module_claims(nm) || module.queue_vars.contains(nm);
@@ -11038,7 +11046,7 @@ impl Simulator {
                 bodies.extend(module.final_blocks.iter_mut().map(|b| &mut b.stmt));
                 let mut renamed: Vec<(usize, Statement)> = Vec::new();
                 for (k, b) in bodies.iter().enumerate() {
-                    if !Self::shadow_rename_possible(b, &claims) {
+                    if !Self::shadow_rename_possible(b, &claims, true) {
                         continue;
                     }
                     let mut st = (**b).clone();
@@ -11047,7 +11055,7 @@ impl Simulator {
                         &claims,
                         &mut Vec::new(),
                         &mut n,
-                        "b",
+                        "pn",
                         0,
                         "",
                         &mut Vec::new(),
@@ -11126,7 +11134,7 @@ impl Simulator {
                     if !td
                         .items
                         .iter()
-                        .any(|s| Self::shadow_rename_possible(s, &claims))
+                        .any(|s| Self::shadow_rename_possible(s, &claims, false))
                     {
                         continue;
                     }
@@ -11149,7 +11157,7 @@ impl Simulator {
                     if !fd
                         .items
                         .iter()
-                        .any(|s| Self::shadow_rename_possible(s, &claims))
+                        .any(|s| Self::shadow_rename_possible(s, &claims, false))
                     {
                         continue;
                     }
@@ -55604,13 +55612,18 @@ impl Simulator {
     }
 
     /// Whether `rename_nested_shadowed` may rename anything in `stmt`: some
-    /// collection local named like a claimed name or like an earlier local
-    /// of the body (a read-only scan, so a body without one is not cloned).
-    fn shadow_rename_possible(stmt: &Statement, claims: &dyn Fn(&str) -> bool) -> bool {
+    /// collection local (with `scalars`, any local) named like a claimed
+    /// name or like an earlier local of the body (a read-only scan, so a
+    /// body without one is not cloned).
+    fn shadow_rename_possible(
+        stmt: &Statement,
+        claims: &dyn Fn(&str) -> bool,
+        scalars: bool,
+    ) -> bool {
         let mut seen: Vec<&str> = Vec::new();
         let mut hit = false;
         Self::for_each_decl_name(stmt, &mut |n, dims| {
-            if dims && !hit && (seen.contains(&n) || claims(n)) {
+            if (dims || scalars) && !hit && (seen.contains(&n) || claims(n)) {
                 hit = true;
             }
             seen.push(n);
@@ -55946,8 +55959,8 @@ impl Simulator {
     /// (declarators with unpacked dimensions) of every block below `depth`
     /// 0 of `stmt` that shadow a name `claims` (a module item) or a local of
     /// an enclosing block (`enclosing`). `n` numbers the renamed blocks,
-    /// `tag` prefixes that number in the fresh names. In an instance's
-    /// process (tag `p`) locals of every kind are renamed. A named block's
+    /// `tag` prefixes that number in the fresh names. In a process (a tag
+    /// starting `p`) locals of every kind are renamed. A named block's
     /// locals are stored under their hierarchical name — `scope` (the
     /// instance path, or the subroutine) and the enclosing block labels
     /// (`labels`) — so `inst.blk.var` still reaches them (§23.6).
@@ -68974,8 +68987,15 @@ impl Simulator {
                         lsb = new_lsb;
                     }
                 }
+                // §23.9/§6.21: a variable of the running frame (a subroutine
+                // local or formal, a block or loop variable) hides a module,
+                // package or $unit variable of the same name, so its select
+                // takes the frame-local arm below, never that variable's
+                // array elements or signal slot.
+                let local = matches!(&expr.kind,
+                    ExprKind::Ident(h) if self.frame_bound_bare_name(h).is_some());
                 // Unpacked array slice assignment: copy element-by-element
-                if let ExprKind::Ident(hier) = &expr.kind {
+                if !local && let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
                     if let Some(&(arr_lo, arr_hi, elem_w)) = self.module.arrays.get(&*name) {
                         let count = msb + 1 - lsb;
@@ -69052,6 +69072,7 @@ impl Simulator {
                 // Fast path: resolve target signal_id directly (avoids format!
                 // + HashMap lookup on every call for tight memory-init loops).
                 let target_id: Option<usize> = match &expr.kind {
+                    ExprKind::Ident(_) if local => None,
                     ExprKind::Ident(hier) => {
                         if let Some(id) = hier.cached_signal_id.get() {
                             Some(id)
@@ -69086,6 +69107,23 @@ impl Simulator {
                     }
                     _ => None,
                 };
+                // §8.10/§23.9: a property of the running method's class (an
+                // instance or static one) hides a same-named module variable
+                // as well. Splice the selected bits into the property's value
+                // and write it back through its name, which reaches the
+                // property the way a whole write does.
+                if target_id.is_some()
+                    && let ExprKind::Ident(h) = &expr.kind
+                    && let Some(n) = Self::bare_ident_name(h)
+                    && self.class_owns_bare(n)
+                {
+                    let cur = self.eval_expr(expr);
+                    let mut nv = cur.clone();
+                    for i in lsb..=msb.min((cur.width as usize).saturating_sub(1)) {
+                        nv.set_bit(i, val.get_bit(i - lsb));
+                    }
+                    return nv != cur && self.assign_value(expr, &nv);
+                }
                 if let Some(id) = target_id {
                     // Packed cell: no signal_table slot, so the whole-word
                     // path below cannot apply. Splice the bits into the cell.
@@ -69213,6 +69251,40 @@ impl Simulator {
                                     } else {
                                         (lsb, msb)
                                     };
+                                // §23.9: a struct of the running frame hides a
+                                // module variable of the same name; its frame
+                                // value is the struct.
+                                if let Some(mut nv) =
+                                    self.local_stack.last().and_then(|l| l.get(&root)).cloned()
+                                    && self
+                                        .module
+                                        .var_decl_types
+                                        .get(&root)
+                                        .and_then(|dt| {
+                                            super::elaborate::packed_struct_field_layout(
+                                                dt,
+                                                &self.module.parameters,
+                                                &self.module.typedefs,
+                                                &self.module.typedef_types,
+                                            )
+                                        })
+                                        .is_some_and(|f| !f.is_empty())
+                                {
+                                    let lo = (field_off as usize) + lsb;
+                                    let hi = (field_off as usize)
+                                        + msb.min((field_w as usize).saturating_sub(1));
+                                    if hi < nv.width as usize {
+                                        let prev = nv.clone();
+                                        for i in lo..=hi {
+                                            nv.set_bit(i, val.get_bit(i - lo));
+                                        }
+                                        let changed = nv != prev;
+                                        if changed && let Some(l) = self.local_stack.last_mut() {
+                                            l.insert(root, nv);
+                                        }
+                                        return changed;
+                                    }
+                                }
                                 if let Some(&id) = self.signal_name_to_id.get(root.as_str()) {
                                     let total_w = self.signal_widths[id] as usize;
                                     let lo = (field_off as usize) + lsb;
@@ -69445,8 +69517,12 @@ impl Simulator {
                             }
                         }
                     }
-                    // (b) packed struct field.
-                    if let ExprKind::Ident(bh) = &base.kind {
+                    // (b) packed struct field. A struct of the running frame
+                    // takes (c): it hides a module variable of the same name
+                    // (§23.9), which this would write.
+                    if let ExprKind::Ident(bh) = &base.kind
+                        && self.frame_bound_bare_name(bh).is_none()
+                    {
                         let base_name = self.resolve_hier_name(bh);
                         if let Some(fields) =
                             self.module.packed_struct_fields.get(&*base_name).cloned()
@@ -87513,6 +87589,7 @@ impl Simulator {
                 }
                 // SV-2023: NBA to a ref formal redirects to the caller's
                 // actual lvalue (IEEE 1800-2023 §13.5.2).
+                let written = lvalue;
                 let lvalue_owned;
                 let lvalue: &Expression = if let ExprKind::Ident(hier) = &lvalue.kind {
                     if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
@@ -87534,6 +87611,9 @@ impl Simulator {
                 } else {
                     lvalue
                 };
+                // The caller's actual of a `ref` formal names the caller's
+                // variables, not this frame's.
+                let rebound = !std::ptr::eq(lvalue, written);
                 let w = self.infer_lhs_width(lvalue);
                 let d = match intra_d {
                     Some(d) => d,
@@ -87562,7 +87642,43 @@ impl Simulator {
                         });
                         return;
                     }
-                    let id_opt = self.resolve_nba_target(lvalue);
+                    // NBA to a task-FRAME local, whole or a select of it
+                    // (`a <= v`, `a[3:0] <= v`): the deferred queue commits
+                    // in `apply_nba`, OUTSIDE the (possibly suspended)
+                    // process's local frame, so the local would never
+                    // update. Apply immediately — delta-vs-blocking timing
+                    // is unobservable for a process-local. (Body-declared
+                    // locals in the signal map are left deferred: routines
+                    // doing `nba <= next_nba; @(nba)` need the NBA region to
+                    // fire the edge.) Checked before `resolve_nba_target`:
+                    // the local hides a module variable of the same name
+                    // (§23.9), which that would find. A `ref` formal, or the
+                    // caller's actual it was rewritten to above, keeps the
+                    // path below.
+                    let root = Self::lvalue_bare_root(lvalue).filter(|_| !rebound);
+                    if root.is_some_and(|n| {
+                        self.local_stack.last().is_some_and(|m| m.contains_key(n))
+                            && !self
+                                .ref_alias_stack
+                                .last()
+                                .is_some_and(|m| m.contains_key(n))
+                            && !self
+                                .ref_binding_stack
+                                .last()
+                                .is_some_and(|m| m.contains_key(n))
+                    }) {
+                        self.assign_value(lvalue, &val.resize_for_assign(w));
+                        return;
+                    }
+                    // §8.10: so does a property of the running method's
+                    // class. Queue it with the method's object instead, as
+                    // the other property writes below are.
+                    let class_root = root.is_some_and(|n| self.class_owns_bare(n));
+                    let id_opt = if class_root {
+                        None
+                    } else {
+                        self.resolve_nba_target(lvalue)
+                    };
                     if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
                         // (NbaAssignRange / NbaAssignBitDyn from the
@@ -87576,21 +87692,15 @@ impl Simulator {
                             signal_id: id,
                             value: val.resize_for_assign(w),
                         });
-                    } else if self.try_schedule_packed_index_nba(lvalue, &val) {
+                    } else if !class_root && self.try_schedule_packed_index_nba(lvalue, &val) {
                         // The packed slice has already been merged into the
                         // pending whole-signal value.
                     } else if matches!(&lvalue.kind, ExprKind::Ident(h)
                         if h.path.len() == 1
                             && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))
                     {
-                        // NBA to a bare task-FRAME local: the deferred queue
-                        // commits in `apply_nba`, OUTSIDE the (possibly
-                        // suspended) process's local frame, so the local would
-                        // never update. Apply immediately — delta-vs-blocking
-                        // timing is unobservable for a process-local. (Body-
-                        // declared locals in the signal map are left deferred:
-                        // routines doing `nba <= next_nba; @(nba)`
-                        // need the NBA region to fire the edge.)
+                        // A bare name of the frame left to here (a `ref`
+                        // formal's), applied now for the reason above.
                         self.assign_value(lvalue, &val.resize_for_assign(w));
                     } else {
                         let frozen = self.freeze_lvalue_indices(lvalue);
@@ -108747,6 +108857,49 @@ impl Simulator {
             .last()
             .is_some_and(|l| l.contains_key(n))
             .then_some(n)
+    }
+
+    /// The name of a bare identifier: one unrooted segment without selects.
+    fn bare_ident_name(hier: &HierarchicalIdentifier) -> Option<&str> {
+        (hier.path.len() == 1 && hier.path[0].selects.is_empty() && hier.root.is_none())
+            .then(|| hier.path[0].name.name.as_str())
+    }
+
+    /// The bare variable a whole or select lvalue writes: `a` in `a`,
+    /// `a[3:0]`, `a[i +: 4]` or `a[i][j]`. None for anything else, a member
+    /// write included.
+    fn lvalue_bare_root(e: &Expression) -> Option<&str> {
+        match &e.kind {
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::Paren(expr) => Self::lvalue_bare_root(expr),
+            ExprKind::Ident(h) if h.path.len() == 1 && h.root.is_none() => {
+                Some(h.path[0].name.name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// §8.10/§23.9: does the bare name `name` reach a property of the running
+    /// method's class, an instance property of `this` or a static one of its
+    /// class chain? Such a property hides a module, package or $unit variable
+    /// of the same name. A module task or function called from a method runs
+    /// without the class context, so there it never matches.
+    fn class_owns_bare(&self, name: &str) -> bool {
+        if let Some(Some(h)) = self.this_stack.last() {
+            let key = self.shadowed_prop_key(name, false);
+            let key = key.as_deref().unwrap_or(name);
+            if self
+                .heap
+                .get(*h)
+                .and_then(|o| o.as_ref())
+                .is_some_and(|i| i.properties.contains_key(key))
+            {
+                return true;
+            }
+        }
+        matches!(self.class_context_stack.last(),
+            Some(Some(c)) if self.static_prop_key(c, name).is_some())
     }
 
     fn get_local_or_signal(&self, name: &str) -> Option<Value> {

@@ -16,6 +16,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* A bit-, part- or indexed part-select write through the name of a
+  subroutine local or formal, a block or loop variable, or, in a method, a
+  class property writes that variable when a module, package or `$unit`
+  variable has the same name (§23.9, §11.5.1). It wrote the hidden variable
+  instead, while whole writes and reads used the local. Nonblocking writes,
+  concatenation targets, output arguments bound to a select, member selects
+  of a packed struct local and compiled function bodies are fixed too. A
+  variable of a nested block of an `always` or `initial` process that shares
+  a module variable's name now has storage of its own: it lost its value
+  between activations, and a block that suspended wrote the module variable
+  (§6.21). (#344)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

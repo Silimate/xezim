@@ -15792,6 +15792,13 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_nba_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
+        // §23.9: an NBA to the body's own variable, whole or a select of it,
+        // goes to the interpreter. The stores below resolve module signals,
+        // and one of the same name is hidden by the local.
+        if self.root_is_local(lhs, true) {
+            self.bail("nba_local_target");
+            return false;
+        }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 if let Some(id) = self.lookup_signal_id(hier) {
@@ -16475,6 +16482,40 @@ impl<'a> BytecodeCompiler<'a> {
         )
     }
 
+    /// §23.9/§8.10: is the variable under the select lvalue `lhs` (`a[3:0]`,
+    /// `a[i][j]`; with `whole`, also a bare `a`) one the compiled body owns:
+    /// a register-backed local or formal, or in a method a member of its
+    /// class? It hides a module signal of the same name, so the signal
+    /// stores must not take it.
+    fn root_is_local(&self, lhs: &Expression, whole: bool) -> bool {
+        let mut e = lhs;
+        let mut sel = false;
+        while let ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::Paren(expr) = &e.kind
+        {
+            sel |= !matches!(e.kind, ExprKind::Paren(_));
+            e = expr;
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return false;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !(whole || sel || !h.path[0].selects.is_empty())
+        {
+            return false;
+        }
+        let n = h.path[0].name.name.as_str();
+        self.local_var_regs.contains_key(n)
+            || self.local_array_regs.contains_key(n)
+            || self.local_var_array.contains_key(n)
+            || (self.method_mode
+                && (self.bare_member_names.contains(n)
+                    || self.static_member_names.contains(n)
+                    || self.string_member_names.contains(n)
+                    || self.coll_member_names.contains(n)
+                    || self.class_shadow_names.contains(n)))
+    }
+
     /// §11.5.1/§11.5.2 bit or part-select STORE into a register-backed
     /// integral local — `v[6:4] = c[3:1]`, `cur[b*8 +: 8] = d`, `x[i] = b` —
     /// as a mask splice on the register: `x = (x & ~(m << lo)) | ((v & m) << lo)`.
@@ -16817,6 +16858,13 @@ impl<'a> BytecodeCompiler<'a> {
         // Bit / part-select store into a register-backed integral local.
         if let Some(done) = self.compile_local_select_store(lhs, val_reg) {
             return done;
+        }
+        // §23.9: any other select of the body's own variable goes to the
+        // interpreter. The stores below resolve module signals, and one of
+        // the same name is hidden by the local.
+        if self.root_is_local(lhs, false) {
+            self.bail("blocking_local_select");
+            return false;
         }
         // Assignment to a register-backed block local (the loop variable of an
         // enclosing `for (int i = ...)`).

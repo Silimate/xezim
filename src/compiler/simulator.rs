@@ -6770,9 +6770,9 @@ pub struct Simulator {
     /// Code coverage counters, indexed by the id a `$__xz_cov` marker or an
     /// `Insn::CovHit` carries. Empty when the run collects none.
     code_cov_hits: Vec<u64>,
-    /// Toggle coverage candidates, named while `new` still has the
-    /// elaboration signal table; resolved to ids in `compile`.
-    code_cov_toggle_names: Vec<String>,
+    /// Toggle coverage candidates and their data types, named while `new`
+    /// still has the elaboration signal table; resolved to ids in `compile`.
+    code_cov_toggle_names: Vec<(String, &'static str)>,
     /// Call stack for tracking 'this' and local variables.
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,

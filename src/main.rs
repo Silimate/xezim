@@ -233,6 +233,10 @@ fn print_usage() {
     eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
     eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
     eprintln!("                   subtrees (tb.dut) and packages. Repeatable.");
+    eprintln!("  --no-toggle-integers  Leave variables of an integer type (int, integer,");
+    eprintln!("                   shortint, longint, byte) out of toggle coverage, as some");
+    eprintln!("                   simulators do by default. --toggle-integers keeps them (the");
+    eprintln!("                   default). XEZIM_TOGGLE_INTEGERS=0 too.");
     eprintln!("  --verbose        Internal engine lines, off by default: the version banner,");
     eprintln!("                   [PHASE] timings, end-of-run engine counters ([PROF]/[FUSE]/");
     eprintln!("                   [EVENT-EDGE]/[COV]), compile-time optimisation notes and");
@@ -1873,6 +1877,8 @@ fn run_main() -> i32 {
     // `--code-coverage[=<kinds>]` / `--code-coverage-scope`.
     let mut code_cov_kinds: Option<u8> = None;
     let mut code_cov_scopes: Vec<String> = Vec::new();
+    // `--[no-]toggle-integers`.
+    let mut code_cov_integers: Option<bool> = None;
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
@@ -2482,6 +2488,12 @@ fn run_main() -> i32 {
                         .map(String::from),
                 );
             }
+            "--toggle-integers" => {
+                code_cov_integers = Some(true);
+            }
+            "--no-toggle-integers" => {
+                code_cov_integers = Some(false);
+            }
             "--fst" => {
                 i += 1;
                 if i < args.len() {
@@ -2853,11 +2865,33 @@ fn run_main() -> i32 {
         .or(env_cov)
         .or(cover_request.map(|(k, _)| k))
         .unwrap_or(0);
+    // Integer variables are toggle-tracked unless `--no-toggle-integers` or
+    // XEZIM_TOGGLE_INTEGERS=0 leaves them out; the flag wins.
+    let integers = match code_cov_integers {
+        Some(on) => on,
+        None => match env::var("XEZIM_TOGGLE_INTEGERS").as_deref() {
+            Err(_) | Ok("") | Ok("1") => true,
+            Ok("0") => false,
+            Ok(v) => {
+                eprintln!("Error: XEZIM_TOGGLE_INTEGERS={}: want 0 or 1", v);
+                std::process::exit(1);
+            }
+        },
+    };
+    if let Some(on) = code_cov_integers {
+        if code_cov & xezim::compiler::simulator::KIND_TOGGLE == 0 {
+            eprintln!(
+                "Warning: --{}toggle-integers has no effect without toggle coverage",
+                if on { "" } else { "no-" }
+            );
+        }
+    }
     if code_cov != 0 {
         xezim::compiler::simulator::set_code_coverage(Some(
             xezim::compiler::simulator::CodeCoverage {
                 kinds: code_cov,
                 scopes: code_cov_scopes,
+                integers,
             },
         ));
     } else if !code_cov_scopes.is_empty() {

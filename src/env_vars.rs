@@ -812,6 +812,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Profiling: group compiled blocks by canonical shape; report repeated-template dynamic coverage (wants COMB_PATHS + EDGE_BLOCK_STATS)",
     ),
     (
+        "XEZIM_TOGGLE_INTEGERS",
+        "Coverage: =0 leaves int, integer, shortint, longint and byte variables out of toggle coverage, like --no-toggle-integers; the flag wins",
+    ),
+    (
         "XEZIM_TOPO_JOIN",
         "Default on; =0 disables: order a comb net with a large writers x readers product through one join node instead of W x R edges",
     ),

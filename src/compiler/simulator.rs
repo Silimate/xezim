@@ -5541,6 +5541,17 @@ enum PendingSel<'a> {
     },
 }
 
+/// How one select of a chain addresses the packed value it is applied to
+/// (see [`Simulator::packed_hops`]), before any index is evaluated.
+#[derive(Debug, Clone, Copy)]
+enum PackedHop {
+    /// A packed dimension declared `[l:r]` of elements `ew` bits wide.
+    /// §7.4.1: the left bound labels the most significant element.
+    Dim { l: i64, r: i64, ew: u32 },
+    /// A member of a packed struct or union, `off` bits above its LSB.
+    Field(u32),
+}
+
 /// The §7.8 collection kind of an unpacked-struct member whose declarator
 /// carries an unsized `[]`, queue `[$]` or associative `[k]` dimension.
 /// (Distinct from the rand-collection [`CollKind`]: this one separates the
@@ -67945,6 +67956,13 @@ impl Simulator {
                 }
                 return changed;
             }
+            // §7.4.1/§11.5.1: a nested select of a packed variable the frame
+            // owns (`p[1][3:0] = v`, `a[i].f[3] = b`).
+            if Self::select_of_select(lhs)
+                && let Some(r) = self.frame_packed_select_write(lhs, val)
+            {
+                return r;
+            }
         }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -70639,6 +70657,448 @@ impl Simulator {
         };
         let lsb = blsb + a.min(b) * ew;
         Some(base_v.range_select((lsb + out_w as u64 - 1) as usize, lsb as usize))
+    }
+
+    /// Is `e` an index or part-select whose base is itself an index or a
+    /// member access (`p[1][3:0]`, `s.f[2]`)? The cheap shape test that
+    /// gates `frame_packed_chain` on the assignment and read paths.
+    #[inline(always)]
+    fn select_of_select(e: &Expression) -> bool {
+        let (ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }) = &e.kind else {
+            return false;
+        };
+        matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::Paren(_)
+        )
+    }
+
+    /// A select of a select of a variable the innermost call frame owns (a
+    /// task or function local, formal or return value): `p[1][3:0]`,
+    /// `p[0][7]`, `p[i][j][k +: 2]`, `a[i].f[3]`, `s.m[1][7:4]`. Returns the
+    /// variable's identifier and name and the selects, root first. `None`
+    /// for any other shape, including a single select.
+    fn frame_packed_chain<'e>(
+        &self,
+        e: &'e Expression,
+    ) -> Option<(&'e Expression, &'e str, Vec<PendingSel<'e>>)> {
+        if !Self::select_of_select(e) {
+            return None;
+        }
+        let mut steps = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    steps.push(PendingSel::Index(index));
+                    cur = expr;
+                }
+                // §11.5.1: only the last select may be a part-select.
+                ExprKind::RangeSelect {
+                    expr,
+                    kind,
+                    left,
+                    right,
+                } if steps.is_empty() => {
+                    steps.push(PendingSel::Range {
+                        kind: *kind,
+                        left,
+                        right,
+                    });
+                    cur = expr;
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    steps.push(PendingSel::Member(member.name.as_str()));
+                    cur = expr;
+                }
+                ExprKind::Paren(x) => cur = x,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        if steps.len() < 2 || h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty()
+        {
+            return None;
+        }
+        let name = h.path[0].name.name.as_str();
+        if !self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name))
+        {
+            return None;
+        }
+        steps.reverse();
+        Some((cur, name, steps))
+    }
+
+    /// `frame_packed_chain` placed on the variable's declared type: the
+    /// identifier, name, selects and their `packed_hops`, and whether the
+    /// type is 2-state. `None` for a collection (its elements have their own
+    /// storage), a type with no packed layout, or a frame value whose width
+    /// is not the declared one.
+    #[allow(clippy::type_complexity)]
+    fn frame_packed_target<'e>(
+        &self,
+        e: &'e Expression,
+    ) -> Option<(
+        &'e Expression,
+        &'e str,
+        Vec<PendingSel<'e>>,
+        Vec<PackedHop>,
+        bool,
+    )> {
+        let (root, name, steps) = self.frame_packed_chain(e)?;
+        if self.module.arrays.contains_key(name)
+            || self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.module.queue_vars.contains(name)
+        {
+            return None;
+        }
+        let dt = self.module.var_decl_types.get(name)?;
+        let (hops, total) = self.packed_hops(dt, &steps)?;
+        let cur = self.local_stack.last()?.get(name)?;
+        if cur.is_real || cur.width != total {
+            return None;
+        }
+        let two = super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types);
+        Some((root, name, steps, hops, two))
+    }
+
+    /// The packed layout of `dt`: its packed dimensions, outermost first and
+    /// through typedefs, then the element below them — a packed struct or
+    /// union, or `None` for a single bit — and that element's width. An
+    /// integer atom or an enum is a vector `[w-1:0]`. `None` for a type with
+    /// no packed layout (class, string, real, unpacked or tagged aggregate)
+    /// or a bound that is not constant.
+    fn packed_shape<'a>(
+        &'a self,
+        dt: &'a DataType,
+    ) -> Option<(
+        Vec<(i64, i64)>,
+        Option<&'a crate::ast::types::StructUnionType>,
+        u32,
+    )> {
+        use crate::ast::types::PackedDimension;
+        fn bounds(
+            ds: &[PackedDimension],
+            params: &HashMap<String, Value>,
+            out: &mut Vec<(i64, i64)>,
+        ) -> Option<()> {
+            for d in ds {
+                let PackedDimension::Range { left, right, .. } = d else {
+                    return None;
+                };
+                out.push((
+                    super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                    super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                ));
+            }
+            Some(())
+        }
+        let params = &self.module.parameters;
+        let typedefs: Option<&HashMap<String, u32>> = Some(&self.module.typedefs);
+        let mut dims = Vec::new();
+        let mut cur = dt;
+        for _ in 0..32 {
+            match cur {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    bounds(dimensions, params, &mut dims)?;
+                    cur = super::elaborate::lookup_scoped_type(name, &self.module.typedef_types)?;
+                }
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. } => {
+                    bounds(dimensions, params, &mut dims)?;
+                    return Some((dims, None, 1));
+                }
+                DataType::IntegerAtom { .. } => {
+                    let w = resolve_type_width(cur, Some(params), typedefs);
+                    dims.push((w as i64 - 1, 0));
+                    return Some((dims, None, 1));
+                }
+                DataType::Enum(e) => {
+                    bounds(&e.dimensions, params, &mut dims)?;
+                    let w = e
+                        .base_type
+                        .as_deref()
+                        .map_or(32, |b| resolve_type_width(b, Some(params), typedefs));
+                    dims.push((w as i64 - 1, 0));
+                    return Some((dims, None, 1));
+                }
+                DataType::Struct(su) if su.packed && !su.tagged => {
+                    bounds(&su.dimensions, params, &mut dims)?;
+                    let ws = su.members.iter().flat_map(|m| {
+                        let w = resolve_type_width(&m.data_type, Some(params), typedefs);
+                        m.declarators.iter().map(move |_| w)
+                    });
+                    let w = if matches!(su.kind, crate::ast::types::StructUnionKind::Union) {
+                        ws.max()?
+                    } else {
+                        ws.sum::<u32>()
+                    };
+                    return Some((dims, Some(su), w));
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// §7.2.1/§7.3.1: the bit offset of member `name` within one `su` and
+    /// its declared type. The first member of a packed struct is the most
+    /// significant; every member of a packed union starts at bit 0.
+    fn packed_member_at<'a>(
+        &self,
+        su: &'a crate::ast::types::StructUnionType,
+        name: &str,
+    ) -> Option<(u32, &'a DataType)> {
+        let union = matches!(su.kind, crate::ast::types::StructUnionKind::Union);
+        let mut off = 0u32;
+        for m in su.members.iter().rev() {
+            let w = resolve_type_width(
+                &m.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            for d in m.declarators.iter().rev() {
+                if d.name.name == name {
+                    return Some((if union { 0 } else { off }, &m.data_type));
+                }
+                off += w;
+            }
+        }
+        None
+    }
+
+    /// Walk the selects `steps` (root first) down the declared type `dt` and
+    /// record how each addresses the value it applies to, without
+    /// evaluating anything: an index or part-select takes the next packed
+    /// dimension (a packed struct with none left is a vector of its bits), a
+    /// member moves to its field. Also returns the width of `dt`. `None`
+    /// when the type has no packed layout or a step does not fit it.
+    fn packed_hops(&self, dt: &DataType, steps: &[PendingSel]) -> Option<(Vec<PackedHop>, u32)> {
+        fn width(dims: &[(i64, i64)], bw: u32) -> Option<u32> {
+            dims.iter().try_fold(bw, |w, &(l, r)| {
+                w.checked_mul(u32::try_from((l - r).unsigned_abs() + 1).ok()?)
+            })
+        }
+        let (mut dims, mut agg, mut bw) = self.packed_shape(dt)?;
+        let total = width(&dims, bw)?;
+        let mut hops = Vec::with_capacity(steps.len());
+        let mut d = 0usize;
+        for step in steps {
+            match step {
+                PendingSel::Index(_) | PendingSel::Range { .. } => {
+                    if let Some(&(l, r)) = dims.get(d) {
+                        d += 1;
+                        hops.push(PackedHop::Dim {
+                            l,
+                            r,
+                            ew: width(&dims[d..], bw)?,
+                        });
+                    } else if agg.take().is_some() {
+                        hops.push(PackedHop::Dim {
+                            l: bw as i64 - 1,
+                            r: 0,
+                            ew: 1,
+                        });
+                        bw = 1;
+                    } else {
+                        return None;
+                    }
+                }
+                PendingSel::Member(m) => {
+                    let su = agg.filter(|_| d == dims.len())?;
+                    let (off, mdt) = self.packed_member_at(su, m)?;
+                    let (md, ma, mb) = self.packed_shape(mdt)?;
+                    let mw = resolve_type_width(
+                        mdt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    if width(&md, mb)? != mw {
+                        return None;
+                    }
+                    hops.push(PackedHop::Field(off));
+                    (dims, agg, bw, d) = (md, ma, mb, 0);
+                }
+            }
+        }
+        Some((hops, total))
+    }
+
+    /// Evaluate the selects `steps` placed by `packed_hops`, in order. Returns
+    /// the width of the select and, unless an index is x/z or out of range
+    /// (§11.5.1: the select then names no bits), `(lsb, src, len)`: the `len`
+    /// bits it names that exist, from bit `lsb` of the variable and bit `src`
+    /// of the select's value. A part-select partly out of range keeps the
+    /// bits in range only.
+    fn packed_hops_eval(
+        &mut self,
+        hops: &[PackedHop],
+        steps: &[PendingSel],
+    ) -> (u32, Option<(u64, u64, u64)>) {
+        fn int(sim: &mut Simulator, e: &Expression) -> Option<i64> {
+            let v = sim.eval_expr(e);
+            v.to_i64().filter(|_| !v.has_xz() && !v.is_real)
+        }
+        let mut lsb = 0u64;
+        // Every index is evaluated, in order, even past an invalid one.
+        let mut ok = true;
+        for (k, (hop, step)) in hops.iter().zip(steps).enumerate() {
+            let (l, r, ew) = match *hop {
+                PackedHop::Field(off) => {
+                    lsb += off as u64;
+                    continue;
+                }
+                PackedHop::Dim { l, r, ew } => (l, r, ew),
+            };
+            // Labels of the first and last element selected, and the element
+            // count when they are unknown.
+            let (ends, elems) = match step {
+                PendingSel::Index(ix) => (int(self, ix).map(|i| (i, i)), 1),
+                PendingSel::Range { kind, left, right } => {
+                    let (a, n) = (int(self, left), int(self, right));
+                    let up = matches!(kind, RangeKind::IndexedUp);
+                    match kind {
+                        RangeKind::Constant => (a.zip(n), 1),
+                        _ => (
+                            a.zip(n.filter(|&n| n > 0)).map(|(a, n)| {
+                                let b = if up {
+                                    a.saturating_add(n - 1)
+                                } else {
+                                    a.saturating_sub(n - 1)
+                                };
+                                (a, b)
+                            }),
+                            n.unwrap_or(1),
+                        ),
+                    }
+                }
+                PendingSel::Member(_) => (None, 1),
+            };
+            let Some((a, b)) = ends else {
+                ok = false;
+                if k + 1 == hops.len() {
+                    let w = elems.max(1).saturating_mul(ew as i64);
+                    return (u32::try_from(w).unwrap_or(0), None);
+                }
+                continue;
+            };
+            // Slot of a label counted from the least significant element;
+            // linear, so a label outside `[l:r]` lands outside `0..count`.
+            let slot = |i: i64| {
+                if l >= r {
+                    i.saturating_sub(r)
+                } else {
+                    r.saturating_sub(i)
+                }
+            };
+            let count = (l - r).abs() + 1;
+            let n = i64::try_from(a.abs_diff(b))
+                .unwrap_or(i64::MAX)
+                .saturating_add(1);
+            let lo = slot(a).min(slot(b));
+            if k + 1 < hops.len() {
+                ok &= lo >= 0 && lo < count;
+                if ok {
+                    lsb += lo as u64 * ew as u64;
+                }
+                continue;
+            }
+            let w = u32::try_from(n.saturating_mul(ew as i64)).unwrap_or(0);
+            let (first, last) = (lo.max(0), lo.saturating_add(n - 1).min(count - 1));
+            if !ok || w == 0 || first > last {
+                return (w, None);
+            }
+            let ew = ew as u64;
+            return (
+                w,
+                Some((
+                    lsb + first as u64 * ew,
+                    (first - lo) as u64 * ew,
+                    (last - first + 1) as u64 * ew,
+                )),
+            );
+        }
+        (0, None)
+    }
+
+    /// §7.4.1/§7.2.1/§11.5.1: store `val` through a select of a select of a
+    /// packed variable the innermost call frame owns (`frame_packed_chain`).
+    /// The select arms resolve a nested select of a multidimensional packed
+    /// array or of a packed array of structs against the module signal table
+    /// only, so the same write to a task or function local was dropped:
+    /// `p[1][3:0] = v` and `p[0][7] = b` left `p` unchanged. Walk the
+    /// local's declared type instead and splice the bits into its frame
+    /// value. `None` when `lhs` is not such a select (the arms below take
+    /// it); `Some(false)` when it names no bits.
+    fn frame_packed_select_write(&mut self, lhs: &Expression, val: &Value) -> Option<bool> {
+        let (_, name, steps, hops, two) = self.frame_packed_target(lhs)?;
+        let (w, sel) = self.packed_hops_eval(&hops, &steps);
+        let Some((lsb, src, len)) = sel else {
+            return Some(false);
+        };
+        let mut v = if val.is_real {
+            Self::real_to_int(val.to_f64(), w)
+        } else {
+            val.resize_for_assign(w)
+        };
+        // §6.11.2: a 2-state variable stores x/z bits as 0.
+        if two && v.has_xz() {
+            v = v.to_two_state();
+        }
+        let slot = self.local_stack.last_mut()?.get_mut(name)?;
+        let mut changed = false;
+        for b in 0..len as usize {
+            let (at, nb) = (lsb as usize + b, v.get_bit(src as usize + b));
+            if slot.get_bit(at) != nb {
+                slot.set_bit(at, nb);
+                changed = true;
+            }
+        }
+        Some(changed)
+    }
+
+    /// The read of `frame_packed_select_write`'s selects, through the same
+    /// walk, so a read returns the bits a write stores. The generic arms
+    /// place a select below a struct member at the member's raw bit
+    /// positions, so `s.f[4:1]` of a member declared `[8:1]` read the wrong
+    /// bits (§7.4.1). Bits outside the variable read x, or 0 in a 2-state
+    /// variable (§11.5.1).
+    fn frame_packed_select_read(&mut self, e: &Expression) -> Option<Value> {
+        let (root, _, steps, hops, two) = self.frame_packed_target(e)?;
+        let base = self.eval_expr(root);
+        let (w, sel) = self.packed_hops_eval(&hops, &steps);
+        let w = w.max(1);
+        let mut out = if two { Value::zero(w) } else { Value::new(w) };
+        if let Some((lsb, src, len)) = sel {
+            for b in 0..len as usize {
+                out.set_bit(src as usize + b, base.get_bit(lsb as usize + b));
+            }
+        }
+        Some(out)
+    }
+
+    /// §7.4.2: the packed dimensions of a packed array of a packed struct
+    /// typedef (`e_t [0:1] b`), the struct counted as one trailing `[w-1:0]`
+    /// dimension, as elaboration records them for a module variable. The
+    /// other shape helpers stop at the struct and record nothing, so on a
+    /// local or formal an element select took every dimension as `[n-1:0]`
+    /// and `b[1]` of an ascending `[0:1]` read and wrote the wrong element.
+    fn struct_array_full_dims(&self, dt: &DataType) -> Option<Vec<(i64, i64)>> {
+        if !matches!(dt, DataType::TypeReference { dimensions, .. } if !dimensions.is_empty()) {
+            return None;
+        }
+        let (mut dims, agg, bw) = self.packed_shape(dt)?;
+        agg?;
+        dims.push((bw as i64 - 1, 0));
+        Some(dims)
     }
 
     /// Bit slice (lsb, width) addressed by an index chain into a packed
@@ -75452,6 +75912,13 @@ impl Simulator {
                 if let Some(v) = self.frame_get(&key) {
                     return v.clone();
                 }
+            }
+            // §7.4.1/§11.5.1: a nested select of a packed variable the frame
+            // owns, placed as its write is (`frame_packed_select_write`).
+            if Self::select_of_select(expr)
+                && let Some(v) = self.frame_packed_select_read(expr)
+            {
+                return v;
             }
         }
         // §6.21: a `static` subroutine local is a LIVE cell shared across ALL
@@ -85431,6 +85898,7 @@ impl Simulator {
                                 &self.module.typedef_types,
                             )
                         })
+                        .or_else(|| self.struct_array_full_dims(data_type))
                 {
                     self.module
                         .packed_full_dims
@@ -146896,6 +147364,7 @@ impl Simulator {
                     &self.module.typedef_types,
                 )
             })
+            .or_else(|| self.struct_array_full_dims(dt))
         {
             self.module.packed_full_dims.insert(name.to_string(), fdims);
         }

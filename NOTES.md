@@ -16,6 +16,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* A select of a select of a packed task or function local writes only the
+  bits it names: `p[1][3:0] = v` and `p[0][7] = b` on a multidimensional
+  packed array, `a[i].f[3] = b` on a packed array of structs. Such writes
+  were dropped, though the same writes to a module variable worked. On a
+  local, a part- or bit-select below a struct member declared with a range
+  other than `[n-1:0]` now reads and writes the bits its labels name, and so
+  does an element select of a packed array of a struct typedef declared
+  ascending (§7.2.1, §7.4.1, §11.5.1).
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

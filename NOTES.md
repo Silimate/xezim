@@ -16,6 +16,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* After `$finish` or a VPI `vpi_control(vpiFinish)`, which is how cocotb ends
+  a test, no always block woken in the finishing time slot runs. Compiled
+  block code used to keep running, updating counters and NBAs while skipping
+  the block's `$display`, so `final` blocks and coverage counted a clock edge
+  the log never showed. A finish from a cbAfterDelay callback, or from a
+  value-change callback on a clock that callback drives, also stops that
+  slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

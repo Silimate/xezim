@@ -6,7 +6,7 @@
 //! from an always block or a process was deferred to the end of the slot
 //! like a resumed waiter's, so later passes ran more blocks.
 //!
-//! The reference simulator runs no block after the finish in any shape
+//! The commercial simulator runs no block after the finish in any shape
 //! below.
 
 use xezim::simulate;
@@ -68,7 +68,7 @@ endmodule
 }
 
 /// A process writes the clock and calls `$finish` without suspending: the
-/// blocks it woke never get to run (reference simulator: edges=1 nb=1).
+/// blocks it woke never get to run (commercial simulator: edges=1 nb=1).
 #[test]
 fn finish_after_clock_write_runs_no_woken_block() {
     let got = lines(

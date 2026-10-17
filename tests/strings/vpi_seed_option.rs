@@ -1,7 +1,7 @@
 //! `-sv_seed <n|random>` (also `-svseed`, `-seed`) is a simulator option, not
 //! a plusarg. It seeds the RNG, but `$test$plusargs`/`$value$plusargs`
 //! (IEEE 1800-2017 §21.6) don't match it and the argv `vpi_get_vlog_info`
-//! returns (§38.17) carries no `+seed=` for it, as on the reference simulator.
+//! returns (§38.17) carries no `+seed=` for it, as on the commercial simulator.
 //! xezim used to turn it into a `+seed=<value>` plusarg, so a cocotb test run
 //! with `-sv_seed random` died at start-up parsing `+seed=random` as its own
 //! seed. A `+seed=` the user writes is still a plusarg everywhere, and still
@@ -157,7 +157,7 @@ fn seed_plusarg_stays_a_plusarg() {
 }
 
 /// Given both, the option seeds the RNG and the plusarg is left to the
-/// testbench, as on the reference simulator.
+/// testbench, as on the commercial simulator.
 #[test]
 fn seed_option_wins_over_seed_plusarg() {
     let (d, so) = setup("both");

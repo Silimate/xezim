@@ -263,7 +263,7 @@ endmodule
 
 /// Toggles: per bit, 0->1 and 1->0 between the ends of time slots, never to
 /// or from x; memories and reals untracked, and input ports too under
-/// `--no-toggle-input-ports`. As in the reference simulator's report, a
+/// `--no-toggle-input-ports`. As in the commercial simulator's report, a
 /// 0-1-0 within one time slot is no toggle.
 #[test]
 fn toggle_counts() {
@@ -418,7 +418,7 @@ endmodule
 /// concatenation's (`e`, `f`), a narrower actual's low bit (`g`). A constant
 /// (`c`) or open (`d`) port never toggles. The unpacked port array and the
 /// interface port are not tracked. Which bins are hit, and every scope's
-/// totals, are the reference simulator's with full signal visibility.
+/// totals, are the commercial simulator's with full signal visibility.
 #[test]
 fn input_ports_toggle_in_their_instance() {
     let d = scratch("ports");

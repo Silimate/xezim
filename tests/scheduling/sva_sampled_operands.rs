@@ -12,10 +12,9 @@
 //! value, and the gate of `$past(e, n, gate)` was ignored.
 //!
 //! Each check compares against shadow flops, which hold the value an operand
-//! had at earlier ticks. The reference simulator prints `PASS` (and the same
-//! `COUNTS` and `RESULT` lines) for every design here; it rejects a
-//! sampled-value call in `disable iff` without an explicit clock (§16.9.3),
-//! so `a_dis` gives one.
+//! had at earlier ticks. The commercial simulator prints `PASS` (and the same
+//! `COUNTS` and `RESULT` lines) for every design here. A sampled-value call
+//! in `disable iff` needs an explicit clock (§16.9.3), so `a_dis` gives one.
 
 use std::path::PathBuf;
 use std::process::Command;

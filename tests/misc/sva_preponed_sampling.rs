@@ -76,3 +76,75 @@ endmodule
         o
     );
 }
+
+/// §16.9.3: the argument of a sampled-value function is sampled in the
+/// Preponed region too. For a flop on the property's own clock, `$past(q)`,
+/// `$rose(q)`, `$fell(q)`, `$stable(q)` and `$changed(q)` see `q` from before
+/// the edge that updates it. Its history used to record the value the flop
+/// took at the edge, so `$past(q)` returned the current sample and `$rose`
+/// fired a cycle early. The reference simulator: 6 changes, no failure.
+#[test]
+fn sampled_value_functions_read_preponed_flop_values() {
+    let o = out(r#"
+module top;
+  logic clk = 0, rst = 1, d = 0, q = 0, q2 = 0;
+  int fails = 0, n = 0;
+  bit pat[12] = '{0, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1};
+  always #5 clk = ~clk;
+  always_ff @(posedge clk) begin q <= d; q2 <= q; end
+  initial begin
+    foreach (pat[i]) begin
+      @(negedge clk);
+      d = pat[i];
+      if (i == 1) rst = 0;
+    end
+    @(negedge clk);
+    $display("[RESULT] changed=%0d fails=%0d", n, fails);
+    $finish;
+  end
+  a_past: assert property (@(posedge clk) disable iff (rst) $past(q) == q2)
+    else begin fails++; $display("[FAIL] a_past t=%0t", $time); end
+  a_rose: assert property (@(posedge clk) disable iff (rst) $rose(q) |-> !q2 && $past(d))
+    else begin fails++; $display("[FAIL] a_rose t=%0t", $time); end
+  a_fell: assert property (@(posedge clk) disable iff (rst) $fell(q) |-> q2 && !$past(d))
+    else begin fails++; $display("[FAIL] a_fell t=%0t", $time); end
+  a_stable: assert property (@(posedge clk) disable iff (rst) $stable(q) == (q == q2))
+    else begin fails++; $display("[FAIL] a_stable t=%0t", $time); end
+  c_changed: cover property (@(posedge clk) disable iff (rst) $changed(q)) n++;
+endmodule
+"#);
+    assert!(
+        o.contains("[RESULT] changed=6 fails=0"),
+        "sampled-value functions must read q's Preponed value; got: {}",
+        o
+    );
+}
+
+/// §16.5.1, §4.4.2.1: values are sampled once per time slot, in its Preponed
+/// region. Here the property's clock rises two deltas into the slot, from the
+/// process that the NBA update of `d` wakes, and `d` is still sampled with
+/// its value from the start of the slot. The samples used to be retaken in
+/// every delta the scheduler re-entered, which saw the new `d`. The
+/// reference simulator: 10 ticks, no failure.
+#[test]
+fn clock_in_a_later_delta_samples_slot_entry_values() {
+    let o = out(r#"
+module top;
+  logic clk0 = 0, clk = 0, d = 0, e = 0;
+  int fails = 0, n = 0;
+  always #5 clk0 = ~clk0;
+  always @(posedge clk0) d <= ~d;
+  always @(negedge clk0) e = d;
+  always @(d) begin #0 clk = 1; #1 clk = 0; end
+  a_d: assert property (@(posedge clk) d == e)
+    else begin fails++; $display("[FAIL] a_d t=%0t", $time); end
+  c_n: cover property (@(posedge clk) 1) n++;
+  initial #100 begin $display("[RESULT] ticks=%0d fails=%0d", n, fails); $finish; end
+endmodule
+"#);
+    assert!(
+        o.contains("[RESULT] ticks=10 fails=0"),
+        "a tick in a later delta must use the slot's Preponed samples; got: {}",
+        o
+    );
+}

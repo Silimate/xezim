@@ -6220,6 +6220,10 @@ pub struct Simulator {
     /// being one clock cycle early. Only populated when `sva_sites` is
     /// non-empty; the referenced ids are those collected per site.
     sva_preponed: HashMap<usize, Value>,
+    /// The time slot `sva_preponed` was captured for. The Preponed region
+    /// runs once per slot (§4.4.2.1), so the later deltas of a slot (a VPI
+    /// write from cbReadWriteSynch reopening the Active region) keep it.
+    sva_preponed_time: Option<u64>,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -12868,6 +12872,7 @@ impl Simulator {
             sva_default_disable: HashMap::default(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
+            sva_preponed_time: None,
             clocking_snapshots: HashMap::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
@@ -47318,6 +47323,11 @@ impl Simulator {
         }
     }
 
+    // Kept out of line, as the inliner left it while `tick_sva_sites` had
+    // one caller: inlined into the event loop, it pushed the loop's other
+    // callees out of line (1.3% more instructions on a design without
+    // assertions).
+    #[inline(never)]
     fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -47339,6 +47349,14 @@ impl Simulator {
         if let Some(t) = _t {
             accum.t_snap += t.elapsed().as_nanos() as u64;
         }
+        // LRM §16.5.1: capture the Preponed samples of every SVA-referenced
+        // signal before anything in this slot changes them. That is before
+        // the Active and NBA regions, and before the Pre-Active VPI callbacks
+        // below (cbAtStartOfSimTime, cbAfterDelay): §4.4.3.2 puts them after
+        // the Preponed region, so a value a VPI client writes there is not
+        // the sampled one. Only once per slot: a later delta of the slot (a
+        // cbReadWriteSynch write reopening the Active region) keeps them.
+        self.refresh_sva_preponed();
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot
@@ -47360,11 +47378,6 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.fire_timing_timers();
-        // LRM §16.5.1: capture Preponed (slot-entry) samples of every
-        // SVA-referenced signal BEFORE the active/NBA regions run, so a
-        // clocked assertion firing later this slot (tick_sva_sites) samples
-        // pre-edge values rather than same-edge NBA updates.
-        self.refresh_sva_preponed();
         // LRM §14.4 `#1step` clocking-input skew: capture the same Preponed
         // (slot-entry) samples for clocking-block inputs, so `cb.<in>` read
         // after a posedge later this slot sees the pre-edge value.
@@ -95085,6 +95098,11 @@ impl Simulator {
                 self.sva_preponed.insert(id, self.signal_table[id].clone());
             }
         }
+        // For the first site these are the slot's only samples: a later
+        // delta of the slot must not retake them (`refresh_sva_preponed`).
+        if self.sva_sites.is_empty() {
+            self.sva_preponed_time = Some(self.time);
+        }
         let mut past_names = Vec::new();
         self.collect_past_arg_names(&body_expanded, &mut past_names);
         // A signal is sampled once per property clock, however many
@@ -95306,19 +95324,14 @@ impl Simulator {
                     self.collect_sva_signal_ids(e, out);
                 }
             }
-            ExprKind::SystemCall { name, args } => {
-                // `$past/$rose/$fell/$stable/$changed` already read from the
-                // per-site ring buffers; their bare argument must NOT be
-                // preponed here (that would double-sample). Skip a leading
-                // bare-Ident argument to those calls; still walk the rest.
-                let skip_first = matches!(
-                    name.as_str(),
-                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
-                );
-                for (i, a) in args.iter().enumerate() {
-                    if skip_first && i == 0 && matches!(a.kind, ExprKind::Ident(_)) {
-                        continue;
-                    }
+            ExprKind::SystemCall { args, .. } => {
+                // §16.9.3: a sampled-value function's argument is sampled
+                // too. Its history ring (`refresh_sva_past_snapshots`) must
+                // record Preponed values, and `$rose(q)` compares q's
+                // Preponed value with the last tick's; with the live value,
+                // `$past(q)` of a flop on the property's clock read the
+                // value the flop took at that very edge.
+                for a in args {
                     self.collect_sva_signal_ids(a, out);
                 }
             }
@@ -95417,9 +95430,10 @@ impl Simulator {
     }
 
     fn refresh_sva_preponed(&mut self) {
-        if self.sva_sites.is_empty() {
+        if self.sva_sites.is_empty() || self.sva_preponed_time == Some(self.time) {
             return;
         }
+        self.sva_preponed_time = Some(self.time);
         self.sva_preponed.clear();
         for i in 0..self.sva_sites.len() {
             for j in 0..self.sva_sites[i].sampled_ids.len() {
@@ -95455,6 +95469,9 @@ impl Simulator {
         }
     }
 
+    // Inline in both callers (`run_one_tick`, `vpi_open_delta`), so a design
+    // without assertions pays one emptiness check per tick.
+    #[inline(always)]
     fn tick_sva_sites(&mut self) {
         if self.sva_sites.is_empty() {
             return;

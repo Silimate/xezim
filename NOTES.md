@@ -16,6 +16,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* Concurrent assertions read a flop's value from before the clock edge that
+  updates it when the clock is written from a VPI callback: an edge cocotb's
+  `Clock` writes from cbReadWriteSynch ticks the assertions in its own delta.
+  Values are sampled once per time slot, before its cbAtStartOfSimTime and
+  cbAfterDelay routines, and the arguments of `$past`, `$rose`, `$fell`,
+  `$stable` and `$changed` are sampled there too, so `$past(q)` of a flop on
+  the property's clock no longer returns the current sample (§16.5.1,
+  §16.9.3). (#11)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

@@ -689,6 +689,19 @@ impl Simulator {
         }
         self.check_edges();
         let _ = self.drain_edge_cascade(self.cascade_limit);
+        // §16.5.1: the delta's Observed region. A clock edge the routine made
+        // (cocotb's Clock writes from cbReadWriteSynch) ticks the concurrent
+        // assertions now, in its own slot and with the slot's Preponed
+        // samples. Without this they ticked in a later delta, after a
+        // resample, or in the next slot, and read every flop's new value.
+        // A slot run by the nested scheduler took no Preponed samples. Once a
+        // routine has finished the run (the edge pass above turns that into
+        // `finish_deferred`) nothing is evaluated: cocotb ends a test from the
+        // value-change callback of the edge, and the reference simulator
+        // reports no assertion at that edge.
+        if !self.finished && !self.finish_deferred && self.sva_preponed_time == Some(self.time) {
+            self.tick_sva_sites();
+        }
         self.snapshot_edge_signals();
         self.vpi_same_time_work()
     }

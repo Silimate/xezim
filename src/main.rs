@@ -233,6 +233,10 @@ fn print_usage() {
     eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
     eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
     eprintln!("                   subtrees (tb.dut) and packages. Repeatable.");
+    eprintln!("  --no-toggle-input-ports  Leave input and inout ports out of toggle coverage:");
+    eprintln!("                   the signal that drives one carries its toggles. By default");
+    eprintln!("                   each instance counts its own ports (--toggle-input-ports).");
+    eprintln!("                   XEZIM_TOGGLE_INPUT_PORTS=0 too.");
     eprintln!("  --verbose        Internal engine lines, off by default: the version banner,");
     eprintln!("                   [PHASE] timings, end-of-run engine counters ([PROF]/[FUSE]/");
     eprintln!("                   [EVENT-EDGE]/[COV]), compile-time optimisation notes and");
@@ -1870,9 +1874,11 @@ fn run_main() -> i32 {
     let mut xtrace_profile: Option<String> = None;
     let mut xtrace_compress: Option<String> = None;
     let mut wave = false;
-    // `--code-coverage[=<kinds>]` / `--code-coverage-scope`.
+    // `--code-coverage[=<kinds>]` / `--code-coverage-scope` /
+    // `--[no-]toggle-input-ports`.
     let mut code_cov_kinds: Option<u8> = None;
     let mut code_cov_scopes: Vec<String> = Vec::new();
+    let mut toggle_input_ports: Option<bool> = None;
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
@@ -2482,6 +2488,12 @@ fn run_main() -> i32 {
                         .map(String::from),
                 );
             }
+            "--toggle-input-ports" => {
+                toggle_input_ports = Some(true);
+            }
+            "--no-toggle-input-ports" => {
+                toggle_input_ports = Some(false);
+            }
             "--fst" => {
                 i += 1;
                 if i < args.len() {
@@ -2853,11 +2865,17 @@ fn run_main() -> i32 {
         .or(env_cov)
         .or(cover_request.map(|(k, _)| k))
         .unwrap_or(0);
+    // Input and inout ports count in their own instance's toggle coverage
+    // unless `--no-toggle-input-ports` (or XEZIM_TOGGLE_INPUT_PORTS=0; the
+    // flag wins) leaves them to the signal that drives them.
+    let input_ports = toggle_input_ports
+        .unwrap_or_else(|| env::var("XEZIM_TOGGLE_INPUT_PORTS").ok().as_deref() != Some("0"));
     if code_cov != 0 {
         xezim::compiler::simulator::set_code_coverage(Some(
             xezim::compiler::simulator::CodeCoverage {
                 kinds: code_cov,
                 scopes: code_cov_scopes,
+                exclude_input_ports: !input_ports,
             },
         ));
     } else if !code_cov_scopes.is_empty() {

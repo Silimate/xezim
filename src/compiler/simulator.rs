@@ -65488,10 +65488,14 @@ impl Simulator {
             self.static_select_target(lhs)
         };
         // An index that calls a function can write the same static, so
-        // evaluate the indices (once, §11.4.1) before taking the copy.
+        // evaluate the indices (once, §11.4.1) before taking the copy. An
+        // x/z index selects nothing, so the write is discarded (§11.5.1).
         let frozen;
         let lhs = if cell.is_some() && !Self::select_indices_plain(lhs) {
-            frozen = self.freeze_lvalue_indices(lhs);
+            let Some(e) = self.freeze_select_indices(lhs, false) else {
+                return false;
+            };
+            frozen = e;
             &frozen
         } else {
             lhs
@@ -87340,9 +87344,12 @@ impl Simulator {
                         return;
                     }
                     // A select of one (`a[3:0] <= v`), for the same reason:
-                    // committed to the same cell, with its indices frozen.
+                    // committed to the same cell, with its indices frozen
+                    // now. An x/z index selects nothing (§11.5.1).
                     if let Some(key) = self.nba_static_select_key(lvalue) {
-                        let frozen = self.freeze_lvalue_indices(lvalue);
+                        let Some(frozen) = self.freeze_select_indices(lvalue, true) else {
+                            return;
+                        };
                         self.nba_queue.push(NbaEntry {
                             lhs: Some(frozen),
                             value: val.resize_for_assign(w),
@@ -87369,11 +87376,9 @@ impl Simulator {
                     } else if self.try_schedule_packed_index_nba(lvalue, &val) {
                         // The packed slice has already been merged into the
                         // pending whole-signal value.
-                    } else if matches!(&lvalue.kind, ExprKind::Ident(h)
-                        if h.path.len() == 1
-                            && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))
-                    {
-                        // NBA to a bare task-FRAME local: the deferred queue
+                    } else if self.nba_frame_local_target(lvalue) {
+                        // NBA to a task-FRAME local, whole or through a
+                        // select (`a[3:0] <= v`): the deferred queue
                         // commits in `apply_nba`, OUTSIDE the (possibly
                         // suspended) process's local frame, so the local would
                         // never update. Apply immediately — delta-vs-blocking
@@ -144988,6 +144993,64 @@ impl Simulator {
         }
     }
 
+    /// The select target `e` with its indices evaluated once and replaced by
+    /// their values (§11.4.1): every index for a nonblocking write (`all`,
+    /// §10.4.2), else only those that are not plain (see
+    /// `select_indices_plain`). None when such an index is x/z or does not
+    /// fit in 64 bits: it selects nothing in a vector (§11.5.1).
+    fn freeze_select_indices(&mut self, e: &Expression, all: bool) -> Option<Expression> {
+        let index = |sim: &mut Self, x: &Expression| -> Option<Box<Expression>> {
+            if matches!(x.kind, ExprKind::Number(_)) || (!all && Self::init_is_plain(x)) {
+                return Some(Box::new(x.clone()));
+            }
+            let v = sim.eval_expr(x);
+            if v.has_xz() {
+                return None;
+            }
+            let n = v.to_i64()?;
+            Some(Box::new(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: n.to_string(),
+                    cached_val: Cell::new(Some((n as u64, 0u64, 64u32))),
+                }),
+                x.span,
+            )))
+        };
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index: i } => {
+                let base = self.freeze_select_indices(expr, all)?;
+                ExprKind::Index {
+                    expr: Box::new(base),
+                    index: index(self, i)?,
+                }
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let base = self.freeze_select_indices(expr, all)?;
+                ExprKind::RangeSelect {
+                    expr: Box::new(base),
+                    kind: *kind,
+                    left: index(self, left)?,
+                    right: index(self, right)?,
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => ExprKind::MemberAccess {
+                expr: Box::new(self.freeze_select_indices(expr, all)?),
+                member: member.clone(),
+            },
+            ExprKind::Paren(x) => return self.freeze_select_indices(x, all),
+            _ => return Some(e.clone()),
+        };
+        Some(Expression::new(kind, e.span))
+    }
+
     /// §6.21: copy the `static` local `name` of the current subroutine
     /// between its frame copy and its live shared cell: into the cell after
     /// a write in place, out of it before one (an NBA or another activation
@@ -145025,6 +145088,18 @@ impl Simulator {
                 self.static_local_vars.insert(key.clone(), copy.clone());
             }
         }
+    }
+
+    /// Is `lvalue` a local of the current call frame, whole or through a
+    /// bit- or part-select (`a`, `a[i]`, `a[3:0]`)?
+    fn nba_frame_local_target(&self, lvalue: &Expression) -> bool {
+        let mut e = lvalue;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &e.kind {
+            e = expr;
+        }
+        matches!(&e.kind, ExprKind::Ident(h)
+            if h.path.len() == 1
+                && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))
     }
 
     /// The persistent-store key of the `static` local a nonblocking select

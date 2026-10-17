@@ -214,6 +214,56 @@ const SRC: &str = r##"module top;
     return a;
   endfunction
 
+  // A side-effecting index runs once, and an x index discards the write
+  // (§11.4.1, §11.5.1).
+  int idx_calls = 0;
+  logic [7:0] r_pick;
+  function automatic logic [31:0] pick(input bit unknown);
+    idx_calls++;
+    return unknown ? 32'bx : 32'd3;
+  endfunction
+  logic [7:0] r_scan, r_nba_idx;
+  logic [15:0] r_calls;
+  task automatic pick_task;
+    static reg [7:0] a;
+    a = 8'h00;
+    a[pick(0)] = 1'b1;
+    a[pick(1)] = 1'b1;
+    r_pick = a;
+  endtask
+  task automatic pick_scan;
+    static reg [7:0] a;
+    a = 8'h00;
+    idx_calls = 0;
+    void'($sscanf("1", "%b", a[pick(1)]));
+    r_calls[15:8] = idx_calls;
+    r_scan = a;
+  endtask
+  task automatic pick_nba;
+    static reg [7:0] a;
+    int i;
+    a = 8'h00;
+    idx_calls = 0;
+    a[pick(1)] <= 1'b1;
+    i = 1;
+    a[i] <= 1'b1;
+    i = 5;
+    #1 r_calls[7:0] = idx_calls;
+    r_nba_idx = a;
+  endtask
+
+  // A nonblocking select write to a local of a static task that the task
+  // writes whole first (so it need not keep its value between calls).
+  logic [7:0] r_nba_frame;
+  task nba_frame;
+    reg [7:0] b;
+    begin
+      b = 8'h00;
+      b[2] <= 1'b1;
+      #1 r_nba_frame = b;
+    end
+  endtask
+
   // Static locals of class methods.
   class C;
     function logic [7:0] m(input logic [3:0] x);
@@ -273,6 +323,13 @@ const SRC: &str = r##"module top;
     hide_loop;
     check("loop block variable hiding a static", {r_loop_inner, r_loop_outer}, 16'h02F0);
     check("index that writes the same static", rec(0), 8'hF1);
+    pick_task;
+    check("index with a side effect runs once", {r_pick, idx_calls[7:0]}, 16'h0802);
+    pick_scan;
+    pick_nba;
+    check("x index from a function, $sscanf and nonblocking", {r_calls, r_scan, r_nba_idx}, 32'h0101_0002);
+    nba_frame;
+    check("nonblocking select write to a per-call local", r_nba_frame, 8'h04);
     o = new;
     check("class method static local", o.m(4'h5), 8'h45);
     check("static class method static local", C::sm(4'h5), 8'h35);

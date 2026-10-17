@@ -10,7 +10,7 @@
 //! Each history is now as long as the deepest tick count read from it, found
 //! once at elaboration: a parameter gives each instance its own depth, and a
 //! shallow assertion keeps no more than it reads. The expected lines are the
-//! reference simulator's.
+//! commercial simulator's.
 
 use std::path::PathBuf;
 use std::process::Command;

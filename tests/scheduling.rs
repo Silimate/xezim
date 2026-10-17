@@ -11,6 +11,9 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "scheduling/named_branch_frames.rs"]
+mod named_branch_frames;
+
 #[path = "scheduling/loop_frame_bail_rollback.rs"]
 mod loop_frame_bail_rollback;
 #[path = "scheduling/nba_region_waiter_order.rs"]

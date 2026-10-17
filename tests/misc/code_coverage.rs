@@ -1163,8 +1163,14 @@ endmodule
     assert_eq!(cond, total(&["--code-coverage=cond,expr"], "condition"));
     assert!(cond.starts_with("\"covered\": 0, \"total\": 2"), "{cond}");
     let branch = total(&["--code-coverage=branch"], "branch");
-    assert_eq!(branch, total(&["--code-coverage=branch,cond,expr"], "branch"));
-    assert!(branch.starts_with("\"covered\": 2, \"total\": 4"), "{branch}");
+    assert_eq!(
+        branch,
+        total(&["--code-coverage=branch,cond,expr"], "branch")
+    );
+    assert!(
+        branch.starts_with("\"covered\": 2, \"total\": 4"),
+        "{branch}"
+    );
     // Line 6: a, b, c and e; b and e decide at 0.
     let expr = total(&["--code-coverage=expr"], "expression");
     assert!(expr.starts_with("\"covered\": 0, \"total\": 4"), "{expr}");
@@ -1182,9 +1188,10 @@ endmodule
 
 /// A part of an item that folds to a constant still has its `?:` branch; a
 /// block's local declaration ends with the block (`p` is the task's 1-bit
-/// argument again after it, so `p & q` is an item); and the instances of a
-/// module whose parameters fold different terms away keep separate items in
-/// the design unit.
+/// argument again after it, so `p & q` is an item), and a `for` loop's
+/// variable is its body's (the `int p` there makes `p & q` a vector
+/// operation, no item); and the instances of a module whose parameters fold
+/// different terms away keep separate items in the design unit.
 #[test]
 fn folded_parts_locals_and_units() {
     let d = scratch("fold");
@@ -1202,6 +1209,7 @@ module tb;
       p = 8'hff;
     end
     y = p & q;
+    for (int p = 0; p < 2; p++) y = p & q;
   endtask
   initial begin
     {a, b, c, e} = 4'b1010;
@@ -1222,7 +1230,10 @@ endmodule
         branch("--code-coverage=all")
     );
     let json = results(&d);
-    assert!(json.contains("\"branch\": {\"covered\": 1, \"total\": 2"), "{json}");
+    assert!(
+        json.contains("\"branch\": {\"covered\": 1, \"total\": 2"),
+        "{json}"
+    );
     let names = |line: u32, kind: &str| {
         terms(&json, line, kind)
             .into_iter()
@@ -1230,11 +1241,19 @@ endmodule
             .collect::<Vec<_>>()
     };
     assert_eq!(names(13, "statement"), ["p", "q"]);
-    assert_eq!(names(17, "statement"), ["a", "b"]);
-    let unit = &json[json.find("\"design_unit\": \"m\",\n        \"instances\": 2").unwrap()..];
+    assert!(!has_item(&json, 14), "{json}");
+    assert_eq!(names(18, "statement"), ["a", "b"]);
+    let unit = &json[json
+        .find("\"design_unit\": \"m\",\n        \"instances\": 2")
+        .unwrap()..];
     let unit = &unit[..unit.find("\"design_unit\": \"tb\"").unwrap_or(unit.len())];
     assert_eq!(terms(unit, 2, "assign").len(), 2, "{unit}");
-    assert_eq!(unit.matches("\"line\": 2, \"kind\": \"assign\", \"text\"").count(), 2, "{unit}");
+    assert_eq!(
+        unit.matches("\"line\": 2, \"kind\": \"assign\", \"text\"")
+            .count(),
+        2,
+        "{unit}"
+    );
     assert!(unit.contains("{\"term\": \"c\", "), "{unit}");
     let _ = std::fs::remove_dir_all(&d);
 }

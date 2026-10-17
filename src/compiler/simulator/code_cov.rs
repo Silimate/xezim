@@ -1192,7 +1192,19 @@ impl Instr<'_> {
                 body,
             } => {
                 self.count(span, "for", out);
+                // The loop's own variables are locals of its body.
+                let outer = self.here.locals.clone();
+                for i in &init {
+                    if let crate::ast::stmt::ForInit::VarDecl {
+                        data_type, name, ..
+                    } = i
+                    {
+                        let w = self.ctx.local(data_type, false);
+                        self.here.locals.insert(name.name.clone(), w);
+                    }
+                }
                 let body = Box::new(self.wrap(*body));
+                self.here.locals = outer;
                 out.push(rebuilt(StatementKind::For {
                     init,
                     condition,
@@ -1202,7 +1214,13 @@ impl Instr<'_> {
             }
             StatementKind::Foreach { array, vars, body } => {
                 self.count(span, "foreach", out);
+                // Index variables take the array's index type: unknown here.
+                let outer = self.here.locals.clone();
+                for v in vars.iter().flatten() {
+                    self.here.locals.insert(v.name.clone(), (0, false));
+                }
                 let body = Box::new(self.wrap(*body));
+                self.here.locals = outer;
                 out.push(rebuilt(StatementKind::Foreach { array, vars, body }));
             }
             StatementKind::While {

@@ -532,7 +532,8 @@ endmodule
             "tb.up",
             &[
                 toggle("p2", &[1, 0, 0, 1], &[1, 0, 0, 1]),
-                toggle("s", &[1, 0, 1], &[1, 0, 1]),
+                // A packed struct port: its entry names the struct type.
+                toggle("s", &[1, 0, 1], &[1, 0, 1]).replace("\"logic\"", "\"struct\""),
                 toggle("t", &[0, 1], &[0, 1]),
                 toggle("wn", &[1, 1], &[0, 0]),
             ],

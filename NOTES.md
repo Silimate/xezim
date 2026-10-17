@@ -27,6 +27,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   deferred to the end of the slot. A finish from a cbAfterDelay callback,
   or from a value-change callback on a clock that callback drives, also stops
   that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
+* In concurrent assertions, `$past`, `$rose`, `$fell`, `$stable` and
+  `$changed` keep a history for any operand, not just a plain signal name.
+  A bit- or part-select, a concatenation, a struct member, a function call or
+  any other expression is sampled at each tick as the expression over the
+  sampled values; `$past(v[1:0])` returned 0, `$rose(v[1])` never held and
+  `$stable(v[2:0])` always did. Calls nested in a select or another call's
+  operand (`dirty[$past(idx)]`, `$past($rose(a))`) keep their history too,
+  `$past(e, n, gate)` counts only the ticks its gate holds, and a struct
+  member read in a property is sampled with its variable (§16.5.1,
+  §16.9.3). (#14)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

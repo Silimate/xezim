@@ -474,6 +474,10 @@ const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
+/// The operand of a sampled-value call in a concurrent assertion that keeps
+/// its own history: `(<slot>, <operand>)` reads the site's `past_ops[slot]`
+/// (see `sva_bind_sampled`); evaluated directly, it is the operand.
+const SVA_PAST_MARKER: &str = "$__xz_sva_past";
 /// §16.3: the message of the `$error` a failed assertion with no `else`
 /// clause reports (the reference simulator's wording).
 const ASSERT_DEFAULT_ERROR: &str = "Assertion error.";
@@ -3392,6 +3396,10 @@ struct SvaClockedSite {
     /// this cycle, index N = N cycles ago)`. Refreshed at every clock fire
     /// BEFORE any attempt advances.
     past_snapshots: HashMap<String, std::collections::VecDeque<Value>>,
+    /// §16.9.3: the history of each sampled-value operand that is not a bare
+    /// signal name, and of each gated `$past`, one slot per call (see
+    /// `sva_bind_sampled`).
+    past_ops: Vec<SvaPastOp>,
     /// LRM §16.5 pass/fail action blocks (`assert property (...) <pass>
     /// else <fail>;`). Run when the property tallies a non-vacuous
     /// pass / a fail at a clock fire — so a failing concurrent assertion
@@ -3432,6 +3440,18 @@ struct SvaClockedSite {
     disable_scope: String,
     /// §20.12: the site's identity for assertion control, and its state.
     ctl: CtlSite,
+}
+
+/// §16.9.3: a sampled-value operand with a history of its own. At each tick
+/// of the property's clock (for a gated `$past`, each tick its gate holds)
+/// `ring` takes the operand evaluated over sampled values (§16.5.1); index 0
+/// is the newest entry, and `fresh` says it is this tick's.
+#[derive(Debug, Clone)]
+struct SvaPastOp {
+    expr: std::sync::Arc<Expression>,
+    gate: Option<std::sync::Arc<Expression>>,
+    ring: std::collections::VecDeque<Value>,
+    fresh: bool,
 }
 
 /// A sequence (§16.9) as parsed, before it is turned into an automaton.
@@ -71295,6 +71315,11 @@ impl Simulator {
                 .get(1)
                 .map(|a| self.eval_expr(a))
                 .unwrap_or_else(|| Value::zero(32)),
+            // Read outside a sampled-value call (to size it), the operand.
+            SVA_PAST_MARKER => args
+                .get(1)
+                .map(|a| self.eval_expr(a))
+                .unwrap_or_else(|| Value::new(1)),
             // LRM §16.9.3 `$past(<sig>[, N])` — value of `<sig>` from
             // N clock cycles ago (default N=1). Only meaningful
             // inside an SVA clocked body; falls back to current
@@ -71302,23 +71327,20 @@ impl Simulator {
             "$past" => {
                 // Inside a concurrent assertion the site's per-cycle ring is the
                 // history (index N = N clock ticks ago, sampled values).
-                if let Some(site_idx) = self.active_sva_site {
-                    let sig_name = match args.first().map(|a| &a.kind) {
-                        Some(ExprKind::Ident(h)) => self.resolve_hier_name(h).into_owned(),
-                        _ => String::new(),
-                    };
+                if self.active_sva_site.is_some() {
                     let n_cycles = args
                         .get(1)
                         .filter(|a| !matches!(a.kind, ExprKind::Null))
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1) as usize)
                         .unwrap_or(1);
-                    if let Some(ring) = self
-                        .sva_sites
-                        .get(site_idx)
-                        .and_then(|s| s.past_snapshots.get(sig_name.as_str()))
-                    {
-                        if let Some(v) = ring.get(n_cycles) {
-                            return v.clone();
+                    // A gated `$past` whose gate is false at this tick has no
+                    // entry for it: its newest entry is a tick back already.
+                    if let Some(hit) = self.sva_history(args).map(|(ring, fresh)| {
+                        ring.get(n_cycles - usize::from(!fresh && n_cycles > 0))
+                            .cloned()
+                    }) {
+                        if let Some(v) = hit {
+                            return v;
                         }
                         // §16.9.3: no such tick yet (before the first clock):
                         // the expression's default value, not its current one.
@@ -71389,19 +71411,24 @@ impl Simulator {
                         Value::zero(1)
                     };
                 }
-                let sig_name = match args.first().map(|a| &a.kind) {
-                    Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
-                    _ => std::borrow::Cow::Owned(String::new()),
+                // Inside a concurrent assertion: this tick's sampled value and
+                // the last tick's, from the site's history of the operand.
+                let hist = self
+                    .sva_history(args)
+                    .map(|(ring, _)| (ring.front().cloned(), ring.get(1).cloned()));
+                let (cur, prev_opt) = match hist {
+                    Some((Some(cur), prev)) => (cur, prev),
+                    _ => {
+                        let sig_name = match args.first().map(|a| &a.kind) {
+                            Some(ExprKind::Ident(h)) => self.resolve_hier_name(h),
+                            _ => std::borrow::Cow::Owned(String::new()),
+                        };
+                        let cur = self
+                            .get_signal_value_by_name(&sig_name)
+                            .unwrap_or_else(|| Value::zero(32));
+                        (cur, None)
+                    }
                 };
-                let cur = self
-                    .get_signal_value_by_name(&sig_name)
-                    .unwrap_or_else(|| Value::zero(32));
-                let prev_opt = self.active_sva_site.and_then(|si| {
-                    self.sva_sites
-                        .get(si)
-                        .and_then(|s| s.past_snapshots.get(&*sig_name))
-                        .and_then(|r| r.get(1).cloned())
-                });
                 if Self::sampled_change_fn(&name, &cur, prev_opt.as_ref()) {
                     Value::ones(1)
                 } else {
@@ -95149,7 +95176,8 @@ impl Simulator {
             }
         }
         let mut past_names = Vec::new();
-        self.collect_past_arg_names(&body_expanded, &mut past_names);
+        let mut past_ops = Vec::new();
+        self.sva_bind_sampled(&mut body_expanded, &mut past_names, &mut past_ops);
         // A signal is sampled once per property clock, however many
         // sampled-value calls reference it.
         past_names.sort_unstable();
@@ -95216,6 +95244,7 @@ impl Simulator {
             prev_clock,
             attempts: Vec::new(),
             past_snapshots: HashMap::default(),
+            past_ops,
             pass_action: a.action.as_deref().cloned(),
             fail_action: a.else_action.as_deref().cloned(),
             scope,
@@ -95316,9 +95345,21 @@ impl Simulator {
     /// changes on the clock edge has an identical preponed and live value.
     fn collect_sva_signal_ids(&self, expr: &Expression, out: &mut Vec<usize>) {
         match &expr.kind {
-            ExprKind::Ident(_) => {
+            ExprKind::Ident(h) => {
                 if let Some(id) = self.get_lhs_signal_id(expr) {
                     out.push(id);
+                    return;
+                }
+                // A member of a packed struct (`s.f`) is sampled with its
+                // variable: the longest prefix of the path that names one.
+                let n = self.resolve_hier_name(h);
+                let mut base = n.as_ref();
+                while let Some(i) = base.rfind('.') {
+                    base = &base[..i];
+                    if let Some(&id) = self.signal_name_to_id.get(base) {
+                        out.push(id);
+                        break;
+                    }
                 }
             }
             ExprKind::Unary { operand, .. } => self.collect_sva_signal_ids(operand, out),
@@ -95373,13 +95414,14 @@ impl Simulator {
                 // `$past/$rose/$fell/$stable/$changed` already read from the
                 // per-site ring buffers; their bare argument must NOT be
                 // preponed here (that would double-sample). Skip a leading
-                // bare-Ident argument to those calls; still walk the rest.
+                // argument whose history is kept by name; any other operand
+                // is evaluated over the sampled values. Still walk the rest.
                 let skip_first = matches!(
                     name.as_str(),
                     "$past" | "$rose" | "$fell" | "$stable" | "$changed"
-                );
+                ) && self.sva_named_operand(name, args).is_some();
                 for (i, a) in args.iter().enumerate() {
-                    if skip_first && i == 0 && matches!(a.kind, ExprKind::Ident(_)) {
+                    if skip_first && i == 0 {
                         continue;
                     }
                     self.collect_sva_signal_ids(a, out);
@@ -95684,12 +95726,14 @@ impl Simulator {
     /// Collect bare-signal `$past` argument names into the site's
     /// snapshot ring, pushing this cycle's sampled value and trimming to a
     /// max depth. Each unique signal gets its own ring; index 0 = this
-    /// cycle, index N = N cycles ago.
+    /// cycle, index N = N cycles ago. Each operand slot (`past_ops`) does
+    /// the same with its operand's value.
     fn refresh_sva_past_snapshots(&mut self, site_idx: usize, sampled_ids: &[usize]) {
         const PAST_MAX_DEPTH: usize = 16;
         // Deduplicated at registration: a duplicate name would make ring[1]
         // another copy of the current cycle instead of the prior one.
-        if self.sva_sites[site_idx].past_names.is_empty() {
+        let site = &self.sva_sites[site_idx];
+        if site.past_names.is_empty() && site.past_ops.is_empty() {
             return;
         }
         let names = std::mem::take(&mut self.sva_sites[site_idx].past_names);
@@ -95715,6 +95759,26 @@ impl Simulator {
             }
         }
         self.sva_sites[site_idx].past_names = names;
+        // §16.5.1: every other operand is the expression over the sampled
+        // values, taken in slot order so a nested call reads its operand's
+        // entry for this tick (`sva_bind_sampled`).
+        if self.sva_sites[site_idx].past_ops.is_empty() {
+            return;
+        }
+        let saved = self.install_preponed(sampled_ids);
+        for k in 0..self.sva_sites[site_idx].past_ops.len() {
+            let op = &self.sva_sites[site_idx].past_ops[k];
+            let (expr, gate) = (op.expr.clone(), op.gate.clone());
+            let fresh = gate.is_none_or(|g| self.eval_expr(&g).is_true());
+            let v = fresh.then(|| self.eval_expr(&expr));
+            let op = &mut self.sva_sites[site_idx].past_ops[k];
+            op.fresh = fresh;
+            if let Some(v) = v {
+                op.ring.push_front(v);
+                op.ring.truncate(PAST_MAX_DEPTH);
+            }
+        }
+        self.restore_preponed(saved);
     }
 
     /// Replace each plain signal read in a concurrent assertion's body with
@@ -96160,59 +96224,184 @@ impl Simulator {
         }
     }
 
-    /// Walk `expr` and append every bare signal name referenced by a
-    /// `$past(<signal>[, N])` system call to `out`. Used to refresh
-    /// per-site snapshots once per clock fire.
-    fn collect_past_arg_names(&self, expr: &Expression, out: &mut Vec<String>) {
-        match &expr.kind {
-            ExprKind::SystemCall { name, args }
-                if matches!(
-                    name.as_str(),
-                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
-                ) =>
-            {
-                if let Some(arg) = args.first() {
-                    if let ExprKind::Ident(h) = &arg.kind {
-                        out.push(self.resolve_hier_name(h).into_owned());
+    /// §16.9.3: give every sampled-value call in a concurrent assertion's
+    /// body a history. A bare signal's is kept by name in `names`, once per
+    /// tick however many calls read it. Any other operand (a select, a
+    /// concatenation, a member, a function call, any expression) and the
+    /// operand of a gated `$past` get a slot of their own in `ops`, and the
+    /// call's operand becomes an `SVA_PAST_MARKER` read of it. Inner calls
+    /// take their slots first, so a nested operand (`$past($rose(v[0]))`) is
+    /// sampled after the history it reads.
+    fn sva_bind_sampled(
+        &self,
+        e: &mut Expression,
+        names: &mut Vec<String>,
+        ops: &mut Vec<SvaPastOp>,
+    ) {
+        {
+            let mut sub = |x: &mut Expression| self.sva_bind_sampled(x, names, ops);
+            match &mut e.kind {
+                ExprKind::Ident(h) => h
+                    .path
+                    .iter_mut()
+                    .flat_map(|s| s.selects.iter_mut())
+                    .for_each(&mut sub),
+                ExprKind::Unary { operand: x, .. }
+                | ExprKind::Paren(x)
+                | ExprKind::MemberAccess { expr: x, .. }
+                | ExprKind::SvaClocked { body: x, .. } => sub(x.as_mut()),
+                ExprKind::Binary { left, right, .. }
+                | ExprKind::Index {
+                    expr: left,
+                    index: right,
+                }
+                | ExprKind::Range(left, right) => {
+                    sub(left.as_mut());
+                    sub(right.as_mut());
+                }
+                ExprKind::Conditional {
+                    condition: a,
+                    then_expr: b,
+                    else_expr: c,
+                }
+                | ExprKind::RangeSelect {
+                    expr: a,
+                    left: b,
+                    right: c,
+                    ..
+                } => {
+                    sub(a.as_mut());
+                    sub(b.as_mut());
+                    sub(c.as_mut());
+                }
+                ExprKind::Concatenation(xs)
+                | ExprKind::SystemCall { args: xs, .. }
+                | ExprKind::Call { args: xs, .. } => xs.iter_mut().for_each(&mut sub),
+                ExprKind::Replication {
+                    count: x,
+                    exprs: xs,
+                }
+                | ExprKind::Inside {
+                    expr: x,
+                    ranges: xs,
+                } => {
+                    sub(x.as_mut());
+                    xs.iter_mut().for_each(&mut sub);
+                }
+                _ => {}
+            }
+        }
+        let ExprKind::SystemCall { name, args } = &mut e.kind else {
+            return;
+        };
+        if args.is_empty()
+            || !matches!(
+                name.as_str(),
+                "$past" | "$rose" | "$fell" | "$stable" | "$changed"
+            )
+        {
+            return;
+        }
+        if let Some(n) = self.sva_named_operand(name, args) {
+            names.push(n);
+            return;
+        }
+        // An explicitly clocked call keeps its history on its own clock
+        // (`sampled_fn_via_watch`). A local variable (§16.10) has a value per
+        // attempt, not per tick.
+        let mut local = false;
+        Self::walk_operands(&args[0], &mut |x| {
+            local |= matches!(&x.kind, ExprKind::SystemCall { name, args }
+                if name == SVA_SIG_MARKER && args.len() == 2);
+        });
+        if local || Self::sampled_call_clocked(args) {
+            return;
+        }
+        let gate = Self::sampled_call_gate(name, args).cloned();
+        let span = args[0].span;
+        let slot = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: NumberBase::Decimal,
+                value: ops.len().to_string(),
+                cached_val: Cell::new(None),
+            }),
+            span,
+        );
+        let op = std::mem::replace(&mut args[0], Expression::new(ExprKind::Null, span));
+        args[0] = Expression::new(
+            ExprKind::SystemCall {
+                name: SVA_PAST_MARKER.to_string(),
+                args: vec![slot, op.clone()],
+            },
+            span,
+        );
+        ops.push(SvaPastOp {
+            expr: std::sync::Arc::new(op),
+            gate: gate.map(std::sync::Arc::new),
+            ring: std::collections::VecDeque::new(),
+            fresh: false,
+        });
+    }
+
+    /// The name a sampled-value call's history is kept under: its operand's,
+    /// when that is a bare signal and the call has neither a gate (`$past`)
+    /// nor a clocking argument.
+    fn sva_named_operand(&self, name: &str, args: &[Expression]) -> Option<String> {
+        let ExprKind::Ident(h) = &args.first()?.kind else {
+            return None;
+        };
+        if Self::sampled_call_gate(name, args).is_some() || Self::sampled_call_clocked(args) {
+            return None;
+        }
+        let n = self.resolve_hier_name(h);
+        self.signal_name_to_id
+            .contains_key(n.as_ref())
+            .then(|| n.into_owned())
+    }
+
+    /// The gating expression of `$past(e, n, gate)`, when given.
+    fn sampled_call_gate<'a>(name: &str, args: &'a [Expression]) -> Option<&'a Expression> {
+        args.get(2)
+            .filter(|g| name == "$past" && !matches!(g.kind, ExprKind::Null | ExprKind::Empty))
+    }
+
+    /// A sampled-value call with an explicit clocking argument.
+    fn sampled_call_clocked(args: &[Expression]) -> bool {
+        args.iter()
+            .skip(1)
+            .any(|a| Self::clocking_arg_marker(a).is_some())
+    }
+
+    /// §16.9.3: inside a concurrent assertion, the history its site keeps
+    /// for a sampled-value call's operand (`args[0]`): the signal's ring for
+    /// a bare name, else the operand's slot. The flag says the newest entry
+    /// is this tick's. `None` for an explicitly clocked call, whose history
+    /// is its own (`sampled_fn_via_watch`).
+    fn sva_history(
+        &self,
+        args: &[Expression],
+    ) -> Option<(&std::collections::VecDeque<Value>, bool)> {
+        let site = self.sva_sites.get(self.active_sva_site?)?;
+        if Self::sampled_call_clocked(args) {
+            return None;
+        }
+        match &args.first()?.kind {
+            ExprKind::Ident(h) => site
+                .past_snapshots
+                .get(self.resolve_hier_name(h).as_ref())
+                .map(|r| (r, true)),
+            ExprKind::SystemCall { name, args } if name == SVA_PAST_MARKER => {
+                let k = match &args.first()?.kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                        value.parse::<usize>().ok()?
                     }
-                }
-                for a in args {
-                    self.collect_past_arg_names(a, out);
-                }
+                    _ => return None,
+                };
+                site.past_ops.get(k).map(|op| (&op.ring, op.fresh))
             }
-            ExprKind::SystemCall { args, .. } => {
-                for a in args {
-                    self.collect_past_arg_names(a, out);
-                }
-            }
-            ExprKind::Binary { left, right, .. } => {
-                self.collect_past_arg_names(left, out);
-                self.collect_past_arg_names(right, out);
-            }
-            ExprKind::Unary { operand, .. } => {
-                self.collect_past_arg_names(operand, out);
-            }
-            ExprKind::Paren(inner) => {
-                self.collect_past_arg_names(inner, out);
-            }
-            ExprKind::Conditional {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                self.collect_past_arg_names(condition, out);
-                self.collect_past_arg_names(then_expr, out);
-                self.collect_past_arg_names(else_expr, out);
-            }
-            ExprKind::Call { args, .. } => {
-                for a in args {
-                    self.collect_past_arg_names(a, out);
-                }
-            }
-            ExprKind::SvaClocked { body, .. } => {
-                self.collect_past_arg_names(body, out);
-            }
-            _ => {}
+            _ => None,
         }
     }
 

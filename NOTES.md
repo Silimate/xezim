@@ -27,6 +27,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   deferred to the end of the slot. A finish from a cbAfterDelay callback,
   or from a value-change callback on a clock that callback drives, also stops
   that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
+* `$past(expr, N)` reads N clock ticks back for any N. A concurrent assertion
+  kept 16 samples per operand, so `$past` returned x for N of 16 or more; each
+  history is now as long as the deepest `$past` of that operand needs, found
+  once at elaboration (a parameter gives each instance its own depth), and an
+  operand read only one tick back keeps two samples instead of 16. A
+  procedural `$past(expr, N)` first reached after N edges no longer returns
+  its default value: its history is sized when it is registered, not at its
+  first call (§16.9.3). (Silimate/xezim#28)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

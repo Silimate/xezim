@@ -3374,8 +3374,10 @@ struct SvaClockedSite {
     /// `@(posedge clk iff g)`: the tick counts only while `g` holds.
     iff: Option<Expression>,
     /// The bare signal names `$past` reads in the body (sorted, unique), found
-    /// once at registration: the walk ran on every clock fire.
-    past_names: Vec<String>,
+    /// once at registration: the walk ran on every clock fire. Each comes
+    /// with the length of its history: one more than the deepest tick count
+    /// the body reads it at (§16.9.3 sets no upper limit).
+    past_names: Vec<(String, usize)>,
     /// The body compiled to an evaluable property tree (see `SvaNode`).
     node: std::sync::Arc<SvaNode>,
     /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
@@ -3389,8 +3391,8 @@ struct SvaClockedSite {
     attempts: Vec<SvaState>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
     /// Each entry is `signal_name → ring of sampled values (index 0 =
-    /// this cycle, index N = N cycles ago)`. Refreshed at every clock fire
-    /// BEFORE any attempt advances.
+    /// this cycle, index N = N cycles ago)`, as long as `past_names` says.
+    /// Refreshed at every clock fire BEFORE any attempt advances.
     past_snapshots: HashMap<String, std::collections::VecDeque<Value>>,
     /// LRM §16.5 pass/fail action blocks (`assert property (...) <pass>
     /// else <fail>;`). Run when the property tallies a non-vacuous
@@ -59527,10 +59529,15 @@ impl Simulator {
                 ) =>
             {
                 // Registration mirrors the eval-time dispatcher; ignore
-                // failures (no clock resolvable) — eval falls back.
+                // failures (no clock resolvable) — eval falls back. A `$past`
+                // registers its tick count (an elaboration-time constant,
+                // §16.9.3), so its history is that long from the first edge:
+                // sized at its first evaluation instead, a call first reached
+                // after N edges had only the last one.
+                let n = self.sampled_ticks(name, args);
                 let ex = e.clone();
                 let ar = args.clone();
-                let _ = self.sampled_fn_via_watch(&ex, &ar, 1);
+                let _ = self.sampled_fn_via_watch(&ex, &ar, n);
             }
             ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
                 for a in args {
@@ -95151,9 +95158,10 @@ impl Simulator {
         let mut past_names = Vec::new();
         self.collect_past_arg_names(&body_expanded, &mut past_names);
         // A signal is sampled once per property clock, however many
-        // sampled-value calls reference it.
-        past_names.sort_unstable();
-        past_names.dedup();
+        // sampled-value calls reference it, into a history as long as the
+        // deepest of them needs: the longest entry sorts first and stays.
+        past_names.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        past_names.dedup_by(|a, b| a.0 == b.0);
         self.sva_resolve_signals(&mut body_expanded);
         self.sva_lv_types = lv_types;
         let (disable, node) = self.sva_compile_site(&body_expanded);
@@ -95682,18 +95690,17 @@ impl Simulator {
     }
 
     /// Collect bare-signal `$past` argument names into the site's
-    /// snapshot ring, pushing this cycle's sampled value and trimming to a
-    /// max depth. Each unique signal gets its own ring; index 0 = this
-    /// cycle, index N = N cycles ago.
+    /// snapshot ring, pushing this cycle's sampled value and trimming to
+    /// the length registration found for the signal. Each unique signal gets
+    /// its own ring; index 0 = this cycle, index N = N cycles ago.
     fn refresh_sva_past_snapshots(&mut self, site_idx: usize, sampled_ids: &[usize]) {
-        const PAST_MAX_DEPTH: usize = 16;
         // Deduplicated at registration: a duplicate name would make ring[1]
         // another copy of the current cycle instead of the prior one.
         if self.sva_sites[site_idx].past_names.is_empty() {
             return;
         }
         let names = std::mem::take(&mut self.sva_sites[site_idx].past_names);
-        for name in &names {
+        for (name, len) in &names {
             // The sampled (Preponed) value when the site tracks the signal.
             let pre = self
                 .signal_name_to_id
@@ -95710,7 +95717,7 @@ impl Simulator {
                 None => snaps.entry(name.clone()).or_default(),
             };
             ring.push_front(v);
-            while ring.len() > PAST_MAX_DEPTH {
+            while ring.len() > *len {
                 ring.pop_back();
             }
         }
@@ -96160,10 +96167,24 @@ impl Simulator {
         }
     }
 
+    /// §16.9.3: how many ticks back a sampled-value call reads — N of
+    /// `$past(e, N)`, else 1. N is an elaboration-time constant, so it is
+    /// evaluated once, when the call registers, as its reader evaluates it
+    /// (a parameter takes the instance's value).
+    fn sampled_ticks(&mut self, name: &str, args: &[Expression]) -> usize {
+        match args.get(1) {
+            Some(n) if name == "$past" && !matches!(n.kind, ExprKind::Null) => {
+                self.eval_expr(n).to_u64().unwrap_or(1) as usize
+            }
+            _ => 1,
+        }
+    }
+
     /// Walk `expr` and append every bare signal name referenced by a
-    /// `$past(<signal>[, N])` system call to `out`. Used to refresh
-    /// per-site snapshots once per clock fire.
-    fn collect_past_arg_names(&self, expr: &Expression, out: &mut Vec<String>) {
+    /// `$past(<signal>[, N])` system call to `out`, with the history length
+    /// the call needs: N + 1 (the value-change functions read one tick
+    /// back). Used to refresh per-site snapshots once per clock fire.
+    fn collect_past_arg_names(&mut self, expr: &Expression, out: &mut Vec<(String, usize)>) {
         match &expr.kind {
             ExprKind::SystemCall { name, args }
                 if matches!(
@@ -96171,10 +96192,10 @@ impl Simulator {
                     "$past" | "$rose" | "$fell" | "$stable" | "$changed"
                 ) =>
             {
-                if let Some(arg) = args.first() {
-                    if let ExprKind::Ident(h) = &arg.kind {
-                        out.push(self.resolve_hier_name(h).into_owned());
-                    }
+                if let Some(ExprKind::Ident(h)) = args.first().map(|a| &a.kind) {
+                    let ticks = self.sampled_ticks(name, args);
+                    let sig = self.resolve_hier_name(h).into_owned();
+                    out.push((sig, ticks.max(1).saturating_add(1)));
                 }
                 for a in args {
                     self.collect_past_arg_names(a, out);

@@ -36,10 +36,10 @@ module chk (input logic clk, input logic v, input logic [7:0] s,
 endmodule
 module top;
   logic clk = 0, v = 0;
-  logic [7:0] a [0:3] = '{default: 0};
+  logic [7:0] a [0:3] = '{0, 0, 0, 0};
   logic [7:0] s = 0;
   logic [1:0] k = 0;
-  logic [1:0] b [0:1] = '{default: 0};
+  logic [1:0] b [0:1] = '{0, 0};
   int f_const = 0, f_var = 0, f_nest = 0, f_mix = 0, n = 0;
   always #5 clk = ~clk;
   always @(negedge clk) s <= s + 3;
@@ -159,8 +159,8 @@ fn indices_the_preponed_region_cannot_evaluate() {
 module top;
   logic clk = 0, v = 0;
   logic [7:0] s = 0;
-  logic [7:0] a [0:3] = '{default: 0};
-  logic r [0:1] = '{default: 0};
+  logic [7:0] a [0:3] = '{0, 0, 0, 0};
+  logic r [0:1] = '{0, 0};
   logic [1:0] k = 0;
   int f_lv = 0, f_proc = 0, f_dis = 0, p_dis = 0, n = 0;
   always #5 clk = ~clk;
@@ -267,18 +267,20 @@ endmodule
     assert_eq!(result(src), "RESULT n=11 da=0 q=0 qv=0");
 }
 
-/// `$past`, `$rose` and `$stable` of array elements: their history must be
-/// kept from sampled values too.
+/// `$past`, `$rose` and `$stable` of array elements, with constant and
+/// variable indices: their history must be kept from sampled values too.
 #[test]
 #[ignore = "known gap: sampled-value functions of a select keep no history (#14)"]
 fn sampled_value_functions_of_elements() {
     let src = r#"
 module top;
   logic clk = 0, v = 0;
-  logic [7:0] a [0:3] = '{default: 0};
+  logic [7:0] a [0:3] = '{0, 0, 0, 0};
   logic [7:0] s = 0;
-  logic r [0:1] = '{default: 0};
-  int f_past = 0, f_rose = 0, f_stab = 0, n = 0;
+  logic r [0:1] = '{0, 0};
+  logic [7:0] h = 0;
+  logic [1:0] k = 0;
+  int f_past = 0, f_rose = 0, f_stab = 0, f_pv = 0, f_rv = 0, n = 0;
   always #5 clk = ~clk;
   always @(negedge clk) s <= s + 3;
   always_ff @(posedge clk) begin
@@ -286,19 +288,29 @@ module top;
     a[2] <= a[1];
     r[0] <= s[0];
     r[1] <= r[0];
+    a[3] <= s;
+    h <= a[k];
+    k <= k + 1;
     v <= 1;
   end
   // a[2] and r[1] hold the samples of a[1] and r[0] from the previous tick.
   a_past: assert property (@(posedge clk) v ##1 v |-> a[2] == $past(a[1])) else f_past++;
   a_rose: assert property (@(posedge clk) v ##1 v |-> $rose(r[0]) == (r[0] && !r[1])) else f_rose++;
   a_stab: assert property (@(posedge clk) v ##1 v |-> $stable(a[1]) == (a[1] == a[2])) else f_stab++;
+  // h holds the sample of a[k] from the previous tick.
+  a_pv: assert property (@(posedge clk) v ##1 v |-> h == $past(a[k])) else f_pv++;
+  a_rv: assert property (@(posedge clk) v ##1 v |-> $rose(a[k][0]) == (a[k][0] && !h[0])) else f_rv++;
   c_n: cover property (@(posedge clk) v) n++;
   initial begin
     #120;
-    $display("RESULT n=%0d past=%0d rose=%0d stable=%0d", n, f_past, f_rose, f_stab);
+    $display("RESULT n=%0d past=%0d rose=%0d stable=%0d pastvar=%0d rosevar=%0d",
+             n, f_past, f_rose, f_stab, f_pv, f_rv);
     $finish;
   end
 endmodule
 "#;
-    assert_eq!(result(src), "RESULT n=11 past=0 rose=0 stable=0");
+    assert_eq!(
+        result(src),
+        "RESULT n=11 past=0 rose=0 stable=0 pastvar=0 rosevar=0"
+    );
 }

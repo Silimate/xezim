@@ -396,7 +396,9 @@ fn print_usage() {
     );
     eprintln!("                   (instance values still win); -g/<top>/NAME=VAL: one module only");
     eprintln!("  -GNAME=VAL       Same, and it also replaces instance and defparam values");
-    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>");
+    eprintln!("  -sv_seed <n|random>  Seed the RNG like +seed=<n|random> (and wins over it),");
+    eprintln!("                   but add no +seed= plusarg ($test$plusargs and VPI argv");
+    eprintln!("                   don't see it). -svseed and -seed are the same");
     eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
     eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
     eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
@@ -897,7 +899,7 @@ fn process_command_file(
         let mut i = 0usize;
         while i < toks.len() {
             let t = toks[i].as_str();
-            let used = cli_compat::handle_flag(&toks, i, base, compat, plusargs)
+            let used = cli_compat::handle_flag(&toks, i, base, compat)
                 .map_err(|e| format!("{} (in args file '{}')", e, path))?;
             if used > 0 {
                 i += used;
@@ -1910,7 +1912,7 @@ fn run_main() -> i32 {
         let arg = &args[i];
         // Other simulators' spellings first: several (`-sv_seed`, `-suppress`,
         // `-lib`) would otherwise read as the glued `-s<top>` / `-l<file>`.
-        match cli_compat::handle_flag(&args, i, Path::new("."), &mut compat, &mut plusargs) {
+        match cli_compat::handle_flag(&args, i, Path::new("."), &mut compat) {
             Ok(0) => {}
             Ok(n) => {
                 i += n;
@@ -2760,6 +2762,8 @@ fn run_main() -> i32 {
     // `--sv2017`/`--sv2023`, or a `-sv*compat` flag here or in an args file.
     let sv2023_mode = sv_parser::is_sv2023();
     dpi_libs.extend(cli_compat::resolve_sv_libs(&compat));
+    // `-sv_seed`: seeds the RNG without becoming a plusarg.
+    xezim::compiler::simulator::set_sv_seed(compat.seed.as_deref());
     if !compat.param_overrides.is_empty() {
         xezim_core::set_param_overrides(
             compat

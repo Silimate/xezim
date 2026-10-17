@@ -96,7 +96,7 @@ xezim (this repository)     — bytecode compiler, simulator, CLI (binary: xezim
 │       ├── jit.rs, aot.rs       — native compilation (feature `jit`)
 │       └── fst_sink.rs          — FST waveform writer
 ├── include/                     — svdpi.h, vpi_user.h, sv_vpi_user.h, the UVM DPI driver
-├── contrib/cocotb/              — cocotb runner backend
+├── contrib/cocotb/              — cocotb runner backend and its pytest suite
 ├── docs/                        — user guide and topic guides
 ├── scripts/                     — PGO build, UVM DPI build, local-core switch
 └── tests/                       — integration test suites (see CONTRIBUTING.md)

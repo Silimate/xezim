@@ -44,6 +44,9 @@ pub(crate) struct CompatArgs {
     pub uvm: bool,
     /// `--fst-scope-file` files named inside args files (src/cli_files.rs).
     pub fst_scope_files: Vec<String>,
+    /// `-sv_seed`/`-svseed`/`-seed`, the last one given. A simulator option,
+    /// not a plusarg: it never reaches `$test$plusargs` or VPI's argv.
+    pub seed: Option<String>,
 }
 
 /// The code coverage `+cover[=<letters>]` and `-coverage [<types>]` ask
@@ -155,7 +158,6 @@ pub(crate) fn handle_flag(
     i: usize,
     base: &Path,
     cx: &mut CompatArgs,
-    plusargs: &mut Vec<String>,
 ) -> Result<usize, String> {
     let t = toks[i].as_str();
     let value = || {
@@ -296,25 +298,17 @@ pub(crate) fn handle_flag(
             );
             Ok(2)
         }
-        // `-svseed`/`-seed` (also `=<n>`) are more spellings of `-sv_seed`.
-        // Here rather than in main.rs, where the glued `-s<top>` took them
-        // for a top named `vseed` or `eed`.
-        _ if matches!(t, "-sv_seed" | "-svseed" | "-seed")
-            || t.starts_with("-svseed=")
-            || t.starts_with("-seed=") =>
-        {
-            let (flag, seed, used) = match t.split_once('=') {
-                Some((flag, seed)) => (flag, seed.to_string(), 1),
-                None => (t, value()?, 2),
-            };
-            if !seed.eq_ignore_ascii_case("random") && seed.parse::<u64>().is_err() {
-                return Err(format!(
-                    "{} wants a non-negative integer or 'random', got '{}'",
-                    flag, seed
-                ));
-            }
-            plusargs.push(format!("+seed={}", seed));
-            Ok(used)
+        // The RNG seed. It is not handed on as a `+seed=` plusarg: other
+        // simulators keep these out of the plusargs a testbench or a VPI
+        // client sees, and cocotb reads `+seed=random` as a seed and fails.
+        "-sv_seed" | "-svseed" | "-seed" => {
+            cx.seed = Some(check_seed(t, value()?)?);
+            Ok(2)
+        }
+        _ if t.starts_with("-svseed=") || t.starts_with("-seed=") => {
+            let (flag, seed) = t.split_once('=').unwrap();
+            cx.seed = Some(check_seed(flag, seed.to_string())?);
+            Ok(1)
         }
         "-sv_root" => {
             cx.sv_root = Some(value()?);
@@ -358,6 +352,17 @@ pub(crate) fn handle_flag(
         }
         _ => Ok(0),
     }
+}
+
+/// A seed option's value: a non-negative integer or `random`.
+fn check_seed(flag: &str, seed: String) -> Result<String, String> {
+    if seed.eq_ignore_ascii_case("random") || seed.parse::<u64>().is_ok() {
+        return Ok(seed);
+    }
+    Err(format!(
+        "{} wants a non-negative integer or 'random', got '{}'",
+        flag, seed
+    ))
 }
 
 /// `-<step>args=<list>`: arguments handed through to a separate optimizer

@@ -54,7 +54,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for third-party sources you cannot edit |
 | `--relax-driver-conflicts` | Report a variable with conflicting drivers — two continuous assigns, a continuous assign plus procedural writes, or an `always_comb`/`always_latch`/`always_ff` variable also written by another process (§6.5, §9.2.2) — as a warning instead of an error, so existing designs (e.g. an `initial` block that initializes an `always_ff` register) still run |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
-| `--code-coverage[=<kinds>]` | Collect code coverage: `stmt`, `branch`, `toggle` (comma-separated) or `all` (the default). Results go to `xezim_cov.json` next to the functional coverage; `--verbose` adds a per-instance summary. See the [coverage guide](coverage-guide.md#code-coverage) |
+| `--code-coverage[=<kinds>]` | Collect code coverage: `stmt`, `branch`, `cond`, `expr`, `toggle` (comma-separated) or `all` (the default). Results go to `xezim_cov.json` next to the functional coverage; `--verbose` adds a per-instance summary. See the [coverage guide](coverage-guide.md#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees (`tb.dut`) and packages (repeatable) |
 | `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters) together with the `--verbose` engine lines. Same as `XEZIM_PROFILE_REPORT=1`. Adds overhead |
 | `--show-env-avail` | List every `XEZIM_*` environment variable with a one-line description, then exit |
@@ -133,7 +133,7 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `+notimingchecks` | Disable timing checks |
 | `-sv12compat`, `-sv17compat` | Same as `--sv2017`. `-sv05compat`/`-sv09compat` do the same with a warning |
 | `-work`, `-L`, `-Lf`, `-lib <lib>` | Ignored, with one warning |
-| `+cover`, `+cover=<letters>`, `-coverage` | Code coverage (`--code-coverage`): `s`, `b` and `t` select statement, branch and toggle coverage; the bare forms select all three. Other letters (`c`, `e`, `f`, `x`) are ignored with one warning |
+| `+cover`, `+cover=<letters>`, `-coverage` | Code coverage (`--code-coverage`): `s`, `b`, `c`, `e` and `t` select statement, branch, condition, expression and toggle coverage; the bare forms select all five. Other letters (`f`, `x`) are ignored with one warning |
 | `-sv`, `-mfcu`, `-quiet`, `-64`, `-32`, `-batch`, `-nologo`, `+acc[=…]`, `-<step>args=…` (arguments for a separate optimization step), `-suppress <ids>`, `+fcover`, `-sva`, `-assertdebug` | Accepted, no effect: SystemVerilog is always on, all files share one compilation unit, every object stays visible, assertions and covergroups are always evaluated |
 | `-sfcu`, `-t <res>`, `-wlf <file>` | Accepted with a warning: xezim always uses one compilation unit and the finest precision declared in the design, and does not write that waveform file (`--fst` / `--wave` dump waveforms) |
 

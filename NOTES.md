@@ -38,6 +38,22 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§7.5, §7.8). Recompile saved designs to refresh their class metadata.
   (#337, reported by Dragon-Git)
 
+**Usability**
+
+* Code coverage collects condition and expression coverage, as focused
+  expression coverage: each logic condition (`if`, `while`, `?:`) and 1-bit
+  logic value (procedural and continuous assignments, input ports connected
+  to expressions) is split into input terms, and each term's rows at 0 and
+  at 1 count when the term alone decides the result, short-circuit aware
+  (§11.3.5). `--code-coverage=cond,expr` and `+cover=ce` select them; bare
+  `--code-coverage`, `+cover` and `-coverage` now collect them too. Each
+  scope in `xezim_cov.json` gains `condition` and `expression` totals
+  (covered terms) and `conditions[]`/`expressions[]`, every item with its
+  terms and their row counts. On the design instances of 23 CVDP designs,
+  the items and terms match the reference simulator's report on 22 and the
+  covered terms on 17. Off by default; a run without it compiles and runs as
+  before. (#48)
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and

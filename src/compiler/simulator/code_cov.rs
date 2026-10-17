@@ -1,6 +1,6 @@
-//! Code coverage: statement, branch and toggle counts, collected when the run
-//! asks for them (`--code-coverage`, `+cover`) and written to the results
-//! file beside the functional coverage.
+//! Code coverage: statement, branch, condition, expression and toggle counts,
+//! collected when the run asks for them (`--code-coverage`, `+cover`) and
+//! written to the results file beside the functional coverage.
 //!
 //! Statements and branches are instrumented at compile time, on the
 //! elaborated design, before any block is lowered: a counted statement gets a
@@ -12,6 +12,16 @@
 //! Continuous assignments count in their comb entry (`ca_counter`). Toggles
 //! compare each tracked signal with its value at the end of the previous
 //! time slot, off the dirty set the waveform writers share.
+//!
+//! Condition and expression coverage are focused expression coverage: a
+//! logic expression (an `if`, `while` or `?:` condition, or a 1-bit
+//! assignment value) is split into its input terms, and each term's two rows
+//! (the term at 0, and at 1) count when the term alone decides the result.
+//! The expression is wrapped in `$__xz_cove(<n>, expr)`, which the
+//! interpreter evaluates itself (the bytecode hands it over): it walks the
+//! item's logic tree (`ExprSite::nodes`) in the order the interpreter would,
+//! with the same short-circuits, and then marks the rows whose term is not
+//! masked.
 use super::*;
 use crate::ast::Span;
 use crate::compiler::elaborate::InitialBlock;
@@ -19,8 +29,14 @@ use crate::compiler::elaborate::InitialBlock;
 pub const KIND_STATEMENT: u8 = 1;
 pub const KIND_BRANCH: u8 = 2;
 pub const KIND_TOGGLE: u8 = 4;
+pub const KIND_CONDITION: u8 = 8;
+pub const KIND_EXPRESSION: u8 = 16;
+/// Every kind: what `--code-coverage` and `+cover` collect by default.
+pub const KIND_ALL: u8 = 31;
+/// The kinds instrumented in the code (toggles watch the signals instead).
+const KIND_CODE: u8 = KIND_STATEMENT | KIND_BRANCH | KIND_CONDITION | KIND_EXPRESSION;
 /// Result names of the kinds, bit `i` of a kind mask naming entry `i`.
-const KIND_NAMES: [&str; 3] = ["statement", "branch", "toggle"];
+const KIND_NAMES: [&str; 5] = ["statement", "branch", "toggle", "condition", "expression"];
 type Tallies = [Tally; KIND_NAMES.len()];
 
 /// `$__xz_cov(<n>)`: counts counter `n` (a statement or a branch arm).
@@ -28,6 +44,28 @@ pub(crate) const HIT_TASK: &str = "$__xz_cov";
 /// `$__xz_covc(<n>, cond)`: yields `cond`, counting counter `n` when it is
 /// true and `n + 1` when it is false (a `?:` condition).
 pub(crate) const COND_FN: &str = "$__xz_covc";
+/// `$__xz_cove(<n>, expr)`: yields `expr` (a 1-bit value), counting the rows
+/// of condition or expression item `n` (`CodeCov::exprs`).
+pub(crate) const EXPR_FN: &str = "$__xz_cove";
+/// Items with more input terms than this are not covered.
+const MAX_TERMS: usize = 32;
+/// Message tasks whose arguments' `?:` conditions are condition items.
+const DISPLAY_TASKS: [&str; 14] = [
+    "$display",
+    "$displayb",
+    "$displayh",
+    "$displayo",
+    "$write",
+    "$strobe",
+    "$fdisplay",
+    "$fwrite",
+    "$fstrobe",
+    "$sformat",
+    "$error",
+    "$warning",
+    "$info",
+    "$fatal",
+];
 
 /// Library packages left out unless `--code-coverage-scope` names them.
 const LIBRARY_PACKAGES: [&str; 2] = ["std", "uvm_pkg"];
@@ -56,18 +94,21 @@ pub(crate) fn code_coverage() -> Option<CodeCoverage> {
 }
 
 /// The kinds a `--code-coverage` list names: `stmt` (or `statement`, `s`),
-/// `branch` (`b`), `toggle` (`t`) or `all`, separated by commas.
+/// `branch` (`b`), `cond` (`condition`, `c`), `expr` (`expression`, `e`),
+/// `toggle` (`t`) or `all`, separated by commas.
 pub fn parse_kinds(spec: &str) -> Result<u8, String> {
     let mut kinds = 0u8;
     for k in spec.split(',').map(str::trim).filter(|k| !k.is_empty()) {
         kinds |= match k {
             "stmt" | "statement" | "s" => KIND_STATEMENT,
             "branch" | "b" => KIND_BRANCH,
+            "cond" | "condition" | "c" => KIND_CONDITION,
+            "expr" | "expression" | "e" => KIND_EXPRESSION,
             "toggle" | "t" => KIND_TOGGLE,
-            "all" => KIND_STATEMENT | KIND_BRANCH | KIND_TOGGLE,
+            "all" => KIND_ALL,
             _ => {
                 return Err(format!(
-                    "unknown code coverage kind '{}' (want stmt, branch, toggle or all)",
+                    "unknown code coverage kind '{}' (want stmt, branch, cond, expr, toggle or all)",
                     k
                 ));
             }
@@ -125,6 +166,714 @@ fn block(mut v: Vec<Statement>, span: Span) -> Statement {
             },
             span,
         )
+    }
+}
+
+fn unparen(mut e: &Expression) -> &Expression {
+    while let ExprKind::Paren(inner) = &e.kind {
+        e = inner;
+    }
+    e
+}
+
+fn unparen_mut(mut e: &mut Expression) -> &mut Expression {
+    while matches!(e.kind, ExprKind::Paren(_)) {
+        let ExprKind::Paren(inner) = &mut e.kind else {
+            unreachable!()
+        };
+        e = inner;
+    }
+    e
+}
+
+/// One operator of a condition or expression item's logic tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Op {
+    /// Input term `n`. With `inv` set the node is `t == 0` (or `t != 1`) on
+    /// a 1-bit `t`, and the term is `t`: its value is the node's, negated.
+    Term(u16, bool),
+    /// A constant operand: no term of its own.
+    Const,
+    /// `!` or `~` (on a 1-bit operand).
+    Not,
+    And,
+    Or,
+    /// `&`, `|`, `^` and `~^` on 1-bit operands.
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitXnor,
+    /// `c ? t : e` on 1-bit arms, in an expression item.
+    Mux,
+}
+
+/// A node of an item's logic tree, in pre-order; `kids` index the tree.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Node {
+    op: Op,
+    kids: [u32; 3],
+}
+
+/// A node value in an item's evaluation: 0, 1, x (or z), or not evaluated.
+const X: u8 = 2;
+const UNEVALUATED: u8 = 3;
+
+/// A condition or expression item.
+pub(crate) struct ExprSite {
+    scope: u32,
+    span: Span,
+    /// `if`, `while`, `do` or `ternary` for a condition; `assign` or
+    /// `statement` for an expression.
+    kind: &'static str,
+    condition: bool,
+    /// The generate block within the scope (`gen[1]`), to keep the items
+    /// of a generate loop's iterations apart.
+    block: String,
+    text: String,
+    terms: Vec<String>,
+    /// Counter of term `t`'s row `v` (`v` = 0 or 1): `row0 + 2 * t + v`.
+    row0: u32,
+    nodes: Arc<[Node]>,
+    /// A continuous assignment's: the scope its names resolve in (`None`
+    /// inside for the top; see `Simulator::cov_expr`). `None` in a process,
+    /// which has its own.
+    hint: Option<Option<String>>,
+    /// Tells apart the copies a generate loop makes of one continuous
+    /// assignment (its expression with the loop index in place).
+    copy: String,
+}
+
+/// An item's logic tree while it is built.
+#[derive(Default)]
+struct Plan {
+    nodes: Vec<Node>,
+    terms: Vec<String>,
+    /// Per node: a relational term (`a == b`, `x < 3`).
+    relational: Vec<bool>,
+    /// Per node: constant, with its value when it is a plain number.
+    konst: Vec<Option<Option<u64>>>,
+    /// A term is a system function call.
+    system: bool,
+}
+
+/// Where instrumented code is, for its names: the block scope
+/// (`u0.gen[1]`), and the widths of the locals and arguments declared so
+/// far (see `Ctx::local`).
+#[derive(Default)]
+struct Here {
+    path: String,
+    locals: HashMap<String, (u32, bool)>,
+}
+
+/// What instrumenting needs to read while the design's blocks are taken
+/// apart: signal and function widths (to tell 1-bit operands) and the
+/// source text (to name items and terms).
+pub(crate) struct Ctx<'a> {
+    module: &'a ElaboratedModule,
+    names: &'a NameMap,
+    widths: &'a [u32],
+    /// Function name -> the width of its return type.
+    rets: Arc<HashMap<String, u32>>,
+}
+
+impl Ctx<'_> {
+    /// The names a bare identifier may have from block scope `path`: as
+    /// written, then qualified by each enclosing scope, then by the top.
+    fn candidates(&self, name: &str, path: &str) -> Vec<String> {
+        let mut out = vec![name.to_string()];
+        let mut p = path;
+        while !p.is_empty() {
+            out.push(format!("{}.{}", p, name));
+            p = p.rsplit_once('.').map(|(a, _)| a).unwrap_or("");
+        }
+        out.push(format!("{}.{}", self.module.name, name));
+        out
+    }
+
+    fn ident_name(h: &crate::ast::expr::HierarchicalIdentifier) -> Option<String> {
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        Some(
+            h.path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        )
+    }
+
+    fn signal_width(&self, name: &str, path: &str) -> Option<u32> {
+        self.candidates(name, path)
+            .iter()
+            .find_map(|n| self.names.get(n))
+            .and_then(|&id| self.widths.get(id).copied())
+    }
+
+    fn parameter(&self, name: &str, path: &str) -> Option<&Value> {
+        self.candidates(name, path)
+            .iter()
+            .find_map(|n| self.module.parameters.get(n.as_str()))
+    }
+
+    /// A constant operand's value (`None` inside when it is not a plain
+    /// number): a literal, a parameter, or an operator on constants.
+    fn constant(&self, e: &Expression, at: &Here) -> Option<Option<u64>> {
+        let e = unparen(e);
+        match &e.kind {
+            ExprKind::Number(_) => Some(Simulator::try_const_u64(e)),
+            ExprKind::Ident(h) => {
+                let n = Self::ident_name(h)?;
+                if at.locals.contains_key(&n) {
+                    return None;
+                }
+                self.parameter(&n, &at.path).map(|v| v.to_u64())
+            }
+            ExprKind::Unary { operand, .. } => self.constant(operand, at).map(|_| None),
+            ExprKind::Binary { left, right, .. } => {
+                self.constant(left, at)?;
+                self.constant(right, at).map(|_| None)
+            }
+            // A constant bit of a concatenation: `{1'b0, a}[1]`, where a
+            // port actual stands in for the port.
+            ExprKind::Index { expr, index } => {
+                let i = Simulator::try_const_u64(index)?;
+                match &unparen(expr).kind {
+                    ExprKind::Concatenation(parts) => {
+                        let mut lo = 0u64;
+                        for p in parts.iter().rev() {
+                            let w = self.width(p, at)? as u64;
+                            if i < lo + w {
+                                let v = self.constant(p, at)?;
+                                let s = (i - lo) as u32;
+                                return Some(v.map(|v| v.checked_shr(s).unwrap_or(0) & 1));
+                            }
+                            lo += w;
+                        }
+                        None
+                    }
+                    _ => self.constant(expr, at).map(|_| None),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The self-determined width of `e` where it can be told without
+    /// evaluating it; `None` otherwise.
+    fn width(&self, e: &Expression, at: &Here) -> Option<u32> {
+        let path = at.path.as_str();
+        let e = unparen(e);
+        match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer { size, .. }) => Some(size.unwrap_or(32)),
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
+            ExprKind::Ident(h) => {
+                let n = Self::ident_name(h)?;
+                if let Some(&(w, _)) = at.locals.get(&n) {
+                    return (w > 0).then_some(w);
+                }
+                if let Some(v) = self.parameter(&n, path) {
+                    return Some(v.width);
+                }
+                self.signal_width(&n, path)
+            }
+            ExprKind::Index { expr, .. } => match &unparen(expr).kind {
+                // A bit of a concatenation (a port actual put in place).
+                ExprKind::Concatenation(_) => Some(1),
+                ExprKind::Ident(h) => {
+                    let n = Self::ident_name(h)?;
+                    if let Some(&(_, bit)) = at.locals.get(&n) {
+                        return bit.then_some(1);
+                    }
+                    let m = self.module;
+                    for c in self.candidates(&n, path) {
+                        let c = c.as_str();
+                        if let Some(&(_, _, w)) = m.arrays.get(c) {
+                            return Some(w);
+                        }
+                        if m.arrays_nd.contains_key(c)
+                            || m.dynamic_arrays.contains(c)
+                            || m.associative_arrays.contains_key(c)
+                            || m.queue_vars.contains(c)
+                            || m.string_signals.contains(c)
+                        {
+                            return None;
+                        }
+                        // An element of a multi-dimensional packed vector.
+                        if let Some(&w) = m.packed_signal_elem_widths.get(c) {
+                            return Some(w);
+                        }
+                        if self.names.get(c).is_some() {
+                            return Some(1);
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            },
+            ExprKind::Call { func, .. } => match &func.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    self.rets.get(h.path[0].name.name.as_str()).copied()
+                }
+                _ => None,
+            },
+            ExprKind::RangeSelect {
+                kind, left, right, ..
+            } => {
+                let (l, r) = (
+                    Simulator::try_const_u64(left),
+                    Simulator::try_const_u64(right),
+                );
+                match kind {
+                    crate::ast::expr::RangeKind::Constant => Some(l?.abs_diff(r?) as u32 + 1),
+                    _ => r.map(|w| w as u32),
+                }
+            }
+            ExprKind::Unary { op, operand } => match op {
+                UnaryOp::BitNot | UnaryOp::Plus | UnaryOp::Minus => self.width(operand, at),
+                UnaryOp::LogNot
+                | UnaryOp::BitAnd
+                | UnaryOp::BitNand
+                | UnaryOp::BitOr
+                | UnaryOp::BitNor
+                | UnaryOp::BitXor
+                | UnaryOp::BitXnor => Some(1),
+                _ => None,
+            },
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor => {
+                    Some(self.width(left, at)?.max(self.width(right, at)?))
+                }
+                _ if Self::relational(*op) || matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) => {
+                    Some(1)
+                }
+                _ => None,
+            },
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => Some(self.width(then_expr, at)?.max(self.width(else_expr, at)?)),
+            ExprKind::Concatenation(parts) => parts.iter().map(|p| self.width(p, at)).sum(),
+            _ => None,
+        }
+    }
+
+    /// A local variable's (or subroutine argument's) width, and whether a
+    /// bit-select of it is one bit; `(0, false)` when neither is known.
+    fn local(&self, dt: &DataType, unpacked: bool) -> (u32, bool) {
+        let bits = match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions.len() <= 1
+            }
+            DataType::IntegerAtom { .. } => true,
+            _ => return (0, false),
+        };
+        if unpacked {
+            return (0, false);
+        }
+        let w = crate::compiler::elaborate::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        (w, bits && w > 0)
+    }
+
+    fn relational(op: BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+        )
+    }
+
+    /// The source text of `e`, comments dropped and white space squeezed,
+    /// without enclosing parentheses; a rendering of the tree when the
+    /// source is not at hand.
+    fn text(&self, e: &Expression, src: Option<u32>) -> String {
+        match self.source(e, src) {
+            Some(s) => strip_parens(&s),
+            None => strip_parens(&show(e)),
+        }
+    }
+
+    /// The source text of `e` in text `src` (or the only text long enough),
+    /// comments dropped and white space squeezed.
+    fn source(&self, e: &Expression, src: Option<u32>) -> Option<String> {
+        let span = e.span;
+        let texts = &self.module.source_texts;
+        let fits = |t: &String| span.start < span.end && span.end <= t.len();
+        let text = match src
+            .map(|s| s as usize)
+            .filter(|&s| texts.get(s).is_some_and(fits))
+        {
+            Some(i) => texts.get(i),
+            None => {
+                let mut all = texts.iter().filter(|t| fits(t));
+                match (all.next(), all.next()) {
+                    (Some(t), None) => Some(t),
+                    _ => None,
+                }
+            }
+        };
+        text.and_then(|t| t.get(span.start..span.end))
+            .map(squeeze)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Byte offsets in `s` of the binary operator `tok` outside brackets and
+/// strings: after an operand, and not part of a longer operator (`&` of
+/// `&&` or `~&`, `^` of `~^`).
+fn binary_ops(s: &str, tok: &str) -> Vec<usize> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ if depth == 0 && s.is_char_boundary(i) && s[i..].starts_with(tok) => {
+                let prev = s[..i].trim_end().bytes().last();
+                let before = i.checked_sub(1).map(|j| b[j]);
+                let after = b.get(i + tok.len()).copied();
+                let operand = prev.is_some_and(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, b'_' | b')' | b']' | b'}' | b'\'' | b'"')
+                });
+                let first = tok.as_bytes()[0];
+                let last = tok.as_bytes()[tok.len() - 1];
+                let longer = match tok {
+                    "&&" | "||" => after == Some(first) || before == Some(first),
+                    "&" | "|" => after == Some(last) || matches!(before, Some(b'~')),
+                    "^" => matches!(after, Some(b'~')),
+                    "==" | "!=" => after == Some(b'='),
+                    _ => false,
+                };
+                if operand && !longer {
+                    out.push(i);
+                    i += tok.len();
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `s`, a left-associative binary operation on `tok` (`~^` also spelled
+/// `^~`), split at its operator: the last one outside brackets.
+fn split_binary(s: &str, tok: &str) -> Option<(String, String)> {
+    let mut at: Vec<(usize, usize)> = binary_ops(s, tok)
+        .into_iter()
+        .map(|p| (p, tok.len()))
+        .collect();
+    if tok == "~^" {
+        at.extend(binary_ops(s, "^~").into_iter().map(|p| (p, 2)));
+    }
+    let &(p, n) = at.iter().max()?;
+    let (l, r) = (s[..p].trim(), s[p + n..].trim());
+    (!l.is_empty() && !r.is_empty()).then(|| (l.to_string(), r.to_string()))
+}
+
+/// `s`, a `c ? a : b`, split into its condition and arms.
+fn split_mux(s: &str) -> Option<(String, String, String)> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut q = None;
+    let mut nest = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'?' if depth == 0 => {
+                if q.is_none() {
+                    q = Some(i);
+                } else {
+                    nest += 1;
+                }
+            }
+            b':' if depth == 0 && b.get(i + 1) == Some(&b':') => i += 1,
+            b':' if depth == 0 && q.is_some() => {
+                if nest == 0 {
+                    let q = q?;
+                    let parts = (s[..q].trim(), s[q + 1..i].trim(), s[i + 1..].trim());
+                    if parts.0.is_empty() || parts.1.is_empty() || parts.2.is_empty() {
+                        return None;
+                    }
+                    return Some((parts.0.into(), parts.1.into(), parts.2.into()));
+                }
+                nest -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `s`, a unary `op` (`!` or `~`) applied to an operand: the operand.
+fn unary_operand(s: &str, op: char) -> Option<String> {
+    let rest = s.strip_prefix(op)?.trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// `s` without comments, its white space runs one space.
+fn squeeze(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut space = false;
+    while i < b.len() {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            space = true;
+            continue;
+        }
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            i += 2;
+            space = true;
+            continue;
+        }
+        if b[i].is_ascii_whitespace() {
+            space = true;
+            i += 1;
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        let n = s[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        out.push_str(&s[i..i + n]);
+        i += n;
+    }
+    out
+}
+
+/// `s` without parentheses that enclose all of it.
+fn strip_parens(s: &str) -> String {
+    let mut s = s.trim();
+    while s.starts_with('(') && s.ends_with(')') {
+        let inner = &s[1..s.len() - 1];
+        let mut depth = 0i32;
+        let balanced = inner.chars().all(|c| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            depth >= 0
+        }) && depth == 0;
+        if !balanced {
+            break;
+        }
+        s = inner.trim();
+    }
+    s.to_string()
+}
+
+/// The number literals of `e`, in order: what tells a generate loop's
+/// copies of one expression apart (the loop index is put in as a number).
+fn numbers(e: &Expression, out: &mut String) {
+    match &e.kind {
+        ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+            out.push_str(value);
+            out.push(',');
+        }
+        ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => numbers(x, out),
+        ExprKind::Binary { left, right, .. } => {
+            numbers(left, out);
+            numbers(right, out);
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            numbers(condition, out);
+            numbers(then_expr, out);
+            numbers(else_expr, out);
+        }
+        ExprKind::Index { expr, index } => {
+            numbers(expr, out);
+            numbers(index, out);
+        }
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => {
+            numbers(expr, out);
+            numbers(left, out);
+            numbers(right, out);
+        }
+        ExprKind::Concatenation(parts) => parts.iter().for_each(|p| numbers(p, out)),
+        ExprKind::Call { args, .. } => args.iter().for_each(|a| numbers(a, out)),
+        // A coverage marker's first argument is its counter.
+        ExprKind::SystemCall { name, args } => {
+            let skip = usize::from(name == COND_FN || name == EXPR_FN);
+            args.iter().skip(skip).for_each(|a| numbers(a, out));
+        }
+        _ => {}
+    }
+}
+
+/// A rendering of `e` for an item or term without source text.
+fn show(e: &Expression) -> String {
+    let bin = |op: BinaryOp| match op {
+        BinaryOp::LogAnd => "&&",
+        BinaryOp::LogOr => "||",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "^",
+        BinaryOp::BitXnor => "~^",
+        BinaryOp::Eq => "==",
+        BinaryOp::Neq => "!=",
+        BinaryOp::CaseEq => "===",
+        BinaryOp::CaseNeq => "!==",
+        BinaryOp::Lt => "<",
+        BinaryOp::Leq => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::Geq => ">=",
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        _ => "?",
+    };
+    match &e.kind {
+        ExprKind::Paren(inner) => format!("({})", show(inner)),
+        ExprKind::Ident(h) => h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
+        ExprKind::Unary { op, operand } => {
+            let o = match op {
+                UnaryOp::LogNot => "!",
+                UnaryOp::BitNot => "~",
+                UnaryOp::BitAnd => "&",
+                UnaryOp::BitOr => "|",
+                UnaryOp::BitXor => "^",
+                _ => "?",
+            };
+            format!("{}{}", o, show(operand))
+        }
+        ExprKind::Binary { op, left, right } => {
+            format!("{} {} {}", show(left), bin(*op), show(right))
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => format!(
+            "{} ? {} : {}",
+            show(condition),
+            show(then_expr),
+            show(else_expr)
+        ),
+        ExprKind::Index { expr, index } => format!("{}[{}]", show(expr), show(index)),
+        ExprKind::SystemCall { name, args } if (name == COND_FN || name == EXPR_FN) => {
+            args.get(1).map(show).unwrap_or_default()
+        }
+        ExprKind::SystemCall { name, args } => format!(
+            "{}({})",
+            name,
+            args.iter().map(show).collect::<Vec<_>>().join(", ")
+        ),
+        ExprKind::Call { func, args } => format!(
+            "{}({})",
+            show(func),
+            args.iter().map(show).collect::<Vec<_>>().join(", ")
+        ),
+        _ => "?".to_string(),
+    }
+}
+
+/// Mark in `rows` (bit `v` of `rows[t]`: term `t` at `v`) the terms of node
+/// `i`'s subtree that decide its value, given the node values of one
+/// evaluation. Short-circuit aware: the left operand of `&&` decides alone
+/// when it is 0 (the right one is not evaluated), and so does the left of
+/// `||` at 1 and a `?:` condition whose other arm was not evaluated.
+fn sensitize(nodes: &[Node], i: u32, vals: &[u8], rows: &mut [u8]) {
+    let n = nodes[i as usize];
+    let [k0, k1, k2] = n.kids;
+    let (l, r) = (vals[k0 as usize], vals[k1 as usize]);
+    let mut go = |k: u32, on: bool| {
+        if on {
+            sensitize(nodes, k, vals, rows);
+        }
+    };
+    match n.op {
+        Op::Term(t, inv) => {
+            let v = vals[i as usize];
+            if v <= 1 {
+                rows[t as usize] |= 1 << (v ^ inv as u8);
+            }
+        }
+        Op::Const => {}
+        Op::Not => go(k0, true),
+        Op::And => {
+            go(k0, l == 0 || (l == 1 && r == 1));
+            go(k1, l == 1);
+        }
+        Op::Or => {
+            go(k0, l == 1 || (l == 0 && r == 0));
+            go(k1, l == 0);
+        }
+        Op::BitAnd => {
+            go(k0, r == 1);
+            go(k1, l == 1);
+        }
+        Op::BitOr => {
+            go(k0, r == 0);
+            go(k1, l == 0);
+        }
+        Op::BitXor | Op::BitXnor => {
+            go(k0, r <= 1);
+            go(k1, l <= 1);
+        }
+        Op::Mux => {
+            let (t, e) = (vals[k1 as usize], vals[k2 as usize]);
+            let (taken, other) = match l {
+                1 => (t, e),
+                0 => (e, t),
+                _ => (X, X),
+            };
+            go(k0, taken <= 1 && (other == UNEVALUATED || other != taken));
+            go(k1, l == 1);
+            go(k2, l == 0);
+        }
     }
 }
 
@@ -210,6 +959,10 @@ pub(crate) struct CodeCov {
     scope_index: HashMap<String, u32>,
     stmts: Vec<StmtSite>,
     branches: Vec<BranchSite>,
+    /// Condition and expression items; `$__xz_cove(<n>, ..)` names `exprs[n]`.
+    exprs: Vec<ExprSite>,
+    /// Function name -> the width of its return type (see `Ctx`).
+    rets: Arc<HashMap<String, u32>>,
     counters: u32,
     /// Continuous assignment (origin span start, end, scope) -> its counter.
     ca_counter: HashMap<(usize, usize, String), u32>,
@@ -218,11 +971,72 @@ pub(crate) struct CodeCov {
     pub(crate) toggle: Option<Toggle>,
 }
 
+/// The instance a block scope (`u0.u1.genblk2`) belongs to, its longest
+/// prefix that names an instance (`""` for the top), and the rest of it.
+fn split_scope<'s>(inst_paths: &HashSet<String>, scope: &'s str) -> (&'s str, &'s str) {
+    let mut path = scope;
+    loop {
+        if path.is_empty() || inst_paths.contains(path) {
+            let rest = scope[path.len()..].trim_start_matches('.');
+            return (path, rest);
+        }
+        path = path.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+    }
+}
+
 /// Rewrites one scope's statements; see the module docs.
 struct Instr<'a> {
     cov: &'a mut CodeCov,
+    ctx: &'a Ctx<'a>,
     kinds: u8,
     scope: u32,
+    /// Where the code is, for its names.
+    here: Here,
+    /// The block scope within the scope's instance (`gen[1]`).
+    block: String,
+    /// The items' `ExprSite::hint`.
+    hint: Option<Option<String>>,
+}
+
+impl<'a> Instr<'a> {
+    fn new(
+        cov: &'a mut CodeCov,
+        ctx: &'a Ctx<'a>,
+        inst_paths: &HashSet<String>,
+        scope: u32,
+        path: &str,
+    ) -> Self {
+        let kinds = cov.kinds;
+        let block = split_scope(inst_paths, path).1.to_string();
+        Instr {
+            cov,
+            ctx,
+            kinds,
+            scope,
+            here: Here {
+                path: path.to_string(),
+                locals: HashMap::default(),
+            },
+            block,
+            hint: None,
+        }
+    }
+
+    /// A subroutine (named by `here.path`): its arguments are locals, and its
+    /// generate block is that of the scope it is declared in.
+    fn args(
+        mut self,
+        ports: &[crate::ast::decl::FunctionPort],
+        inst_paths: &HashSet<String>,
+    ) -> Self {
+        for p in ports {
+            let w = self.ctx.local(&p.data_type, !p.dimensions.is_empty());
+            self.here.locals.insert(p.name.name.clone(), w);
+        }
+        let scope = self.here.path.rsplit_once('.').map_or("", |(p, _)| p);
+        self.block = split_scope(inst_paths, scope).1.to_string();
+        self
+    }
 }
 
 impl Instr<'_> {
@@ -383,14 +1197,22 @@ impl Instr<'_> {
                 let body = Box::new(self.wrap(*body));
                 out.push(rebuilt(StatementKind::Foreach { array, vars, body }));
             }
-            StatementKind::While { condition, body } => {
+            StatementKind::While {
+                mut condition,
+                body,
+            } => {
                 self.count(span, "while", out);
+                self.cond(&mut condition, "while", false);
                 let body = Box::new(self.wrap(*body));
                 out.push(rebuilt(StatementKind::While { condition, body }));
             }
-            StatementKind::DoWhile { body, condition } => {
+            StatementKind::DoWhile {
+                body,
+                mut condition,
+            } => {
                 self.count(span, "do", out);
                 let body = Box::new(self.wrap(*body));
+                self.cond(&mut condition, "do", false);
                 out.push(rebuilt(StatementKind::DoWhile { body, condition }));
             }
             StatementKind::Repeat { count, body } => {
@@ -429,10 +1251,26 @@ impl Instr<'_> {
                     stmt: inner,
                 }));
             }
-            // Not statements of their own: declarations, and the markers and
-            // bodies the executor and other constructs own.
+            // A declaration is no statement; its variables are locals for
+            // the code after it.
+            StatementKind::VarDecl {
+                data_type,
+                lifetime,
+                declarators,
+            } => {
+                for d in &declarators {
+                    let w = self.ctx.local(&data_type, !d.dimensions.is_empty());
+                    self.here.locals.insert(d.name.name.clone(), w);
+                }
+                out.push(rebuilt(StatementKind::VarDecl {
+                    data_type,
+                    lifetime,
+                    declarators,
+                }));
+            }
+            // Not statements of their own: the markers and bodies the
+            // executor and other constructs own.
             kind @ (StatementKind::Null
-            | StatementKind::VarDecl { .. }
             | StatementKind::Typedef(_)
             | StatementKind::Coverpoint { .. }
             | StatementKind::Cross { .. }
@@ -444,7 +1282,7 @@ impl Instr<'_> {
             | StatementKind::RsReturn) => out.push(rebuilt(kind)),
             StatementKind::BlockingAssign { lvalue, mut rvalue } => {
                 self.count(span, "statement", out);
-                self.expr(&mut rvalue);
+                self.value(&mut rvalue, &lvalue, "statement", true);
                 out.push(rebuilt(StatementKind::BlockingAssign { lvalue, rvalue }));
             }
             StatementKind::NonblockingAssign {
@@ -453,7 +1291,7 @@ impl Instr<'_> {
                 mut rvalue,
             } => {
                 self.count(span, "statement", out);
-                self.expr(&mut rvalue);
+                self.value(&mut rvalue, &lvalue, "statement", true);
                 out.push(rebuilt(StatementKind::NonblockingAssign {
                     lvalue,
                     delay,
@@ -474,6 +1312,15 @@ impl Instr<'_> {
                         right,
                         ..
                     } => self.expr(right),
+                    // A `?:` in a message is not a branch, but its condition
+                    // is a condition, as in the reference simulator.
+                    ExprKind::SystemCall { name, args }
+                        if DISPLAY_TASKS.contains(&name.as_str()) =>
+                    {
+                        for a in args.iter_mut() {
+                            self.message(a);
+                        }
+                    }
                     _ => {}
                 }
                 out.push(rebuilt(StatementKind::Expr(e)));
@@ -503,6 +1350,7 @@ impl Instr<'_> {
         out: &mut Vec<Statement>,
     ) {
         if self.kinds & KIND_BRANCH == 0 {
+            self.cond(&mut condition, "if", true);
             let then_stmt = Box::new(self.wrap(*then_stmt));
             let else_stmt = else_stmt.map(|e| Box::new(self.wrap(*e)));
             out.push(Statement::new(
@@ -538,7 +1386,7 @@ impl Instr<'_> {
             arms: Vec::new(),
         });
         let mut arms = Vec::new();
-        self.expr(&mut condition);
+        self.cond(&mut condition, "if", true);
         let rewritten = self.if_arms(
             unique_priority,
             condition,
@@ -590,7 +1438,7 @@ impl Instr<'_> {
                     then_stmt: t,
                     else_stmt: el,
                 } => {
-                    self.expr(&mut cond);
+                    self.cond(&mut cond, "if", true);
                     self.if_arms(up, cond, t, el, espan, false, arms)
                 }
                 kind => {
@@ -681,52 +1529,68 @@ impl Instr<'_> {
         ));
     }
 
-    /// Wrap the condition of every `?:` in `e` (see `COND_FN`). Stops at
-    /// system calls, whose arguments some tasks read by shape.
+    /// A `?:` as a branch: its arms' counters, and its condition wrapped in
+    /// `COND_FN`.
+    fn ternary(&mut self, e: &mut Expression) {
+        let espan = e.span;
+        let ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } = &mut e.kind
+        else {
+            return;
+        };
+        let t = self.counter();
+        let f = self.counter();
+        self.cov.branches.push(BranchSite {
+            scope: self.scope,
+            span: espan,
+            kind: "ternary",
+            entry: None,
+            arms: vec![
+                Arm {
+                    span: then_expr.span,
+                    label: "true",
+                    counter: Some(t),
+                },
+                Arm {
+                    span: else_expr.span,
+                    label: "false",
+                    counter: Some(f),
+                },
+            ],
+        });
+        let cspan = condition.span;
+        let cond = std::mem::replace(&mut **condition, Expression::new(ExprKind::Empty, cspan));
+        **condition = Expression::new(
+            ExprKind::SystemCall {
+                name: COND_FN.to_string(),
+                args: vec![number(t, cspan), cond],
+            },
+            cspan,
+        );
+    }
+
+    /// Instrument every `?:` in `e`: its condition as a condition item, and
+    /// the `?:` as a branch (see `COND_FN`). Stops at system calls, whose
+    /// arguments some tasks read by shape.
     fn expr(&mut self, e: &mut Expression) {
-        if self.kinds & KIND_BRANCH == 0 {
+        if self.kinds & (KIND_BRANCH | KIND_CONDITION) == 0 {
             return;
         }
-        let espan = e.span;
         match &mut e.kind {
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                self.expr(condition);
+                self.cond(condition, "ternary", true);
                 self.expr(then_expr);
                 self.expr(else_expr);
-                let t = self.counter();
-                let f = self.counter();
-                self.cov.branches.push(BranchSite {
-                    scope: self.scope,
-                    span: espan,
-                    kind: "ternary",
-                    entry: None,
-                    arms: vec![
-                        Arm {
-                            span: then_expr.span,
-                            label: "true",
-                            counter: Some(t),
-                        },
-                        Arm {
-                            span: else_expr.span,
-                            label: "false",
-                            counter: Some(f),
-                        },
-                    ],
-                });
-                let cspan = condition.span;
-                let cond =
-                    std::mem::replace(&mut **condition, Expression::new(ExprKind::Empty, cspan));
-                **condition = Expression::new(
-                    ExprKind::SystemCall {
-                        name: COND_FN.to_string(),
-                        args: vec![number(t, cspan), cond],
-                    },
-                    cspan,
-                );
+                if self.kinds & KIND_BRANCH != 0 {
+                    self.ternary(e);
+                }
             }
             ExprKind::Unary { operand, .. } => self.expr(operand),
             ExprKind::Binary { left, right, .. } => {
@@ -755,6 +1619,363 @@ impl Instr<'_> {
             }
             _ => {}
         }
+    }
+
+    /// The `?:` conditions in a message task's argument, as condition items.
+    fn message(&mut self, e: &mut Expression) {
+        if self.kinds & KIND_CONDITION == 0 {
+            return;
+        }
+        match &mut e.kind {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.cond(condition, "ternary", false);
+                self.message(then_expr);
+                self.message(else_expr);
+            }
+            ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => self.message(inner),
+            ExprKind::Binary { left, right, .. } => {
+                self.message(left);
+                self.message(right);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts.iter_mut() {
+                    self.message(p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// An `if`, `while` or `?:` condition: a condition item when it is a
+    /// logic expression. `deep` instruments the `?:`s inside its terms (not
+    /// done in loop conditions, whose `?:`s are not branches).
+    fn cond(&mut self, e: &mut Expression, kind: &'static str, deep: bool) {
+        if self.kinds & KIND_CONDITION != 0 {
+            if let Some(p) = self.plan(e, false) {
+                self.rewrite(e, &p.nodes, 0, deep);
+                self.item(e, p, kind, true);
+                return;
+            }
+        }
+        if deep {
+            self.expr(e);
+        }
+    }
+
+    /// An assignment's value: an expression item when it is a logic
+    /// expression whose value is 1 bit wide where it is assigned. `deep`
+    /// also instruments its `?:`s (not done in port connections, which are
+    /// not statements).
+    fn value(&mut self, e: &mut Expression, lhs: &Expression, kind: &'static str, deep: bool) {
+        // A compound assignment (`a |= b`) arrives as `a = a | b`, the
+        // copy of `a` at its own place: not an expression of the source.
+        let compound = e.span.start == lhs.span.start;
+        if self.kinds & KIND_EXPRESSION != 0 && !compound {
+            if let Some(p) = self.plan(e, true) {
+                // `~`, the bitwise operators and `?:` take their width from
+                // where the value goes.
+                let sized = match &unparen(e).kind {
+                    ExprKind::Unary {
+                        op: UnaryOp::BitNot,
+                        ..
+                    }
+                    | ExprKind::Conditional { .. } => true,
+                    ExprKind::Binary { op, .. } => matches!(
+                        op,
+                        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor
+                    ),
+                    _ => false,
+                };
+                if !sized || self.ctx.width(lhs, &self.here) == Some(1) {
+                    self.rewrite(e, &p.nodes, 0, deep);
+                    self.item(e, p, kind, false);
+                    return;
+                }
+            }
+        }
+        if deep {
+            self.expr(e);
+        }
+    }
+
+    /// The logic tree of `e` when it is a condition or expression item: it
+    /// has a logic operator on two non-constant operands (or a `?:` in an
+    /// expression), or it is a relation (`a == b`; a negated one, `!(a ==
+    /// b)`, is not, as in the reference simulator), and at most `MAX_TERMS`
+    /// input terms.
+    fn plan(&self, e: &Expression, mux: bool) -> Option<Plan> {
+        let mut p = Plan::default();
+        let text = self.ctx.source(e, self.cov.scopes[self.scope as usize].src);
+        self.build(e, text, mux, &mut p);
+        // A system function as a term (`!$isunknown(x) && y`) leaves the
+        // expression out, as in the reference simulator.
+        if p.terms.is_empty() || p.terms.len() > MAX_TERMS || p.system {
+            return None;
+        }
+        let constant = |k: u32| p.nodes[k as usize].op == Op::Const;
+        let operators = p.nodes.iter().any(|n| match n.op {
+            Op::And | Op::Or | Op::BitAnd | Op::BitOr | Op::BitXor | Op::BitXnor => {
+                !constant(n.kids[0]) && !constant(n.kids[1])
+            }
+            Op::Mux => !constant(n.kids[0]),
+            _ => false,
+        });
+        (operators || p.relational[0]).then_some(p)
+    }
+
+    /// Fold node `i` of `p` (its kids built) to a constant when its value
+    /// is: a constant operand that decides it (`x & 0`, `x || 1`), or
+    /// constant operands only. The reference simulator leaves such parts of
+    /// an expression out; their terms (those after the first `terms`) go
+    /// with them.
+    fn fold(p: &mut Plan, i: usize, op: Op, kids: [u32; 3], terms: usize) -> Op {
+        let k = |j: usize| p.konst[kids[j] as usize];
+        let value = match op {
+            Op::Not => k(0).map(|v| v.map(|v| (v == 0) as u64)),
+            Op::And | Op::BitAnd | Op::Or | Op::BitOr => {
+                let decides = matches!(op, Op::Or | Op::BitOr) as u64;
+                let ctl = |c: Option<Option<u64>>| {
+                    c.flatten().is_some_and(|v| (v != 0) as u64 == decides)
+                };
+                if ctl(k(0)) || ctl(k(1)) {
+                    Some(Some(decides))
+                } else {
+                    (k(0).is_some() && k(1).is_some()).then_some(None)
+                }
+            }
+            Op::BitXor | Op::BitXnor => (k(0).is_some() && k(1).is_some()).then_some(None),
+            _ => None,
+        };
+        let Some(value) = value else {
+            return op;
+        };
+        p.nodes.truncate(i + 1);
+        p.relational.truncate(i + 1);
+        p.konst.truncate(i + 1);
+        p.terms.truncate(terms);
+        p.konst[i] = Some(value);
+        Op::Const
+    }
+
+    /// Add `e` to `p` as a tree node; returns its index. `text` is `e`'s
+    /// source text, cut from the item's by the operators above it (the
+    /// spans of an instance's port references can point into its parent's
+    /// file).
+    fn build(&self, e: &Expression, text: Option<String>, mux: bool, p: &mut Plan) -> u32 {
+        let e = unparen(e);
+        let text = text.map(|t| strip_parens(&t));
+        let i = p.nodes.len();
+        let (terms, system) = (p.terms.len(), p.system);
+        p.nodes.push(Node {
+            op: Op::Const,
+            kids: [0; 3],
+        });
+        p.relational.push(false);
+        p.konst.push(self.ctx.constant(e, &self.here));
+        let one = |x: &Expression| self.ctx.width(x, &self.here) == Some(1);
+        let reduction = |x: &Expression| {
+            matches!(
+                &unparen(x).kind,
+                ExprKind::Unary {
+                    op: UnaryOp::BitAnd | UnaryOp::BitOr | UnaryOp::BitXor,
+                    ..
+                }
+            )
+        };
+        let t = text.as_deref();
+        let (op, kids): (Op, Vec<(&Expression, Option<String>)>) = match &e.kind {
+            // Folded away, as by the reference simulator: no term.
+            _ if p.konst[i].is_some() => (Op::Const, Vec::new()),
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } => (
+                Op::Not,
+                vec![(operand, t.and_then(|t| unary_operand(t, '!')))],
+            ),
+            // `~^x` (`~(^x)` once parsed) is a term, the reduction xnor.
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                operand,
+            } if one(operand) && !reduction(operand) => (
+                Op::Not,
+                vec![(operand, t.and_then(|t| unary_operand(t, '~')))],
+            ),
+            ExprKind::Binary { op, left, right } => {
+                let op = match op {
+                    BinaryOp::LogAnd => Some((Op::And, "&&")),
+                    BinaryOp::LogOr => Some((Op::Or, "||")),
+                    BinaryOp::BitAnd if one(left) && one(right) => Some((Op::BitAnd, "&")),
+                    BinaryOp::BitOr if one(left) && one(right) => Some((Op::BitOr, "|")),
+                    BinaryOp::BitXor if one(left) && one(right) => Some((Op::BitXor, "^")),
+                    BinaryOp::BitXnor if one(left) && one(right) => Some((Op::BitXnor, "~^")),
+                    _ => None,
+                };
+                match op {
+                    Some((op, tok)) => {
+                        let (l, r) = match t.and_then(|t| split_binary(t, tok)) {
+                            Some((l, r)) => (Some(l), Some(r)),
+                            None => (None, None),
+                        };
+                        (op, vec![(left, l), (right, r)])
+                    }
+                    None => (self.term(e, t, p, i), Vec::new()),
+                }
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } if mux && one(then_expr) && one(else_expr) => {
+                let (c, a, b) = match t.and_then(split_mux) {
+                    Some((c, a, b)) => (Some(c), Some(a), Some(b)),
+                    None => (None, None, None),
+                };
+                (
+                    Op::Mux,
+                    vec![(condition, c), (then_expr, a), (else_expr, b)],
+                )
+            }
+            _ => (self.term(e, t, p, i), Vec::new()),
+        };
+        let mut ks = [0u32; 3];
+        for (j, (k, kt)) in kids.into_iter().enumerate() {
+            ks[j] = self.build(k, kt, mux, p);
+        }
+        let op = Self::fold(p, i, op, ks, terms);
+        if op == Op::Const {
+            p.system = system;
+            ks = [0; 3];
+        }
+        p.nodes[i] = Node { op, kids: ks };
+        i as u32
+    }
+
+    /// The term `e` (node `i` of `p`, source text `text`) stands for. A
+    /// 1-bit `t == 0` (or `t != 1`, either way round) is the term `t`,
+    /// inverted, as in the reference simulator; another relation is a term
+    /// of its own.
+    fn term(&self, e: &Expression, text: Option<&str>, p: &mut Plan, i: usize) -> Op {
+        let mut named = text.map(str::to_string);
+        let mut inv = false;
+        match &e.kind {
+            ExprKind::Binary { op, left, right } if matches!(op, BinaryOp::Eq | BinaryOp::Neq) => {
+                let bit = |x: &Expression| self.ctx.width(x, &self.here) == Some(1);
+                let k = |x: &Expression| self.ctx.constant(x, &self.here).flatten();
+                let pick = match (k(left), k(right)) {
+                    (None, Some(v)) if v <= 1 && bit(left) => Some((&**left, v, 0)),
+                    (Some(v), None) if v <= 1 && bit(right) => Some((&**right, v, 1)),
+                    _ => None,
+                };
+                match pick {
+                    Some((t, v, side)) => {
+                        inv = (v == 0) == matches!(op, BinaryOp::Eq);
+                        let tok = if matches!(op, BinaryOp::Eq) {
+                            "=="
+                        } else {
+                            "!="
+                        };
+                        named = text
+                            .and_then(|s| split_binary(s, tok))
+                            .map(|(l, r)| strip_parens(if side == 0 { &l } else { &r }))
+                            .or_else(|| Some(show(t)));
+                    }
+                    None => p.relational[i] = true,
+                }
+            }
+            ExprKind::Binary { op, .. } if Ctx::relational(*op) => p.relational[i] = true,
+            ExprKind::SystemCall { .. } => p.system = true,
+            _ => {}
+        }
+        let text = named.unwrap_or_else(|| strip_parens(&show(e)));
+        let t = match p.terms.iter().position(|x| *x == text) {
+            Some(t) => t,
+            None => {
+                p.terms.push(text);
+                p.terms.len() - 1
+            }
+        };
+        Op::Term(t as u16, inv)
+    }
+
+    /// Instrument what an item's tree leaves to the rest of the design:
+    /// the `?:`s inside its terms (with `deep`) and the `?:` branches of its
+    /// multiplexers, whose conditions it evaluates itself.
+    fn rewrite(&mut self, e: &mut Expression, nodes: &[Node], i: u32, deep: bool) {
+        let e = unparen_mut(e);
+        let n = nodes[i as usize];
+        match n.op {
+            Op::Term(..) => {
+                if deep {
+                    self.expr(e);
+                }
+            }
+            Op::Const => {}
+            Op::Mux => {
+                if let ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } = &mut e.kind
+                {
+                    self.rewrite(condition, nodes, n.kids[0], deep);
+                    self.rewrite(then_expr, nodes, n.kids[1], deep);
+                    self.rewrite(else_expr, nodes, n.kids[2], deep);
+                }
+                if deep && self.kinds & KIND_BRANCH != 0 {
+                    self.ternary(e);
+                }
+            }
+            _ => match &mut e.kind {
+                ExprKind::Unary { operand, .. } => self.rewrite(operand, nodes, n.kids[0], deep),
+                ExprKind::Binary { left, right, .. } => {
+                    self.rewrite(left, nodes, n.kids[0], deep);
+                    self.rewrite(right, nodes, n.kids[1], deep);
+                }
+                _ => {}
+            },
+        }
+    }
+
+    /// Register `e` as a condition or expression item and wrap it in
+    /// `EXPR_FN`.
+    fn item(&mut self, e: &mut Expression, p: Plan, kind: &'static str, condition: bool) {
+        let src = self.cov.scopes[self.scope as usize].src;
+        let id = self.cov.exprs.len() as u32;
+        let row0 = self.cov.counters;
+        self.cov.counters += 2 * p.terms.len() as u32;
+        self.cov.exprs.push(ExprSite {
+            scope: self.scope,
+            span: e.span,
+            kind,
+            condition,
+            block: self.block.clone(),
+            text: self.ctx.text(e, src),
+            terms: p.terms,
+            row0,
+            nodes: p.nodes.into(),
+            hint: self.hint.clone(),
+            copy: if self.hint.is_some() {
+                let mut s = String::new();
+                numbers(e, &mut s);
+                s
+            } else {
+                String::new()
+            },
+        });
+        let span = e.span;
+        let inner = std::mem::replace(e, Expression::new(ExprKind::Empty, span));
+        *e = Expression::new(
+            ExprKind::SystemCall {
+                name: EXPR_FN.to_string(),
+                args: vec![number(id, span), inner],
+            },
+            span,
+        );
     }
 }
 
@@ -838,11 +2059,91 @@ struct ToggleRow {
     fall: Vec<u32>,
 }
 
+/// A condition or expression item: each term with the counts of its two
+/// rows (the term at 0, and at 1, deciding the result).
+#[derive(Clone)]
+struct ItemRow {
+    file: String,
+    line: u32,
+    start: usize,
+    kind: &'static str,
+    block: String,
+    copy: String,
+    text: String,
+    terms: Vec<(String, [u64; 2])>,
+}
+
+impl ItemRow {
+    #[allow(clippy::type_complexity)]
+    fn key(&self) -> (&String, u32, usize, &str, &String, &String, &String) {
+        (
+            &self.file,
+            self.line,
+            self.start,
+            self.kind,
+            &self.block,
+            &self.text,
+            &self.copy,
+        )
+    }
+}
+
 #[derive(Default)]
 struct Report {
     stmts: Vec<StmtRow>,
     branches: Vec<BranchRow>,
     toggles: Vec<ToggleRow>,
+    conds: Vec<ItemRow>,
+    exprs: Vec<ItemRow>,
+}
+
+/// Sort items and add up the copies of one (a parameterized class's, the
+/// pieces of one continuous assignment); a generate loop's iterations stay
+/// apart by their block.
+fn merge_items(items: &mut Vec<ItemRow>) {
+    items.sort_by(|a, b| a.key().cmp(&b.key()));
+    let mut merged: Vec<ItemRow> = Vec::with_capacity(items.len());
+    for it in items.drain(..) {
+        match merged.last_mut() {
+            Some(m) if m.key() == it.key() && m.terms.len() == it.terms.len() => {
+                for (x, y) in m.terms.iter_mut().zip(&it.terms) {
+                    x.1[0] += y.1[0];
+                    x.1[1] += y.1[1];
+                }
+            }
+            _ => merged.push(it),
+        }
+    }
+    *items = merged;
+}
+
+fn items_json(items: &[ItemRow], out: &mut String) {
+    for (i, it) in items.iter().enumerate() {
+        out.push_str(&format!(
+            "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\", ",
+            if i == 0 { "" } else { ", " },
+            json_escape(&it.file),
+            it.line,
+            it.kind
+        ));
+        if !it.block.is_empty() {
+            out.push_str(&format!("\"block\": \"{}\", ", json_escape(&it.block)));
+        }
+        out.push_str(&format!(
+            "\"text\": \"{}\", \"terms\": [",
+            json_escape(&it.text)
+        ));
+        for (j, (t, h)) in it.terms.iter().enumerate() {
+            out.push_str(&format!(
+                "{}{{\"term\": \"{}\", \"hits\": [{}, {}]}}",
+                if j == 0 { "" } else { ", " },
+                json_escape(t),
+                h[0],
+                h[1]
+            ));
+        }
+        out.push_str("]}");
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -901,6 +2202,17 @@ impl Report {
             t[2].covered += r.rise.iter().filter(|&&c| c > 0).count() as u64
                 + r.fall.iter().filter(|&&c| c > 0).count() as u64;
         }
+        // A term is covered once both of its rows are.
+        for (k, items) in [(3, &self.conds), (4, &self.exprs)] {
+            for it in items {
+                t[k].total += it.terms.len() as u64;
+                t[k].covered += it
+                    .terms
+                    .iter()
+                    .filter(|(_, h)| h[0] > 0 && h[1] > 0)
+                    .count() as u64;
+            }
+        }
         t
     }
 
@@ -941,6 +2253,8 @@ impl Report {
         }
         self.branches = merged;
         self.toggles.sort_by(|a, b| a.name.cmp(&b.name));
+        merge_items(&mut self.conds);
+        merge_items(&mut self.exprs);
     }
 
     /// Add another instance of the same design unit (rows keyed by source
@@ -948,6 +2262,8 @@ impl Report {
     fn merge(&mut self, o: &Report) {
         self.stmts.extend(o.stmts.iter().cloned());
         self.branches.extend(o.branches.iter().cloned());
+        self.conds.extend(o.conds.iter().cloned());
+        self.exprs.extend(o.exprs.iter().cloned());
         let mut by_name: HashMap<String, usize> = self
             .toggles
             .iter()
@@ -1038,6 +2354,16 @@ impl Report {
             }
             out.push_str("],\n");
         }
+        if kinds & KIND_CONDITION != 0 {
+            out.push_str(&format!("{}\"conditions\": [", indent));
+            items_json(&self.conds, out);
+            out.push_str("],\n");
+        }
+        if kinds & KIND_EXPRESSION != 0 {
+            out.push_str(&format!("{}\"expressions\": [", indent));
+            items_json(&self.exprs, out);
+            out.push_str("],\n");
+        }
         // Drop the trailing comma of the last member.
         if out.ends_with(",\n") {
             out.truncate(out.len() - 2);
@@ -1070,6 +2396,8 @@ impl Simulator {
             scope_index: HashMap::default(),
             stmts: Vec::new(),
             branches: Vec::new(),
+            exprs: Vec::new(),
+            rets: Arc::new(self.cov_return_widths()),
             counters: 0,
             ca_counter: HashMap::default(),
             inst_paths: inst_paths.clone(),
@@ -1079,113 +2407,95 @@ impl Simulator {
         // `compile` and `build_comb_entries` take them (`cov_initial`,
         // `cov_contassign`): most of them are still lazy here, and building
         // them early would change the order and the passes they go through.
-        if kinds & (KIND_STATEMENT | KIND_BRANCH) != 0 {
+        if kinds & KIND_CODE != 0 {
             let mut program = std::mem::take(&mut self.module.program_initial_blocks);
-            for ib in program.iter_mut() {
-                if let Some(sc) =
-                    Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &ib.scope)
-                {
-                    let span = ib.stmt.span;
-                    let s =
-                        std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
-                    ib.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
+            let mut fin = std::mem::take(&mut self.module.final_blocks);
+            let mut always = std::mem::take(&mut self.module.always_blocks);
+            let mut functions = std::mem::take(&mut self.module.functions).into_map();
+            let mut tasks = std::mem::take(&mut self.module.tasks);
+            {
+                let ctx = self.cov_ctx(&cov);
+                for ib in program.iter_mut().chain(fin.iter_mut()) {
+                    if let Some(sc) =
+                        Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &ib.scope)
+                    {
+                        let span = ib.stmt.span;
+                        let s = std::mem::replace(
+                            &mut ib.stmt,
+                            Statement::new(StatementKind::Null, span),
+                        );
+                        ib.stmt = Instr::new(&mut cov, &ctx, &inst_paths, sc, &ib.scope).wrap(s);
                     }
-                    .wrap(s);
+                }
+                for ab in always.iter_mut() {
+                    if let Some(sc) =
+                        Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &ab.scope)
+                    {
+                        let kind = match ab.kind {
+                            crate::ast::decl::AlwaysKind::Always => "always",
+                            crate::ast::decl::AlwaysKind::AlwaysComb => "always_comb",
+                            crate::ast::decl::AlwaysKind::AlwaysFf => "always_ff",
+                            crate::ast::decl::AlwaysKind::AlwaysLatch => "always_latch",
+                        };
+                        let span = ab.stmt.span;
+                        let s = std::mem::replace(
+                            &mut ab.stmt,
+                            Statement::new(StatementKind::Null, span),
+                        );
+                        ab.stmt =
+                            Instr::new(&mut cov, &ctx, &inst_paths, sc, &ab.scope).always(s, kind);
+                    }
+                }
+                // Subroutines: a package's belong to the package, the others
+                // to the instance their qualified name starts with.
+                // A bare-named copy of an instance's subroutine (same source
+                // span) is not the top module's own.
+                let dotted: HashSet<(String, usize)> = functions
+                    .iter()
+                    .map(|(k, f)| (k, f.span))
+                    .chain(tasks.iter().map(|(k, t)| (k, t.span)))
+                    .filter_map(|(k, sp)| {
+                        let (_, leaf) = k.rsplit_once('.')?;
+                        Some((leaf.to_string(), sp.start))
+                    })
+                    .collect();
+                let copy = |k: &str, sp: Span| {
+                    !k.contains('.')
+                        && !k.contains("::")
+                        && dotted.contains(&(k.to_string(), sp.start))
+                };
+                for (key, fd) in functions.iter_mut() {
+                    if copy(key, fd.span) && !self.module.pkg_subr_owner.contains_key(key.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(sc) = self.cov_subroutine_scope(&mut cov, &inst_paths, key) {
+                        let items = std::mem::take(&mut fd.items);
+                        let mut ins = Instr::new(&mut cov, &ctx, &inst_paths, sc, key)
+                            .args(&fd.ports, &inst_paths);
+                        // The function's name is its result variable.
+                        let ret = ctx.local(&fd.return_type, false);
+                        ins.here.locals.insert(fd.name.name.name.clone(), ret);
+                        fd.items = ins.stmts(items);
+                    }
+                }
+                for (key, td) in tasks.iter_mut() {
+                    if copy(key, td.span) && !self.module.pkg_subr_owner.contains_key(key.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(sc) = self.cov_subroutine_scope(&mut cov, &inst_paths, key) {
+                        let items = std::mem::take(&mut td.items);
+                        td.items = Instr::new(&mut cov, &ctx, &inst_paths, sc, key)
+                            .args(&td.ports, &inst_paths)
+                            .stmts(items);
+                    }
                 }
             }
             self.module.program_initial_blocks = program;
-            let mut fin = std::mem::take(&mut self.module.final_blocks);
-            for fb in fin.iter_mut() {
-                if let Some(sc) =
-                    Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &fb.scope)
-                {
-                    let span = fb.stmt.span;
-                    let s =
-                        std::mem::replace(&mut fb.stmt, Statement::new(StatementKind::Null, span));
-                    fb.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .wrap(s);
-                }
-            }
             self.module.final_blocks = fin;
-            let mut always = std::mem::take(&mut self.module.always_blocks);
-            for ab in always.iter_mut() {
-                if let Some(sc) =
-                    Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &ab.scope)
-                {
-                    let kind = match ab.kind {
-                        crate::ast::decl::AlwaysKind::Always => "always",
-                        crate::ast::decl::AlwaysKind::AlwaysComb => "always_comb",
-                        crate::ast::decl::AlwaysKind::AlwaysFf => "always_ff",
-                        crate::ast::decl::AlwaysKind::AlwaysLatch => "always_latch",
-                    };
-                    let span = ab.stmt.span;
-                    let s =
-                        std::mem::replace(&mut ab.stmt, Statement::new(StatementKind::Null, span));
-                    ab.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .always(s, kind);
-                }
-            }
             self.module.always_blocks = always;
-            // Subroutines: a package's belong to the package, the others to
-            // the instance their qualified name starts with.
-            // A bare-named copy of an instance's subroutine (same source
-            // span) is not the top module's own.
-            let dotted: HashSet<(String, usize)> = self
-                .module
-                .functions
-                .iter()
-                .map(|(k, f)| (k, f.span))
-                .chain(self.module.tasks.iter().map(|(k, t)| (k, t.span)))
-                .filter_map(|(k, sp)| {
-                    let (_, leaf) = k.rsplit_once('.')?;
-                    Some((leaf.to_string(), sp.start))
-                })
-                .collect();
-            let copy = |k: &str, sp: Span| {
-                !k.contains('.') && !k.contains("::") && dotted.contains(&(k.to_string(), sp.start))
-            };
-            let mut functions = std::mem::take(&mut self.module.functions).into_map();
-            for (key, fd) in functions.iter_mut() {
-                if copy(key, fd.span) && !self.module.pkg_subr_owner.contains_key(key.as_str()) {
-                    continue;
-                }
-                if let Some(sc) = self.cov_subroutine_scope(&mut cov, &inst_paths, key) {
-                    let items = std::mem::take(&mut fd.items);
-                    fd.items = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .stmts(items);
-                }
-            }
             self.module.functions = xezim_core::elaborate::FuncTable::from_map(functions);
-            let mut tasks = std::mem::take(&mut self.module.tasks);
-            for (key, td) in tasks.iter_mut() {
-                if copy(key, td.span) && !self.module.pkg_subr_owner.contains_key(key.as_str()) {
-                    continue;
-                }
-                if let Some(sc) = self.cov_subroutine_scope(&mut cov, &inst_paths, key) {
-                    let items = std::mem::take(&mut td.items);
-                    td.items = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .stmts(items);
-                }
-            }
             self.module.tasks = tasks;
             self.cov_instrument_classes(&mut cov);
         }
@@ -1196,6 +2506,36 @@ impl Simulator {
         }
         self.code_cov_hits = vec![0; cov.counters as usize];
         self.code_cov = Some(Box::new(cov));
+    }
+
+    fn cov_ctx(&self, cov: &CodeCov) -> Ctx<'_> {
+        Ctx {
+            module: &self.module,
+            names: &self.signal_name_to_id,
+            widths: &self.signal_widths,
+            rets: cov.rets.clone(),
+        }
+    }
+
+    /// The width of each function's return type, by the name a call uses
+    /// (`call_return_width` resolves calls the same way).
+    fn cov_return_widths(&self) -> HashMap<String, u32> {
+        self.module
+            .functions
+            .iter()
+            .filter(|(_, f)| {
+                !matches!(f.return_type, DataType::Void { .. } | DataType::Real { .. })
+            })
+            .map(|(k, f)| {
+                let w = crate::compiler::elaborate::resolve_type_width(
+                    &f.return_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                (k.clone(), w)
+            })
+            .filter(|(_, w)| *w > 0)
+            .collect()
     }
 
     /// An initial block elaboration made rather than the source: a
@@ -1216,17 +2556,13 @@ impl Simulator {
             return ib;
         };
         let kinds = cov.kinds;
-        if kinds & (KIND_STATEMENT | KIND_BRANCH) != 0 && !Self::cov_synthesized_initial(&ib.stmt) {
+        if kinds & KIND_CODE != 0 && !Self::cov_synthesized_initial(&ib.stmt) {
             let paths = std::mem::take(&mut cov.inst_paths);
             if let Some(sc) = Self::cov_instance_scope(&self.module, &mut cov, &paths, &ib.scope) {
                 let span = ib.stmt.span;
                 let s = std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
-                ib.stmt = Instr {
-                    cov: &mut cov,
-                    kinds,
-                    scope: sc,
-                }
-                .wrap(s);
+                let ctx = self.cov_ctx(&cov);
+                ib.stmt = Instr::new(&mut cov, &ctx, &paths, sc, &ib.scope).wrap(s);
             }
             cov.inst_paths = paths;
             self.code_cov_hits.resize(cov.counters as usize, 0);
@@ -1236,55 +2572,78 @@ impl Simulator {
     }
 
     /// Instrument a continuous assignment as `build_comb_entries` takes it:
-    /// its `?:`s become branches, and it gets its statement counter (shared
-    /// by the pieces one assignment expands to), which is returned. Takes
-    /// the fields it needs: the caller's iterator holds `module`.
+    /// its value becomes an expression item or its `?:`s branches, and it
+    /// gets its statement counter (shared by the pieces one assignment
+    /// expands to), which is returned. An input port's connection to an
+    /// expression (`.en(a & b)`) is only an expression item, of the parent
+    /// instance. Takes the fields it needs: the caller's iterator holds
+    /// `module`.
     pub(super) fn cov_contassign(
         module: &ElaboratedModule,
+        names: &NameMap,
+        widths: &[u32],
         code_cov: &mut Option<Box<CodeCov>>,
         hits: &mut Vec<u64>,
         ca: &mut crate::compiler::elaborate::ContinuousAssignment,
     ) -> Option<u32> {
-        let (span, scope) = ca.origin.clone()?;
         let cov = code_cov.as_mut()?;
         let kinds = cov.kinds;
-        let scope = if scope.is_empty() {
-            Self::cov_lhs_base(&ca.lhs)
-                .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
-                .unwrap_or_default()
-        } else {
-            scope
+        let (span, scope, port) = match ca.origin.clone() {
+            Some((span, scope)) if scope.is_empty() => {
+                let scope = Self::cov_lhs_base(&ca.lhs)
+                    .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
+                    .unwrap_or_default();
+                (span, scope, false)
+            }
+            Some((span, scope)) => (span, scope, false),
+            None if ca.rhs_parent_scoped && kinds & KIND_EXPRESSION != 0 => {
+                let base = Self::cov_lhs_base(&ca.lhs)?;
+                let base = base
+                    .strip_prefix(&format!("{}.", module.name))
+                    .unwrap_or(&base);
+                let inst = base.rsplit_once('.')?.0;
+                let parent = inst.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+                (ca.rhs.span, parent.to_string(), true)
+            }
+            None => return None,
         };
         let paths = std::mem::take(&mut cov.inst_paths);
         let sc = Self::cov_instance_scope(module, cov, &paths, &scope);
-        cov.inst_paths = paths;
-        let sc = sc?;
-        let mut ins = Instr {
-            cov,
-            kinds,
-            scope: sc,
+        let ctx = Ctx {
+            module,
+            names,
+            widths,
+            rets: cov.rets.clone(),
         };
-        ins.expr(&mut ca.rhs);
-        let mut counter = None;
-        if kinds & KIND_STATEMENT != 0 {
-            let key = (span.start, span.end, scope);
-            counter = Some(match ins.cov.ca_counter.get(&key) {
-                Some(&c) => c,
-                None => {
-                    let c = ins.counter();
-                    ins.cov.stmts.push(StmtSite {
-                        scope: sc,
-                        span,
-                        kind: "assign",
-                        counter: c,
-                    });
-                    ins.cov.ca_counter.insert(key, c);
-                    c
+        let counter = sc.map(|sc| {
+            let mut ins = Instr::new(cov, &ctx, &paths, sc, &scope);
+            ins.hint = Some((!scope.is_empty()).then(|| scope.clone()));
+            if port {
+                ins.value(&mut ca.rhs, &ca.lhs, "port", false);
+                return None;
+            }
+            ins.value(&mut ca.rhs, &ca.lhs, "assign", true);
+            (kinds & KIND_STATEMENT != 0).then(|| {
+                let key = (span.start, span.end, scope.clone());
+                match ins.cov.ca_counter.get(&key) {
+                    Some(&c) => c,
+                    None => {
+                        let c = ins.counter();
+                        ins.cov.stmts.push(StmtSite {
+                            scope: sc,
+                            span,
+                            kind: "assign",
+                            counter: c,
+                        });
+                        ins.cov.ca_counter.insert(key, c);
+                        c
+                    }
                 }
-            });
-        }
+            })
+        });
+        cov.inst_paths = paths;
         hits.resize(cov.counters as usize, 0);
-        counter
+        counter.flatten()
     }
 
     /// The signal-name base of a continuous assignment's target.
@@ -1426,7 +2785,6 @@ impl Simulator {
     }
 
     fn cov_instrument_classes(&mut self, cov: &mut CodeCov) {
-        let kinds = cov.kinds;
         let mut classes = std::mem::take(&mut self.module.classes);
         let mut done: HashMap<usize, Arc<crate::compiler::elaborate::ElaboratedClass>> =
             HashMap::default();
@@ -1467,19 +2825,18 @@ impl Simulator {
                 let Some(method) = Arc::make_mut(&mut cls.methods).get_mut(&m) else {
                     continue;
                 };
-                let items = match &mut method.kind {
+                let (items, ports) = match &mut method.kind {
                     crate::ast::decl::ClassMethodKind::Function(fd)
-                    | crate::ast::decl::ClassMethodKind::Extern(fd) => &mut fd.items,
-                    crate::ast::decl::ClassMethodKind::Task(td) => &mut td.items,
+                    | crate::ast::decl::ClassMethodKind::Extern(fd) => (&mut fd.items, &fd.ports),
+                    crate::ast::decl::ClassMethodKind::Task(td) => (&mut td.items, &td.ports),
                     crate::ast::decl::ClassMethodKind::PureVirtual(_) => continue,
                 };
                 let body = std::mem::take(items);
-                *items = Instr {
-                    cov: &mut *cov,
-                    kinds,
-                    scope: sc,
-                }
-                .stmts(body);
+                let ctx = self.cov_ctx(cov);
+                let none = HashSet::default();
+                *items = Instr::new(&mut *cov, &ctx, &none, sc, "")
+                    .args(ports, &none)
+                    .stmts(body);
             }
             done.insert(ptr, arc.clone());
             classes.insert(key, arc);
@@ -1530,6 +2887,154 @@ impl Simulator {
                 *c += 1;
             }
         }
+        v
+    }
+
+    /// `$__xz_cove(<n>, expr)`: evaluate condition or expression item `n`
+    /// node by node, as the interpreter evaluates `expr`, count the rows of
+    /// its terms that decided the result, and yield the value.
+    pub(super) fn cov_expr(&mut self, args: &[Expression]) -> Value {
+        let Some(e) = args.get(1) else {
+            return Value::new(1);
+        };
+        let site = args.first().and_then(marker_id).and_then(|id| {
+            let s = self.code_cov.as_ref()?.exprs.get(id as usize)?;
+            Some((s.nodes.clone(), s.row0, s.terms.len(), s.hint.clone()))
+        });
+        let Some((nodes, row0, terms, hint)) = site else {
+            return self.eval_expr(e);
+        };
+        // A compiled continuous assignment reaches here through an
+        // expression fallback, which leaves name resolution to the
+        // interpreter but does not set its scope: resolve in the
+        // assignment's own, and put the caller's back (resolution moves it),
+        // so no later process resolves its names in this one's scope.
+        let saved = hint.map(|h| self.name_resolve_hint.replace(h));
+        let mut vals = vec![UNEVALUATED; nodes.len()];
+        let v = self.cov_node(&nodes, 0, e, &mut vals);
+        if let Some(s) = saved {
+            *self.name_resolve_hint.borrow_mut() = s;
+        }
+        let mut rows = vec![0u8; terms];
+        sensitize(&nodes, 0, &vals, &mut rows);
+        for (t, r) in rows.iter().enumerate() {
+            for b in 0..2 {
+                if r & (1 << b) != 0 {
+                    if let Some(h) = self.code_cov_hits.get_mut(row0 as usize + 2 * t + b) {
+                        *h += 1;
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// Evaluate node `i` of an item's tree (`e` is its expression) with the
+    /// interpreter's operators and short-circuits, noting each node's value
+    /// in `vals`.
+    fn cov_node(&mut self, nodes: &[Node], i: u32, e: &Expression, vals: &mut [u8]) -> Value {
+        let e = unparen(e);
+        let n = nodes[i as usize];
+        let [k0, k1, k2] = n.kids;
+        let v = match (n.op, &e.kind) {
+            (Op::Not, ExprKind::Unary { op, operand }) => {
+                let o = self.cov_node(nodes, k0, operand, vals);
+                if *op == UnaryOp::LogNot {
+                    o.logic_not()
+                } else {
+                    o.bitwise_not()
+                }
+            }
+            (Op::And, ExprKind::Binary { left, right, .. }) => {
+                let l = self.cov_node(nodes, k0, left, vals);
+                // §11.3.5: only a known 0 on the left skips the right.
+                if !l.has_xz() && l.to_u64() == Some(0) {
+                    Value::from_u64(0, 1)
+                } else {
+                    let r = self.cov_node(nodes, k1, right, vals);
+                    l.logic_and(&r)
+                }
+            }
+            (Op::Or, ExprKind::Binary { left, right, .. }) => {
+                let l = self.cov_node(nodes, k0, left, vals);
+                if l.to_u64().is_some_and(|v| v != 0) {
+                    Value::from_u64(1, 1)
+                } else {
+                    let r = self.cov_node(nodes, k1, right, vals);
+                    l.logic_or(&r)
+                }
+            }
+            (
+                Op::BitAnd | Op::BitOr | Op::BitXor | Op::BitXnor,
+                ExprKind::Binary { left, right, .. },
+            ) => {
+                let l = self.cov_node(nodes, k0, left, vals);
+                let r = self.cov_node(nodes, k1, right, vals);
+                match n.op {
+                    Op::BitAnd => l.bitwise_and(&r),
+                    Op::BitOr => l.bitwise_or(&r),
+                    Op::BitXor => l.bitwise_xor(&r),
+                    _ => l.bitwise_xor(&r).bitwise_not(),
+                }
+            }
+            (
+                Op::Mux,
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                },
+            ) => {
+                // The condition may carry its branch counters (`COND_FN`).
+                let (c, arm) = match &unparen(condition).kind {
+                    ExprKind::SystemCall { name, args } if name == COND_FN && args.len() == 2 => {
+                        (&args[1], marker_id(&args[0]))
+                    }
+                    _ => (&**condition, None),
+                };
+                let c = self.cov_node(nodes, k0, c, vals);
+                if let Some(t) = arm {
+                    let slot = match c.is_nonzero() {
+                        Some(true) => Some(t),
+                        Some(false) => Some(t + 1),
+                        None => None,
+                    };
+                    if let Some(h) = slot.and_then(|s| self.code_cov_hits.get_mut(s as usize)) {
+                        *h += 1;
+                    }
+                }
+                if c.has_unknown() {
+                    let t = self.cov_node(nodes, k1, then_expr, vals);
+                    let f = self.cov_node(nodes, k2, else_expr, vals);
+                    t.merge_unknown(&f)
+                } else {
+                    // Only the taken arm is evaluated; a constant other arm
+                    // is known all the same, and decides whether the
+                    // condition is masked.
+                    let (taken, kt, other, ko) = if c.is_true() {
+                        (then_expr, k1, else_expr, k2)
+                    } else {
+                        (else_expr, k2, then_expr, k1)
+                    };
+                    let v = self.cov_node(nodes, kt, taken, vals);
+                    // (Only a literal or a parameter: reading it does nothing.)
+                    let pure = matches!(
+                        unparen(other).kind,
+                        ExprKind::Number(_) | ExprKind::Ident(_)
+                    );
+                    if nodes[ko as usize].op == Op::Const && pure {
+                        self.cov_node(nodes, ko, other, vals);
+                    }
+                    v
+                }
+            }
+            _ => self.eval_expr(e),
+        };
+        vals[i as usize] = match v.is_nonzero() {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => X,
+        };
         v
     }
 
@@ -1775,6 +3280,32 @@ impl Simulator {
                 kind: b.kind,
                 arms,
             });
+        }
+        for x in &cov.exprs {
+            let src = cov.scopes[x.scope as usize].src;
+            let (file, line) = lines.locate(x.span, src).unwrap_or_default();
+            let row = |t: usize, v: usize| count(x.row0 + 2 * t as u32 + v as u32);
+            let item = ItemRow {
+                file,
+                line,
+                start: x.span.start,
+                kind: x.kind,
+                block: x.block.clone(),
+                copy: x.copy.clone(),
+                text: x.text.clone(),
+                terms: x
+                    .terms
+                    .iter()
+                    .enumerate()
+                    .map(|(t, name)| (name.clone(), [row(t, 0), row(t, 1)]))
+                    .collect(),
+            };
+            let r = &mut reports[x.scope as usize];
+            if x.condition {
+                r.conds.push(item);
+            } else {
+                r.exprs.push(item);
+            }
         }
         if let Some(t) = &cov.toggle {
             for (sc, name, k) in &t.names {

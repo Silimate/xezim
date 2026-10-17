@@ -2452,11 +2452,12 @@ mod vpi_cb;
 mod vpi_model;
 use assert_ctl::{AssertCtl, CtlIdent, CtlSite};
 pub(crate) use code_cov::{
-    COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
+    COND_FN as COV_COND_FN, EXPR_FN as COV_EXPR_FN, HIT_TASK as COV_HIT_TASK,
+    marker_id as cov_marker_id,
 };
 pub use code_cov::{
-    CodeCoverage, KIND_BRANCH, KIND_STATEMENT, KIND_TOGGLE,
-    parse_kinds as parse_code_coverage_kinds, set_code_coverage,
+    CodeCoverage, KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_STATEMENT,
+    KIND_TOGGLE, parse_kinds as parse_code_coverage_kinds, set_code_coverage,
 };
 use event_stamps::{EventId, EventStampStore, NamedEventPlan, NamedEventTarget};
 pub(crate) use names::{IdNames, NameMap};
@@ -36997,6 +36998,8 @@ impl Simulator {
             let cov_counter = if self.code_cov.is_some() {
                 Self::cov_contassign(
                     &self.module,
+                    &self.signal_name_to_id,
+                    &self.signal_widths,
                     &mut self.code_cov,
                     &mut self.code_cov_hits,
                     &mut ca,
@@ -37318,6 +37321,7 @@ impl Simulator {
                 // instantiation passes it; this one simply never did.
                 compiler.set_functions(&self.module.functions);
                 compiler.top_module_name = Some(self.module.name.clone());
+                compiler.set_cov_fallback(self.code_cov.is_some());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
                 }
@@ -37403,6 +37407,7 @@ impl Simulator {
                 // inline its calls and stayed on the AST interpreter.
                 compiler.set_functions(&self.module.functions);
                 compiler.top_module_name = Some(self.module.name.clone());
+                compiler.set_cov_fallback(self.code_cov.is_some());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
                 }
@@ -71200,6 +71205,7 @@ impl Simulator {
     ) -> Value {
         match name.as_str() {
             COV_COND_FN => return self.cov_cond(args),
+            COV_EXPR_FN => return self.cov_expr(args),
             // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
             // (stashed by the suspend path; see make_intra_saved_expr).
             INTRA_SAVED_MARKER => {

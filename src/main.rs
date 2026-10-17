@@ -228,9 +228,10 @@ fn print_usage() {
                    error. Also enabled by XEZIM_RELAX_DRIVER_CONFLICTS=1."
     );
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
-    eprintln!("                   stmt, branch, toggle (or all, the default). Counts go to");
-    eprintln!("                   xezim_cov.json (XEZIM_COV_DB) with the functional coverage;");
-    eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
+    eprintln!("                   stmt, branch, cond, expr, toggle (or all, the default).");
+    eprintln!("                   Counts go to xezim_cov.json (XEZIM_COV_DB) with the");
+    eprintln!("                   functional coverage; --verbose prints a summary.");
+    eprintln!("                   XEZIM_CODE_COVERAGE=<kinds> too.");
     eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
     eprintln!("                   subtrees (tb.dut) and packages. Repeatable.");
     eprintln!("  --verbose        Internal engine lines, off by default: the version banner,");
@@ -399,9 +400,9 @@ fn print_usage() {
         "  -work/-L/-Lf/-lib <lib>  Ignored with one warning: every run compiles from source"
     );
     eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
-    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, t");
-    eprintln!("                   = stmt, branch, toggle; bare = all three. Other letters are");
-    eprintln!("                   ignored with a warning");
+    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, c,");
+    eprintln!("                   e, t = stmt, branch, cond, expr, toggle; bare = all. Other");
+    eprintln!("                   letters are ignored with a warning");
     eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -<step>args=..,");
     eprintln!("  -suppress <ids>, +fcover, -sva,");
     eprintln!("  -assertdebug     Accepted, no effect");
@@ -2441,11 +2442,7 @@ fn run_main() -> i32 {
                 wave = true;
             }
             "--code-coverage" => {
-                code_cov_kinds = Some(
-                    xezim::compiler::simulator::KIND_STATEMENT
-                        | xezim::compiler::simulator::KIND_BRANCH
-                        | xezim::compiler::simulator::KIND_TOGGLE,
-                );
+                code_cov_kinds = Some(xezim::compiler::simulator::KIND_ALL);
             }
             _ if arg.starts_with("--code-coverage=") => {
                 match xezim::compiler::simulator::parse_code_coverage_kinds(
@@ -2809,8 +2806,6 @@ fn run_main() -> i32 {
             let names: Vec<String> = unsupported
                 .chars()
                 .map(|c| match c {
-                    'c' => "condition (c)".to_string(),
-                    'e' => "expression (e)".to_string(),
                     'f' => "FSM (f)".to_string(),
                     'x' => "extended toggle (x)".to_string(),
                     _ => format!("'{}'", c),
@@ -2819,6 +2814,8 @@ fn run_main() -> i32 {
             let kept: Vec<&str> = [
                 (xezim::compiler::simulator::KIND_STATEMENT, "statement"),
                 (xezim::compiler::simulator::KIND_BRANCH, "branch"),
+                (xezim::compiler::simulator::KIND_CONDITION, "condition"),
+                (xezim::compiler::simulator::KIND_EXPRESSION, "expression"),
                 (xezim::compiler::simulator::KIND_TOGGLE, "toggle"),
             ]
             .iter()

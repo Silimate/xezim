@@ -2456,6 +2456,7 @@ pub(crate) use code_cov::{
 };
 pub use code_cov::{
     CodeCoverage, KIND_BRANCH, KIND_STATEMENT, KIND_TOGGLE,
+    parse_constant_mode as parse_code_coverage_constant_mode,
     parse_kinds as parse_code_coverage_kinds, set_code_coverage,
 };
 use event_stamps::{EventId, EventStampStore, NamedEventPlan, NamedEventTarget};
@@ -36996,7 +36997,11 @@ impl Simulator {
             // on a form that runs a counter (compiled, or interpreted).
             let cov_counter = if self.code_cov.is_some() {
                 Self::cov_contassign(
-                    &self.module,
+                    code_cov::Consts::new(
+                        &self.module,
+                        &self.signal_name_to_id,
+                        &self.signal_widths,
+                    ),
                     &mut self.code_cov,
                     &mut self.code_cov_hits,
                     &mut ca,

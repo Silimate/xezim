@@ -34,11 +34,29 @@ const LIBRARY_PACKAGES: [&str; 2] = ["std", "uvm_pkg"];
 
 /// What the command line asked for. `scopes` limits every kind to the
 /// instances at or below the listed paths and to the listed packages (empty:
-/// the whole design).
+/// the whole design). `keep_constant` keeps the statements and branch arms a
+/// constant condition rules out in the totals (see `Instr::truth`).
 #[derive(Clone, Debug, Default)]
 pub struct CodeCoverage {
     pub kinds: u8,
     pub scopes: Vec<String>,
+    pub keep_constant: bool,
+}
+
+/// Why a statement, branch or arm is left out of the totals.
+const EXCLUDED: &str = "constant";
+
+/// `--code-coverage-constant=<mode>`: `exclude` (the default) leaves code a
+/// constant condition rules out of the totals, `keep` counts it.
+pub fn parse_constant_mode(spec: &str) -> Result<bool, String> {
+    match spec.trim() {
+        "exclude" => Ok(false),
+        "keep" => Ok(true),
+        other => Err(format!(
+            "unknown constant-code mode '{}' (want exclude or keep)",
+            other
+        )),
+    }
 }
 
 static CONFIG: Mutex<Option<CodeCoverage>> = Mutex::new(None);
@@ -143,6 +161,8 @@ struct StmtSite {
     span: Span,
     kind: &'static str,
     counter: u32,
+    /// In an arm a constant condition rules out: left out of the totals.
+    excluded: bool,
 }
 
 struct Arm {
@@ -151,6 +171,8 @@ struct Arm {
     /// `None` for the implicit `else` / `default`: the branch's entry count
     /// minus the other arms.
     counter: Option<u32>,
+    /// A constant condition rules this arm out.
+    excluded: bool,
 }
 
 struct BranchSite {
@@ -159,6 +181,21 @@ struct BranchSite {
     kind: &'static str,
     entry: Option<u32>,
     arms: Vec<Arm>,
+    /// The decision is a constant, or the branch is in an excluded arm: all
+    /// of its arms are left out of the totals.
+    excluded: bool,
+}
+
+/// What a constant condition leaves of one arm of an `if` chain or a `case`.
+#[derive(Clone, Copy, PartialEq)]
+enum Fate {
+    /// Not decided by a constant: the arm counts.
+    Live,
+    /// The constant condition selects this arm: its statements count, and
+    /// the arm counts unless the whole decision is constant.
+    Taken,
+    /// The arm can never run: it and its statements are left out.
+    Dead,
 }
 
 /// Per-bit rise/fall counts of the tracked signals.
@@ -205,6 +242,8 @@ impl Toggle {
 
 pub(crate) struct CodeCov {
     kinds: u8,
+    /// `--code-coverage-constant=keep`: nothing is excluded.
+    keep_constant: bool,
     limit: Vec<String>,
     scopes: Vec<Scope>,
     scope_index: HashMap<String, u32>,
@@ -218,14 +257,54 @@ pub(crate) struct CodeCov {
     pub(crate) toggle: Option<Toggle>,
 }
 
+/// What decides constant conditions (IEEE 1800 §11.2.1): the design's
+/// parameters, and its signals' widths for `$bits`.
+#[derive(Clone, Copy)]
+pub(super) struct Consts<'a> {
+    module: &'a ElaboratedModule,
+    ids: &'a NameMap,
+    widths: &'a [u32],
+}
+
+impl<'a> Consts<'a> {
+    pub(super) fn new(module: &'a ElaboratedModule, ids: &'a NameMap, widths: &'a [u32]) -> Self {
+        Consts {
+            module,
+            ids,
+            widths,
+        }
+    }
+}
+
 /// Rewrites one scope's statements; see the module docs.
 struct Instr<'a> {
     cov: &'a mut CodeCov,
     kinds: u8,
     scope: u32,
+    /// What decides constant conditions, or `None` when nothing is
+    /// excluded: `--code-coverage-constant=keep`, and scopes outside the
+    /// instance tree, whose bare names are not resolved yet.
+    consts: Option<Consts<'a>>,
+    /// Names declared in the code being rewritten (variables, subroutine
+    /// arguments): never constants, even where they shadow a parameter.
+    locals: HashSet<String>,
+    /// Inside an arm a constant condition rules out: everything is excluded.
+    dead: bool,
 }
 
-impl Instr<'_> {
+impl<'a> Instr<'a> {
+    fn new(cov: &'a mut CodeCov, kinds: u8, scope: u32, consts: Option<Consts<'a>>) -> Self {
+        let consts = consts.filter(|_| !cov.keep_constant);
+        Instr {
+            cov,
+            kinds,
+            scope,
+            consts,
+            locals: HashSet::default(),
+            dead: false,
+        }
+    }
+
     fn counter(&mut self) -> u32 {
         let c = self.cov.counters;
         self.cov.counters += 1;
@@ -242,8 +321,415 @@ impl Instr<'_> {
             span,
             kind,
             counter,
+            excluded: self.dead,
         });
         out.push(hit(counter, span));
+    }
+
+    /// Rewrite with everything excluded when `dead`.
+    fn under<T>(&mut self, dead: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let was = self.dead;
+        self.dead |= dead;
+        let r = f(self);
+        self.dead = was;
+        r
+    }
+
+    /// The parameter an identifier names, with its flat name. Elaboration
+    /// has already resolved an instance's names to flat paths (`u0.WIDTH`).
+    fn param(&self, h: &HierarchicalIdentifier) -> Option<(String, Value)> {
+        let module = self.consts?.module;
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        if self.locals.contains(&name) {
+            return None;
+        }
+        let params = &module.parameters;
+        if let Some(v) = params.get(&name) {
+            return Some((name, v.clone()));
+        }
+        // `pkg::P` (§26.3) is keyed by its package; a package's enum
+        // constants have a table of their own.
+        let [pkg, leaf] = &h.path[..] else {
+            return None;
+        };
+        let name = format!("{}::{}", pkg.name.name, leaf.name.name);
+        if let Some(v) = params.get(&name) {
+            return Some((name, v.clone()));
+        }
+        let &(v, w) = module
+            .package_enum_members
+            .get(&pkg.name.name)?
+            .get(&leaf.name.name)?;
+        Some((name, Value::from_u64(v, w)))
+    }
+
+    /// The value of an elaboration-time constant expression (IEEE 1800
+    /// §11.2.1): literals and parameters (enum constants and genvars
+    /// included, which elaboration substitutes or records as parameters)
+    /// under operators, `?:`, concatenation and the constant system
+    /// functions. `None` for anything else, which keeps its code counted.
+    fn value(&self, e: &Expression) -> Option<Value> {
+        let consts = self.consts?;
+        let module = consts.module;
+        let v = match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer {
+                size,
+                signed,
+                base,
+                value,
+                ..
+            }) => {
+                let radix = match base {
+                    NumberBase::Binary => 2,
+                    NumberBase::Octal => 8,
+                    NumberBase::Hex => 16,
+                    NumberBase::Decimal => 10,
+                };
+                let width = size.unwrap_or_else(|| Value::unsized_literal_width(value, radix));
+                let mut v = Value::from_str_radix(value, radix, width);
+                v.is_signed = *signed;
+                v.is_fill = size.is_none() && Value::unsized_xz_fill_char(value).is_some();
+                v
+            }
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Value::fill_of(*c),
+            ExprKind::Paren(x) => return self.value(x),
+            ExprKind::Ident(h) => self.param(h)?.1,
+            // A select of a parameter declared `[N-1:0]` (the elaborator
+            // records the other shapes' ranges, which are left alone).
+            ExprKind::Index { expr, index }
+            | ExprKind::RangeSelect {
+                expr, left: index, ..
+            } => {
+                let ExprKind::Ident(h) = &expr.kind else {
+                    return None;
+                };
+                let (name, v) = self.param(h)?;
+                if module.packed_full_dims.contains_key(&name)
+                    || module.ascending_packed.contains_key(&name)
+                    || module.packed_signal_elem_widths.contains_key(&name)
+                    || module.packed_struct_fields.contains_key(&name)
+                {
+                    return None;
+                }
+                let i = self.value(index)?.to_index()?;
+                match &e.kind {
+                    ExprKind::RangeSelect { kind, right, .. } => {
+                        let r = self.value(right)?.to_index()?;
+                        let (hi, lo) = match kind {
+                            RangeKind::Constant => (i, r),
+                            RangeKind::IndexedUp => (i + r - 1, i),
+                            RangeKind::IndexedDown => (i, i - r + 1),
+                        };
+                        if lo < 0 || hi < lo || hi >= v.width as i64 {
+                            return None;
+                        }
+                        v.range_select(hi as usize, lo as usize)
+                    }
+                    _ if i >= 0 && i < v.width as i64 => v.bit_select(i as usize),
+                    _ => return None,
+                }
+            }
+            ExprKind::Unary { op, operand } => {
+                if *op == UnaryOp::LogNot {
+                    return self.truth(e).map(|t| Value::from_u64(t as u64, 1));
+                }
+                let v = self.value(operand)?;
+                match op {
+                    UnaryOp::Plus => v,
+                    UnaryOp::Minus => {
+                        let mut r = Value::zero(v.width).sub(&v);
+                        r.is_signed = v.is_signed;
+                        r
+                    }
+                    UnaryOp::BitNot => v.bitwise_not(),
+                    UnaryOp::BitAnd => v.reduce_and(),
+                    UnaryOp::BitNand => v.reduce_and().bitwise_not(),
+                    UnaryOp::BitOr => v.reduce_or(),
+                    UnaryOp::BitNor => v.reduce_or().bitwise_not(),
+                    UnaryOp::BitXor => v.reduce_xor(),
+                    UnaryOp::BitXnor => v.reduce_xor().bitwise_not(),
+                    _ => return None,
+                }
+            }
+            ExprKind::Binary { op, left, right } => {
+                if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
+                    return self.truth(e).map(|t| Value::from_u64(t as u64, 1));
+                }
+                let l = self.value(left)?;
+                let r = self.value(right)?;
+                match op {
+                    BinaryOp::Add => l.add(&r),
+                    BinaryOp::Sub => l.sub(&r),
+                    BinaryOp::Mul => l.mul(&r),
+                    BinaryOp::Div => l.div(&r),
+                    BinaryOp::Mod => l.modulo(&r),
+                    BinaryOp::Power => l.power(&r),
+                    BinaryOp::Eq => l.is_equal(&r),
+                    BinaryOp::Neq => l.is_not_equal(&r),
+                    BinaryOp::CaseEq => l.case_eq(&r),
+                    BinaryOp::CaseNeq => l.case_neq(&r),
+                    BinaryOp::WildcardEq => l.wildcard_eq(&r),
+                    BinaryOp::WildcardNeq => l.wildcard_ne(&r),
+                    BinaryOp::Lt => l.less_than(&r),
+                    BinaryOp::Leq => l.less_equal(&r),
+                    BinaryOp::Gt => l.greater_than(&r),
+                    BinaryOp::Geq => l.greater_equal(&r),
+                    BinaryOp::BitAnd => l.bitwise_and(&r),
+                    BinaryOp::BitOr => l.bitwise_or(&r),
+                    BinaryOp::BitXor => l.bitwise_xor(&r),
+                    BinaryOp::BitXnor => l.bitwise_xnor(&r),
+                    BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => l.shift_left(&r),
+                    BinaryOp::ShiftRight => l.shift_right(&r),
+                    BinaryOp::ArithShiftRight => l.arith_shift_right(&r),
+                    _ => return None,
+                }
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                if self.truth(condition)? {
+                    self.value(then_expr)?
+                } else {
+                    self.value(else_expr)?
+                }
+            }
+            ExprKind::StringLiteral(s) => Value::from_string(s),
+            ExprKind::Concatenation(parts) => Value::concat(
+                &parts
+                    .iter()
+                    .map(|p| self.value(p))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            ExprKind::Replication { count, exprs } => {
+                let n = self.value(count)?.to_u64()?;
+                let parts = exprs
+                    .iter()
+                    .map(|p| self.value(p))
+                    .collect::<Option<Vec<_>>>()?;
+                if n == 0 || n > 4096 {
+                    return None;
+                }
+                Value::concat(&parts).replicate(n as usize)
+            }
+            ExprKind::SystemCall { name, args } => {
+                let arg = |i: usize| args.get(i).and_then(|a| self.value(a));
+                match (name.as_str(), args.len()) {
+                    ("$clog2", 1) => {
+                        let v = arg(0)?.to_u64()?;
+                        let n = if v <= 1 {
+                            0
+                        } else {
+                            64 - (v - 1).leading_zeros() as u64
+                        };
+                        let mut r = Value::from_u64(n, 32);
+                        r.is_signed = true;
+                        r
+                    }
+                    ("$signed" | "$unsigned", 1) => {
+                        let mut v = arg(0)?;
+                        v.is_signed = name == "$signed";
+                        v
+                    }
+                    // §20.6.2: the width of a parameter or of a fixed-width
+                    // net or variable.
+                    ("$bits", 1) => {
+                        let w = match &args[0].kind {
+                            ExprKind::Ident(h) if h.path.len() == 1 => {
+                                let n = h.path[0].name.name.as_str();
+                                if !h.path[0].selects.is_empty()
+                                    || self.locals.contains(n)
+                                    || module.arrays.contains_key(n)
+                                    || module.arrays_nd.contains_key(n)
+                                    || module.dynamic_arrays.contains(n)
+                                    || module.associative_arrays.contains_key(n)
+                                    || module.queue_vars.contains(n)
+                                    || module.string_signals.contains(n)
+                                {
+                                    return None;
+                                }
+                                match module.parameters.get(n) {
+                                    Some(p) => p.width,
+                                    None => *consts.widths.get(*consts.ids.get(n)?)?,
+                                }
+                            }
+                            _ => arg(0)?.width,
+                        };
+                        let mut r = Value::from_u64(w as u64, 32);
+                        r.is_signed = true;
+                        r
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        (!v.is_real).then_some(v)
+    }
+
+    /// Whether a condition is constantly true or false. Besides fully
+    /// constant conditions, an `&&` or `&` with a constant-false operand is
+    /// false and an `||` or `|` with a constant-true one true, whatever the
+    /// other operand, as in the reference simulator. A condition with x or z
+    /// bits and no 1 is not decided.
+    fn truth(&self, e: &Expression) -> Option<bool> {
+        self.consts?;
+        match &e.kind {
+            ExprKind::Paren(x) => self.truth(x),
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } => self.truth(operand).map(|t| !t),
+            ExprKind::Binary {
+                op: op @ (BinaryOp::LogAnd | BinaryOp::LogOr),
+                left,
+                right,
+            } => {
+                let short = *op == BinaryOp::LogOr;
+                match (self.truth(left), self.truth(right)) {
+                    (Some(l), _) if l == short => Some(short),
+                    (_, Some(r)) if r == short => Some(short),
+                    (Some(_), Some(_)) => Some(!short),
+                    _ => None,
+                }
+            }
+            ExprKind::Binary {
+                op: op @ (BinaryOp::BitAnd | BinaryOp::BitOr),
+                left,
+                right,
+            } => {
+                let short = *op == BinaryOp::BitOr;
+                let l = self.value(left);
+                let r = self.value(right);
+                if [&l, &r]
+                    .iter()
+                    .any(|v| v.as_ref().and_then(|v| v.is_nonzero()) == Some(short))
+                {
+                    return Some(short);
+                }
+                self.value(e)?.is_nonzero()
+            }
+            _ => self.value(e)?.is_nonzero(),
+        }
+    }
+
+    /// The fates of an `if` chain's arms, one per condition and one for the
+    /// final `else` (written or implicit), and whether every condition is a
+    /// constant (then the chain is no decision at all). The arm of the first
+    /// condition that is constantly true takes everything that reaches it;
+    /// arms whose condition is constantly false, and every arm after a
+    /// constantly true one, never run.
+    fn chain_fates(&self, conds: &[&Expression]) -> (Vec<Fate>, bool) {
+        let mut fates = Vec::with_capacity(conds.len() + 1);
+        let mut all = true;
+        let mut open = true;
+        for c in conds {
+            if !open {
+                fates.push(Fate::Dead);
+                continue;
+            }
+            fates.push(match self.truth(c) {
+                Some(true) => {
+                    open = false;
+                    Fate::Taken
+                }
+                Some(false) => Fate::Dead,
+                None => {
+                    all = false;
+                    Fate::Live
+                }
+            });
+        }
+        fates.push(match (open, all) {
+            (false, _) => Fate::Dead,
+            (true, true) => Fate::Taken,
+            (true, false) => Fate::Live,
+        });
+        (fates, all)
+    }
+
+    /// The fates of a `case`'s items, and the implicit `default`'s, when the
+    /// selector and every item expression are constants: the first matching
+    /// item is taken, or the `default` (written or implicit) when none
+    /// matches. `None` otherwise: as in the reference simulator, a `case`
+    /// with any item that is not a constant keeps all of its arms, and so
+    /// does a `case inside`.
+    fn case_fates(
+        &self,
+        kind: CaseKind,
+        expr: &Expression,
+        items: &[CaseItem],
+    ) -> Option<Vec<Fate>> {
+        if matches!(kind, CaseKind::CaseInside) {
+            return None;
+        }
+        let sel = self.value(expr)?;
+        let mut hit = None;
+        for (i, it) in items.iter().enumerate() {
+            if it.pattern.is_some() || it.guard.is_some() {
+                return None;
+            }
+            for p in &it.patterns {
+                let v = self.value(p)?;
+                let m = match kind {
+                    CaseKind::Casez => sel.casez_eq(&v),
+                    CaseKind::Casex => sel.casex_eq(&v),
+                    _ => sel.case_eq(&v),
+                };
+                if m.is_nonzero()? && hit.is_none() {
+                    hit = Some(i);
+                }
+            }
+        }
+        let hit = hit.or_else(|| items.iter().position(|it| it.is_default));
+        let mut fates: Vec<Fate> = (0..items.len())
+            .map(|i| {
+                if Some(i) == hit {
+                    Fate::Taken
+                } else {
+                    Fate::Dead
+                }
+            })
+            .collect();
+        fates.push(if hit.is_some() {
+            Fate::Dead
+        } else {
+            Fate::Taken
+        });
+        Some(fates)
+    }
+
+    /// Note the names a statement declares (see `locals`).
+    fn declare(&mut self, s: &Statement) {
+        match &s.kind {
+            StatementKind::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    self.locals.insert(d.name.name.clone());
+                }
+            }
+            StatementKind::For { init, .. } => {
+                for i in init {
+                    if let ForInit::VarDecl { name, .. } = i {
+                        self.locals.insert(name.name.clone());
+                    }
+                }
+            }
+            StatementKind::Foreach { vars, .. } => {
+                for v in vars.iter().flatten() {
+                    self.locals.insert(v.name.clone());
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A statement in a single-statement position.
@@ -254,11 +740,12 @@ impl Instr<'_> {
         block(v, span)
     }
 
-    /// A branch arm: its counter, then the arm's own statements.
-    fn arm(&mut self, s: Statement, counter: u32) -> Statement {
+    /// A branch arm: its counter, then the arm's own statements (excluded
+    /// when the arm is `dead`).
+    fn arm(&mut self, s: Statement, counter: u32, dead: bool) -> Statement {
         let span = s.span;
         let mut v = vec![hit(counter, span)];
-        self.stmt(s, &mut v);
+        self.under(dead, |me| me.stmt(s, &mut v));
         block(v, span)
     }
 
@@ -302,6 +789,9 @@ impl Instr<'_> {
     fn stmt(&mut self, s: Statement, out: &mut Vec<Statement>) {
         let span = s.span;
         let rebuilt = |kind| Statement::new(kind, span);
+        if self.consts.is_some() {
+            self.declare(&s);
+        }
         match s.kind {
             StatementKind::SeqBlock { name, stmts } => {
                 let stmts = self.stmts(stmts);
@@ -343,8 +833,9 @@ impl Instr<'_> {
                                 span: st.span,
                                 label: "item",
                                 counter: Some(c),
+                                excluded: false,
                             });
-                            (w, self.arm(st, c))
+                            (w, self.arm(st, c, false))
                         })
                         .collect();
                     self.cov.branches.push(BranchSite {
@@ -353,6 +844,7 @@ impl Instr<'_> {
                         kind: "randcase",
                         entry: None,
                         arms,
+                        excluded: self.dead,
                     });
                     items
                 } else {
@@ -493,6 +985,8 @@ impl Instr<'_> {
     /// An `if`, with its `else if` chain as one branch: one arm per
     /// condition plus the final `else`, written or implicit. A `unique` or
     /// `priority` chain has no implicit arm (no match is a violation).
+    /// Constant conditions exclude the arms they rule out (see
+    /// `chain_fates`), and the whole branch when they all are constants.
     fn if_stmt(
         &mut self,
         unique_priority: Option<UniquePriority>,
@@ -503,8 +997,10 @@ impl Instr<'_> {
         out: &mut Vec<Statement>,
     ) {
         if self.kinds & KIND_BRANCH == 0 {
-            let then_stmt = Box::new(self.wrap(*then_stmt));
-            let else_stmt = else_stmt.map(|e| Box::new(self.wrap(*e)));
+            let t = self.truth(&condition);
+            let then_stmt = Box::new(self.under(t == Some(false), |me| me.wrap(*then_stmt)));
+            let else_stmt =
+                else_stmt.map(|e| Box::new(self.under(t == Some(true), |me| me.wrap(*e))));
             out.push(Statement::new(
                 StatementKind::If {
                     unique_priority,
@@ -516,17 +1012,26 @@ impl Instr<'_> {
             ));
             return;
         }
+        let mut conds = vec![&condition];
         let mut has_else = false;
         let mut tail = else_stmt.as_deref();
         while let Some(e) = tail {
             match &e.kind {
-                StatementKind::If { else_stmt, .. } => tail = else_stmt.as_deref(),
+                StatementKind::If {
+                    condition,
+                    else_stmt,
+                    ..
+                } => {
+                    conds.push(condition);
+                    tail = else_stmt.as_deref();
+                }
                 _ => {
                     has_else = true;
                     break;
                 }
             }
         }
+        let (fates, constant) = self.chain_fates(&conds);
         let implicit = !has_else && unique_priority.is_none();
         let entry = implicit.then(|| self.counter());
         let site = self.cov.branches.len();
@@ -536,9 +1041,10 @@ impl Instr<'_> {
             kind: "if",
             entry,
             arms: Vec::new(),
+            excluded: self.dead || constant,
         });
         let mut arms = Vec::new();
-        self.expr(&mut condition);
+        self.under(fates[0] != Fate::Live, |me| me.expr(&mut condition));
         let rewritten = self.if_arms(
             unique_priority,
             condition,
@@ -546,6 +1052,7 @@ impl Instr<'_> {
             else_stmt,
             span,
             true,
+            &fates,
             &mut arms,
         );
         if implicit {
@@ -553,6 +1060,7 @@ impl Instr<'_> {
                 span,
                 label: "else (implicit)",
                 counter: None,
+                excluded: fates.last() == Some(&Fate::Dead),
             });
         }
         self.cov.branches[site].arms = arms;
@@ -562,6 +1070,8 @@ impl Instr<'_> {
         out.push(rewritten);
     }
 
+    /// The arms of an `if` chain from the one `arms` has reached on; `fates`
+    /// has one entry per arm, in order.
     #[allow(clippy::too_many_arguments)]
     fn if_arms(
         &mut self,
@@ -571,18 +1081,22 @@ impl Instr<'_> {
         else_stmt: Option<Box<Statement>>,
         span: Span,
         first: bool,
+        fates: &[Fate],
         arms: &mut Vec<Arm>,
     ) -> Statement {
+        let dead = fates.get(arms.len()) == Some(&Fate::Dead);
         let c = self.counter();
         arms.push(Arm {
             span: then_stmt.span,
             label: if first { "if" } else { "else if" },
             counter: Some(c),
+            excluded: dead,
         });
-        let then_stmt = Box::new(self.arm(*then_stmt, c));
+        let then_stmt = Box::new(self.arm(*then_stmt, c, dead));
         let else_stmt = else_stmt.map(|e| {
             let e = *e;
             let espan = e.span;
+            let fate = fates.get(arms.len()).copied().unwrap_or(Fate::Live);
             Box::new(match e.kind {
                 StatementKind::If {
                     unique_priority: up,
@@ -590,8 +1104,8 @@ impl Instr<'_> {
                     then_stmt: t,
                     else_stmt: el,
                 } => {
-                    self.expr(&mut cond);
-                    self.if_arms(up, cond, t, el, espan, false, arms)
+                    self.under(fate != Fate::Live, |me| me.expr(&mut cond));
+                    self.if_arms(up, cond, t, el, espan, false, fates, arms)
                 }
                 kind => {
                     let c = self.counter();
@@ -599,8 +1113,9 @@ impl Instr<'_> {
                         span: espan,
                         label: "else",
                         counter: Some(c),
+                        excluded: fate == Fate::Dead,
                     });
-                    self.arm(Statement::new(kind, espan), c)
+                    self.arm(Statement::new(kind, espan), c, fate == Fate::Dead)
                 }
             })
         });
@@ -616,7 +1131,9 @@ impl Instr<'_> {
     }
 
     /// A `case`: one arm per item, plus an implicit `default` when there is
-    /// none (except for `unique` / `priority` cases).
+    /// none (except for `unique` / `priority` cases). A constant selector
+    /// with constant items is no decision: the branch and the items it
+    /// cannot select are excluded (see `case_fates`).
     fn case_stmt(
         &mut self,
         unique_priority: Option<UniquePriority>,
@@ -626,10 +1143,12 @@ impl Instr<'_> {
         span: Span,
         out: &mut Vec<Statement>,
     ) {
+        let fates = self.case_fates(kind, &expr, &items);
+        let dead = |i: usize| fates.as_ref().is_some_and(|f| f[i] == Fate::Dead);
         if self.kinds & KIND_BRANCH == 0 {
-            for it in items.iter_mut() {
+            for (i, it) in items.iter_mut().enumerate() {
                 let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
-                it.stmt = self.wrap(st);
+                it.stmt = self.under(dead(i), |me| me.wrap(st));
             }
         } else {
             let implicit = !items.iter().any(|it| it.is_default) && unique_priority.is_none();
@@ -646,23 +1165,26 @@ impl Instr<'_> {
                 },
                 entry,
                 arms: Vec::new(),
+                excluded: self.dead || fates.is_some(),
             });
             let mut arms = Vec::new();
-            for it in items.iter_mut() {
+            for (i, it) in items.iter_mut().enumerate() {
                 let c = self.counter();
                 arms.push(Arm {
                     span: it.span,
                     label: if it.is_default { "default" } else { "item" },
                     counter: Some(c),
+                    excluded: dead(i),
                 });
                 let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
-                it.stmt = self.arm(st, c);
+                it.stmt = self.arm(st, c, dead(i));
             }
             if implicit {
                 arms.push(Arm {
                     span,
                     label: "default (implicit)",
                     counter: None,
+                    excluded: dead(items.len()),
                 });
             }
             self.cov.branches[site].arms = arms;
@@ -682,21 +1204,32 @@ impl Instr<'_> {
     }
 
     /// Wrap the condition of every `?:` in `e` (see `COND_FN`). Stops at
-    /// system calls, whose arguments some tasks read by shape.
+    /// system calls, whose arguments some tasks read by shape. A `?:` whose
+    /// condition is a constant is excluded with the operand it never
+    /// yields, and so is everything under an `&&`, `||`, `&` or `|` that a
+    /// constant operand decides.
     fn expr(&mut self, e: &mut Expression) {
         if self.kinds & KIND_BRANCH == 0 {
             return;
         }
         let espan = e.span;
+        let decided = matches!(
+            &e.kind,
+            ExprKind::Binary {
+                op: BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::BitAnd | BinaryOp::BitOr,
+                ..
+            }
+        ) && self.truth(e).is_some();
         match &mut e.kind {
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                self.expr(condition);
-                self.expr(then_expr);
-                self.expr(else_expr);
+                let known = self.truth(condition);
+                self.under(known.is_some(), |me| me.expr(condition));
+                self.under(known == Some(false), |me| me.expr(then_expr));
+                self.under(known == Some(true), |me| me.expr(else_expr));
                 let t = self.counter();
                 let f = self.counter();
                 self.cov.branches.push(BranchSite {
@@ -709,13 +1242,16 @@ impl Instr<'_> {
                             span: then_expr.span,
                             label: "true",
                             counter: Some(t),
+                            excluded: known == Some(false),
                         },
                         Arm {
                             span: else_expr.span,
                             label: "false",
                             counter: Some(f),
+                            excluded: known == Some(true),
                         },
                     ],
+                    excluded: self.dead || known.is_some(),
                 });
                 let cspan = condition.span;
                 let cond =
@@ -729,10 +1265,10 @@ impl Instr<'_> {
                 );
             }
             ExprKind::Unary { operand, .. } => self.expr(operand),
-            ExprKind::Binary { left, right, .. } => {
-                self.expr(left);
-                self.expr(right);
-            }
+            ExprKind::Binary { left, right, .. } => self.under(decided, |me| {
+                me.expr(left);
+                me.expr(right);
+            }),
             ExprKind::Paren(inner) => self.expr(inner),
             ExprKind::Concatenation(parts) => {
                 for p in parts.iter_mut() {
@@ -813,6 +1349,7 @@ struct StmtRow {
     start: usize,
     kind: &'static str,
     count: u64,
+    excluded: bool,
 }
 
 #[derive(Clone)]
@@ -820,6 +1357,7 @@ struct ArmRow {
     line: u32,
     label: &'static str,
     count: u64,
+    excluded: bool,
 }
 
 #[derive(Clone)]
@@ -829,6 +1367,32 @@ struct BranchRow {
     start: usize,
     kind: &'static str,
     arms: Vec<ArmRow>,
+    excluded: bool,
+}
+
+/// Add the count of another copy of a row (another instance of the design
+/// unit, or a copy elaboration made) to a row's. The row stays excluded
+/// only when both are, and an included row does not take in an excluded
+/// copy's count: the taken arm of a constant decision runs, but it is no
+/// arm where the decision is not constant.
+fn add_count(count: &mut u64, excluded: &mut bool, other: u64, other_excluded: bool) {
+    match (*excluded, other_excluded) {
+        (true, false) => {
+            *count = other;
+            *excluded = false;
+        }
+        (false, true) => {}
+        _ => *count += other,
+    }
+}
+
+/// The JSON member marking an excluded row.
+fn excluded_json(excluded: bool) -> String {
+    if excluded {
+        format!(", \"excluded\": \"{}\"", EXCLUDED)
+    } else {
+        String::new()
+    }
 }
 
 #[derive(Clone)]
@@ -845,27 +1409,39 @@ struct Report {
     toggles: Vec<ToggleRow>,
 }
 
+/// Covered and total items; `excluded` counts the ones left out of both.
 #[derive(Clone, Copy, Default)]
 struct Tally {
     covered: u64,
     total: u64,
+    excluded: u64,
 }
 
 impl Tally {
     fn add(&mut self, o: Tally) {
         self.covered += o.covered;
         self.total += o.total;
+        self.excluded += o.excluded;
     }
 
     fn json(&self) -> String {
+        let excluded = if self.excluded > 0 {
+            format!(", \"excluded\": {}", self.excluded)
+        } else {
+            String::new()
+        };
         if self.total == 0 {
-            "{\"covered\": 0, \"total\": 0, \"percent\": null}".to_string()
+            format!(
+                "{{\"covered\": 0, \"total\": 0, \"percent\": null{}}}",
+                excluded
+            )
         } else {
             format!(
-                "{{\"covered\": {}, \"total\": {}, \"percent\": {:.2}}}",
+                "{{\"covered\": {}, \"total\": {}, \"percent\": {:.2}{}}}",
                 self.covered,
                 self.total,
-                self.percent()
+                self.percent(),
+                excluded
             )
         }
     }
@@ -875,10 +1451,17 @@ impl Tally {
     }
 
     fn text(&self) -> String {
-        if self.total == 0 {
-            "0/0".to_string()
+        let mut notes = Vec::new();
+        if self.total > 0 {
+            notes.push(format!("{:.2}%", self.percent()));
+        }
+        if self.excluded > 0 {
+            notes.push(format!("{} excluded", self.excluded));
+        }
+        if notes.is_empty() {
+            format!("{}/{}", self.covered, self.total)
         } else {
-            format!("{}/{} ({:.2}%)", self.covered, self.total, self.percent())
+            format!("{}/{} ({})", self.covered, self.total, notes.join("; "))
         }
     }
 }
@@ -887,11 +1470,19 @@ impl Report {
     fn tallies(&self) -> Tallies {
         let mut t = Tallies::default();
         for s in &self.stmts {
+            if s.excluded {
+                t[0].excluded += 1;
+                continue;
+            }
             t[0].total += 1;
             t[0].covered += (s.count > 0) as u64;
         }
         for b in &self.branches {
             for a in &b.arms {
+                if b.excluded || a.excluded {
+                    t[1].excluded += 1;
+                    continue;
+                }
                 t[1].total += 1;
                 t[1].covered += (a.count > 0) as u64;
             }
@@ -914,7 +1505,7 @@ impl Report {
         for s in self.stmts.drain(..) {
             match merged.last_mut() {
                 Some(m) if m.file == s.file && m.start == s.start && m.kind == s.kind => {
-                    m.count += s.count
+                    add_count(&mut m.count, &mut m.excluded, s.count, s.excluded)
                 }
                 _ => merged.push(s),
             }
@@ -932,9 +1523,17 @@ impl Report {
                         && m.kind == b.kind
                         && m.arms.len() == b.arms.len() =>
                 {
+                    // Where both copies are excluded whole, an arm's own
+                    // marker says whether it can run at all; otherwise an
+                    // arm is out where its branch is.
+                    let whole = m.excluded && b.excluded;
                     for (x, y) in m.arms.iter_mut().zip(&b.arms) {
-                        x.count += y.count;
+                        let mut out = x.excluded || (m.excluded && !whole);
+                        let other = y.excluded || (b.excluded && !whole);
+                        add_count(&mut x.count, &mut out, y.count, other);
+                        x.excluded = out;
                     }
+                    m.excluded = whole;
                 }
                 _ => merged.push(b),
             }
@@ -985,12 +1584,13 @@ impl Report {
             out.push_str(&format!("{}\"statements\": [", indent));
             for (i, s) in self.stmts.iter().enumerate() {
                 out.push_str(&format!(
-                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\", \"count\": {}}}",
+                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\", \"count\": {}{}}}",
                     if i == 0 { "" } else { ", " },
                     json_escape(&s.file),
                     s.line,
                     s.kind,
-                    s.count
+                    s.count,
+                    excluded_json(s.excluded)
                 ));
             }
             out.push_str("],\n");
@@ -999,19 +1599,21 @@ impl Report {
             out.push_str(&format!("{}\"branches\": [", indent));
             for (i, b) in self.branches.iter().enumerate() {
                 out.push_str(&format!(
-                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\", \"arms\": [",
+                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\"{}, \"arms\": [",
                     if i == 0 { "" } else { ", " },
                     json_escape(&b.file),
                     b.line,
-                    b.kind
+                    b.kind,
+                    excluded_json(b.excluded)
                 ));
                 for (j, a) in b.arms.iter().enumerate() {
                     out.push_str(&format!(
-                        "{}{{\"line\": {}, \"arm\": \"{}\", \"count\": {}}}",
+                        "{}{{\"line\": {}, \"arm\": \"{}\", \"count\": {}{}}}",
                         if j == 0 { "" } else { ", " },
                         a.line,
                         a.label,
-                        a.count
+                        a.count,
+                        excluded_json(a.excluded)
                     ));
                 }
                 out.push_str("]}");
@@ -1065,6 +1667,7 @@ impl Simulator {
             .collect();
         let mut cov = CodeCov {
             kinds,
+            keep_constant: cfg.keep_constant,
             limit: cfg.scopes,
             scopes: Vec::new(),
             scope_index: HashMap::default(),
@@ -1088,12 +1691,7 @@ impl Simulator {
                     let span = ib.stmt.span;
                     let s =
                         std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
-                    ib.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .wrap(s);
+                    ib.stmt = Instr::new(&mut cov, kinds, sc, Some(self.cov_consts())).wrap(s);
                 }
             }
             self.module.program_initial_blocks = program;
@@ -1105,12 +1703,7 @@ impl Simulator {
                     let span = fb.stmt.span;
                     let s =
                         std::mem::replace(&mut fb.stmt, Statement::new(StatementKind::Null, span));
-                    fb.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .wrap(s);
+                    fb.stmt = Instr::new(&mut cov, kinds, sc, Some(self.cov_consts())).wrap(s);
                 }
             }
             self.module.final_blocks = fin;
@@ -1128,12 +1721,8 @@ impl Simulator {
                     let span = ab.stmt.span;
                     let s =
                         std::mem::replace(&mut ab.stmt, Statement::new(StatementKind::Null, span));
-                    ab.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .always(s, kind);
+                    ab.stmt =
+                        Instr::new(&mut cov, kinds, sc, Some(self.cov_consts())).always(s, kind);
                 }
             }
             self.module.always_blocks = always;
@@ -1162,12 +1751,9 @@ impl Simulator {
                 }
                 if let Some(sc) = self.cov_subroutine_scope(&mut cov, &inst_paths, key) {
                     let items = std::mem::take(&mut fd.items);
-                    fd.items = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .stmts(items);
+                    fd.items = self
+                        .cov_subroutine_instr(&mut cov, kinds, sc, key, &fd.ports)
+                        .stmts(items);
                 }
             }
             self.module.functions = xezim_core::elaborate::FuncTable::from_map(functions);
@@ -1178,12 +1764,9 @@ impl Simulator {
                 }
                 if let Some(sc) = self.cov_subroutine_scope(&mut cov, &inst_paths, key) {
                     let items = std::mem::take(&mut td.items);
-                    td.items = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .stmts(items);
+                    td.items = self
+                        .cov_subroutine_instr(&mut cov, kinds, sc, key, &td.ports)
+                        .stmts(items);
                 }
             }
             self.module.tasks = tasks;
@@ -1221,12 +1804,7 @@ impl Simulator {
             if let Some(sc) = Self::cov_instance_scope(&self.module, &mut cov, &paths, &ib.scope) {
                 let span = ib.stmt.span;
                 let s = std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
-                ib.stmt = Instr {
-                    cov: &mut cov,
-                    kinds,
-                    scope: sc,
-                }
-                .wrap(s);
+                ib.stmt = Instr::new(&mut cov, kinds, sc, Some(self.cov_consts())).wrap(s);
             }
             cov.inst_paths = paths;
             self.code_cov_hits.resize(cov.counters as usize, 0);
@@ -1240,11 +1818,12 @@ impl Simulator {
     /// by the pieces one assignment expands to), which is returned. Takes
     /// the fields it needs: the caller's iterator holds `module`.
     pub(super) fn cov_contassign(
-        module: &ElaboratedModule,
+        consts: Consts,
         code_cov: &mut Option<Box<CodeCov>>,
         hits: &mut Vec<u64>,
         ca: &mut crate::compiler::elaborate::ContinuousAssignment,
     ) -> Option<u32> {
+        let module = consts.module;
         let (span, scope) = ca.origin.clone()?;
         let cov = code_cov.as_mut()?;
         let kinds = cov.kinds;
@@ -1259,11 +1838,7 @@ impl Simulator {
         let sc = Self::cov_instance_scope(module, cov, &paths, &scope);
         cov.inst_paths = paths;
         let sc = sc?;
-        let mut ins = Instr {
-            cov,
-            kinds,
-            scope: sc,
-        };
+        let mut ins = Instr::new(cov, kinds, sc, Some(consts));
         ins.expr(&mut ca.rhs);
         let mut counter = None;
         if kinds & KIND_STATEMENT != 0 {
@@ -1277,6 +1852,7 @@ impl Simulator {
                         span,
                         kind: "assign",
                         counter: c,
+                        excluded: false,
                     });
                     ins.cov.ca_counter.insert(key, c);
                     c
@@ -1425,6 +2001,30 @@ impl Simulator {
         Self::cov_instance_scope(&self.module, cov, inst_paths, scope)
     }
 
+    /// The rewriter for subroutine `key`: an instance's sees its parameters,
+    /// and its arguments shadow them; a package's excludes nothing.
+    fn cov_subroutine_instr<'a>(
+        &'a self,
+        cov: &'a mut CodeCov,
+        kinds: u8,
+        scope: u32,
+        key: &str,
+        ports: &[crate::ast::decl::FunctionPort],
+    ) -> Instr<'a> {
+        let pkg = key.contains("::") || self.module.pkg_subr_owner.contains_key(key);
+        let mut ins = Instr::new(cov, kinds, scope, (!pkg).then(|| self.cov_consts()));
+        for p in ports {
+            ins.locals.insert(p.name.name.clone());
+            ins.locals.insert(format!("{}.{}", key, p.name.name));
+        }
+        ins
+    }
+
+    /// What decides constant conditions (see `Instr::value`).
+    pub(super) fn cov_consts(&self) -> Consts<'_> {
+        Consts::new(&self.module, &self.signal_name_to_id, &self.signal_widths)
+    }
+
     fn cov_instrument_classes(&mut self, cov: &mut CodeCov) {
         let kinds = cov.kinds;
         let mut classes = std::mem::take(&mut self.module.classes);
@@ -1474,12 +2074,7 @@ impl Simulator {
                     crate::ast::decl::ClassMethodKind::PureVirtual(_) => continue,
                 };
                 let body = std::mem::take(items);
-                *items = Instr {
-                    cov: &mut *cov,
-                    kinds,
-                    scope: sc,
-                }
-                .stmts(body);
+                *items = Instr::new(&mut *cov, kinds, sc, None).stmts(body);
             }
             done.insert(ptr, arc.clone());
             classes.insert(key, arc);
@@ -1750,6 +2345,7 @@ impl Simulator {
                 start: s.span.start,
                 kind: s.kind,
                 count: count(s.counter),
+                excluded: s.excluded,
             });
         }
         for b in &cov.branches {
@@ -1766,6 +2362,7 @@ impl Simulator {
                         Some(c) => count(c),
                         None => b.entry.map(count).unwrap_or(0).saturating_sub(taken),
                     },
+                    excluded: a.excluded,
                 })
                 .collect();
             reports[b.scope as usize].branches.push(BranchRow {
@@ -1774,6 +2371,7 @@ impl Simulator {
                 start: b.span.start,
                 kind: b.kind,
                 arms,
+                excluded: b.excluded,
             });
         }
         if let Some(t) = &cov.toggle {

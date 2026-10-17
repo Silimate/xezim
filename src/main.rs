@@ -233,6 +233,10 @@ fn print_usage() {
     eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
     eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
     eprintln!("                   subtrees (tb.dut) and packages. Repeatable.");
+    eprintln!("  --code-coverage-constant=<exclude|keep>  Statements and branch arms a");
+    eprintln!("                   constant condition (a parameter's value) rules out are left");
+    eprintln!("                   out of the totals (exclude, the default) or counted (keep).");
+    eprintln!("                   XEZIM_CODE_COVERAGE_CONSTANT=<exclude|keep> too.");
     eprintln!("  --verbose        Internal engine lines, off by default: the version banner,");
     eprintln!("                   [PHASE] timings, end-of-run engine counters ([PROF]/[FUSE]/");
     eprintln!("                   [EVENT-EDGE]/[COV]), compile-time optimisation notes and");
@@ -1870,9 +1874,11 @@ fn run_main() -> i32 {
     let mut xtrace_profile: Option<String> = None;
     let mut xtrace_compress: Option<String> = None;
     let mut wave = false;
-    // `--code-coverage[=<kinds>]` / `--code-coverage-scope`.
+    // `--code-coverage[=<kinds>]` / `--code-coverage-scope` /
+    // `--code-coverage-constant`.
     let mut code_cov_kinds: Option<u8> = None;
     let mut code_cov_scopes: Vec<String> = Vec::new();
+    let mut code_cov_keep: Option<bool> = None;
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
@@ -2482,6 +2488,24 @@ fn run_main() -> i32 {
                         .map(String::from),
                 );
             }
+            _ if arg == "--code-coverage-constant"
+                || arg.starts_with("--code-coverage-constant=") =>
+            {
+                let mode = match arg.strip_prefix("--code-coverage-constant=") {
+                    Some(m) => m.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i).cloned().unwrap_or_default()
+                    }
+                };
+                match xezim::compiler::simulator::parse_code_coverage_constant_mode(&mode) {
+                    Ok(k) => code_cov_keep = Some(k),
+                    Err(e) => {
+                        eprintln!("Error: --code-coverage-constant: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "--fst" => {
                 i += 1;
                 if i < args.len() {
@@ -2853,11 +2877,28 @@ fn run_main() -> i32 {
         .or(env_cov)
         .or(cover_request.map(|(k, _)| k))
         .unwrap_or(0);
+    // `--code-coverage-constant` wins over XEZIM_CODE_COVERAGE_CONSTANT.
+    let keep_constant = match code_cov_keep {
+        Some(k) => k,
+        None => match env::var("XEZIM_CODE_COVERAGE_CONSTANT") {
+            Ok(v) if !v.is_empty() => {
+                match xezim::compiler::simulator::parse_code_coverage_constant_mode(&v) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("Error: XEZIM_CODE_COVERAGE_CONSTANT: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => false,
+        },
+    };
     if code_cov != 0 {
         xezim::compiler::simulator::set_code_coverage(Some(
             xezim::compiler::simulator::CodeCoverage {
                 kinds: code_cov,
                 scopes: code_cov_scopes,
+                keep_constant,
             },
         ));
     } else if !code_cov_scopes.is_empty() {

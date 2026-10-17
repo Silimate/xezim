@@ -26,7 +26,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--dump-timescales` | Print every module's resolved timescale before the run (no source `$printtimescale` needed); modules with no `` `timescale `` are flagged |
 | `--max-time <N>[ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time (default `100ms`) — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
-| `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
+| `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects). `+seed=random` draws a seed and prints it. Like any plusarg, the design and VPI clients see it; cocotb takes it as its own seed. `-sv_seed` seeds without adding a plusarg |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate SDF delays (IOPATH/INTERCONNECT) and TIMINGCHECK limits |
 | `--upf <file>`, `--upf-top <instance>` | Apply IEEE 1801 power intent. See the [UPF guide](upf-guide.md) |
 | `--sim-debug` | Print `[DEBUG]` / `[OPT]` diagnostics (`--sim_debug` still accepted); implies `--verbose`'s engine lines |
@@ -56,6 +56,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
 | `--code-coverage[=<kinds>]` | Collect code coverage: `stmt`, `branch`, `cond`, `expr`, `toggle` (comma-separated) or `all` (the default). Results go to `xezim_cov.json` next to the functional coverage; `--verbose` adds a per-instance summary. See the [coverage guide](coverage-guide.md#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees (`tb.dut`) and packages (repeatable) |
+| `--no-toggle-input-ports` | Leave input and inout ports out of toggle coverage: the signal that drives one carries its toggles. By default each instance counts its own ports, as commercial simulators do (`--toggle-input-ports`). See the [coverage guide](coverage-guide.md#toggles) |
 | `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters) together with the `--verbose` engine lines. Same as `XEZIM_PROFILE_REPORT=1`. Adds overhead |
 | `--show-env-avail` | List every `XEZIM_*` environment variable with a one-line description, then exit |
 
@@ -94,6 +95,7 @@ unless noted.
 | `XEZIM_VERBOSE=1` | Same as `--verbose` (for scripts that grep `[PHASE]`/`[PROF]` lines without adding a flag) |
 | `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |
 | `XEZIM_COV_DB=<path>` | Write the coverage results somewhere other than `xezim_cov.json` |
+| `XEZIM_TOGGLE_INPUT_PORTS=0` | Same as `--no-toggle-input-ports`; the flag wins |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
 | `XEZIM_UVM_DIR=<dir>` | The UVM library `-uvm` adds: a `src` directory, a release root holding `src/`, or a checkout holding several releases (`1.1d`, `1.2`, `1800.2-2017`, `1800.2-2020`) |
@@ -123,7 +125,7 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `-do "<cmds>"`, `-do <file>` | A subset of the command language: `run -all` (until `$finish` or no events remain), `run <n><unit>` (`fs`…`sec`; several `run`s add up; the run ends at that time, which `final` blocks and the closing line report), `quit`/`exit` (`-f`, `-force`), `do <file>`, separated by `;` or newlines, `#` comments. `log`, `add wave`, `coverage save` and `coverage report` are accepted with one warning each and do nothing. Any other command is an error. A script that quits before any `run` only elaborates. `--max-time` stays a hard cap |
 | `-gNAME=VAL` | Sets the default of parameter `NAME` in every module, interface or program that declares it overridable (a `string` parameter takes an unquoted value as text); a value given at an instantiation or by `defparam` still wins. Parameters in generate blocks, and body `parameter`s of a module that has a parameter port list, are local and not reached. `-g/<top>/NAME=VAL` limits it to module `<top>`; deeper paths are ignored with a warning. A name no module declares is warned about and ignored |
 | `-GNAME=VAL` | Like `-g`, and it also replaces values given at instantiations and by `defparam` |
-| `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |
+| `-sv_seed <n>`, `-sv_seed random` (also `-svseed`, `-seed`, and `-svseed=`/`-seed=`) | Seeds the RNG as `+seed=<n>` / `+seed=random` does, and wins over a `+seed=` also given. It is an option, not a plusarg: `$test$plusargs`, `$value$plusargs` and the argv VPI clients get from `vpi_get_vlog_info` don't see it, so a cocotb test doesn't take it as its own seed |
 | `-sv_lib <name>`, `-sv_root <dir>` | Load `<dir>/<name>.so` as a DPI library (`--dpi-lib`) |
 | `-timescale <u>/<p>` | Default timescale for design elements without one (`--module-timescale`) |
 | `-override_timescale <u>/<p>` (also `--override-timescale`, `=` form) | One timescale for every design element, package and compilation unit: every `` `timescale `` directive, `timeunit`/`timeprecision` declaration and `--module-timescale` is ignored. Bare delays count in `<u>`; literals with a unit (`#3ns`) keep their absolute value |

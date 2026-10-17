@@ -16,6 +16,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* After `$finish` or a VPI `vpi_control(vpiFinish)`, which is how cocotb ends
+  a test, no always block runs again in the finishing time slot. Compiled
+  block code used to keep running, updating counters and NBAs while skipping
+  the block's `$display`. A finish raised before the edge's waiting processes
+  resumed, by an always block, an earlier process or a VPI routine, was also
+  deferred to the end of the slot like one of theirs, so later passes ran
+  more blocks. `final` blocks and coverage then counted a clock edge the log
+  never showed. Only a finish from a resumed waiting process is still
+  deferred to the end of the slot. A finish from a cbAfterDelay callback,
+  or from a value-change callback on a clock that callback drives, also stops
+  that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -27,6 +38,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   different width. Unsupported variable-length strings are omitted with a
   warning naming them, preserving the rest of the waveform (§6.16, §10.8).
   (#339, reported by Lramseyer)
+* `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
+  adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
+  `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so
+  a cocotb test run with `-sv_seed random` starts instead of failing to parse
+  `+seed=random` as its seed. If both are given, `-sv_seed` wins over
+  `+seed=`. A `+seed=` you write is still a plusarg, and still seeds the RNG
+  (§21.6, §38.17). (Silimate/xezim#2)
 
 * Integer `inside` constraints evaluate size-cast bounds in the joint
   comparison context and sample uniformly over distinct legal values,
@@ -37,6 +55,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   key types and independent rows through allocation, copying and resizing
   (§7.5, §7.8). Recompile saved designs to refresh their class metadata.
   (#337, reported by Dragon-Git)
+
+* Toggle coverage counts each instance's input and inout ports in that
+  instance, as commercial simulators do, with the value the connection gives
+  the port: a port connected to a whole net shows that net's counts, one
+  connected to an expression or select toggles as its value, and a constant
+  or unconnected port never toggles (§23.3.3). The ports of a module that is
+  the top of the design, driven through VPI, are now covered too. Instance
+  toggle scores and design totals change accordingly;
+  `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
+  previous counting, where only the driving signal counts.
 
 **Usability**
 
@@ -71,6 +99,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   paths, preserving comparison results, branch targets and X/Z fallback.
 * Event-reference checks borrow ordinary names and alias targets, reducing
   temporary string allocation during procedural assignments.
+
+**cocotb**
+
+* The cocotb runner (`contrib/cocotb/xezim_runner.py`) applies the options
+  cocotb's other runners do. `parameters` were ignored and now become
+  `-gNAME=VALUE`; a value is any constant expression, such as `{3'd7,3'd5}`.
+  `build_args` and a `timescale` given to `build()` were dropped and now
+  apply at run time. `elab_args` are passed too, and a `string` define becomes
+  a string literal, as with the other runners. The toplevel comes from
+  `test()`, and VHDL sources are an error. `build()` records its arguments,
+  parameters included, in `xezim_build.json` instead of `xezim_sources.f`, so
+  `test()` on another runner uses them too. The runner's tests are in
+  `contrib/cocotb/tests`.
 
 **Maintenance**
 

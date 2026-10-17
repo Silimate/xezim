@@ -13,6 +13,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
+* Toggle coverage no longer lists the names of the top module's instance
+  arrays, instances in generate blocks and generate blocks as 1-bit signals.
+  They are scopes, not signals, so their bins could never be covered and the
+  top instance's toggle score and the design's total read low (§23.6). (#34)
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).

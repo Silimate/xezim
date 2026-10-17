@@ -458,7 +458,12 @@ Each library's `vlog_startup_routines` entries run before simulation.
   `vpi_handle_by_index`, `vpi_get`, `vpi_get_str`,
   `vpi_get_value`/`vpi_put_value`.
 - `vpi_control`: `vpiStop`/`vpiFinish` end the run once the calling routine
-  returns; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
+  returns, as `$finish` does: no always block or waiting process that the
+  routine's writes woke runs afterwards, so `final` blocks see the values from
+  before them. When the routine is a cbAfterDelay, cbNextSimTime or
+  cbAtStartOfSimTime callback, or a value change it caused (the way cocotb
+  ends a test), that time slot's NBAs, assertions and monitors do not run
+  either; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
   refused (xezim cannot rewind a run).
 - `vpi_chk_error`, `vpi_printf`, `vpi_flush`, `vpi_compare_objects`,
   `vpi_get64`.

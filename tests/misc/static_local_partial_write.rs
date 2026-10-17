@@ -16,6 +16,11 @@
 //! select write (§10.4.2) was dropped too, as it committed with no call
 //! frame.
 //!
+//! Two neighbours of the fix are pinned as well: a block variable that hides
+//! a static of the same name keeps its reads and writes to itself, and an
+//! index that writes the same static is evaluated before the select is
+//! applied (§11.4.1).
+//!
 //! The design checks itself. Every expected value follows the LRM and
 //! matches the reference simulator. It runs with the default method tiering,
 //! with every method and function compiled on its first call, and with none
@@ -175,6 +180,40 @@ const SRC: &str = r##"module top;
     end
   endtask
 
+  // A block variable hides the subroutine's static of the same name, so
+  // its writes stay out of the static (§6.21).
+  logic [7:0] r_inner, r_outer, r_loop_inner, r_loop_outer;
+  task automatic hide;
+    static reg [7:0] a = 8'hF0;
+    begin
+      automatic reg [7:0] a = 8'h00;
+      a[0] = 1'b1;
+      r_inner = a;
+    end
+    r_outer = a;
+  endtask
+  task automatic hide_loop;
+    static reg [7:0] b = 8'hF0;
+    for (int k = 0; k < 2; k++) begin
+      automatic reg [7:0] b = 8'h00;
+      b[k] = 1'b1;
+      r_loop_inner = b;
+    end
+    r_loop_outer = b;
+  endtask
+
+  // An index whose evaluation writes the same static is evaluated before
+  // the select is applied (§11.4.1).
+  function automatic logic [7:0] rec(input int n);
+    static reg [7:0] a = 8'h00;
+    if (n == 1) begin
+      a = 8'hF0;
+      return 0;
+    end
+    a[rec(1)] = 1'b1;
+    return a;
+  endfunction
+
   // Static locals of class methods.
   class C;
     function logic [7:0] m(input logic [3:0] x);
@@ -229,6 +268,11 @@ const SRC: &str = r##"module top;
     after_nba;
     check("select write after a nonblocking write", r_after, 8'h54);
     check("select write from a fork child", r_fork, 8'h27);
+    hide;
+    check("block variable hiding a static", {r_inner, r_outer}, 16'h01F0);
+    hide_loop;
+    check("loop block variable hiding a static", {r_loop_inner, r_loop_outer}, 16'h02F0);
+    check("index that writes the same static", rec(0), 8'hF1);
     o = new;
     check("class method static local", o.m(4'h5), 8'h45);
     check("static class method static local", C::sm(4'h5), 8'h35);

@@ -12,25 +12,27 @@ Usage::
     from cocotb_tools.runner import get_runner
 
     runner = get_runner("xezim")
-    runner.build(verilog_sources=["dut.sv"], hdl_toplevel="dut")
+    runner.build(sources=["dut.sv"], hdl_toplevel="dut", parameters={"W": 8})
     runner.test(hdl_toplevel="dut", test_module="test_dut")
 
 or, without touching the harness, set ``SIM=xezim`` and preload this module
 via ``PYTHONSTARTUP``/``sitecustomize``/``python -m``.
 
 xezim has no separate elaboration step — it reads sources at run time — so
-``build()`` only records the file list and ``test()`` runs the simulator once.
+``build()`` records what a compiling simulator would compile and ``test()``
+runs the simulator once on that record. The tests are in ``tests/``.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
 from typing import List, Mapping, Sequence, Union
 
 import cocotb_tools.config
-from cocotb_tools.runner import Runner, Verilog
+from cocotb_tools.runner import VHDL, Runner, Verilog, _as_sv_literal
 
 PathLike = Union[str, os.PathLike]
 _Command = List[str]
@@ -49,11 +51,27 @@ class Xezim(Runner):
 
     .. admonition:: Simulator-specific usage
 
-       * There is no separate compile step; ``build()`` writes a file list and
-         ``test()`` runs the simulator on it.
-       * ``parameters`` is not supported — xezim has no parameter-override
-         switch, so passing any raises rather than silently elaborating with
-         the defaults.
+       * There is no compile step. ``build()`` records the sources, include
+         directories, defines, ``parameters``, ``build_args`` and
+         ``timescale`` in ``xezim_build.json`` in the build directory, and
+         ``test()`` runs xezim with them, also from another runner. So
+         ``build_args`` apply at run time, and ``always`` has no effect.
+         ``hdl_library`` and ``hdl_toplevel_library`` are ignored: xezim keeps
+         no libraries.
+       * ``parameters`` become ``-gNAME=VALUE``, which sets the default of
+         parameter ``NAME`` in every module that declares it overridable, as
+         other simulators' ``-g`` does; a value given at an instantiation
+         still wins. A value is a constant expression, such as ``8``,
+         ``8'hff`` or ``{3'd7,3'd5}``; a ``string`` parameter also takes plain
+         text. Parameters given to ``test()`` replace those given to
+         ``build()``.
+       * A ``timescale`` given to ``test()`` replaces the one given to
+         ``build()``. It applies to modules without a timescale of their own.
+       * A define whose value is ``None`` is defined with no value.
+       * ``waves`` writes ``<hdl_toplevel>.fst`` to the build directory. xezim
+         has no GUI; ``gui`` also writes it, and under pytest cocotb then
+         opens it in a waveform viewer.
+       * Only Verilog and SystemVerilog are supported.
        * ``pre_cmd`` is not supported.
     """
 
@@ -70,31 +88,32 @@ class Xezim(Runner):
 
     # -- option translation ------------------------------------------------
 
+    # `-I` and `-D` rather than `+incdir+` and `+define+`, which split at `+`.
+
     def _get_include_options(self, includes: Sequence[PathLike]) -> _Command:
-        return [f"+incdir+{include}" for include in includes]
+        return [arg for inc in includes for arg in ("-I", str(inc))]
 
     def _get_define_options(self, defines: Mapping[str, object]) -> _Command:
-        opts: _Command = []
-        for name, value in defines.items():
-            opts += ["-D", f"{name}={value}"]
-        return opts
+        # Values as cocotb's other runners give them, through the same helper:
+        # a number as written, a string as a string literal.
+        return [
+            arg
+            for name, value in defines.items()
+            for arg in (
+                "-D",
+                name if value is None else f"{name}={_as_sv_literal(value)}",
+            )
+        ]
 
     def _get_parameter_options(self, parameters: Mapping[str, object]) -> _Command:
-        if parameters:
-            raise NotImplementedError(
-                "xezim has no parameter-override switch, so "
-                f"{sorted(parameters)} cannot be applied. Failing here rather "
-                "than elaborating with the declared defaults, which would run "
-                "a different design than the test asked for."
-            )
-        return []
+        return [f"-g{name}={value}" for name, value in parameters.items()]
 
     # -- artefacts ---------------------------------------------------------
 
     @property
-    def sources_file(self) -> Path:
-        """File list written by :meth:`build`, consumed by :meth:`test`."""
-        return self.build_dir / "xezim_sources.f"
+    def build_file(self) -> Path:
+        """Arguments recorded by :meth:`build`, used by :meth:`test`."""
+        return self.build_dir / "xezim_build.json"
 
     @property
     def _vpi_lib(self) -> Path:
@@ -102,11 +121,17 @@ class Xezim(Runner):
             "vpi", _VPI_LIB_FLAVOUR
         )
 
+    def _waves_file(self) -> str:
+        return str(self.build_dir / f"{self.sim_hdl_toplevel}.fst")
+
+    def _use_external_viewer(self) -> bool:
+        return True
+
     # -- build -------------------------------------------------------------
 
     def _build_command(self) -> List[_Command]:
         # Entries are `_ValueAndTag`: `.value` is the path, `.tag` the language.
-        sources = list(self._sources) + list(self._verilog_sources)
+        sources = self._sources + self._vhdl_sources + self._verilog_sources
         if not sources:
             raise ValueError("xezim needs at least one Verilog/SystemVerilog source")
         for source in sources:
@@ -115,30 +140,50 @@ class Xezim(Runner):
                     f"xezim only supports Verilog/SystemVerilog. "
                     f"{str(source.value)!r} cannot be compiled."
                 )
+        for arg in self._build_args:
+            if arg.tag is VHDL:
+                raise ValueError(
+                    f"xezim only supports Verilog/SystemVerilog. "
+                    f"build_args {arg.value!r} cannot be applied."
+                )
 
-        lines: List[str] = []
-        lines += [f"+incdir+{inc}" for inc in self.includes]
-        for name, value in self.defines.items():
-            lines.append(f"+define+{name}={value}")
-        lines += [str(Path(source.value).resolve()) for source in sources]
+        # Kept for the command line rather than written as an args file, which
+        # splits at whitespace, drops quotes, expands `$VAR` and knows fewer
+        # options.
+        args = self._get_include_options(self.includes)
+        args += self._get_define_options(self.defines)
+        if self.timescale is not None:
+            args += ["--module-timescale", "{}/{}".format(*self.timescale)]
+        args += [str(arg.value) for arg in self._build_args]
+        args += [str(source.value) for source in sources]
 
+        record = {
+            "args": args,
+            "parameters": self._get_parameter_options(self.parameters),
+        }
         self.build_dir.mkdir(parents=True, exist_ok=True)
-        self.sources_file.write_text("\n".join(lines) + "\n")
+        self.build_file.write_text(json.dumps(record, indent=1) + "\n")
 
         # Nothing to execute: xezim elaborates at run time, so the "build" is
-        # the file list above. Returning no commands keeps `build()` a no-op
+        # the record above. Returning no commands keeps `build()` a no-op
         # rather than inventing a compile that would only be thrown away.
         return []
 
     # -- test --------------------------------------------------------------
 
+    def test(self, *args, parameters=None, **kwargs) -> Path:
+        # cocotb's Runner keeps build()'s parameters on the runner object, so
+        # a runner that did not run the build has none; the record has them.
+        self._replace_parameters = parameters is not None
+        return super().test(*args, parameters=parameters, **kwargs)
+
     def _test_command(self) -> List[_Command]:
         if self.pre_cmd is not None:
             raise RuntimeError("pre_cmd is not implemented for xezim.")
 
-        if not self.sources_file.is_file():
+        if not self.build_file.is_file():
             raise FileNotFoundError(
-                f"{self.sources_file} is missing — call build() before test()."
+                f"{self.build_file} is missing — call build() before test()."
             )
 
         # libcocotbvpi_*.so links against libcocotb.so beside it.
@@ -146,24 +191,23 @@ class Xezim(Runner):
         ld = self.env.get("LD_LIBRARY_PATH", os.environ.get("LD_LIBRARY_PATH", ""))
         self.env["LD_LIBRARY_PATH"] = f"{libs_dir}:{ld}" if ld else libs_dir
 
-        cmd: _Command = [
-            XEZIM_BIN,
-            "--sv2017",
-            "--vpi-lib",
-            str(self._vpi_lib),
-            "-f",
-            str(self.sources_file),
-        ]
-        if self.hdl_toplevel is not None:
-            cmd += ["-s", self.sim_hdl_toplevel]
+        record = json.loads(self.build_file.read_text())
+        cmd: _Command = [XEZIM_BIN, "--sv2017", "--vpi-lib", str(self._vpi_lib)]
+        cmd += record["args"]
+        cmd += ["-s", self.sim_hdl_toplevel]
+        # The last --module-timescale wins, so this replaces build()'s.
         if self.timescale is not None:
             cmd += ["--module-timescale", "{}/{}".format(*self.timescale)]
         if self.waves or self.gui:
-            cmd += ["--fst", str(self.build_dir / f"{self.sim_hdl_toplevel}.fst")]
-        cmd += [
-            arg.value if hasattr(arg, "value") else arg for arg in self.test_args
-        ]
-        cmd += list(self.plusargs)
+            cmd += ["--fst", self._waves_file()]
+        cmd += self.elab_args
+        cmd += self.test_args
+        # Parameters given to test() replace build()'s.
+        if self._replace_parameters:
+            cmd += self._get_parameter_options(self.parameters)
+        else:
+            cmd += record["parameters"]
+        cmd += self.plusargs
         return [cmd]
 
 

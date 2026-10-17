@@ -21,6 +21,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `for (int i = 2; i >= 0; i--)` never ended and `i > -1` stopped after one
   pass. An unsigned header variable no longer takes its initializer's
   signedness (§6.11.1, §11.8.1, §12.7.1). (#341, reported by urbanij)
+* After `$finish` or a VPI `vpi_control(vpiFinish)`, which is how cocotb ends
+  a test, no always block runs again in the finishing time slot. Compiled
+  block code used to keep running, updating counters and NBAs while skipping
+  the block's `$display`. A finish raised before the edge's waiting processes
+  resumed, by an always block, an earlier process or a VPI routine, was also
+  deferred to the end of the slot like one of theirs, so later passes ran
+  more blocks. `final` blocks and coverage then counted a clock edge the log
+  never showed. Only a finish from a resumed waiting process is still
+  deferred to the end of the slot. A finish from a cbAfterDelay callback,
+  or from a value-change callback on a clock that callback drives, also stops
+  that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -32,6 +43,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   different width. Unsupported variable-length strings are omitted with a
   warning naming them, preserving the rest of the waveform (§6.16, §10.8).
   (#339, reported by Lramseyer)
+* `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
+  adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
+  `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so
+  a cocotb test run with `-sv_seed random` starts instead of failing to parse
+  `+seed=random` as its seed. If both are given, `-sv_seed` wins over
+  `+seed=`. A `+seed=` you write is still a plusarg, and still seeds the RNG
+  (§21.6, §38.17). (Silimate/xezim#2)
 
 * Integer `inside` constraints evaluate size-cast bounds in the joint
   comparison context and sample uniformly over distinct legal values,
@@ -60,6 +78,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   paths, preserving comparison results, branch targets and X/Z fallback.
 * Event-reference checks borrow ordinary names and alias targets, reducing
   temporary string allocation during procedural assignments.
+
+**cocotb**
+
+* The cocotb runner (`contrib/cocotb/xezim_runner.py`) applies the options
+  cocotb's other runners do. `parameters` were ignored and now become
+  `-gNAME=VALUE`; a value is any constant expression, such as `{3'd7,3'd5}`.
+  `build_args` and a `timescale` given to `build()` were dropped and now
+  apply at run time. `elab_args` are passed too, and a `string` define becomes
+  a string literal, as with the other runners. The toplevel comes from
+  `test()`, and VHDL sources are an error. `build()` records its arguments,
+  parameters included, in `xezim_build.json` instead of `xezim_sources.f`, so
+  `test()` on another runner uses them too. The runner's tests are in
+  `contrib/cocotb/tests`.
 
 **Maintenance**
 

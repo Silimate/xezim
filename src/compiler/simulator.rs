@@ -54490,17 +54490,7 @@ impl Simulator {
                                 name,
                                 init: e,
                             } => {
-                                let v = self.eval_expr(e);
-                                let w = super::elaborate::resolve_type_width(
-                                    data_type,
-                                    Some(&self.module.parameters),
-                                    Some(&self.module.typedefs),
-                                );
-                                self.widths.insert(name.name.clone(), w);
-                                let mut rv = v.resize(w);
-                                if super::elaborate::is_type_signed(data_type) {
-                                    rv.is_signed = true;
-                                }
+                                let rv = self.declare_for_init_var(data_type, &name.name, e);
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
                                 } else {
@@ -87552,29 +87542,7 @@ impl Simulator {
                             name,
                             init: e,
                         } => {
-                            let v = self.eval_expr(e);
-                            let w = super::elaborate::resolve_type_width(
-                                data_type,
-                                Some(&self.module.parameters),
-                                Some(&self.module.typedefs),
-                            );
-                            self.widths.insert(name.name.clone(), w);
-                            let mut rv = v.resize(w);
-                            // Preserve declared signedness: `resize` yields an
-                            // unsigned Value, so a `for (int i = ...; i >= 0;
-                            // --i)` loop var would read as unsigned and `i >= 0`
-                            // would be always-true -> infinite descending loop
-                            // in any count-down loop.
-                            if super::elaborate::is_type_signed(data_type) {
-                                rv.is_signed = true;
-                            }
-                            // Keep `signed_signals` authoritative for the
-                            // fitted frame-write stamp (§6.11.1).
-                            if super::elaborate::is_type_signed(data_type) {
-                                self.signed_signals.insert(name.name.clone());
-                            } else {
-                                self.signed_signals.remove(&name.name);
-                            }
+                            let rv = self.declare_for_init_var(data_type, &name.name, e);
                             // Declare the loop variable in the current call
                             // frame's local scope (highest read/write
                             // precedence) so its init, the step, and condition
@@ -87605,7 +87573,7 @@ impl Simulator {
                     .filter_map(|fi| match fi {
                         ForInit::VarDecl {
                             data_type, name, ..
-                        } if super::elaborate::is_type_signed(data_type) => Some(name.name.clone()),
+                        } if self.type_is_signed_concrete(data_type) => Some(name.name.clone()),
                         _ => None,
                     })
                     .collect();
@@ -115112,6 +115080,36 @@ impl Simulator {
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
         let types = self.take_pooled_types();
         self.push_local_frame_typed(f, types);
+    }
+
+    /// §12.7.1: a variable declared in a `for` header has the header's data
+    /// type. Returns its initial value, fitted to the declared width and
+    /// carrying the declared signedness rather than the initializer's
+    /// (§6.11.1), so `for (bit [3:0] i = 2; i > -1; i--)` compares unsigned
+    /// (§11.8.1). Registers the width and signedness by name, as a block
+    /// declaration does: the frame-write path fits every later write to the
+    /// variable, the step included, from them. Both the synchronous `for`
+    /// and the lowering for a body that blocks declare through here; the
+    /// lowering used to register no signedness, so after a delay `i--`
+    /// stored an unsigned value and `for (int i = 2; i >= 0; i--)` never
+    /// ended.
+    fn declare_for_init_var(&mut self, data_type: &DataType, name: &str, e: &Expression) -> Value {
+        let v = self.eval_expr(e);
+        let w = super::elaborate::resolve_type_width(
+            data_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        self.widths.insert(name.to_string(), w);
+        let signed = self.type_is_signed_concrete(data_type);
+        if signed {
+            self.signed_signals.insert(name.to_string());
+        } else {
+            self.signed_signals.remove(name);
+        }
+        let mut v = v.resize(w);
+        v.is_signed = signed;
+        v
     }
 
     /// The frame a loop pushes for its loop variables in a process that has

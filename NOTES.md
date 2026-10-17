@@ -16,6 +16,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* A variable declared in a `for` header keeps its declared signedness when
+  the loop body blocks. With a delay or event control in the body,
+  `for (int i = 2; i >= 0; i--)` never ended and `i > -1` stopped after one
+  pass. An unsigned header variable no longer takes its initializer's
+  signedness (§6.11.1, §11.8.1, §12.7.1). (#341, reported by urbanij)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

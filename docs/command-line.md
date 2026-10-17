@@ -24,7 +24,9 @@ how to use them together, see the [user guide](user-guide.md).
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines`. Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. Repeatable. See the [user guide](user-guide.md#module-timescale-extension) |
 | `--dump-timescales` | Print every module's resolved timescale before the run (no source `$printtimescale` needed); modules with no `` `timescale `` are flagged |
-| `--max-time <N>[ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time (default `100ms`) — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision |
+| `--max-time <N>[ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time (default `100ms`) — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision. `--max-time none` (or `0`) lifts the cap: the run goes until `$finish` or no events remain, like `-do "run -all"` (both stop at 9,000 s of simulated time, which leaves headroom in the tick count at a 1 fs precision) |
+| `--compat` | Do what commercial simulators do by default, for flows written for them: no time cap (as `--max-time none`; an explicit `--max-time` or a `-do` run time still sets the length), `--relax-implicit-static`, `--relax-driver-conflicts` and `--error-exit`. Works in `-f`/`-F` files too. Same as `XEZIM_COMPAT=1`. See [below](#command-lines-from-other-simulators) |
+| `-V`, `--version`, `-version` | Print the version and the git revision, then exit 0 |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate SDF delays (IOPATH/INTERCONNECT) and TIMINGCHECK limits |
@@ -90,6 +92,7 @@ unless noted.
 | `XEZIM_COMPILE_PHASES=1` | Report detailed simulator compilation phase timings |
 | `XEZIM_ALLOW_IMPLICIT_STATIC=1` | Same as `--relax-implicit-static` |
 | `XEZIM_RELAX_DRIVER_CONFLICTS=1` | Same as `--relax-driver-conflicts` |
+| `XEZIM_COMPAT=1` | Same as `--compat` |
 | `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
 | `XEZIM_VERBOSE=1` | Same as `--verbose` (for scripts that grep `[PHASE]`/`[PROF]` lines without adding a flag) |
 | `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |
@@ -117,13 +120,15 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | Spelling | Behaviour in xezim |
 |---|---|
 | `<top> …`, `work.<top>` | A bare design-unit name that is not an existing file names a top module, same as `-s <top>`. Several give several tops. `<lib>.<top>` works for `work` and libraries named by an earlier `-work`/`-L`/`-lib` |
+| `-top <top>` | Same as `-s <top>` |
 | `+define+A+B=1`, `+incdir+d1+d2` | Several macros / directories in one flag |
+| `-define <A>[=<val>]`, `-incdir <dir>` | Same as `-D`, `-I` |
 | `-f <file>`, `-file <file>` | Args file; relative file names resolve as given, else against the args file's directory |
 | `-F <file>` | Same as `-f`, except that `+incdir+` directories inside it resolve against the args file's directory first, so `+incdir+.` names the file's own directory |
 | `-do "<cmds>"`, `-do <file>` | A subset of the command language: `run -all` (until `$finish` or no events remain), `run <n><unit>` (`fs`…`sec`; several `run`s add up; the run ends at that time, which `final` blocks and the closing line report), `quit`/`exit` (`-f`, `-force`), `do <file>`, separated by `;` or newlines, `#` comments. `log`, `add wave`, `coverage save` and `coverage report` are accepted with one warning each and do nothing. Any other command is an error. A script that quits before any `run` only elaborates. `--max-time` stays a hard cap |
 | `-gNAME=VAL` | Sets the default of parameter `NAME` in every module, interface or program that declares it overridable (a `string` parameter takes an unquoted value as text); a value given at an instantiation or by `defparam` still wins. Parameters in generate blocks, and body `parameter`s of a module that has a parameter port list, are local and not reached. `-g/<top>/NAME=VAL` limits it to module `<top>`; deeper paths are ignored with a warning. A name no module declares is warned about and ignored |
 | `-GNAME=VAL` | Like `-g`, and it also replaces values given at instantiations and by `defparam` |
-| `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |
+| `-sv_seed <n>`, `-sv_seed random` (also `-svseed`, `-seed`) | Same as `+seed=<n>` / `+seed=random` |
 | `-sv_lib <name>`, `-sv_root <dir>` | Load `<dir>/<name>.so` as a DPI library (`--dpi-lib`) |
 | `-timescale <u>/<p>` | Default timescale for design elements without one (`--module-timescale`) |
 | `-override_timescale <u>/<p>` (also `--override-timescale`, `=` form) | One timescale for every design element, package and compilation unit: every `` `timescale `` directive, `timeunit`/`timeprecision` declaration and `--module-timescale` is ignored. Bare delays count in `<u>`; literals with a unit (`#3ns`) keep their absolute value |
@@ -134,12 +139,37 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `-sv12compat`, `-sv17compat` | Same as `--sv2017`. `-sv05compat`/`-sv09compat` do the same with a warning |
 | `-work`, `-L`, `-Lf`, `-lib <lib>` | Ignored, with one warning |
 | `+cover`, `+cover=<letters>`, `-coverage` | Code coverage (`--code-coverage`): `s`, `b` and `t` select statement, branch and toggle coverage; the bare forms select all three. Other letters (`c`, `e`, `f`, `x`) are ignored with one warning |
-| `-sv`, `-mfcu`, `-quiet`, `-64`, `-32`, `-batch`, `-nologo`, `+acc[=…]`, `-<step>args=…` (arguments for a separate optimization step), `-suppress <ids>`, `+fcover`, `-sva`, `-assertdebug` | Accepted, no effect: SystemVerilog is always on, all files share one compilation unit, every object stays visible, assertions and covergroups are always evaluated |
+| `-coverage <types>` | Code coverage of the types listed: `all` (or `A`), or `B` (block: statement and branch), `T` (toggle), `U` (functional: covergroups and assertions, always collected), `E` (expression) and `F` (FSM) joined by `:`, in either case. xezim has no expression or FSM coverage, so `E` and `F` are ignored with one warning. The value is taken only when it is such a list and not a file; a `+cover=<letters>` wins |
+| `-covworkdir <dir>`, `-covscope <name>`, `-covtest <name>` | The results file goes in `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`, `scope`, `test`), created if missing, instead of `./xezim_cov.json`. `XEZIM_COV_DB` still wins |
+| `-sv`, `-mfcu`, `-quiet`, `-64`, `-32`, `-batch`, `-nologo`, `+acc[=…]`, `-access <spec>`, `+access+<spec>`, `-<step>args=…` (arguments for a separate optimization step), `-suppress <ids>`, `-nowarn <id>`, `+fcover`, `-sva`, `-assertdebug` | Accepted, no effect: SystemVerilog is always on, all files share one compilation unit, every object stays visible, assertions and covergroups are always evaluated |
+| `-covoverwrite`, `-licqueue`, `-R`, `-errormax <n>`, `-xmlibdirname <dir>`, `-cds_implicit_tmpdir <dir>` | Accepted, no effect: xezim always replaces its results file, needs no license, keeps no snapshot, library or scratch directory (every run compiles its sources) and never stops a simulation on an error count |
 | `-sfcu`, `-t <res>`, `-wlf <file>` | Accepted with a warning: xezim always uses one compilation unit and the finest precision declared in the design, and does not write that waveform file (`--fst` / `--wave` dump waveforms) |
 
 Where a spelling means something else in xezim, xezim's meaning is kept:
 `-l` redirects rather than copies the transcript; `-c <file>` reads an args
 file. The glued forms `-s<top>`, `-l<file>` and `-f<file>` lose to the
-spellings above (`-sv`, `-sv_seed`, `-suppress`, `-lib`, `-logfile`,
-`-file`); use `-s <top>` / `-l <file>` / `-f <file>` with a space for such
-names.
+spellings above (`-sv`, `-sv_seed`, `-svseed`, `-seed`, `-suppress`,
+`-lib`, `-logfile`, `-licqueue`, `-file`); use `-s <top>` / `-l <file>` /
+`-f <file>` with a space for such names.
+
+### Commercial simulators' defaults: `--compat`
+
+The spellings above change how a command line is read, not how the design
+runs. A few of xezim's defaults are stricter than flows written for
+commercial simulators expect: those simulators run until `$finish`, accept
+the two checks below by default or let the flow suppress them, and such a
+flow fails a run that reported an error. `--compat` (or `XEZIM_COMPAT=1`)
+switches all four, so a wrapper that stands in for another simulator's
+command needs one flag:
+
+| xezim default | With `--compat` | Alone |
+|---|---|---|
+| The run stops at 100 ms of simulated time | No cap: the run goes until `$finish` or no events remain. An explicit `--max-time`, or a `-do` script's `run <time>`, still sets the length | `--max-time none` |
+| An initializer on an implicitly static variable of a static task or function is an error (§6.21) | A warning | `--relax-implicit-static` |
+| A variable written by an `always_comb`/`always_latch`/`always_ff` and another process is an error (§9.2.2), as is any other conflicting variable driver (§6.5) | A warning, for every kind of conflict, two continuous assigns to one variable included | `--relax-driver-conflicts` |
+| The exit status is 0 after `$error` | 1, so a flow that judges a run by its exit status sees the error (the run still carries on, §20.10) | `--error-exit` |
+
+```bash
+xezim --compat -coverage all -covtest test -covoverwrite -seed random \
+      -define WIDTH=8 -incdir rtl -top tb rtl/*.sv tb.sv -l run.log
+```

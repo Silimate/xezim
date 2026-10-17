@@ -194,7 +194,7 @@ fn print_usage() {
     eprintln!("  --compile        Parse + elaborate, report diagnostics (no simulation)");
     eprintln!("  --simulate       Parse + elaborate + simulate (default)");
     eprintln!("Options:");
-    eprintln!("  -V               Print version and exit");
+    eprintln!("  -V, --version    Print the version and git revision and exit (-version too)");
     eprintln!("  -I <dir>         Add directory to include search path");
     eprintln!("  -D <name>[=val]  Define a macro");
     eprintln!("  -uvm, --uvm      Add the UVM library named by XEZIM_UVM_DIR (its src include");
@@ -207,6 +207,7 @@ fn print_usage() {
     eprintln!(
         "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
     );
+    eprintln!("                   0 or none: no cap, run until $finish or no events remain");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug);");
     eprintln!("                   implies the --verbose engine lines");
     eprintln!("  --strict-top     Error out if -s names a module that does not exist (default)");
@@ -225,7 +226,11 @@ fn print_usage() {
                    (two continuous assigns, continuous plus procedural writes,
                    an always_comb/always_latch/always_ff variable written by
                    another process; §6.5, §9.2.2) as a warning instead of an
-                   error. Also enabled by XEZIM_RELAX_DRIVER_CONFLICTS=1."
+                   error. Also enabled by XEZIM_RELAX_DRIVER_CONFLICTS=1.
+  --compat         Commercial simulators' defaults in one flag: no time cap
+                   (an explicit --max-time still sets one), --relax-implicit-
+                   static, --relax-driver-conflicts and --error-exit. Also
+                   enabled by XEZIM_COMPAT=1."
     );
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
     eprintln!("                   stmt, branch, toggle (or all, the default). Counts go to");
@@ -399,12 +404,18 @@ fn print_usage() {
         "  -work/-L/-Lf/-lib <lib>  Ignored with one warning: every run compiles from source"
     );
     eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
+    eprintln!("  -define <N>[=<v>], -incdir <dir>, -top <module>  Same as -D, -I, -s");
     eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, t");
     eprintln!("                   = stmt, branch, toggle; bare = all three. Other letters are");
     eprintln!("                   ignored with a warning");
-    eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -<step>args=..,");
-    eprintln!("  -suppress <ids>, +fcover, -sva,");
-    eprintln!("  -assertdebug     Accepted, no effect");
+    eprintln!("  -coverage <types>  all, or B:E:F:T:U letters: B = stmt + branch, T = toggle;");
+    eprintln!("                   E and F are ignored with a warning, U adds nothing");
+    eprintln!("  -covworkdir <dir>, -covscope <name>, -covtest <name>  Write the results to");
+    eprintln!("                   <dir>/<scope>/<test>/xezim_cov.json (cov_work/scope/test)");
+    eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -access <spec>,");
+    eprintln!("  +access+<spec>, -<step>args=.., -suppress <ids>, -nowarn <id>, +fcover,");
+    eprintln!("  -sva, -assertdebug, -covoverwrite, -licqueue, -R, -errormax <n>,");
+    eprintln!("  -xmlibdirname <dir>, -cds_implicit_tmpdir <dir>  Accepted, no effect");
     eprintln!("  -sfcu, -t <res>, -wlf <file>  Accepted with a warning (one compilation unit;");
     eprintln!("                   finest precision; waveforms come from --fst/--wave)");
 }
@@ -490,9 +501,14 @@ fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
 /// `1ms`, `2s` (case-insensitive; `us` or `µs`). Returns nanoseconds.
 /// A customer run set `--max-time 30000000` intending picoseconds under a
 /// 1ps timescale and got 30 ms — the unit was invisible and unspellable.
+/// `none` or `0` (in any unit) lifts the cap, as `-do "run -all"` does: the
+/// run goes until `$finish` or no events remain.
 fn parse_max_time(raw: &str) -> Result<u64, String> {
     let t = raw.trim();
     let lower = t.to_ascii_lowercase();
+    if lower == "none" {
+        return Ok(RUN_ALL_NS);
+    }
     let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower.strip_suffix("ps") {
         (n, 1e-3)
     } else if let Some(n) = lower.strip_suffix("ns") {
@@ -510,12 +526,18 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     };
     let num: f64 = num_str.trim().parse().map_err(|_| {
         format!(
-            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])",
+            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s], or none)",
             raw
         )
     })?;
+    if num == 0.0 {
+        return Ok(RUN_ALL_NS);
+    }
     if !(num > 0.0) {
-        return Err(format!("--max-time must be positive, got '{}'", raw));
+        return Err(format!(
+            "--max-time must be positive (or 0/none for no cap), got '{}'",
+            raw
+        ));
     }
     let ns = num * factor_ns;
     let rounded = ns.round();
@@ -882,13 +904,13 @@ fn process_command_file(
                 continue;
             }
             match t {
-                "-s" => {
+                "-s" | "-top" => {
                     i += 1;
                     let top = toks
                         .get(i)
                         .filter(|top| !top.is_empty() && !top.starts_with('-'))
                         .ok_or_else(|| {
-                            format!("-s requires a top module (in args file '{}')", path)
+                            format!("{} requires a top module (in args file '{}')", t, path)
                         })?;
                     top_modules.push(top.clone());
                 }
@@ -897,13 +919,13 @@ fn process_command_file(
                     toks.get(i + 1).map(|s| s.as_str()),
                     &compat.libs,
                 ) => {}
-                "-I" => {
+                "-I" | "-incdir" => {
                     i += 1;
                     if i < toks.len() {
                         include_dirs.push(resolve_rel(base, &toks[i]));
                     }
                 }
-                "-D" => {
+                "-D" | "-define" => {
                     i += 1;
                     if i < toks.len() {
                         push_define_token(&toks[i], defines);
@@ -1084,21 +1106,6 @@ fn process_command_file(
                         }
                     }
                 },
-                // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
-                // (and `-seed` likewise) lower onto the `+seed=` plusarg the
-                // simulator already consumes.
-                "-svseed" | "-seed" => {
-                    if i + 1 < toks.len() {
-                        i += 1;
-                        plusargs.push(format!("+seed={}", toks[i]));
-                    }
-                }
-                _ if t.starts_with("-svseed=") => {
-                    plusargs.push(format!("+seed={}", &t["-svseed=".len()..]));
-                }
-                _ if t.starts_with("-seed=") => {
-                    plusargs.push(format!("+seed={}", &t["-seed=".len()..]));
-                }
                 _ if t.starts_with("-s") && t.len() > 2 => {
                     top_modules.push(t[2..].to_string());
                 }
@@ -1919,11 +1926,17 @@ fn run_main() -> i32 {
                 print_usage();
                 std::process::exit(0);
             }
+            "-V" | "--version" | "-version" => {
+                print_version();
+                std::process::exit(0);
+            }
             "--show-env-avail" => {
                 xezim::env_vars::print_env_avail();
                 std::process::exit(0);
             }
-            "-I" => {
+            // `-incdir <dir>` and `-define <NAME>[=<val>]` are other
+            // simulators' long spellings of `-I` and `-D`.
+            "-I" | "-incdir" => {
                 i += 1;
                 if i < args.len() {
                     include_dirs.push(args[i].clone());
@@ -1932,7 +1945,7 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-I") && arg.len() > 2 => {
                 include_dirs.push(arg[2..].to_string());
             }
-            "-D" => {
+            "-D" | "-define" => {
                 i += 1;
                 if i < args.len() {
                     push_define_token(&args[i], &mut defines);
@@ -1981,7 +1994,8 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-l") && arg.len() > 2 => {
                 log_file = Some(arg[2..].to_string());
             }
-            "-s" => {
+            // `-top <module>`: other simulators' spelling of `-s`.
+            "-s" | "-top" => {
                 i += 1;
                 if i < args.len() {
                     top_modules.push(args[i].clone());
@@ -2216,10 +2230,6 @@ fn run_main() -> i32 {
             }
             "--no-strict-top" => {
                 xezim::set_strict_top(false);
-            }
-            "-V" => {
-                print_version();
-                std::process::exit(0);
             }
             "--preprocess" => {
                 if mode_explicit && mode != Mode::Preprocess {
@@ -2720,19 +2730,6 @@ fn run_main() -> i32 {
             _ if arg.starts_with("--timescale=") => {
                 module_timescale_args.push(arg["--timescale=".len()..].to_string());
             }
-            // commercial-simulator-compatible seed aliases (undocumented): lower onto `+seed=`.
-            "-svseed" | "-seed" => {
-                i += 1;
-                if i < args.len() {
-                    plusargs.push(format!("+seed={}", args[i]));
-                }
-            }
-            _ if arg.starts_with("-svseed=") => {
-                plusargs.push(format!("+seed={}", &arg["-svseed=".len()..]));
-            }
-            _ if arg.starts_with("-seed=") => {
-                plusargs.push(format!("+seed={}", &arg["-seed=".len()..]));
-            }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
@@ -2745,6 +2742,20 @@ fn run_main() -> i32 {
             },
         }
         i += 1;
+    }
+    // `--compat` (or XEZIM_COMPAT=1): what commercial simulators do by
+    // default, so a flow written for one runs with one flag. The run goes
+    // until `$finish` or no events remain (an explicit `--max-time` or a
+    // `-do "run <time>"` still sets the length), implicitly static
+    // initializers (§6.21) and conflicting variable drivers (§6.5, §9.2.2)
+    // are warnings, and an `$error` fails the run, as those flows expect.
+    if compat.compat_mode || env::var("XEZIM_COMPAT").is_ok_and(|v| v == "1") {
+        xezim_core::elaborate::set_relax_implicit_static(true);
+        xezim_core::elaborate::set_relax_driver_conflicts(true);
+        error_exit = true;
+        if !max_time_explicit {
+            max_time = RUN_ALL_NS;
+        }
     }
     // `--sv2017`/`--sv2023`, or a `-sv*compat` flag here or in an args file.
     let sv2023_mode = sv_parser::is_sv2023();
@@ -2804,7 +2815,7 @@ fn run_main() -> i32 {
     // Code coverage: `--code-coverage` wins over XEZIM_CODE_COVERAGE, which
     // wins over other simulators' `+cover` / `-coverage`.
     let cover_request = cli_compat::cover_request(&compat);
-    if let (Some(spec), Some((kinds, unsupported))) = (&compat.cover, &cover_request) {
+    if let Some((kinds, unsupported, spelling)) = &cover_request {
         if !unsupported.is_empty() {
             let names: Vec<String> = unsupported
                 .chars()
@@ -2826,8 +2837,8 @@ fn run_main() -> i32 {
             .map(|(_, n)| *n)
             .collect();
             eprintln!(
-                "Warning: +cover={}: xezim has no {} coverage; collecting {}",
-                spec,
+                "Warning: {}: xezim has no {} coverage; collecting {}",
+                spelling,
                 names.join(", "),
                 if kept.is_empty() {
                     "no code coverage".to_string()
@@ -2851,7 +2862,7 @@ fn run_main() -> i32 {
     };
     let code_cov = code_cov_kinds
         .or(env_cov)
-        .or(cover_request.map(|(k, _)| k))
+        .or(cover_request.map(|(k, _, _)| k))
         .unwrap_or(0);
     if code_cov != 0 {
         xezim::compiler::simulator::set_code_coverage(Some(
@@ -2862,6 +2873,23 @@ fn run_main() -> i32 {
         ));
     } else if !code_cov_scopes.is_empty() {
         eprintln!("Warning: --code-coverage-scope has no effect without --code-coverage");
+    }
+    // `-covworkdir`/`-covscope`/`-covtest`: the results file goes in the
+    // test's directory of a coverage work area, created here, unless
+    // XEZIM_COV_DB names a file.
+    if let Some(db) = cli_compat::cov_db(&compat)
+        .filter(|_| mode == Mode::Simulate && env::var_os("XEZIM_COV_DB").is_none())
+    {
+        if let Err(e) = std::fs::create_dir_all(db.parent().unwrap_or(Path::new("."))) {
+            eprintln!(
+                "Warning: cannot create the coverage directory for {}: {}",
+                db.display(),
+                e
+            );
+        }
+        // SAFETY: argument handling runs single-threaded, before any
+        // simulator thread exists.
+        unsafe { env::set_var("XEZIM_COV_DB", &db) };
     }
 
     // Opt-in statistics footer: the CLI flag wins over XEZIM_REPORT_STATS.

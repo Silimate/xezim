@@ -67,6 +67,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§7.5, §7.8). Recompile saved designs to refresh their class metadata.
   (#337, reported by Dragon-Git)
 
+* Toggle coverage counts each instance's input and inout ports in that
+  instance, as commercial simulators do, with the value the connection gives
+  the port: a port connected to a whole net shows that net's counts, one
+  connected to an expression or select toggles as its value, and a constant
+  or unconnected port never toggles (§23.3.3). The ports of a module that is
+  the top of the design, driven through VPI, are now covered too. Instance
+  toggle scores and design totals change accordingly;
+  `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
+  previous counting, where only the driving signal counts.
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and

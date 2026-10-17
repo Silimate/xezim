@@ -399,3 +399,66 @@ fn entries_name_the_declaring_scope_and_its_file() {
         "{json}"
     );
 }
+
+const SETTLE: &str = r#"module leaf;
+  function automatic void bump(input int v);
+    a_bump : assert (v != 3);
+  endfunction
+endmodule
+
+module top;
+  logic clk = 0, a = 0, b = 0, c = 0, never = 0, go = 0;
+  always #5 clk = ~clk;
+  leaf u0 ();
+  leaf u1 ();
+  a_or_impl   : assert property (@(posedge clk) (never |-> b) or (a |-> ##2 b));
+  a_or_strong : assert property (@(posedge clk) (never |-> b) or (a |-> strong(##[1:$] never)));
+  a_or_rev    : assert property (@(posedge clk) (a |-> ##2 b) or (never |-> b));
+  a_and_seq   : assert property (@(posedge clk) (never |-> b) and (a ##2 b));
+  a_notimpl   : assert property (@(posedge clk) not ((1 ##[0:1] 1) |-> not (c |-> 0)));
+  always @(posedge clk) begin
+    if (go) assert property (a |-> b);
+    assert property (a |-> b);
+  end
+  initial begin
+    for (int i = 0; i < 4; i++) begin
+      u0.bump(i);
+      u1.bump(i + 1);
+    end
+  end
+  // a: 0 1 0 1 1 0 0 ; b: 0 0 1 1 0 1 0 ; c: 0 1 0 0 0 0 0
+  initial begin
+    @(negedge clk) begin a = 1; c = 1; end
+    @(negedge clk) begin a = 0; b = 1; c = 0; end
+    @(negedge clk) begin a = 1; b = 1; end
+    @(negedge clk) begin a = 1; b = 0; end
+    @(negedge clk) begin a = 0; b = 1; end
+    @(negedge clk) begin a = 0; b = 0; end
+    @(negedge clk) $finish;
+  end
+endmodule
+"#;
+
+/// `p or q` is settled as soon as an operand holds, and is nonvacuous when
+/// the other operand's evaluation already is (an implication whose
+/// antecedent matched): it neither waits nor fails at the end for a strong
+/// obligation left in the other operand. A failure is never vacuous, so
+/// `not` of one is a nonvacuous success. One process calling the same
+/// function of two instances counts each instance apart, and unlabeled
+/// statements are numbered by declaration, a branch never taken included.
+#[test]
+fn or_settles_early_and_names_follow_declarations() {
+    let (json, _) = run("settle", &[("t.sv", SETTLE)]);
+    for (inst, name, want) in [
+        ("top", "a_or_impl", [7, 3, 4, 0, 0]),
+        ("top", "a_or_strong", [7, 3, 4, 0, 0]),
+        ("top", "a_or_rev", [7, 3, 4, 0, 0]),
+        ("top", "a_and_seq", [7, 2, 0, 5, 0]),
+        ("top", "a_notimpl", [7, 7, 0, 0, 0]),
+        ("top", "assert__1", [7, 1, 4, 2, 0]),
+        ("top.u0", "bump.a_bump", [4, 3, 0, 1, 0]),
+        ("top.u1", "bump.a_bump", [4, 3, 0, 1, 0]),
+    ] {
+        assert_eq!(counts(&json, inst, name), want, "{inst} {name}:\n{json}");
+    }
+}

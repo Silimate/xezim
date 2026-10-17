@@ -479,18 +479,23 @@ report for every assertion. For the [assertion example](#assertion-coverage):
 | `disabled` | Attempts that `disable iff` cancelled: the attempts in flight at a tick where its condition held, and the one that tick would have started |
 | `matches` | Covers only: the number of matches, the same as `pass`. A `cover sequence` counts every match of an attempt |
 
-An attempt that is still running when the simulation ends counts only in `attempts`:
-`attempts - pass - vacuous - fail - disabled` attempts were left running. One that
-still owes a strong obligation (`strong(...)`, `s_eventually`) fails at the end
-instead.
+For an `assert` or `assume`, an attempt still running when the simulation ends
+counts only in `attempts`: `attempts - pass - vacuous - fail - disabled` attempts
+were left running. One that still owes a strong obligation (`strong(...)`,
+`s_eventually`) fails at the end instead. A cover's attempts that did not match are
+not counted apart, and a `cover sequence` can match more than once per attempt.
 
 A success is vacuous as §16.14.8 defines it:
 
 - An implication (`|->`, `|=>`) is vacuous when its antecedent never matches, or
   when every consequent evaluation it starts is vacuous: `a |-> (c |-> b)` while
   `c` is false. `if (c) p` is vacuous when `c` is false.
-- `not p` is vacuous when `p` is; `p and q` and `p or q` when both operands are.
-- A sequence or a boolean is never vacuous.
+- `p and q` is vacuous when both operands are. `p or q` is settled when an operand
+  holds, and is vacuous when that operand's success is and the other operand's
+  evaluation is not yet known to be nonvacuous (as a sequence's always is, and an
+  implication's once its antecedent has matched).
+- A sequence or a boolean is never vacuous, and neither is a failure: `not p`
+  fails when `p` holds and succeeds, nonvacuously, when `p` fails.
 
 A vacuous success runs no pass action, and a `cover` of an implication counts only
 its nonvacuous successes. The followed-by operators `#-#` and `#=#` are not
@@ -498,12 +503,13 @@ supported yet.
 
 A statement without a label is named the way the reference simulator names it. A
 concurrent one is `assert__<n>`, `assume__<n>` or `cover__<n>`, numbered by kind
-from 0 in source order within its module. An immediate or deferred one is
-`immed__<line>`, or `i_cover__<line>` for a cover. Unnamed blocks are not part of
-a name.
+from 0 in source order among those its module declares, whether they run or not.
+An immediate or deferred one is `immed__<line>`, or `i_cover__<line>` for a cover.
+Unnamed blocks are not part of a name.
 
-Immediate statements have an entry once they have been evaluated. Concurrent ones
-have one from the start, attempted or not.
+Immediate statements, and concurrent ones in procedural code, have an entry once
+they have been reached. Other concurrent ones have one from the start, attempted
+or not.
 
 The reference simulator counts an `assert` or `assume` as covered once it has a
 nonvacuous success and no failure, and a `cover` once it has matched: for every

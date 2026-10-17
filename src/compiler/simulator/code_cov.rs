@@ -1112,14 +1112,6 @@ impl ToggleTypes<'_> {
         }
         let (inst, port) = name.rsplit_once('.')?;
         let def = self.defs.get(inst)?;
-        let output = self
-            .module
-            .signals
-            .get(name)
-            .is_some_and(|s| s.direction == Some(PortDirection::Output));
-        if !output {
-            return None;
-        }
         self.ports
             .get_or_init(|| self.ansi_ports())
             .get(&(def.to_string(), port.to_string()))

@@ -1118,7 +1118,10 @@ impl Instr<'_> {
         let rebuilt = |kind| Statement::new(kind, span);
         match s.kind {
             StatementKind::SeqBlock { name, stmts } => {
+                // A block's declarations end with it.
+                let outer = self.here.locals.clone();
                 let stmts = self.stmts(stmts);
+                self.here.locals = outer;
                 out.push(rebuilt(StatementKind::SeqBlock { name, stmts }));
             }
             // Each fork branch stays one process.
@@ -1127,7 +1130,9 @@ impl Instr<'_> {
                 join_type,
                 stmts,
             } => {
+                let outer = self.here.locals.clone();
                 let stmts = stmts.into_iter().map(|c| self.wrap(c)).collect();
+                self.here.locals = outer;
                 out.push(rebuilt(StatementKind::ParBlock {
                     name,
                     join_type,
@@ -1313,7 +1318,7 @@ impl Instr<'_> {
                         ..
                     } => self.expr(right),
                     // A `?:` in a message is not a branch, but its condition
-                    // is a condition, as in the reference simulator.
+                    // is a condition, as in the commercial simulator.
                     ExprKind::SystemCall { name, args }
                         if DISPLAY_TASKS.contains(&name.as_str()) =>
                     {
@@ -1674,7 +1679,10 @@ impl Instr<'_> {
         // A compound assignment (`a |= b`) arrives as `a = a | b`, the
         // copy of `a` at its own place: not an expression of the source.
         let compound = e.span.start == lhs.span.start;
-        if self.kinds & KIND_EXPRESSION != 0 && !compound {
+        // The `?:`s of an expression item are its multiplexers, not
+        // conditions, whichever kinds are collected: the item is planned
+        // for condition coverage too, so that it never counts them.
+        if self.kinds & (KIND_EXPRESSION | KIND_CONDITION) != 0 && !compound {
             if let Some(p) = self.plan(e, true) {
                 // `~`, the bitwise operators and `?:` take their width from
                 // where the value goes.
@@ -1692,7 +1700,9 @@ impl Instr<'_> {
                 };
                 if !sized || self.ctx.width(lhs, &self.here) == Some(1) {
                     self.rewrite(e, &p.nodes, 0, deep);
-                    self.item(e, p, kind, false);
+                    if self.kinds & KIND_EXPRESSION != 0 {
+                        self.item(e, p, kind, false);
+                    }
                     return;
                 }
             }
@@ -1705,14 +1715,14 @@ impl Instr<'_> {
     /// The logic tree of `e` when it is a condition or expression item: it
     /// has a logic operator on two non-constant operands (or a `?:` in an
     /// expression), or it is a relation (`a == b`; a negated one, `!(a ==
-    /// b)`, is not, as in the reference simulator), and at most `MAX_TERMS`
+    /// b)`, is not, as in the commercial simulator), and at most `MAX_TERMS`
     /// input terms.
     fn plan(&self, e: &Expression, mux: bool) -> Option<Plan> {
         let mut p = Plan::default();
         let text = self.ctx.source(e, self.cov.scopes[self.scope as usize].src);
         self.build(e, text, mux, &mut p);
         // A system function as a term (`!$isunknown(x) && y`) leaves the
-        // expression out, as in the reference simulator.
+        // expression out, as in the commercial simulator.
         if p.terms.is_empty() || p.terms.len() > MAX_TERMS || p.system {
             return None;
         }
@@ -1729,7 +1739,7 @@ impl Instr<'_> {
 
     /// Fold node `i` of `p` (its kids built) to a constant when its value
     /// is: a constant operand that decides it (`x & 0`, `x || 1`), or
-    /// constant operands only. The reference simulator leaves such parts of
+    /// constant operands only. The commercial simulator leaves such parts of
     /// an expression out; their terms (those after the first `terms`) go
     /// with them.
     fn fold(p: &mut Plan, i: usize, op: Op, kids: [u32; 3], terms: usize) -> Op {
@@ -1788,7 +1798,7 @@ impl Instr<'_> {
         };
         let t = text.as_deref();
         let (op, kids): (Op, Vec<(&Expression, Option<String>)>) = match &e.kind {
-            // Folded away, as by the reference simulator: no term.
+            // Folded away, as by the commercial simulator: no term.
             _ if p.konst[i].is_some() => (Op::Const, Vec::new()),
             ExprKind::Unary {
                 op: UnaryOp::LogNot,
@@ -1857,7 +1867,7 @@ impl Instr<'_> {
 
     /// The term `e` (node `i` of `p`, source text `text`) stands for. A
     /// 1-bit `t == 0` (or `t != 1`, either way round) is the term `t`,
-    /// inverted, as in the reference simulator; another relation is a term
+    /// inverted, as in the commercial simulator; another relation is a term
     /// of its own.
     fn term(&self, e: &Expression, text: Option<&str>, p: &mut Plan, i: usize) -> Op {
         let mut named = text.map(str::to_string);
@@ -1909,12 +1919,12 @@ impl Instr<'_> {
         let e = unparen_mut(e);
         let n = nodes[i as usize];
         match n.op {
-            Op::Term(..) => {
+            // (A folded constant may hold a `?:` too.)
+            Op::Term(..) | Op::Const => {
                 if deep {
                     self.expr(e);
                 }
             }
-            Op::Const => {}
             Op::Mux => {
                 if let ExprKind::Conditional {
                     condition,
@@ -2098,14 +2108,16 @@ struct Report {
 }
 
 /// Sort items and add up the copies of one (a parameterized class's, the
-/// pieces of one continuous assignment); a generate loop's iterations stay
-/// apart by their block.
+/// pieces of one continuous assignment, an instance's in a design unit); a
+/// generate loop's iterations stay apart by their block, and copies whose
+/// constants left different terms stay apart by their terms.
 fn merge_items(items: &mut Vec<ItemRow>) {
-    items.sort_by(|a, b| a.key().cmp(&b.key()));
+    let names = |it: &ItemRow| it.terms.iter().map(|t| t.0.clone()).collect::<Vec<_>>();
+    items.sort_by(|a, b| (a.key(), names(a)).cmp(&(b.key(), names(b))));
     let mut merged: Vec<ItemRow> = Vec::with_capacity(items.len());
     for it in items.drain(..) {
         match merged.last_mut() {
-            Some(m) if m.key() == it.key() && m.terms.len() == it.terms.len() => {
+            Some(m) if m.key() == it.key() && names(m) == names(&it) => {
                 for (x, y) in m.terms.iter_mut().zip(&it.terms) {
                     x.1[0] += y.1[0];
                     x.1[1] += y.1[1];

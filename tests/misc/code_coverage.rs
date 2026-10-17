@@ -542,7 +542,7 @@ fn has_item(json: &str, line: u32) -> bool {
 /// (IEEE 1800-2023 §11.3.5: `&&` skips its right operand after a 0, `||`
 /// after a 1): a term's row counts when the term alone decides the result.
 /// The left of `&&` decides at 0 whatever the right would be; at 1 only
-/// when the right is 1. Rows and terms covered are the reference
+/// when the right is 1. Rows and terms covered are the commercial
 /// simulator's on this design (4 of 6 terms; `half` never sees x or y at 1
 /// deciding).
 #[test]
@@ -604,7 +604,7 @@ endmodule
 /// when the other arm was not evaluated, and an item whose code never ran
 /// is listed with no hits. Vector `&` and a lone reduction are not
 /// expressions. The items, terms and covered terms (8 of 10) are the
-/// reference simulator's; continuous evaluations are not counted the same,
+/// commercial simulator's; continuous evaluations are not counted the same,
 /// so only rows hit are compared there.
 #[test]
 fn expression_items() {
@@ -670,7 +670,7 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// Which expressions are items, as in the reference simulator's report on
+/// Which expressions are items, as in the commercial simulator's report on
 /// this design: a condition or value with a logic operator on two
 /// non-constant operands, or a relation; not a lone (possibly negated)
 /// signal, nor a 1-bit signal compared with a constant (it is that signal),
@@ -804,7 +804,7 @@ endmodule
 /// testbench's `$monitor` of its own `op_select` and `start`, also the names
 /// of ports of the two instances, keeps its bindings (once, it printed the
 /// second instance's ports instead, `5 op_select=5 start=1`). The items of
-/// the two iterations of a generate loop stay apart, as in the reference
+/// the two iterations of a generate loop stay apart, as in the commercial
 /// simulator.
 #[test]
 fn items_in_instances() {
@@ -856,6 +856,115 @@ endmodule
         2,
         "{scope}"
     );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Each kind's results are the same whichever other kinds are collected: the
+/// `?:` of a 1-bit value is a multiplexer of the expression item (its
+/// condition no condition item) even when only conditions are collected,
+/// and every `?:` is a branch either way. A `?:` of a wider value has a
+/// condition item.
+#[test]
+fn kinds_are_independent() {
+    let d = scratch("kinds");
+    let src = "\
+module tb;
+  logic a, b, c, e, y;
+  logic [3:0] w;
+  initial begin
+    {a, b, c, e} = 4'b1010;
+    y = (a && b) ? c : e;
+    w = (a || b) ? 4'd1 : 4'd2;
+    #1 $display(\"y=%b w=%0d\", y, w);
+  end
+endmodule
+";
+    let total = |args: &[&str], kind: &str| {
+        let out = run(&d, src, args);
+        assert!(out.status.success());
+        let json = results(&d);
+        let key = format!("\"{}\": {{", kind);
+        let at = json.find(&key).unwrap_or_else(|| panic!("{json}")) + key.len();
+        json[at..at + json[at..].find('}').unwrap()].to_string()
+    };
+    // Line 7's `a || b` (a at 1 decides alone; b is not evaluated).
+    let cond = total(&["--code-coverage=cond"], "condition");
+    assert_eq!(cond, total(&["--code-coverage=cond,expr"], "condition"));
+    assert!(cond.starts_with("\"covered\": 0, \"total\": 2"), "{cond}");
+    let branch = total(&["--code-coverage=branch"], "branch");
+    assert_eq!(branch, total(&["--code-coverage=branch,cond,expr"], "branch"));
+    assert!(branch.starts_with("\"covered\": 2, \"total\": 4"), "{branch}");
+    // Line 6: a, b, c and e; b and e decide at 0.
+    let expr = total(&["--code-coverage=expr"], "expression");
+    assert!(expr.starts_with("\"covered\": 0, \"total\": 4"), "{expr}");
+    assert_eq!(
+        terms(&results(&d), 6, "statement"),
+        vec![
+            ("a".to_string(), [0, 0]),
+            ("b".to_string(), [1, 0]),
+            ("c".to_string(), [0, 0]),
+            ("e".to_string(), [1, 0])
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A part of an item that folds to a constant still has its `?:` branch; a
+/// block's local declaration ends with the block (`p` is the task's 1-bit
+/// argument again after it, so `p & q` is an item); and the instances of a
+/// module whose parameters fold different terms away keep separate items in
+/// the design unit.
+#[test]
+fn folded_parts_locals_and_units() {
+    let d = scratch("fold");
+    let src = "\
+module m #(parameter bit P = 1, parameter bit Q = 0) (input logic a, b, c, d, output logic y);
+  assign y = (a & b & P) | (c & d & Q);
+endmodule
+module tb;
+  logic a, b, c, e, y, y1, y2;
+  m #(.P(1), .Q(0)) u1(.a, .b, .c, .d(e), .y(y1));
+  m #(.P(0), .Q(1)) u2(.a, .b, .c, .d(e), .y(y2));
+  task automatic t(input logic p, input logic q);
+    begin : inner
+      logic [7:0] p;
+      p = 8'hff;
+    end
+    y = p & q;
+  endtask
+  initial begin
+    {a, b, c, e} = 4'b1010;
+    y = (a & b) | ((c ? a : e) & 1'b0);
+    t(a, b);
+    #1 $display(\"y=%b y1=%b y2=%b\", y, y1, y2);
+  end
+endmodule
+";
+    let branch = |kinds: &str| {
+        assert!(run(&d, src, &[kinds]).status.success());
+        let json = results(&d);
+        let at = json.find("\"branch\": {").unwrap();
+        json[at..at + json[at..].find('}').unwrap()].to_string()
+    };
+    assert_eq!(
+        branch("--code-coverage=branch"),
+        branch("--code-coverage=all")
+    );
+    let json = results(&d);
+    assert!(json.contains("\"branch\": {\"covered\": 1, \"total\": 2"), "{json}");
+    let names = |line: u32, kind: &str| {
+        terms(&json, line, kind)
+            .into_iter()
+            .map(|t| t.0)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(13, "statement"), ["p", "q"]);
+    assert_eq!(names(17, "statement"), ["a", "b"]);
+    let unit = &json[json.find("\"design_unit\": \"m\",\n        \"instances\": 2").unwrap()..];
+    let unit = &unit[..unit.find("\"design_unit\": \"tb\"").unwrap_or(unit.len())];
+    assert_eq!(terms(unit, 2, "assign").len(), 2, "{unit}");
+    assert_eq!(unit.matches("\"line\": 2, \"kind\": \"assign\", \"text\"").count(), 2, "{unit}");
+    assert!(unit.contains("{\"term\": \"c\", "), "{unit}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

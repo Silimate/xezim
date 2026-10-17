@@ -95746,8 +95746,10 @@ impl Simulator {
             }
             for j in 0..self.sva_sites[i].sampled_ids.len() {
                 let id = self.sva_sites[i].sampled_ids[j];
-                if let Some(v) = self.sva_cell_value(id) {
-                    self.sva_preponed.insert(id, v);
+                if id < self.signal_table.len() {
+                    self.sva_preponed.insert(id, self.signal_table[id].clone());
+                } else if is_packed_id(id) {
+                    self.sva_preponed.insert(id, self.packed.read(id));
                 }
             }
         }
@@ -95808,14 +95810,15 @@ impl Simulator {
     fn install_preponed(&mut self, ids: &[usize]) -> Vec<(usize, Value)> {
         let mut saved: Vec<(usize, Value)> = Vec::new();
         for &id in ids {
-            let Some(pre) = self.sva_preponed.get(&id).cloned() else {
-                continue;
-            };
-            if is_packed_id(id) {
-                saved.push((id, self.packed.read(id)));
-                self.packed.write(id, &pre);
-            } else if id < self.signal_table.len() {
-                saved.push((id, std::mem::replace(&mut self.signal_table[id], pre)));
+            // Only cells of the signal table or the packed arena are sampled.
+            if let Some(pre) = self.sva_preponed.get(&id) {
+                let pre = pre.clone();
+                if id < self.signal_table.len() {
+                    saved.push((id, std::mem::replace(&mut self.signal_table[id], pre)));
+                } else {
+                    saved.push((id, self.packed.read(id)));
+                    self.packed.write(id, &pre);
+                }
             }
         }
         saved
@@ -95824,12 +95827,12 @@ impl Simulator {
     /// Restore the live values swapped out by `install_preponed`.
     fn restore_preponed(&mut self, saved: Vec<(usize, Value)>) {
         for (id, v) in saved.into_iter().rev() {
-            if is_packed_id(id) {
+            if id < self.signal_table.len() {
+                self.signal_table[id] = v;
+                self.sync_mirror(id);
+            } else {
                 self.packed.write(id, &v);
-                continue;
             }
-            self.signal_table[id] = v;
-            self.sync_mirror(id);
         }
     }
 

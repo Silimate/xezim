@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A value a VPI client writes to an element of an instance's unpacked-array
+  input port reaches the instance, through any number of port levels, and
+  the actual's name reads it too; a value written to the actual reaches the
+  port's name in the same delta. The port and a whole-array actual are one
+  object (§23.3.3.7), as a scalar port and its actual already were. They had
+  storage of their own, connected element by element, while the instance
+  read the actual, so a cocotb test driving `dut.inst.port[i]` left the
+  instance reading z. (#66)
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).

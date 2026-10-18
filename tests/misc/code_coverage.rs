@@ -1441,3 +1441,66 @@ endmodule
     assert_eq!(terms(&json, 29, "if"), t("d", [2, 4], "v", [3, 2]));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A transient state is counted only when the order of the inputs'
+/// changes is certain whichever signals upstream changed. `a` reads a
+/// deep input that does not change, so its block can settle late, but
+/// when `v` changes, `a` and `b` change together, as the reference
+/// simulator shows: no state with `a` at 0 and `b` at 1 (in an
+/// assignment or a block). `c3` is two blocks behind `a` whatever
+/// changed, so the state between its change and `b`'s counts.
+#[test]
+fn transient_state_order() {
+    let d = scratch("glitchorder");
+    let src = "\
+module tb;
+  logic v = 0;
+  logic en0 = 1;
+  logic e1, e2, e3, enable;
+  always_comb e1 = en0;
+  always_comb e2 = e1;
+  always_comb e3 = e2;
+  always_comb enable = e3;
+  // G1: a's block also reads a deep input that does not change
+  logic a, b;
+  always_comb a = v & enable;
+  always_comb b = v;
+  wire y1 = a | ~b;
+  // G2: the same with a deep net
+  wire n1 = ~e3;
+  wire n2 = v & n1;
+  wire n3 = v;
+  wire y2 = n2 | ~n3;
+  // G3: a later block of a's, against b: changes after b whichever input changed
+  logic c1, c2, c3;
+  always_comb c1 = v & enable;
+  always_comb c2 = c1;
+  always_comb c3 = c2;
+  wire y3 = c3 | ~b;
+  // G4: a combinational block's item on G1's inputs
+  logic z4;
+  always_comb z4 = a | ~b;
+  initial begin
+    repeat (3) begin
+      #1 v = 1;
+      #1 v = 0;
+    end
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let t = |a: &str, x: [u64; 2], b: &str, y: [u64; 2]| {
+        vec![(a.to_string(), x), (b.to_string(), y)]
+    };
+    assert_eq!(terms(&json, 13, "assign"), t("a", [0, 3], "b", [4, 0]));
+    assert_eq!(terms(&json, 27, "statement"), t("a", [0, 3], "b", [4, 0]));
+    assert_eq!(terms(&json, 24, "assign"), t("c3", [3, 3], "b", [4, 3]));
+    let _ = std::fs::remove_dir_all(&d);
+}

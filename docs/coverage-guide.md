@@ -789,6 +789,11 @@ both of its rows are; coverage is the covered terms over all terms.
   output. A combinational block runs after the continuous assignments of its
   inputs' cycle, and sees the outputs of the blocks above it in its module
   that ran in that cycle too. Inputs one process writes change together.
+  How late a signal changes depends on which signals upstream changed, so
+  each input has an earliest and a latest step (the shortest and the longest
+  path to it), and a state between two inputs' changes counts only when one
+  input's latest step is before the other's earliest: otherwise they count
+  as changing together.
 - **Counts** are the evaluations in which the row was hit, one per
   evaluation (or replayed state) however many times the term appears.
 - **Evaluation.** The interpreter evaluates each item, operator by operator
@@ -849,7 +854,11 @@ differences:
     `case` or in a loop of a combinational block (the reference simulator
     counts those states too when the item runs in them), in a function or
     task, with a function call in a term, or with a term that reads what its
-    own block writes.
+    own block writes; nor a state between two inputs whose order depends on
+    which signals upstream changed: with `assign n = p & en`, `p` a block
+    output and `en` a register, `n` changes after `p` when `p` changes and
+    on its own when `en` does, so the state between `p`'s change and `n`'s,
+    which the reference simulator counts, is not counted.
   - Each iteration of a generate loop has its own items, as there. Those of
     procedural code name their generate block (`block`); those of continuous
     assignments share `file`, `line` and `text`.

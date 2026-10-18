@@ -250,11 +250,12 @@ pub(crate) struct ExprSite {
     /// each time the block does): the block's scope and source offset.
     proc: Option<(String, usize)>,
     /// A continuous assignment's, or a `proc` item's: the term values of
-    /// its last evaluation (empty before the first), and when each term
-    /// settles (`None` until first needed, empty when the item has nothing
-    /// to replay); see `Simulator::cov_replay`.
+    /// its last evaluation (empty before the first), and the earliest and
+    /// latest step each term can settle at (`None` until first needed,
+    /// empty when the item has nothing to replay); see
+    /// `Simulator::cov_replay`.
     last: Vec<u8>,
-    steps: Option<Vec<u32>>,
+    steps: Option<Vec<(u32, u32)>>,
 }
 
 /// An item's logic tree while it is built.
@@ -1025,6 +1026,32 @@ fn replay(nodes: &[Node], i: u32, terms: &[u8], konst: &[u8], vals: &mut [u8]) -
     v
 }
 
+/// Group terms by when they settle, given the earliest and latest step
+/// each can (`steps`), so that the groups settle one after another
+/// whichever signals upstream changed: a term whose earliest step is not
+/// after the latest of the group before it joins that group (their order
+/// is not certain, so no state between them is counted). Each listed term
+/// with its group, in step order.
+fn order(steps: &[(u32, u32)], mut terms: Vec<usize>) -> Vec<(usize, usize)> {
+    terms.sort_by_key(|&t| steps[t].0);
+    let (mut group, mut end) = (0, None);
+    terms
+        .into_iter()
+        .map(|t| {
+            let (lo, hi) = steps[t];
+            end = Some(match end {
+                Some(e) if lo > e => {
+                    group += 1;
+                    hi
+                }
+                Some(e) => hi.max(e),
+                None => hi,
+            });
+            (t, group)
+        })
+        .collect()
+}
+
 /// Reading `e` has no side effects (no function call), so a replay may
 /// read it again.
 fn pure(e: &Expression) -> bool {
@@ -1166,10 +1193,10 @@ pub(crate) struct CodeCov {
     /// Instance paths below the top.
     inst_paths: HashSet<String>,
     pub(crate) toggle: Option<Toggle>,
-    /// Signal id -> its settle step, and the scope and source offset of the
-    /// combinational `always` block that writes it (see
-    /// `Simulator::cov_steps`).
-    steps: Vec<u32>,
+    /// Signal id -> the earliest and latest step it settles at, and the
+    /// scope and source offset of the combinational `always` block that
+    /// writes it (see `Simulator::cov_steps`).
+    steps: Vec<(u32, u32)>,
     writers: HashMap<usize, (String, usize)>,
     /// The names clocked `always` blocks write, by scope, and the
     /// continuous assignments that invert a signal (target, operand,
@@ -3264,8 +3291,9 @@ impl Simulator {
     /// in a delta cycle where one input has its new value and another not
     /// yet, while xezim settles combinational logic in dependency order and
     /// evaluates it once all have theirs. The terms that changed are
-    /// replayed in the order they settle in (`cov_term_steps`): at each
-    /// step but the last, those of that step or an earlier one have their
+    /// replayed in the order they settle in (`cov_term_steps`), where that
+    /// order is certain whichever signals upstream changed (`order`): after
+    /// each group but the last, its terms and the earlier ones have their
     /// new values and the others their old ones.
     fn cov_replay(&mut self, id: u32, nodes: &[Node], e: &Expression, vals: &[u8]) {
         let Some(site) = self
@@ -3326,20 +3354,15 @@ impl Simulator {
         let Some(steps) = site.steps.as_ref().filter(|_| last.len() == n) else {
             return;
         };
-        let mut ks: Vec<u32> = (0..n)
-            .filter(|&t| cur[t] != last[t])
-            .map(|t| steps[t])
-            .collect();
-        ks.sort_unstable();
-        ks.dedup();
-        // (The last step is the evaluation itself.)
-        ks.pop();
-        let states: Vec<Vec<u8>> = ks
-            .iter()
-            .map(|&k| {
-                (0..n)
-                    .map(|t| if steps[t] <= k { cur[t] } else { last[t] })
-                    .collect()
+        let groups = order(steps, (0..n).filter(|&t| cur[t] != last[t]).collect());
+        // (The last group's state is the evaluation itself.)
+        let states: Vec<Vec<u8>> = (0..groups.last().map_or(0, |g| g.1))
+            .map(|k| {
+                let mut state = last.clone();
+                for &(t, _) in groups.iter().filter(|g| g.1 <= k) {
+                    state[t] = cur[t];
+                }
+                state
             })
             .collect();
         for state in states {
@@ -3349,14 +3372,15 @@ impl Simulator {
         }
     }
 
-    /// When each term of an item settles, for `cov_replay`: in a continuous
-    /// assignment, at the latest settle step (`cov_steps`) of the signals
-    /// it reads. A block runs after the continuous assignments of its
-    /// inputs' delta cycle (`step / 2`), and sees the outputs of the blocks
-    /// of its own instance written above it that ran in that cycle too.
-    /// Empty when the item has nothing to replay: its terms all settle
-    /// together, a leaf has side effects (a function call) and can't be
-    /// read again, or a term reads what its own block writes.
+    /// When each term of an item can settle, for `cov_replay`: the earliest
+    /// and the latest step (`cov_steps`) of the signals it reads, in a
+    /// continuous assignment. A block runs after the continuous
+    /// assignments of its inputs' delta cycle (`step / 2`), and sees the
+    /// outputs of the blocks of its own instance written above it that ran
+    /// in that cycle too. A term that reads no signal could settle at any
+    /// step. Empty when the item has nothing to replay: the order of its
+    /// terms is never certain, a leaf has side effects (a function call)
+    /// and can't be read again, or a term reads what its own block writes.
     fn cov_term_steps(
         &self,
         nodes: &[Node],
@@ -3364,7 +3388,7 @@ impl Simulator {
         n: usize,
         hint: Option<&str>,
         proc: Option<&(String, usize)>,
-    ) -> Vec<u32> {
+    ) -> Vec<(u32, u32)> {
         let Some(cov) = self.code_cov.as_ref() else {
             return Vec::new();
         };
@@ -3372,7 +3396,7 @@ impl Simulator {
             return Vec::new();
         }
         let hint = proc.map(|p| p.0.as_str()).or(hint);
-        let mut steps = vec![0u32; n];
+        let mut steps = vec![(u32::MAX, 0u32); n];
         for &(i, x) in leaves {
             let Op::Term(t, _) = nodes[i as usize].op else {
                 continue;
@@ -3380,19 +3404,25 @@ impl Simulator {
             let mut names = HashSet::default();
             Self::collect_expr_reads(x, &self.module, &mut names);
             for id in names.iter().filter_map(|name| self.cov_signal(name, hint)) {
-                let Some(&s) = cov.steps.get(id) else {
+                let Some(&(lo, hi)) = cov.steps.get(id) else {
                     continue;
                 };
-                let s = match (proc, cov.writers.get(&id)) {
+                let (lo, hi) = match (proc, cov.writers.get(&id)) {
                     (Some(p), Some(w)) if w == p => return Vec::new(),
-                    (Some(p), Some(w)) if w.0 == p.0 && w.1 < p.1 && s >= 2 => s / 2 - 1,
-                    (Some(_), _) => s / 2,
-                    (None, _) => s,
+                    (Some(p), Some(w)) if w.0 == p.0 && w.1 < p.1 && lo >= 2 => {
+                        (lo / 2 - 1, hi / 2 - 1)
+                    }
+                    (Some(_), _) => (lo / 2, hi / 2),
+                    (None, _) => (lo, hi),
                 };
-                steps[t as usize] = steps[t as usize].max(s);
+                let s = &mut steps[t as usize];
+                *s = (s.0.min(lo), s.1.max(hi));
             }
         }
-        if steps.iter().all(|&s| s == steps[0]) {
+        for s in steps.iter_mut().filter(|s| s.0 > s.1) {
+            *s = (0, u32::MAX);
+        }
+        if order(&steps, (0..n).collect()).last().is_none_or(|g| g.1 == 0) {
             return Vec::new();
         }
         steps
@@ -3410,18 +3440,20 @@ impl Simulator {
         self.resolve_read_name(name, "")
     }
 
-    /// Each signal's settle step, after the comb entries are built, for
+    /// When each signal can settle, after the comb entries are built, for
     /// `cov_replay`: how many delta cycles after a change of the signals no
     /// combinational logic drives (the outputs of clocked and initial
     /// blocks, and testbench inputs) the reference simulator updates it, in
-    /// half cycles. An `always_comb` or `always @*` output is 2 later than
-    /// the latest signal its block reads. A net driven by a continuous
-    /// assignment (a gate, a port connection) is 1 later than a variable it
-    /// reads, and as late as a net: the reference simulator updates a
-    /// network of continuous assignments together. An inverter of an
-    /// `always` block's output updates with it (the block computes it), one
-    /// of a variable an `initial` block or the testbench writes 1 later.
-    /// Also notes which block writes each combinational block output.
+    /// half cycles, at the earliest and at the latest (it depends on which
+    /// of those signals changed: the shortest and the longest path). An
+    /// `always_comb` or `always @*` output is 2 later than a signal its
+    /// block reads. A net driven by a continuous assignment (a gate, a port
+    /// connection) is 1 later than a variable it reads, and as late as a
+    /// net: the reference simulator updates a network of continuous
+    /// assignments together. An inverter of an `always` block's output
+    /// updates with it (the block computes it), one of a variable an
+    /// `initial` block or the testbench writes 1 later. Also notes which
+    /// block writes each combinational block output.
     pub(super) fn cov_steps(&mut self) {
         let (inverters, clocked) = match self.code_cov.as_mut() {
             Some(c) if c.exprs.iter().any(|s| s.hint.is_some() || s.proc.is_some()) => {
@@ -3476,8 +3508,16 @@ impl Simulator {
                 }
             }
         }
-        // Longest paths; a loop stops growing after a few rounds.
-        let mut steps = vec![0u32; n];
+        // Shortest and longest paths; a loop stops growing after a few
+        // rounds.
+        let mut steps: Vec<(u32, u32)> = vec![(0, 0); n];
+        for (e, k) in self.comb_entries.iter().zip(&kinds) {
+            for &w in e.cold.write_signal_ids.iter().filter(|_| k.is_some()) {
+                if w < n {
+                    steps[w].0 = u32::MAX;
+                }
+            }
+        }
         for _ in 0..16 {
             let mut moved = false;
             for (e, k) in self.comb_entries.iter().zip(&kinds) {
@@ -3485,21 +3525,26 @@ impl Simulator {
                     continue;
                 };
                 let writes = &e.cold.write_signal_ids;
-                let s = e
+                let reads: Vec<(u32, u32)> = e
                     .cold
                     .read_signal_ids
                     .iter()
                     .filter(|&&r| r < n && !writes.contains(&r))
-                    .map(|&r| steps[r] + if process { 2 } else { u32::from(!net[r]) })
-                    .max()
-                    .unwrap_or(0);
+                    .map(|&r| {
+                        let d = if process { 2 } else { u32::from(!net[r]) };
+                        (steps[r].0.saturating_add(d), steps[r].1 + d)
+                    })
+                    .collect();
+                let lo = reads.iter().map(|r| r.0).min().unwrap_or(0);
+                let hi = reads.iter().map(|r| r.1).max().unwrap_or(0);
                 for &w in writes.iter().filter(|&&w| w < n) {
-                    let s = match inv.get(&w) {
+                    let (lo, hi) = match inv.get(&w) {
                         Some(&x) if !process && always[x] => steps[x],
-                        _ => s,
+                        _ => (lo, hi),
                     };
-                    if steps[w] < s {
-                        steps[w] = s;
+                    let s = &mut steps[w];
+                    if lo < s.0 || hi > s.1 {
+                        *s = (s.0.min(lo), s.1.max(hi));
                         moved = true;
                     }
                 }
@@ -3507,6 +3552,10 @@ impl Simulator {
             if !moved {
                 break;
             }
+        }
+        // (A loop with no way in never changes.)
+        for s in steps.iter_mut().filter(|s| s.0 > s.1) {
+            s.0 = s.1;
         }
         cov.steps = steps;
     }

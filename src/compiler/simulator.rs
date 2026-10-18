@@ -49894,15 +49894,19 @@ impl Simulator {
     /// label in the declaration of module `unit` in source text `src`, as
     /// (kind, offset of the keyword), in source order. Read from the
     /// preprocessed text, which has no comments left; string literals are
-    /// skipped.
+    /// skipped. A statement is labeled when `<label> :` precedes the keyword,
+    /// and the colon is not a case item's (`2'd1 : assert ...`): a case body
+    /// alternates items and statements, and an item's statement ends at its
+    /// `;` or at the `end` of its block.
     fn unlabeled_concurrent_decls(&self, unit: &str, src: u32) -> Vec<(u8, usize)> {
         let Some(t) = self.module.source_texts.get(src as usize) else {
             return Vec::new();
         };
         let t = t.as_bytes();
         let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
-        // The words of the text with their offsets, strings left out.
-        let mut words: Vec<(usize, &[u8])> = Vec::new();
+        // The words of the text, and the brackets, semicolons and colons
+        // (not `::`) around them, with their offsets; strings left out.
+        let mut toks: Vec<(usize, &[u8])> = Vec::new();
         let mut i = 0;
         while i < t.len() {
             match t[i] {
@@ -49918,54 +49922,126 @@ impl Simulator {
                     while i < t.len() && word(t[i]) {
                         i += 1;
                     }
-                    words.push((start, &t[start..i]));
+                    toks.push((start, &t[start..i]));
                 }
                 c if word(c) => {
                     while i < t.len() && word(t[i]) {
                         i += 1;
                     }
                 }
+                b':' if t.get(i + 1) == Some(&b':') => i += 2,
+                b'(' | b'[' | b'{' | b')' | b']' | b'}' | b';' | b':' => {
+                    toks.push((i, &t[i..i + 1]));
+                    i += 1;
+                }
                 _ => i += 1,
             }
         }
         let opens = |w: &[u8]| matches!(w, b"module" | b"macromodule" | b"interface" | b"program");
         let closes = |w: &[u8]| matches!(w, b"endmodule" | b"endinterface" | b"endprogram");
+        let ends = |w: &[u8]| {
+            matches!(
+                w,
+                b"end" | b"endcase" | b"join" | b"join_any" | b"join_none"
+            )
+        };
+        // An open case body: the bracket depth of its keyword, whether its
+        // `(...)` header is still open, and whether an item (not the item's
+        // statement) comes next. `None` is a begin-end or fork-join block.
+        struct Case {
+            at: usize,
+            header: bool,
+            item: bool,
+        }
+        let mut blocks: Vec<Option<Case>> = Vec::new();
+        let mut brackets = 0usize;
+        // The last colon that is not a label's: a case item's, or one
+        // naming a block.
+        let mut plain = usize::MAX;
         let mut out = Vec::new();
         let mut depth = 0usize;
-        // The open case bodies (true) and begin-end or fork-join blocks.
-        let mut blocks: Vec<bool> = Vec::new();
-        for (n, &(off, w)) in words.iter().enumerate() {
+        for (n, &(off, w)) in toks.iter().enumerate() {
             if depth == 0 {
                 let name = || {
-                    words[n + 1..]
+                    toks[n + 1..]
                         .iter()
                         .map(|w| w.1)
-                        .find(|w| !matches!(*w, b"automatic" | b"static"))
+                        .find(|w| word(w[0]) && !matches!(*w, b"automatic" | b"static"))
                 };
                 if opens(w) && name() == Some(unit.as_bytes()) {
                     depth = 1;
                 }
                 continue;
             }
-            if opens(w) {
-                depth += 1;
-            } else if closes(w) {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
+            let case = blocks.last_mut().and_then(Option::as_mut);
             let kind = match w {
+                b"(" | b"[" | b"{" => {
+                    brackets += 1;
+                    continue;
+                }
+                b")" | b"]" | b"}" => {
+                    brackets = brackets.saturating_sub(1);
+                    if let Some(c) = case.filter(|c| c.header && c.at == brackets) {
+                        c.header = false;
+                        c.item = true;
+                    }
+                    continue;
+                }
+                b";" => {
+                    if let Some(c) = case.filter(|c| !c.header && c.at == brackets) {
+                        c.item = true;
+                    }
+                    continue;
+                }
+                b":" => {
+                    if n > 0 && (ends(toks[n - 1].1) || matches!(toks[n - 1].1, b"begin" | b"fork"))
+                    {
+                        plain = n;
+                    } else if let Some(c) = case.filter(|c| c.item && c.at == brackets) {
+                        c.item = false;
+                        plain = n;
+                    }
+                    continue;
+                }
                 b"case" | b"casex" | b"casez" | b"randcase" => {
-                    blocks.push(true);
+                    let header = w != b"randcase";
+                    blocks.push(Some(Case {
+                        at: brackets,
+                        header,
+                        item: !header,
+                    }));
                     continue;
                 }
                 b"begin" | b"fork" => {
-                    blocks.push(false);
+                    blocks.push(None);
                     continue;
                 }
-                b"end" | b"endcase" | b"join" | b"join_any" | b"join_none" => {
+                _ if ends(w) => {
                     blocks.pop();
+                    if let Some(c) = blocks
+                        .last_mut()
+                        .and_then(Option::as_mut)
+                        .filter(|c| c.at == brackets)
+                    {
+                        c.item = true;
+                    }
+                    continue;
+                }
+                b"else" => {
+                    if let Some(c) = case.filter(|c| c.at == brackets) {
+                        c.item = false;
+                    }
+                    continue;
+                }
+                _ if opens(w) => {
+                    depth += 1;
+                    continue;
+                }
+                _ if closes(w) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
                     continue;
                 }
                 b"assert" => 0,
@@ -49973,30 +50049,15 @@ impl Simulator {
                 b"cover" => 2,
                 _ => continue,
             };
-            if !matches!(words.get(n + 1), Some((_, b"property" | b"sequence"))) {
+            if !matches!(toks.get(n + 1), Some((_, b"property" | b"sequence"))) {
                 continue;
             }
-            // `<label> :` before the keyword (not `::`, nor a case's
-            // `default :`). Directly in a case body, `<item> :` is the case
-            // item, and a label follows it: `2'd1 : lab : assert ...`.
-            let skip = |mut j: usize| {
-                while j > 0 && t[j - 1].is_ascii_whitespace() {
-                    j -= 1;
-                }
-                j
-            };
-            let colon = |j: usize| j > 0 && t[j - 1] == b':' && (j < 2 || t[j - 2] != b':');
-            let mut j = skip(off);
-            let labeled = colon(j) && {
-                j = skip(j - 1);
-                let end = j;
-                while j > 0 && word(t[j - 1]) {
-                    j -= 1;
-                }
-                j < end
-                    && &t[j..end] != b"default"
-                    && (blocks.last() != Some(&true) || colon(skip(j)))
-            };
+            // `<label> :` before the keyword (not `default :`).
+            let labeled = n >= 2
+                && toks[n - 1].1 == b":"
+                && plain != n - 1
+                && word(toks[n - 2].1[0])
+                && toks[n - 2].1 != b"default";
             if !labeled {
                 out.push((kind, off));
             }

@@ -594,6 +594,12 @@ const CASES: &str = r#"module top;
       2'd1: assert property (b || !b);
       2'b10, 2'b11: lab_c : assert property (a);
     endcase
+    case (sel)
+      2'd0: if (a) lab_d : assert property (b);
+      default: begin : blk
+        assert property (b || !b);
+      end : blk
+    endcase
   end
   assert property (@(posedge clk) a || !a);
   initial begin
@@ -612,8 +618,10 @@ endmodule
 /// instance, keep an entry each, under their package and with their own
 /// file. A case item is not a label: `2'd1 : assert property ...` is the
 /// second unlabeled statement, `assert__1`, whether or not the first item
-/// ever runs (the reference simulator also lists the unreached `assert__0`
-/// with zero counts; xezim lists a procedural statement once reached).
+/// ever runs, and `lab_d`, labeled after an item and an `if`, takes no
+/// number though it never runs (the reference simulator also lists the
+/// unreached `assert__0` and `lab_d` with zero counts; xezim lists a
+/// procedural statement once reached).
 #[test]
 fn class_methods_and_case_items_keep_their_own_entries() {
     let (json, _) = run(
@@ -627,7 +635,8 @@ fn class_methods_and_case_items_keep_their_own_entries() {
         ("pb", "cb.f.immed__5", [4, 3, 0, 1, 0]),
         ("top", "assert__1", [2, 2, 0, 0, 0]),
         ("top", "lab_c", [2, 0, 0, 2, 0]),
-        ("top", "assert__2", [4, 4, 0, 0, 0]),
+        ("top", "blk.assert__2", [4, 4, 0, 0, 0]),
+        ("top", "assert__3", [4, 4, 0, 0, 0]),
     ] {
         assert_eq!(counts(&json, inst, name), want, "{inst} {name}:\n{json}");
     }

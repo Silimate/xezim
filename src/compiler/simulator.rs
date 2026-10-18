@@ -94662,8 +94662,9 @@ impl Simulator {
     /// element (`blk[1].sig`, `blk[1].mem[2]`) parses as a member access over
     /// a select, which the elaborator leaves alone even in a process body.
     /// Unfolded, the assertion neither sampled it nor kept a `$past` history
-    /// of it. Fold each one that names a signal or an unpacked array into
-    /// the flat name the scope's own code uses (`blk[1].sig`).
+    /// of it. Fold each one with constant selects that names a signal or an
+    /// unpacked array into the flat name the scope's own code uses
+    /// (`blk[1].sig`).
     fn sva_fold_scopes(&self, e: &mut Expression) {
         if matches!(e.kind, ExprKind::MemberAccess { .. }) {
             if let Some(name) = self.sva_scope_name(e) {
@@ -94725,22 +94726,54 @@ impl Simulator {
     }
 
     /// The storage `blk[1].sig` names (see `sva_fold_scopes`): `None` unless
-    /// the chain has a select and names a signal or an unpacked array.
+    /// the chain has a select, every select is a constant (a generate-block
+    /// or instance-array index fixed at elaboration), and it names a signal
+    /// or an unpacked array. A variable index (`a[i].f`) is evaluated at
+    /// every tick, so folding it would freeze the element it picked.
     fn sva_scope_name(&self, e: &Expression) -> Option<String> {
+        let chain = Self::member_chain_as_hier_ident(e)?;
+        let ExprKind::Ident(h) = &chain.kind else {
+            return None;
+        };
+        let mut sels = h.path.iter().flat_map(|s| &s.selects).peekable();
+        if sels.peek().is_none()
+            || !sels.all(|x| super::elaborate::const_eval_i64_with_params(x, None).is_some())
+        {
+            return None;
+        }
         let flat = self.member_chain_ident(e)?;
         let ExprKind::Ident(h) = &flat.kind else {
             return None;
         };
-        if !h.path.iter().any(|s| s.name.name.ends_with(']')) {
-            return None;
+        let path = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        // §23.8: the name is looked up in the assertion's scope, then in each
+        // enclosing one (`comb[0].delay_reg` in instance `dut` is
+        // `dut.comb[0].delay_reg`).
+        let scope = self.active_instance_scope();
+        let mut up = scope.as_str();
+        loop {
+            let name = match up {
+                "" => path.clone(),
+                _ => format!("{up}.{path}"),
+            };
+            if self.signal_name_to_id.contains_key(name.as_str())
+                || self.array_first_id.contains_key(name.as_str())
+                || self.module.arrays.contains_key(&name)
+                || self.module.arrays_2d.contains_key(&name)
+                || self.module.arrays_nd.contains_key(&name)
+            {
+                return Some(name);
+            }
+            if up.is_empty() {
+                return None;
+            }
+            up = up.rsplit_once('.').map_or("", |(p, _)| p);
         }
-        let name = self.resolve_hier_name(h).into_owned();
-        let known = self.signal_name_to_id.contains_key(name.as_str())
-            || self.array_first_id.contains_key(name.as_str())
-            || self.module.arrays.contains_key(&name)
-            || self.module.arrays_2d.contains_key(&name)
-            || self.module.arrays_nd.contains_key(&name);
-        known.then_some(name)
     }
 
     fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {

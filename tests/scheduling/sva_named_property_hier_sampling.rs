@@ -37,12 +37,24 @@ module core(input logic clk, input logic go);
   end
 endmodule
 module chk(input logic clk, input logic go);    // a named property below the top
-  int sn = 0, sf = 0;
+  int sn = 0, sf = 0, gn = 0, gf = 0, pn = 0, pf = 0;
   core u(.clk(clk), .go(go));
+  for (genvar j = 0; j < 2; j++) begin : cg
+    logic [1:0] y = 0;
+    always @(posedge clk) y <= (y == 0 && go) ? 2'd1 : 2'd0;
+  end
   property p_sub;
     @(posedge clk) (u.st == 0 && go) |=> u.st == 1;
   endproperty
+  property p_cg;                                // into this instance's generate block
+    @(posedge clk) (cg[1].y == 0 && go) |=> cg[1].y == 1;
+  endproperty
+  property p_cgpast;
+    @(posedge clk) cg[1].y == 1 |-> $past(cg[1].y) == 0 && $past(go);
+  endproperty
   a_sub: assert property (p_sub) sn++; else sf++;
+  a_cg: assert property (p_cg) gn++; else gf++;
+  a_cgpast: assert property (p_cgpast) pn++; else pf++;
 endmodule
 module t;
   logic clk = 0, go = 0;
@@ -127,6 +139,8 @@ module t;
     for (int i = 0; i < 17; i++)
       $display("a%0d %s pass=%0d fail=%0d", i, n[i] == 1 && f[i] == 0 ? "PASS" : "FAIL", n[i], f[i]);
     $display("a_sub %s pass=%0d fail=%0d", c.sn == 1 && c.sf == 0 ? "PASS" : "FAIL", c.sn, c.sf);
+    $display("a_cg %s pass=%0d fail=%0d", c.gn == 1 && c.gf == 0 ? "PASS" : "FAIL", c.gn, c.gf);
+    $display("a_cgpast %s pass=%0d fail=%0d", c.pn == 1 && c.pf == 0 ? "PASS" : "FAIL", c.pn, c.pf);
     $finish;
   end
 endmodule
@@ -186,11 +200,48 @@ fn hierarchical_references_in_named_properties_are_sampled() {
     let text = run("hier", DESIGN);
     let names = (0..17)
         .map(|i| format!("a{i}"))
-        .chain(["a_sub".to_string()]);
+        .chain(["a_sub", "a_cg", "a_cgpast"].map(String::from));
     for name in names {
         assert!(
             text.contains(&format!("{name} PASS pass=1 fail=0")),
             "{name}: expected one success and no failure:\n{text}"
         );
     }
+}
+
+/// §16.5.1: a member of an unpacked struct array element picked by a
+/// variable (`a[i].f`) is read with `i`'s sampled value at every tick. Only
+/// a select fixed at elaboration (a generate block's or an instance array's)
+/// is folded into a name; folding this one froze the element `i` named when
+/// the assertion registered, so every other tick checked the wrong element.
+#[test]
+fn variable_selects_in_assertions_follow_the_index() {
+    let text = run(
+        "index",
+        r#"
+module t;
+  typedef struct { logic [1:0] f; } e_t;
+  logic clk = 0;
+  e_t a [2];
+  int i = 0, n = 0, f = 0, m = 0, k = 0;
+  initial begin a[0].f = 1; a[1].f = 2; end
+  always #5 clk = ~clk;
+  always @(posedge clk) i <= 1 - i;
+  property p_idx;
+    @(posedge clk) a[i].f == i + 1;
+  endproperty
+  a_named: assert property (p_idx) n++; else f++;
+  a_inline: assert property (@(posedge clk) a[i].f == i + 1) m++; else k++;
+  initial begin
+    #60;
+    $display("named pass=%0d fail=%0d inline pass=%0d fail=%0d", n, f, m, k);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(
+        text.contains("named pass=6 fail=0 inline pass=6 fail=0"),
+        "{text}"
+    );
 }

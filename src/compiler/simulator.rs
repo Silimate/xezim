@@ -66651,30 +66651,11 @@ impl Simulator {
         {
             return changed;
         }
-        // §6.21: a select or member write to a `static` subroutine local
-        // (`a[7:0] = v`) updates the frame copy in place, while reads come
-        // from the live shared cell. Bring the copy up to date first and
-        // write it back after, or the write is lost.
-        let cell = if self.static_local_names.is_empty() || self.in_const_param_eval {
-            None
-        } else {
-            self.static_select_target(lhs)
-        };
-        // An index that calls a function can write the same static, so
-        // evaluate the indices (once, §11.4.1) before taking the copy. An
-        // x/z index selects nothing, so the write is discarded (§11.5.1).
-        let frozen;
-        let lhs = if cell.is_some() && !Self::select_indices_plain(lhs) {
-            let Some(e) = self.freeze_select_indices(lhs) else {
-                return false;
-            };
-            frozen = e;
-            &frozen
-        } else {
-            lhs
-        };
-        if let Some(n) = cell {
-            self.static_cell_sync(n, false);
+        if !self.static_local_names.is_empty()
+            && !self.in_const_param_eval
+            && let Some(n) = self.static_select_target(lhs)
+        {
+            return self.assign_static_select(n, lhs, val);
         }
         // §6.8/§6.11.1: a write to a 2-state procedural local drops X/Z
         // (whole, bit- or part-select). Probed only for an X/Z value.
@@ -66683,9 +66664,39 @@ impl Simulator {
         } else {
             self.assign_value_inner(lhs, val)
         };
-        if let Some(n) = cell {
-            self.static_cell_sync(n, true);
+        if changed && !self.condition_waiters.is_empty() {
+            self.check_condition_waiters_for_write(lhs);
         }
+        changed
+    }
+
+    /// §6.21: `assign_value` for a select or member write to the `static`
+    /// subroutine local `name` (`a[7:0] = v`; see `static_select_target`).
+    /// The write updates the frame copy in place, while reads come from the
+    /// live shared cell, so bring the copy up to date first and store it
+    /// back after, or the write is lost.
+    #[inline(never)]
+    fn assign_static_select(&mut self, name: &str, lhs: &Expression, val: &Value) -> bool {
+        // An index that calls a function can write the same static, so
+        // evaluate the indices (once, §11.4.1) before taking the copy. An
+        // x/z index selects nothing, so the write is discarded (§11.5.1).
+        let frozen;
+        let lhs = if Self::select_indices_plain(lhs) {
+            lhs
+        } else {
+            let Some(e) = self.freeze_select_indices(lhs) else {
+                return false;
+            };
+            frozen = e;
+            &frozen
+        };
+        self.static_cell_sync(name, false);
+        let changed = if val.has_xz() {
+            self.assign_value_xz(lhs, val)
+        } else {
+            self.assign_value_inner(lhs, val)
+        };
+        self.static_cell_sync(name, true);
         if changed && !self.condition_waiters.is_empty() {
             self.check_condition_waiters_for_write(lhs);
         }

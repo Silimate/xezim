@@ -19,6 +19,8 @@ mod ansi_net_port_procedural_assign;
 mod argument_binding;
 #[path = "misc/artifact_compression_modes.rs"]
 mod artifact_compression_modes;
+#[path = "misc/assertion_instances.rs"]
+mod assertion_instances;
 #[path = "misc/assign_z_passthrough.rs"]
 mod assign_z_passthrough;
 #[path = "misc/assignment_compatibility.rs"]

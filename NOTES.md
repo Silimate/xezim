@@ -10,6 +10,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* The results file lists every assertion statement per instance in
+  `assertion_instances`: the instance path, the label (or the reference
+  simulator's name for an unlabeled statement), kind, file and line, and the
+  attempts, nonvacuous passes, vacuous passes, failures, disabled attempts and
+  cover matches (§16.14.3). The summed `assertions` list is unchanged.
+* Vacuity follows §16.14.8 through nested properties: `a |-> (c |-> b)`
+  succeeds vacuously while `c` is false, so it runs no pass action and a
+  `cover` of it does not match, and `p or q` with a sequence operand is never
+  vacuous. Followed-by (§16.12.9) succeeds at the first tick a consequent
+  holds, vacuously when that consequent's success is vacuous.
+* An assertion in a task or function declared in another module or in a
+  package reports that module's or package's file and line in the results
+  file; it had the calling process's file and a wrong line.
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).

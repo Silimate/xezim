@@ -269,6 +269,8 @@ mod delay_always_compound_body;
 mod delayed_write_pending_semantics;
 #[path = "scheduling/edge_skip_shared_output.rs"]
 mod edge_skip_shared_output;
+#[path = "scheduling/finish_stops_woken_blocks.rs"]
+mod finish_stops_woken_blocks;
 #[path = "scheduling/finish_with_live_fork_child.rs"]
 mod finish_with_live_fork_child;
 #[path = "scheduling/hierarchical_event_wait.rs"]

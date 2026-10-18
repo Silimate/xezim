@@ -327,6 +327,44 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// §20.2: `$finish` ends the run inside its time slot, and toggles are
+/// counted per slot, so a value written in the finishing slot is no toggle:
+/// `d` rises only there. The reference simulator reports `d` untoggled and
+/// 4 of 6 bins. xezim used to count the finishing slot too, `d`'s rise and
+/// the clock's third rise with it (#8).
+#[test]
+fn finishing_slot_is_no_toggle() {
+    let d = scratch("finish");
+    let src = "\
+module tb;
+  logic clk = 0;
+  logic d = 0, e = 0;
+  always #5 clk = ~clk;
+  initial begin
+    #12 e = 1; #1 e = 0;
+    #2 d = 1;
+    $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    for row in [
+        toggle("clk", &[1], &[1]),
+        toggle("d", &[0], &[0]),
+        toggle("e", &[1], &[1]),
+        toggle_total(4, 6, "66.67"),
+    ] {
+        assert!(json.contains(&row), "{row}: {json}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The entry of scope `name` in the results file, up to the next scope's.
 fn scope<'a>(json: &'a str, name: &str) -> &'a str {
     let key = format!("\"scope\": \"{}\",", name);

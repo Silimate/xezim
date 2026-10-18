@@ -49905,8 +49905,9 @@ impl Simulator {
         let t = t.as_bytes();
         let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
         // The words of the text, and the brackets, semicolons, colons (not
-        // `::`) and `?` around them, with their offsets; strings and based
-        // literals (whose `?` is a digit: `2'b1?`) left out.
+        // `::`) and conditional operators around them, with their offsets;
+        // strings and based literals (whose `?` is a digit: `2'b1?`) left
+        // out, and the `?` of the wildcard equalities `==?` and `!=?`.
         let mut toks: Vec<(usize, &[u8])> = Vec::new();
         let mut i = 0;
         while i < t.len() {
@@ -49953,6 +49954,7 @@ impl Simulator {
                     }
                 }
                 b':' if t.get(i + 1) == Some(&b':') => i += 2,
+                b'?' if i >= 2 && t[i - 1] == b'=' && matches!(t[i - 2], b'=' | b'!') => i += 1,
                 b'(' | b'[' | b'{' | b')' | b']' | b'}' | b';' | b':' | b'?' => {
                     toks.push((i, &t[i..i + 1]));
                     i += 1;

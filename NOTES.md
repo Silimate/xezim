@@ -20,6 +20,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* A variable declared in a `for` header keeps its declared signedness when
+  the loop body blocks. With a delay or event control in the body,
+  `for (int i = 2; i >= 0; i--)` never ended and `i > -1` stopped after one
+  pass. An unsigned header variable no longer takes its initializer's
+  signedness (§6.11.1, §11.8.1, §12.7.1). (#341, reported by urbanij)
 * After `$finish` or a VPI `vpi_control(vpiFinish)`, which is how cocotb ends
   a test, no always block runs again in the finishing time slot. Compiled
   block code used to keep running, updating counters and NBAs while skipping
@@ -31,6 +36,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   deferred to the end of the slot. A finish from a cbAfterDelay callback,
   or from a value-change callback on a clock that callback drives, also stops
   that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
+* Bit-, part- and indexed part-select writes to a variable of a static task
+  or function, or to a `static` local of any subroutine or class method,
+  update the one variable all calls share. They were lost, so a static
+  function that built a value bit by bit returned its input and
+  `a[15:8] = v` left `a` all X. Member writes, increments and output
+  arguments are fixed too (§6.21, §11.5.1). Nonblocking writes to a local
+  of a static task or function, whole or select, commit in the NBA region;
+  select writes were dropped and whole writes to a local the task wrote
+  first took effect at once (§10.4.2). (#4)
 * Concurrent assertions sample the elements of unpacked arrays in the
   Preponed region like other variables. They read the value an element took
   in the NBA region of the edge being evaluated, so `a[0] == $past(s)` with
@@ -80,6 +94,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   toggle scores and design totals change accordingly;
   `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
   previous counting, where only the driving signal counts.
+* Named blocking `case` branches retain their `%m` scope and `disable`
+  targets across suspension (§9.3, §9.6.2).
 
 **Performance**
 
@@ -98,6 +114,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   paths, preserving comparison results, branch targets and X/Z fallback.
 * Event-reference checks borrow ordinary names and alias targets, reducing
   temporary string allocation during procedural assignments.
+
+* Class-heavy simulations share suspended process frames, reuse object
+  initialization templates, and avoid unnecessary interpreter lookups.
+  An explicit `XEZIM_METHOD_TIER` also attempts compilation on a later call
+  after enough interpreted loop iterations, including `foreach`; default
+  admission continues to use call counts. (#326, contributed by Thomasb81)
 
 **cocotb**
 

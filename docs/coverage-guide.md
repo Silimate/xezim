@@ -732,6 +732,11 @@ named after the package (kind `package`); a class declared outside any package
 or module belongs to `$unit` (kind `unit`), and one declared inside a module to a
 scope named after the module (kind `module`), shared by all of its instances.
 
+The signals declared in a generate block are listed in its instance under their
+names below the block (`u_r[0].r`, `u_if.s`). The names of generate blocks and
+instances, instance arrays included, are scopes, not signals, and have no
+toggle bins.
+
 #### Compared with other simulators
 
 The rules above follow what other simulators report for the same constructs. The

@@ -13,6 +13,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
+* Toggle coverage no longer lists the names of the top module's instance
+  arrays, instances in generate blocks and generate blocks as 1-bit signals.
+  They are scopes, not signals, so their bins could never be covered and the
+  top instance's toggle score and the design's total read low (§23.6). (#34)
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
@@ -65,6 +69,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   toggle scores and design totals change accordingly;
   `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
   previous counting, where only the driving signal counts.
+* Named blocking `case` branches retain their `%m` scope and `disable`
+  targets across suspension (§9.3, §9.6.2).
 
 **Performance**
 
@@ -83,6 +89,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   paths, preserving comparison results, branch targets and X/Z fallback.
 * Event-reference checks borrow ordinary names and alias targets, reducing
   temporary string allocation during procedural assignments.
+
+* Class-heavy simulations share suspended process frames, reuse object
+  initialization templates, and avoid unnecessary interpreter lookups.
+  An explicit `XEZIM_METHOD_TIER` also attempts compilation on a later call
+  after enough interpreted loop iterations, including `foreach`; default
+  admission continues to use call counts. (#326, contributed by Thomasb81)
 
 **Usability**
 

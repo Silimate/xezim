@@ -581,6 +581,12 @@ change. The instrumented run is slower, most of all for RTL:
 The C906 run's results file is 23 MB: 47,632 statements, 23,603 branch arms and
 979,190 toggle bins in 1,773 scopes.
 
+FSM coverage instruments only the always blocks that hold a state register. On
+CVDP designs with state machines, `--code-coverage=fsm` took 2 to 3% more CPU
+time than a run without code coverage for `helmholtz` (six FSMs) and
+`search_algorithm`, and 21 to 26% more for `uart`, whose state register lives
+in one large block with 40 inputs.
+
 ### An example
 
 ```systemverilog
@@ -722,7 +728,7 @@ state machine: nothing tests it (see [FSMs](#fsms)).
 
 #### FSMs
 
-xezim finds the design's finite state machines the way the commercial simulator
+xezim finds the design's finite state machines the way the reference simulator
 does, and counts their states and transitions. For example:
 
 ```systemverilog
@@ -780,7 +786,7 @@ The door's entry in `xezim_cov.json` (spread over several lines here):
           "unreachable": [], "illegal": 0}]
 ```
 
-The commercial simulator reports the same states, transitions, lines and counts
+The reference simulator reports the same states, transitions, lines and counts
 for this design.
 
 **What is an FSM.** A variable is a state machine's state when all of these hold:
@@ -798,7 +804,7 @@ for this design.
   member (a package's too), a literal or a `` `define `` of one, a cast of one
   (`state_t'(IDLE)`), the variable itself, a `?:` of those, or an expression
   of the variable in a branch that fixes its value (`2'd1: cnt <= cnt + 1` under
-  `case (cnt)`; such a counter is an FSM, as in the commercial simulator).
+  `case (cnt)`; such a counter is an FSM, as in the reference simulator).
 - Or the state process loads a next-state variable (`state <= next`), which one
   combinational block (`always_comb`, `always @*`, `always @(a or b)`), the
   state process itself, or one continuous assignment computes, under the same
@@ -813,7 +819,7 @@ the tests compare with. An enum member that no assignment or test names is not a
 state. Each state is named after the parameter or enum member that gives it, or
 `st0`, `st1`, ... in value order when none has a name. Its `line` is that of
 the first transition out of it (preferring one inside a test of the variable),
-as in the commercial simulator's report.
+as in the reference simulator's report.
 
 **Transitions.** A transition from S to T is an assignment that yields T in a
 branch where the variable can be S. An assignment outside every test of the
@@ -829,7 +835,7 @@ logic, then the last in the source.
 **Counting.** A state counts when the state process assigns the variable and
 leaves it in that state at the end of the time slot, but only on a run in which
 something the process reads (or the state variable itself) changed since its
-previous clock edge. That is the commercial simulator's count: it skips a
+previous clock edge. That is the reference simulator's count: it skips a
 clocked process whose inputs have not changed. So a state held by
 `state <= next` counts on the clock that enters it and on the next one (when
 `state` has just changed), not on every clock: the example's OPEN, held three
@@ -848,7 +854,7 @@ assignment to part of the variable, is not seen.
 
 **Unreachable and illegal states.** A state that no transition reaches from a
 reset state is still a state: it counts in the totals, stays uncovered and is
-listed in `unreachable`, as in the commercial simulator. A value outside the
+listed in `unreachable`, as in the reference simulator. A value outside the
 state set that the state process leaves in the variable (one the testbench
 forced in, held by `next = state`) counts in `illegal`, not in the coverage, and
 no transition is counted into or out of it. A value with x or z bits (before
@@ -856,7 +862,7 @@ reset) is neither.
 
 FSM coverage is the states and transitions together: `fsm` in the results has
 the covered and total counts of both, and `states` and `transitions` apart, the
-commercial simulator's "FSM States" and "FSM Transitions".
+reference simulator's "FSM States" and "FSM Transitions".
 
 #### Scopes
 
@@ -900,11 +906,11 @@ differences:
 - Toggle counts are not capped at 1.
 - A state process's input check compares values at its runs and at the end of
   each time slot. An input that changes and changes back within one time slot
-  goes unseen, so a held state can count once less than in the commercial
+  goes unseen, so a held state can count once less than in the reference
   simulator. The clock is the edge in the event control on a signal the body
   does not read; with none or several, every run counts as a clock run. An
   assignment to part of the state variable (`state[1] <= 1'b1`) is not a state
-  assignment; the commercial simulator counts a visit of the current state for
+  assignment; the reference simulator counts a visit of the current state for
   it.
 
 ### The code coverage results
@@ -1007,7 +1013,7 @@ Only `1: acc = 2;` never ran. Toggles add up per bit in the same way, from
   than 64 bits or of one bit, an element of an array or a member of a struct, a
   state computed by a function call, next-state logic spread over several
   blocks, and assignments made in a task or function the state process calls.
-  The FSM extraction of the commercial simulator recognizes some of these.
+  The FSM extraction of the reference simulator recognizes some of these.
 - Instrumented code leaves some of xezim's fast paths: the optional native code
   generators, gate fusion for instrumented continuous assignments, table
   lookups for `case` statements, skipping a flop's clock edge when its inputs

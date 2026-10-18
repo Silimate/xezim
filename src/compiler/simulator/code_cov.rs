@@ -931,7 +931,7 @@ impl Report {
         t
     }
 
-    /// FSM states and FSM transitions, the commercial simulator's two bins.
+    /// FSM states and FSM transitions, the reference simulator's two bins.
     fn fsm_split(&self) -> [Tally; 2] {
         let mut t = [Tally::default(); 2];
         for f in &self.fsms {

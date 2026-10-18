@@ -18,7 +18,7 @@
 //! tests compare with. A transition is an assignment that moves the variable
 //! from one state to another under the branches around it; an assignment
 //! outside every test of the variable (a reset, a `next_state = IDLE`
-//! default) moves it from every state. These follow the commercial
+//! default) moves it from every state. These follow the reference
 //! simulator.
 //!
 //! Counting: the state process gets two kinds of marker, `$__xz_cov` calls
@@ -27,7 +27,7 @@
 //! previous clock run; one in front of each assignment of the state variable
 //! notes the write. At the end of the time slot the variable's value counts
 //! as a visit when the block ran with changed inputs, and as a transition
-//! from the value the previous sample saw when the two differ. The commercial
+//! from the value the previous sample saw when the two differ. The reference
 //! simulator skips a clocked block whose inputs are unchanged, so a state
 //! held by `state <= next_state` counts on the clock that enters it and the
 //! next one, not on every clock; the input check reproduces that, with the
@@ -977,11 +977,19 @@ pub(crate) struct Fsm {
     counted: bool,
 }
 
+/// One thing a state process's input check reads: a whole variable, from
+/// the signal table, or a constant select of one (a port connected to one
+/// bit of a vector), evaluated.
+enum Input {
+    Sig(usize),
+    Expr(Expression),
+}
+
 /// A state process: the variables (or constant selects of them, such as a
 /// port connected to one bit of a vector) its body reads or writes, and
 /// their values when it last ran.
 struct Proc {
-    inputs: Vec<Expression>,
+    inputs: Vec<Input>,
     /// The variables `inputs` read.
     ids: Vec<usize>,
     /// An input changed after the last run (seen at the end of a time slot).
@@ -990,9 +998,9 @@ struct Proc {
     /// read (`posedge clk` of `@(posedge clk or negedge rst_n)`). A run is a
     /// clock run when the clock had that edge in the time slot and no other
     /// run of the slot was; only clock runs move the snapshot `words` (the
-    /// commercial simulator compares a clock run's inputs with those of the
+    /// reference simulator compares a clock run's inputs with those of the
     /// previous clock run, not of a run an asynchronous reset started).
-    clock: Option<(Expression, Edge)>,
+    clock: Option<(Input, Edge)>,
     /// The clock's level at the end of the last time slot (`None`: x or z).
     level: Option<bool>,
     /// A clock run happened in this time slot.
@@ -1474,7 +1482,7 @@ impl Simulator {
                     .collect();
                 let n = values.len();
                 // Transitions, each with the assignment that makes it, as
-                // the commercial simulator picks it: one inside a test of the
+                // the reference simulator picks it: one inside a test of the
                 // variable over one outside (a reset, a default), then one in
                 // the state process over one in the next-state logic, then
                 // the last in the source.
@@ -1630,7 +1638,22 @@ impl Simulator {
                 (_, [one]) => Some((*one).clone()),
                 _ => None,
             };
-            let level = clock.as_ref().and_then(|(e, _)| bit(&self.eval_expr(e)));
+            let input = |e: Expression| {
+                let id = whole(&e).and_then(|n| {
+                    self.signal_name_to_id.get(n).copied().or_else(|| {
+                        self.signal_name_to_id
+                            .get(format!("{}{}", top, n).as_str())
+                            .copied()
+                    })
+                });
+                match id {
+                    Some(id) => Input::Sig(id),
+                    None => Input::Expr(e),
+                }
+            };
+            let inputs: Vec<Input> = inputs.into_iter().map(input).collect();
+            let clock = clock.map(|(e, edge)| (input(e), edge));
+            let level = clock.as_ref().and_then(|(i, _)| self.fsm_bit(i));
             out.procs.push(Proc {
                 inputs,
                 ids,
@@ -1847,11 +1870,8 @@ impl Simulator {
             let clock = p.clock.take();
             let mut w = std::mem::take(&mut f.scratch);
             w.clear();
-            for e in &inputs {
-                let v = self.eval_expr(e);
-                words(&v, v.width, &mut w);
-            }
-            let now = clock.as_ref().map(|(e, _)| bit(&self.eval_expr(e)));
+            self.fsm_read(&inputs, &mut w);
+            let now = clock.as_ref().map(|(i, _)| self.fsm_bit(i));
             let Some(f) = self.code_cov.as_mut().and_then(|c| c.fsm.as_mut()) else {
                 return;
             };
@@ -1895,6 +1915,32 @@ impl Simulator {
             if !fsm.pending {
                 fsm.pending = true;
                 f.pending.push(k as u32);
+            }
+        }
+    }
+
+    /// Bit 0 of an input (a clock): `None` when it is x or z.
+    fn fsm_bit(&mut self, i: &Input) -> Option<bool> {
+        match i {
+            Input::Sig(id) => self.signal_table.get(*id).and_then(bit),
+            Input::Expr(e) => bit(&self.eval_expr(e)),
+        }
+    }
+
+    /// The current values of a state process's inputs.
+    fn fsm_read(&mut self, inputs: &[Input], w: &mut Vec<u64>) {
+        for i in inputs {
+            match i {
+                Input::Sig(id) => {
+                    let width = self.signal_widths.get(*id).copied().unwrap_or(0);
+                    if let Some(v) = self.signal_table.get(*id) {
+                        words(v, width, w);
+                    }
+                }
+                Input::Expr(e) => {
+                    let v = self.eval_expr(e);
+                    words(&v, v.width, w);
+                }
             }
         }
     }
@@ -1960,7 +2006,7 @@ impl Simulator {
 
     /// End of a time slot: note the state processes an input of which now
     /// differs from what their last run read, so their next run counts even
-    /// when the input has changed back by then (the commercial simulator
+    /// when the input has changed back by then (the reference simulator
     /// runs a block after any change of its inputs). Only processes with an
     /// input written in the slot are compared.
     fn fsm_watch(&mut self) {
@@ -1994,7 +2040,7 @@ impl Simulator {
             else {
                 continue;
             };
-            let level = bit(&self.eval_expr(&clock.0));
+            let level = self.fsm_bit(&clock.0);
             if let Some(f) = self.code_cov.as_mut().and_then(|c| c.fsm.as_mut()) {
                 let p = &mut f.procs[k];
                 p.clock = Some(clock);
@@ -2012,10 +2058,7 @@ impl Simulator {
                 return;
             };
             let mut w = Vec::new();
-            for e in &inputs {
-                let v = self.eval_expr(e);
-                words(&v, v.width, &mut w);
-            }
+            self.fsm_read(&inputs, &mut w);
             if let Some(f) = self.code_cov.as_mut().and_then(|c| c.fsm.as_mut()) {
                 let p = &mut f.procs[k];
                 p.inputs = inputs;

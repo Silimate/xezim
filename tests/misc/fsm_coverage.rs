@@ -1,7 +1,7 @@
 //! FSM coverage (`--code-coverage=fsm`, docs/coverage-guide.md, "FSMs"):
 //! which variables are state machines, their states and transitions, and
 //! the counts. IEEE 1800 does not define FSM coverage; each expected value
-//! below is the commercial simulator's report on the same design and
+//! below is the reference simulator's report on the same design and
 //! stimulus (its FSM states with values, lines and visit counts, and its
 //! transitions with lines and counts). The designs use enums (§6.19),
 //! parameters and `define constants (§6.20, §22.5), `case` (§12.5), `if`
@@ -128,7 +128,7 @@ fn fsms(json: &str) -> Vec<Found> {
 }
 
 /// Run `src` with FSM coverage and check its FSMs, all of them, against the
-/// commercial simulator's.
+/// reference simulator's.
 fn check(tag: &str, src: &str, want: &[Expect]) -> String {
     let d = scratch(tag);
     let out = run(&d, src, &["--code-coverage=fsm"], &[]);
@@ -1135,7 +1135,7 @@ fn visit_counts() {
     check("visits", VISITS, VISITS_FSMS);
 }
 
-/// The forms the commercial simulator recognizes (an enum cast of a
+/// The forms the reference simulator recognizes (an enum cast of a
 /// constant, two states, `unique case` with a multi-label item, a
 /// continuous-assignment next state, `next = I` defaults, package enums, an
 /// `integer` state, FSMs in a generate loop) and the ones it does not: a

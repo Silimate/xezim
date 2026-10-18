@@ -66684,10 +66684,11 @@ impl Simulator {
         let lhs = if Self::select_indices_plain(lhs) {
             lhs
         } else {
-            let Some(e) = self.freeze_select_indices(lhs) else {
+            let mut bad = false;
+            frozen = self.freeze_select_indices(lhs, &mut bad);
+            if bad {
                 return false;
-            };
-            frozen = e;
+            }
             &frozen
         };
         self.static_cell_sync(name, false);
@@ -147894,10 +147895,12 @@ impl Simulator {
             .map(|(_, key)| key.clone())
     }
 
-    /// §6.21/§11.5.1: the `static` subroutine local that a select or member
-    /// write changes in place: `a` in `a[i]`, `a[7:0]`, `a[i*8 +: 8]`,
-    /// `a.f` or `a.f[1:0]`. None for a write to the whole variable, which
-    /// reaches its shared cell by itself, and for any other target.
+    /// §6.21/§11.5.1: the `static` local of the current subroutine that a
+    /// select or member write changes in place: `a` in `a[i]`, `a[7:0]`,
+    /// `a[i*8 +: 8]`, `a.f` or `a.f[1:0]`. None for a write to the whole
+    /// variable, which reaches its shared cell by itself, and for any other
+    /// target, including a variable named like another subroutine's static
+    /// or a block variable that hides one.
     fn static_select_target<'a>(&self, lhs: &'a Expression) -> Option<&'a str> {
         let mut e = lhs;
         let mut sel = false;
@@ -147925,7 +147928,11 @@ impl Simulator {
             .as_bytes()
             .first()
             .is_some_and(|&b| self.static_local_first[b as usize])
-            && self.static_local_names.contains(n);
+            && self.static_local_names.contains(n)
+            && self.static_local_syncs.last().is_some_and(|(_, s)| {
+                s.iter()
+                    .any(|(m, k)| m == n && self.static_local_keys.contains(k))
+            });
         hit.then_some(n)
     }
 
@@ -147951,20 +147958,21 @@ impl Simulator {
     }
 
     /// The select target `e` with each index that is not plain (see
-    /// `select_indices_plain`) evaluated once and replaced by its value
-    /// (§11.4.1). None when such an index is x/z or does not fit in 64
-    /// bits: it selects nothing in a vector (§11.5.1).
-    fn freeze_select_indices(&mut self, e: &Expression) -> Option<Expression> {
-        let index = |sim: &mut Self, x: &Expression| -> Option<Box<Expression>> {
+    /// `select_indices_plain`) evaluated once, in order, and replaced by its
+    /// value (§11.4.1). An index that is x/z or does not fit in 64 bits
+    /// selects nothing in a vector (§11.5.1): it sets `bad`, for the caller
+    /// to discard the write, and the indices after it still run.
+    fn freeze_select_indices(&mut self, e: &Expression, bad: &mut bool) -> Expression {
+        let index = |sim: &mut Self, x: &Expression, bad: &mut bool| -> Box<Expression> {
             if Self::init_is_plain(x) {
-                return Some(Box::new(x.clone()));
+                return Box::new(x.clone());
             }
             let v = sim.eval_expr(x);
-            if v.has_xz() {
-                return None;
-            }
-            let n = v.to_i64()?;
-            Some(Box::new(Expression::new(
+            let Some(n) = v.to_i64().filter(|_| !v.has_xz()) else {
+                *bad = true;
+                return Box::new(x.clone());
+            };
+            Box::new(Expression::new(
                 ExprKind::Number(NumberLiteral::Integer {
                     size: Some(64),
                     signed: true,
@@ -147973,12 +147981,12 @@ impl Simulator {
                     cached_val: Cell::new(Some((n as u64, 0u64, 64u32))),
                 }),
                 x.span,
-            )))
+            ))
         };
         let kind = match &e.kind {
             ExprKind::Index { expr, index: i } => ExprKind::Index {
-                expr: Box::new(self.freeze_select_indices(expr)?),
-                index: index(self, i)?,
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
+                index: index(self, i, bad),
             },
             ExprKind::RangeSelect {
                 expr,
@@ -147986,19 +147994,19 @@ impl Simulator {
                 left,
                 right,
             } => ExprKind::RangeSelect {
-                expr: Box::new(self.freeze_select_indices(expr)?),
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
                 kind: *kind,
-                left: index(self, left)?,
-                right: index(self, right)?,
+                left: index(self, left, bad),
+                right: index(self, right, bad),
             },
             ExprKind::MemberAccess { expr, member } => ExprKind::MemberAccess {
-                expr: Box::new(self.freeze_select_indices(expr)?),
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
                 member: member.clone(),
             },
-            ExprKind::Paren(x) => return self.freeze_select_indices(x),
-            _ => return Some(e.clone()),
+            ExprKind::Paren(x) => return self.freeze_select_indices(x, bad),
+            _ => return e.clone(),
         };
-        Some(Expression::new(kind, e.span))
+        Expression::new(kind, e.span)
     }
 
     /// §6.21: copy the `static` local `name` of the current subroutine

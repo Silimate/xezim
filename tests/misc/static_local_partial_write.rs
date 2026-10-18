@@ -15,10 +15,12 @@
 //! a whole member of a static packed struct (`s.lo <= v`, §10.4.2) was
 //! dropped as well.
 //!
-//! Two neighbours of the fix are pinned as well: a block variable that hides
-//! a static of the same name keeps its reads and writes to itself, and an
-//! index that writes the same static is evaluated before the select is
-//! applied (§11.4.1).
+//! Neighbours of the fix are pinned as well: a block variable that hides a
+//! static of the same name keeps its reads and writes to itself, and so does
+//! a queue named like another method's static; an index that writes the
+//! same static is evaluated before the select is applied; and every index
+//! runs once, in order, even after an x index that discards the write
+//! (§11.4.1, §11.5.1).
 //!
 //! The design checks itself. Every expected value follows the LRM and
 //! matches the reference simulator. It runs with the default method tiering,
@@ -372,11 +374,27 @@ const SRC: &str = r##"module top;
       end
       o = a;
     endtask
+    // A queue named like the static `q` of `m` keeps its own writes, with
+    // `$` naming its last element (§7.10.1).
+    function int last();
+      int q[$];
+      q = '{1, 2, 3};
+      void'($sscanf("7", "%d", q[$]));
+      return q[2];
+    endfunction
+    // An x index discards the write, but the index after it still runs.
+    function logic [15:0] pair();
+      static logic [1:0][7:0] p;
+      p = 16'h1234;
+      void'($sscanf("1", "%b", p[pick(1)][pick(0)]));
+      return p;
+    endfunction
   endclass
 
   initial begin
     C o;
     logic [7:0] c1, c2, c3;
+    logic [15:0] w;
     check("static function bit-selects", {incr(5), incr(7), incr(15)}, {20'd0, 4'd6, 4'd8, 4'd0});
     sel_forms;
     check("constant part-select", r_const, 16'hA5xx);
@@ -432,6 +450,10 @@ const SRC: &str = r##"module top;
     check("static class method static local", C::sm(4'h5), 8'h35);
     o.shadow(c1, c2);
     check("method block variable hiding a static", {c1, c2}, 16'h01F0);
+    check("queue named like a static", o.last(), 7);
+    idx_calls = 0;
+    w = o.pair();
+    check("x index before another index call", {w, idx_calls[7:0]}, 24'h1234_02);
     // Enough calls for a compiled body to take over part way.
     c1 = count(1);
     repeat (4999) c2 = count(0);

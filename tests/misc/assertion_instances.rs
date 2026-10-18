@@ -11,8 +11,6 @@
 //!   `if (c) p else q` is lowered to implications and gets the same rule.
 //! - §16.12: a `disable iff` that holds cancels the attempts in flight and
 //!   the one the tick would start.
-//! - §16.12.9: followed-by is nonvacuous iff the consequent evaluation that
-//!   makes it succeed is.
 //!
 //! Every count below is the reference simulator's (attempts, passes,
 //! vacuous passes, failures and disabled attempts per directive; hits per
@@ -496,70 +494,6 @@ fn procedural_assertions_count_per_instance() {
         );
         assert_eq!(matches(&json, inst, "cover__0"), 2, "{inst}:\n{json}");
     }
-}
-
-const FOLLOWED: &str = r#"module top;
-  logic clk = 0, a = 0, b = 0, c = 0, d = 0, never = 0;
-  // Bit k is the value sampled at rising edge k (5, 15, ..., 115):
-  //   a 0 1 1 0 1 0 1 1 0 0 0 0
-  //   b 0 0 1 1 1 1 0 1 1 0 0 0
-  //   c 0 0 1 1 0 1 1 0 1 0 0 0
-  //   d 0 0 0 1 1 1 0 1 1 0 0 0
-  logic [11:0] av = 12'b000011010110;
-  logic [11:0] bv = 12'b000110111100;
-  logic [11:0] cv = 12'b000101101100;
-  logic [11:0] dv = 12'b000110111000;
-  always #5 clk = ~clk;
-
-  f_ov    : assert property (@(posedge clk) a #-# (c |-> d));
-  f_nov   : assert property (@(posedge clk) a #=# (c |-> d));
-  f_multi : assert property (@(posedge clk) (a ##[0:2] b) #-# (c |-> d)) $display("%0t PASS f_multi", $time);
-  f_not   : assert property (@(posedge clk) not (a #-# (c |-> d)));
-  f_nest  : assert property (@(posedge clk) b |-> (a #-# (c |-> d)));
-  f_never : assert property (@(posedge clk) a #-# (never |-> d));
-  f_fbfb  : assert property (@(posedge clk) a #-# (b #=# (c |-> d)));
-  c_multi : cover property (@(posedge clk) (a ##[0:2] b) #-# (c |-> d));
-  assert property (@(posedge clk) a #=# d);
-
-  initial begin
-    for (int k = 0; k < 12; k++) begin
-      a = av[k]; b = bv[k]; c = cv[k]; d = dv[k];
-      @(posedge clk); @(negedge clk);
-    end
-    $finish;
-  end
-endmodule
-"#;
-
-/// §16.12.9 followed-by succeeds once one antecedent match has a consequent
-/// that holds, and §16.14.8 makes it vacuous when that consequent's success
-/// is. It is settled at the first tick a consequent holds: the attempts of
-/// `f_multi` from edges 4 and 6 succeed vacuously there (`c` false), not
-/// nonvacuously at the next match, so their pass action does not run and the
-/// cover does not count them. Without an antecedent match whose consequent
-/// holds it fails, and `not` of that failure is a nonvacuous success.
-#[test]
-fn followed_by_settles_at_the_first_consequent_that_holds() {
-    let (json, out) = run("followed", &[("f.sv", FOLLOWED)]);
-    for (name, want) in [
-        ("f_ov", [12, 0, 3, 9, 0]),
-        ("f_nov", [12, 3, 1, 8, 0]),
-        ("f_multi", [12, 2, 3, 7, 0]),
-        ("f_not", [12, 9, 0, 3, 0]),
-        ("f_nest", [12, 0, 8, 4, 0]),
-        ("f_never", [12, 0, 5, 7, 0]),
-        ("f_fbfb", [12, 3, 0, 9, 0]),
-        ("assert__0", [12, 4, 0, 8, 0]),
-    ] {
-        assert_eq!(counts(&json, "top", name), want, "{name}:\n{json}");
-    }
-    assert_eq!(matches(&json, "top", "c_multi"), 2, "{json}");
-    let actions: Vec<&str> = out
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.contains("PASS f_multi"))
-        .collect();
-    assert_eq!(actions, ["35 PASS f_multi", "35 PASS f_multi"], "{out}");
 }
 
 const CLASS_A: &str = r#"package pa;

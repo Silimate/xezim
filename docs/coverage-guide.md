@@ -490,14 +490,16 @@ A success is vacuous as §16.14.8 defines it:
 - An implication (`|->`, `|=>`) is vacuous when its antecedent never matches, or
   when every consequent evaluation it starts is vacuous: `a |-> (c |-> b)` while
   `c` is false. `if (c) p` is vacuous when `c` is false.
-- Followed-by (`#-#`, `#=#`, §16.12.9) succeeds at the first tick a consequent
-  evaluation holds, and is vacuous when that evaluation is: `a #-# (c |-> b)`
-  while `c` is false. With no antecedent match whose consequent holds, it fails.
+- Followed-by (`#-#`, `#=#`, §16.12.9) succeeds as soon as a consequent
+  evaluation succeeds nonvacuously. A consequent that succeeds only vacuously
+  (`a #-# (c |-> b)` while `c` is false) leaves the attempt waiting for the
+  other antecedent matches; if none succeeds nonvacuously, the attempt ends as
+  a vacuous success. With no consequent that holds, it fails.
 - `p and q` is vacuous when both operands are. `p or q` is settled when an operand
   holds, and is vacuous when that operand's success is and the other operand's
-  evaluation is not yet known to be nonvacuous (as a sequence's always is, and an
-  implication's or a followed-by's once a consequent evaluation that is has
-  started).
+  evaluation is not yet known to be nonvacuous (as a sequence's or a
+  followed-by's always is, and an implication's once a consequent evaluation
+  that is has started).
 - A sequence or a boolean is never vacuous, and neither is a failure: `not p`
   fails when `p` holds and succeeds, nonvacuously, when `p` fails.
 

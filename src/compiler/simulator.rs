@@ -3697,6 +3697,7 @@ enum SvaState {
         ante: SvaRun,
         ante_alive: bool,
         cons: Vec<(u32, SvaState)>,
+        vacuous: bool,
     },
     And {
         a: Box<SvaState>,
@@ -97495,8 +97496,8 @@ impl Simulator {
     }
 
     /// Is the evaluation `st` of `node`, still running, already known to be
-    /// nonvacuous (§16.14.8)? A sequence's always is; an implication's or a
-    /// followed-by's once a consequent evaluation that is has started.
+    /// nonvacuous (§16.14.8)? A sequence's always is; an implication's once a
+    /// consequent evaluation that is has started.
     fn sva_known_nonvacuous(node: &SvaNode, st: &SvaState) -> bool {
         match (node, st) {
             (SvaNode::Not(n), SvaState::Not(s)) => Self::sva_known_nonvacuous(n, s),
@@ -97511,9 +97512,6 @@ impl Simulator {
                         .iter()
                         .any(|(_, cs)| Self::sva_known_nonvacuous(cn, cs))
             }
-            (SvaNode::Followed { cons: cn, .. }, SvaState::Followed { cons, .. }) => cons
-                .iter()
-                .any(|(_, cs)| Self::sva_known_nonvacuous(cn, cs)),
             (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb })
             | (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
                 ra.map_or_else(|| Self::sva_known_nonvacuous(na, a), |r| r.nonvacuous())
@@ -97607,6 +97605,7 @@ impl Simulator {
                 ante: SvaRun::with_env(env.clone()),
                 ante_alive: true,
                 cons: Vec::new(),
+                vacuous: false,
             },
             SvaNode::And(a, b) => SvaState::And {
                 a: Box::new(Self::sva_new_state(a, env)),
@@ -97986,6 +97985,7 @@ impl Simulator {
                     ante: arun,
                     ante_alive,
                     cons,
+                    vacuous,
                 },
             ) => {
                 // Unlike implication, one successful match suffices. Failure of
@@ -97998,10 +97998,6 @@ impl Simulator {
                         fresh.push(Self::sva_new_state(cons_node, &env));
                     }
                 }
-                // Settled at the first tick a consequent holds, as on the
-                // reference simulator: nonvacuous iff one that holds then is
-                // (§16.14.8).
-                let mut held: Option<bool> = None;
                 let mut keep = Vec::new();
                 for (mut delay, mut cst) in cons.drain(..) {
                     delay = delay.saturating_sub(1);
@@ -98010,18 +98006,18 @@ impl Simulator {
                         continue;
                     }
                     match self.sva_advance(cons_node, &mut cst) {
-                        Some(r) if r.holds() => held = Some(held == Some(true) || r.nonvacuous()),
-                        Some(_) => {}
+                        Some(SvaOutcome::Pass) => return Some(SvaOutcome::Pass),
+                        Some(SvaOutcome::Vacuous) => *vacuous = true,
+                        Some(SvaOutcome::Fail) => {}
                         None => keep.push((0, cst)),
                     }
                 }
                 for mut cst in fresh {
                     if *overlap {
                         match self.sva_advance(cons_node, &mut cst) {
-                            Some(r) if r.holds() => {
-                                held = Some(held == Some(true) || r.nonvacuous())
-                            }
-                            Some(_) => {}
+                            Some(SvaOutcome::Pass) => return Some(SvaOutcome::Pass),
+                            Some(SvaOutcome::Vacuous) => *vacuous = true,
+                            Some(SvaOutcome::Fail) => {}
                             None => keep.push((0, cst)),
                         }
                     } else {
@@ -98029,13 +98025,12 @@ impl Simulator {
                     }
                 }
                 *cons = keep;
-                if let Some(nonvacuous) = held {
-                    cons.clear();
-                    *ante_alive = false;
-                    return Some(SvaOutcome::of(true, nonvacuous));
-                }
                 if !*ante_alive && cons.is_empty() {
-                    Some(SvaOutcome::Fail)
+                    Some(if *vacuous {
+                        SvaOutcome::Vacuous
+                    } else {
+                        SvaOutcome::Fail
+                    })
                 } else {
                     None
                 }

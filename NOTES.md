@@ -18,8 +18,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Vacuity follows §16.14.8 through nested properties: `a |-> (c |-> b)`
   succeeds vacuously while `c` is false, so it runs no pass action and a
   `cover` of it does not match, and `p or q` with a sequence operand is never
-  vacuous. Followed-by (§16.12.9) succeeds at the first tick a consequent
-  holds, vacuously when that consequent's success is vacuous.
+  vacuous.
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.

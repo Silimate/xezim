@@ -11,6 +11,9 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "scheduling/named_branch_frames.rs"]
+mod named_branch_frames;
+
 #[path = "scheduling/loop_frame_bail_rollback.rs"]
 mod loop_frame_bail_rollback;
 #[path = "scheduling/nba_region_waiter_order.rs"]
@@ -112,6 +115,8 @@ mod expect_statement_blocks;
 mod explicit_level_suspend;
 #[path = "scheduling/explicit_sensitivity_and_delay_task.rs"]
 mod explicit_sensitivity_and_delay_task;
+#[path = "scheduling/for_decl_signed_across_wait.rs"]
+mod for_decl_signed_across_wait;
 #[path = "scheduling/forever_break_and_disable_fork_label.rs"]
 mod forever_break_and_disable_fork_label;
 #[path = "scheduling/fork_automatic_capture.rs"]
@@ -266,6 +271,8 @@ mod delay_always_compound_body;
 mod delayed_write_pending_semantics;
 #[path = "scheduling/edge_skip_shared_output.rs"]
 mod edge_skip_shared_output;
+#[path = "scheduling/finish_stops_woken_blocks.rs"]
+mod finish_stops_woken_blocks;
 #[path = "scheduling/finish_with_live_fork_child.rs"]
 mod finish_with_live_fork_child;
 #[path = "scheduling/hierarchical_event_wait.rs"]

@@ -588,7 +588,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_METHOD_TIER",
-        "class-perf: compile a class method only after N calls (0 = first call)",
+        "compile a class method after N calls (0 = first call); an explicit setting also attempts compilation on the next call after a wait-free method reaches N measured loop iterations",
     ),
     (
         "XEZIM_NAME_STATS",
@@ -810,6 +810,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_TEMPLATE_CENSUS",
         "Profiling: group compiled blocks by canonical shape; report repeated-template dynamic coverage (wants COMB_PATHS + EDGE_BLOCK_STATS)",
+    ),
+    (
+        "XEZIM_TOGGLE_INPUT_PORTS",
+        "Coverage: =0 leaves input and inout ports out of toggle coverage, like --no-toggle-input-ports (default: each instance counts its own); the flag wins",
     ),
     (
         "XEZIM_TOPO_JOIN",

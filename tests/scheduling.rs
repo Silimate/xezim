@@ -311,3 +311,24 @@ mod sva_local_diagnostics;
 mod sva_semantics_reference;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]
 mod waiter_cont_anyedge_wake;
+
+#[path = "scheduling/clocking_delivery_356.rs"]
+mod clocking_delivery_356;
+
+#[path = "scheduling/sampled_history_363.rs"]
+mod next_twelve_sampled_history_363;
+
+#[path = "scheduling/sequence_counts_367.rs"]
+mod next_twelve_sequence_counts_367;
+
+#[path = "scheduling/finish_barrier_371.rs"]
+mod next_twelve_finish_barrier_371;
+
+#[path = "scheduling/generated_assertions_374.rs"]
+mod next_rest_generated_assertions_374;
+
+#[path = "scheduling/followed_by_375.rs"]
+mod next_rest_followed_by_375;
+
+#[path = "scheduling/loop_scope_379.rs"]
+mod next_rest_loop_scope_379;

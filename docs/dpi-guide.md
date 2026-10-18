@@ -517,7 +517,7 @@ before a callback runs appears before the routine's `vpi_printf` output.
 | `cbDisable` | after a `disable` terminates the named block, fork or task around a `$systf` call | obj = that call's `vpiSysTfCall` handle |
 | `cbStmt` | before each interpreted statement a process of the given module instance runs | obj = a module handle |
 | `cbEndOfCompile`, `cbStartOfSimulation` | before time 0, in that order | |
-| `cbEndOfSimulation` | after the last time step, before `final` blocks | |
+| `cbEndOfSimulation` | after the last time step and all `final` blocks | |
 | `cbError` | after each run-time error: `$error`, `$fatal`, a reported timing violation, an illegal bin | `vpi_chk_error` reports it inside the routine |
 | `cbPLIError` | after each VPI routine error | `vpi_chk_error` reports it inside the routine, and still to the caller after |
 | `cbTchkViolation` | on each timing-check violation | obj NULL; `value` = the violation text (`vpiStringVal`) |

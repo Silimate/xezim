@@ -157,6 +157,8 @@ mod ivtest_tail2_cluster;
 mod ivtest_tail_cluster;
 #[path = "misc/library_flags.rs"]
 mod library_flags;
+#[path = "misc/local_shadow_select.rs"]
+mod local_shadow_select;
 #[path = "misc/log_redirect.rs"]
 mod log_redirect;
 #[path = "misc/lrm_audit2_runner.rs"]
@@ -505,3 +507,6 @@ mod let_declaration_scopes;
 mod constraint_inside_wrap;
 #[path = "misc/loop_var_scope_lint.rs"]
 mod loop_var_scope_lint;
+
+#[path = "misc/cli_transcript_347.rs"]
+mod cli_transcript_347;

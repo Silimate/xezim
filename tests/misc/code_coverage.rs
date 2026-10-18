@@ -720,13 +720,17 @@ fn vpi_toggles(d: &Path, c: &str, src: &str, case: &str) -> (String, String) {
     (text, results(d))
 }
 
-/// Assert the (signal, rise, fall) rows of one-bit signals.
+/// Assert the (signal, rise, fall) counts of one-bit signals, whatever other
+/// members their entries carry.
 fn toggle_rows(json: &str, rows: &[(&str, u32, u32)], what: &str) {
     for (name, rise, fall) in rows {
-        let row = format!(
-            "{{\"signal\": \"{name}\", \"width\": 1, \"rise\": [{rise}], \"fall\": [{fall}]}}"
-        );
-        assert!(json.contains(&row), "{what}: {row}: {json}");
+        let key = format!("{{\"signal\": \"{name}\", \"width\": 1,");
+        let start = json
+            .find(&key)
+            .unwrap_or_else(|| panic!("{what}: no {name}: {json}"));
+        let row = &json[start..start + json[start..].find('}').unwrap()];
+        let counts = format!("\"rise\": [{rise}], \"fall\": [{fall}]");
+        assert!(row.contains(&counts), "{what}: {name} {counts}: {row}");
     }
 }
 

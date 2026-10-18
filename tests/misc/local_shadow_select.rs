@@ -4,23 +4,20 @@
 //! A subroutine's locals and formals, a block's variables and a loop's
 //! variable hide every outer variable of the same name, so a bit-, part- or
 //! indexed part-select of one (§11.5.1) writes the local and nothing else.
-//! So does a property of a class in its methods. Whole reads and writes
-//! already reached the local, but a select write resolved the name through
-//! the module's signal table first and changed the module variable: `a =
-//! 8'h00; a[3:0] = 4'h5;` in a task left the local at 00 and wrote 5 into
-//! the module's `a`. The same went for concatenation targets, compound and
-//! increment forms, output arguments bound to a select, member selects of a
-//! packed struct, nonblocking writes, and compiled function bodies, which
-//! stored a select of a formal into the module signal.
+//! So does a property of a class in its methods. The design covers blocking
+//! and nonblocking selects, concatenation targets, compound and increment
+//! forms, output arguments bound to a select, member selects of a packed
+//! struct, package and `$unit` names, compiled function bodies, and the
+//! static block variables of `always` and `initial` processes (§6.21).
 //!
-//! A block of an `always` or `initial` process has no frame of its own. Its
-//! variables are static (§6.21) and are given storage of their own when
-//! they share a module variable's name; a block that suspended used to
-//! write the module variable outright, and one that did not lost its
-//! variable's value between activations.
+//! Two kinds of write still went wrong once plain selects reached the
+//! local. A nonblocking select of a frame local (`a[3:0] <= v`, §10.4.2)
+//! was queued and committed after the frame was gone, so it was lost or
+//! wrote the module variable. A part-select of a member of a packed struct
+//! local (`ps.hi[1:0] = v`) wrote the module's `ps`.
 //!
 //! The design checks itself. Every expected value follows the LRM, and
-//! Verilator 5.038 (`--binary --timing`) passes all 60 checks. It runs with
+//! Verilator 5.038 (`--binary --timing`) passes all 63 checks. It runs with
 //! the default method tiering, with every method and function compiled on
 //! its first call, and with none compiled.
 
@@ -111,6 +108,17 @@ module top;
     end
   endtask
 
+  // Nonblocking selects of an automatic task's local (§10.4.2).
+  logic [7:0] o_anba, o_abit;
+  task automatic auto_nba;
+    logic [7:0] a;
+    a = 8'h00;
+    a[3:0] <= 4'h5;
+    #1 o_anba = a;
+    a[7] <= 1'b1;
+    #1 o_abit = a;
+  endtask
+
   // Array elements and nested selects of an unpacked local, and a vector
   // local named like a module array.
   logic [7:0] o_e1, o_e2, o_e3, o_vec;
@@ -199,13 +207,15 @@ module top;
   endtask
 
   // A packed struct local.
-  logic [7:0] o_ps;
+  logic [7:0] o_ps, o_ps2;
   task automatic structs;
     pair_t ps;
     ps = 8'h00;
     ps.lo = 4'h7;
     ps.hi[1:0] = 2'b10;
     o_ps = ps;
+    ps.hi[2 +: 2] = 2'b11;
+    o_ps2 = ps;
   endtask
 
   // An output argument bound to a select of a local.
@@ -291,6 +301,9 @@ module top;
     check("static nonblocking select", o_nba, 8'hE5);
     check("block nonblocking select", o_bnba, 8'h0A);
     check("block nonblocking write", o_wnba, 8'h3C);
+    auto_nba;
+    check("automatic nonblocking part-select", o_anba, 8'h05);
+    check("automatic nonblocking bit-select", o_abit, 8'h85);
     arrays;
     check("array element", o_e1, 8'h12);
     check("array element part-select", o_e2, 8'h07);
@@ -324,6 +337,7 @@ module top;
     check("local named like a $unit variable", o_unit, 8'h40);
     structs;
     check("packed struct local", o_ps, 8'h27);
+    check("packed struct member indexed part-select", o_ps2, 8'hE7);
     out_arg;
     check("output argument to a select", o_arg, 8'h90);
     o = new;

@@ -697,6 +697,8 @@ impl Simulator {
         // the next snapshot. Otherwise @(cb) remains deferred until another
         // clock toggle, and #0 inputs still expose the preceding edge.
         self.drain_observed_region();
+        // silimate: assertions tick in the slot of a clock edge a VPI routine makes
+        self.vpi_observed();
         self.tick_clocking_blocks();
         if self.clocking_mirror_dirty {
             self.clocking_mirror_dirty = false;
@@ -712,6 +714,34 @@ impl Simulator {
         self.snapshot_edge_signals();
         self.vpi_same_time_work()
     }
+
+    // silimate: assertions tick in the slot of a clock edge a VPI routine makes
+    /// A cbNBASynch or cbReadWriteSynch due now: the active region set
+    /// (§4.4.2) still has work, and the Observed region waits for it.
+    #[inline]
+    pub(super) fn vpi_synch_due(&self) -> bool {
+        let now = self.time;
+        let due = |s: &BTreeSet<(u64, u64)>| s.first().is_some_and(|&(t, _)| t <= now);
+        self.vpi_cb_mask & (m(CB_NBA_SYNCH) | m(CB_READ_WRITE_SYNCH)) != 0
+            && (due(&self.vpi_cb.nba) || due(&self.vpi_cb.rw))
+    }
+
+    /// §16.5.1, §4.4.2: the Observed region of a delta a VPI routine opened.
+    /// cocotb's Clock writes the clock from cbReadWriteSynch; the concurrent
+    /// assertions tick in that slot, with its Preponed samples, once the
+    /// active region set is done (`sva_observed`). Without this they ticked
+    /// in a later delta or the next slot and read every flop's new value. A
+    /// slot the nested scheduler ran took no samples. Once a routine has
+    /// finished the run nothing is evaluated (§38.14): cocotb ends a test
+    /// from the value-change callback of the edge, and the reference
+    /// simulator reports no assertion at that edge.
+    fn vpi_observed(&mut self) {
+        if self.finished || self.sva_preponed_slot != Some(self.time) {
+            return;
+        }
+        self.sva_observed();
+    }
+    // /silimate
 
     /// Earliest tick a pending simulation-time callback holds the scheduler
     /// at. Same-time cbNBASynch/cbReadWriteSynch/cbAtEndOfSimTime/
@@ -818,6 +848,14 @@ impl Simulator {
         }
         let mut fired = self.vpi_checkpoint();
         for set in [TimedSet::Nba, TimedSet::Rw, TimedSet::AtEnd] {
+            // silimate: assertions tick in the slot of a clock edge a VPI routine makes
+            // The active region set is done before cbAtEndOfSimTime: tick an
+            // edge whose assertions waited for a cbReadWriteSynch that was
+            // removed instead of run.
+            if matches!(set, TimedSet::AtEnd) {
+                self.vpi_observed();
+            }
+            // /silimate
             if self.vpi_fire_due(set) {
                 fired = true;
                 if self.vpi_open_delta() {

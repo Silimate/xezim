@@ -721,8 +721,10 @@ testbench signals' counts: `clk` rose and fell four times, `rst` only fell and
   event control, `wait` or task call. Any other write in the design keeps a
   variable, even one that never runs: a procedural or continuous assignment,
   a port connection, `force`, a clocking block drive, `++`, or an argument a
-  task, function or system task can write. Writes through VPI don't count, so
-  a variable a cocotb test drives stays only if it has no initializer. Ports,
+  task, function or system task can write. A write xezim can't trace to its
+  variable, such as one through a virtual interface, keeps every variable of
+  that name. Writes through VPI don't count, so a variable a cocotb test
+  drives stays only if it has no initializer. Ports,
   nets, structs, enums, variables of a named type and an initialized variable
   declared in a generate block are always tracked.
 - Counts are exact: they do not stop at 1.
@@ -767,7 +769,8 @@ differences:
   holds (`if (0)`), from another module through a hierarchical name, or to a
   part of it (`v[3:0] = 0`), or when it is a 2-state variable initialized to
   0 or one initialized to all x, which xezim can't tell from one nothing
-  writes. A net whose only driver is a constant stays tracked too.
+  writes. So does one that only a class writes through a virtual interface.
+  A net whose only driver is a constant stays tracked too.
 - An input port is always its own entry in its instance. A simulator that
   optimizes for speed can merge a port connected straight to a parent's net
   into that net, and then lists it under the parent only; with full signal

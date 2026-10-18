@@ -737,6 +737,66 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Writes that are easy to miss keep a variable, as on the reference
+/// simulator: `i` changes only through `x[i++]`, `drv` only through the
+/// renamed clocking output `oalias` (§14.3), and `b2` is assigned after the
+/// intra-assignment delay of `a2 = #2 ...` (§9.4.5), not at time 0. A write
+/// the census can't place keeps every variable of that name: `bi.data`,
+/// which a class drives through a virtual interface, stays, where the
+/// reference simulator leaves it out; `bi.idle`, which nothing writes after
+/// its initializer, does not.
+#[test]
+fn toggle_keeps_variables_written_through_selects_aliases_and_delays() {
+    let d = scratch("init_hidden");
+    let src = "\
+interface bus_if(input logic clk);
+  logic [1:0] data = 2'b01;
+  logic [1:0] idle = 2'b11;
+endinterface
+class drv_c;
+  virtual bus_if vif;
+  task run(); vif.data <= 2'b10; @(posedge vif.clk); vif.data <= 2'b01; endtask
+endclass
+module dut(input logic clk, output logic [3:0] y);
+  logic [1:0] i = 2'd1;
+  logic [3:0] x = 4'd0;
+  always @(posedge clk) x[i++] = 1'b1;
+  logic [7:0] drv = 8'd0;
+  clocking cb @(posedge clk); output oalias = drv; endclocking
+  logic [3:0] a2, b2;
+  initial begin a2 = #2 4'b0101; b2 = 4'b0011; end
+  initial begin #1 cb.oalias <= 8'hff; #2 cb.oalias <= 8'h00; end
+  assign y = x ^ {2'b0, i} ^ drv[3:0] ^ a2 ^ b2;
+endmodule
+module tb;
+  logic clk = 0;
+  wire [3:0] y;
+  bus_if bi(clk);
+  dut u(.clk, .y);
+  initial begin
+    drv_c d = new;
+    d.vif = bi;
+    fork d.run(); join_none
+    repeat (8) #1 clk = ~clk;
+    $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let u = scope(&json, "tb.u");
+    assert_eq!(toggled(u), ["a2", "b2", "clk", "drv", "i", "x", "y"], "{u}");
+    assert!(u.contains("\"total\": 54,"), "{u}");
+    let bi = scope(&json, "tb.bi");
+    assert_eq!(toggled(bi), ["clk", "data"], "{bi}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The two-state executors take back a count when they hand a block to the
 /// four-state VM, so both give the same counts (the flop reads x before
 /// `d` is driven).

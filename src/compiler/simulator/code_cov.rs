@@ -1692,7 +1692,8 @@ impl Simulator {
     /// block with no timing control. Any other write in the design keeps a
     /// variable: a procedural or continuous assignment (even one that never
     /// runs), a port connection, a `force`, or an argument a subroutine or
-    /// system task may write. Values a VPI client writes don't count, as on
+    /// system task may write. A write the census can't place keeps every
+    /// variable of its name. Values a VPI client writes don't count, as on
     /// the reference simulator; a variable nothing writes that has no
     /// initializer (one a VPI client drives) stays tracked.
     fn cov_drop_fixed(&self, names: Vec<(String, Option<bool>)>) -> Vec<String> {
@@ -1705,12 +1706,18 @@ impl Simulator {
         if index.is_empty() {
             return names.into_iter().map(|(n, _)| n).collect();
         }
+        let mut leaves: HashMap<String, Vec<usize>> = HashMap::default();
+        for (n, &i) in &index {
+            let leaf = n.rsplit('.').next().unwrap_or(n);
+            leaves.entry(leaf.to_string()).or_default().push(i);
+        }
         let m = &self.module;
         let mut c = Census {
             sim: self,
             index,
             top: format!("{}.", m.name),
             scope: String::new(),
+            leaves,
             once: vec![0; names.len()],
             more: vec![false; names.len()],
         };
@@ -2070,6 +2077,9 @@ struct Census<'a> {
     /// Instance or subroutine scope of the code being read: a subroutine
     /// body may still name a variable of its instance without it.
     scope: String,
+    /// Candidates by the last part of their name, for writes the census
+    /// can't place (`mark_path`).
+    leaves: HashMap<String, Vec<usize>>,
     once: Vec<u32>,
     more: Vec<bool>,
 }
@@ -2090,45 +2100,75 @@ impl<'a> Census<'a> {
         }
     }
 
-    /// Count a write to each candidate the lvalue `e` names: its whole
-    /// path and every prefix (a select or member writes its variable), with
-    /// and without the scope in front. A clocking block's output writes the
-    /// signal of the block's scope (§14.16).
+    /// Count a write to each candidate the lvalue `e` names.
     fn mark(&mut self, e: &Expression, once: bool) {
         let mut found = Vec::new();
         paths(e, &mut found);
         for p in found {
-            let p = match p.strip_prefix(self.top.as_str()) {
-                Some(rest) => rest.to_string(),
-                None => p,
-            };
-            let scoped = (!self.scope.is_empty()).then(|| format!("{}.{}", self.scope, p));
-            for full in std::iter::once(p).chain(scoped) {
-                let mut end = full.len();
-                loop {
-                    let head = &full[..end];
-                    if let Some(&i) = self.index.get(head) {
-                        if once {
-                            self.once[i] += 1;
-                        } else {
-                            self.more[i] = true;
-                        }
-                    }
-                    if end < full.len() && self.sim.module.clocking_blocks.contains_key(head) {
-                        let var = full[end + 1..].split('.').next().unwrap_or_default();
-                        let n = match head.rsplit_once('.') {
-                            Some((p, _)) => format!("{}.{}", p, var),
-                            None => var.to_string(),
-                        };
-                        if let Some(&i) = self.index.get(&n) {
-                            self.more[i] = true;
-                        }
-                    }
-                    match full[..end].rfind('.') {
-                        Some(d) => end = d,
-                        None => break,
+            self.mark_path(&p, once);
+        }
+    }
+
+    /// Count a write to the candidate path `p` names, whole or by a prefix
+    /// (a select or member writes its variable), with and without the scope
+    /// in front. A clocking block output writes the signal it is bound to
+    /// (§14.3). A write the census can't place, such as one through a
+    /// virtual interface or to a name it doesn't know, counts for every
+    /// candidate with the same last name: when unsure, keep the variable.
+    fn mark_path(&mut self, p: &str, once: bool) {
+        let sim = self.sim;
+        let p = p.strip_prefix(self.top.as_str()).unwrap_or(p);
+        let scoped = (!self.scope.is_empty()).then(|| format!("{}.{}", self.scope, p));
+        let mut placed = false;
+        for full in std::iter::once(p.to_string()).chain(scoped) {
+            placed |= sim.signal_name_to_id.get(&full).is_some();
+            let mut end = full.len();
+            loop {
+                let head = &full[..end];
+                if let Some(&i) = self.index.get(head) {
+                    placed = true;
+                    if once {
+                        self.once[i] += 1;
+                    } else {
+                        self.more[i] = true;
                     }
                 }
+                if let Some(cb) = sim
+                    .module
+                    .clocking_blocks
+                    .get(head)
+                    .filter(|_| end < full.len())
+                {
+                    placed = true;
+                    let var = full[end + 1..].split('.').next().unwrap_or_default();
+                    let mut bound = Vec::new();
+                    match cb
+                        .signals
+                        .iter()
+                        .find(|s| s.name.name == var)
+                        .and_then(|s| s.bound_to.as_ref())
+                    {
+                        Some(e) => paths(e, &mut bound),
+                        None => bound.push(var.to_string()),
+                    }
+                    let up = head.rsplit_once('.').map(|(u, _)| u);
+                    for b in bound {
+                        if let Some(u) = up {
+                            self.mark_path(&format!("{}.{}", u, b), false);
+                        }
+                        self.mark_path(&b, false);
+                    }
+                }
+                match head.rfind('.') {
+                    Some(d) => end = d,
+                    None => break,
+                }
+            }
+        }
+        if !placed {
+            let leaf = p.rsplit('.').next().unwrap_or(p);
+            for i in self.leaves.get(leaf).cloned().unwrap_or_default() {
+                self.more[i] = true;
             }
         }
     }
@@ -2150,12 +2190,14 @@ impl<'a> Census<'a> {
                     && matches!(&src.kind,
                         StatementKind::BlockingAssign { rvalue: r, .. } if self.constant(r));
                 self.mark(lvalue, fixed);
+                self.expr(lvalue);
                 self.expr(rvalue);
             }
             StatementKind::NonblockingAssign { lvalue, rvalue, .. }
             | StatementKind::ProceduralContinuous(PC::Assign { lvalue, rvalue })
             | StatementKind::ProceduralContinuous(PC::Force { lvalue, rvalue }) => {
                 self.mark(lvalue, false);
+                self.expr(lvalue);
                 self.expr(rvalue);
             }
             StatementKind::Expr(e) | StatementKind::Return(Some(e)) => self.expr(e),
@@ -2201,6 +2243,7 @@ impl<'a> Census<'a> {
                     match i {
                         ForInit::Assign { lvalue, rvalue } => {
                             self.mark(lvalue, false);
+                            self.expr(lvalue);
                             self.expr(rvalue);
                         }
                         ForInit::VarDecl { init, .. } => self.expr(init),
@@ -2271,6 +2314,7 @@ impl<'a> Census<'a> {
                 right: r,
             } => {
                 self.mark(l, false);
+                self.expr(l);
                 self.expr(r);
             }
             ExprKind::Unary { op, operand } => {
@@ -2365,6 +2409,7 @@ impl<'a> Census<'a> {
             | ExprKind::RandomizeWith { call: x, .. }
             | ExprKind::Specialization { base: x, .. }
             | ExprKind::ShallowCopy { source: x }
+            | ExprKind::Matches { expr: x, .. }
             | ExprKind::NamedArg { expr: Some(x), .. }
             | ExprKind::Tagged { inner: Some(x), .. } => self.expr(x),
             _ => {}
@@ -2468,7 +2513,7 @@ fn paths(e: &Expression, out: &mut Vec<String>) {
 }
 
 /// A statement that can suspend its process: a delay, event control, wait
-/// or task call.
+/// (an intra-assignment one included) or task call.
 fn timed(s: &Statement) -> bool {
     match &s.kind {
         StatementKind::TimingControl { .. }
@@ -2476,6 +2521,8 @@ fn timed(s: &Statement) -> bool {
         | StatementKind::WaitFork
         | StatementKind::WaitOrder { .. } => true,
         StatementKind::Expr(e) => matches!(e.kind, ExprKind::Call { .. }),
+        // `a = #5 b;` and `a = @e b;` (§9.4.5) suspend too.
+        StatementKind::BlockingAssign { rvalue, .. } => Simulator::intra_timing_suspends(rvalue),
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
             stmts.iter().any(timed)
         }

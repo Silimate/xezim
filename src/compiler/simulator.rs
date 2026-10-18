@@ -46213,14 +46213,9 @@ impl Simulator {
             return;
         }
         let __sc_before = self.settle_calls;
-        // A blocking write interpreted inside a combinational block that
-        // this kind of settle is running (a `StmtFallback`) gets here too:
-        // keep the outer settle deferring, or the continuous assignments
-        // after that block in its pass see the process's writes so far.
-        let outer = self.proc_settle_defer;
         self.proc_settle_defer = true;
         self.settle_combinatorial();
-        self.proc_settle_defer = outer;
+        self.proc_settle_defer = false;
         // The deferred updates are PENDING WORK: without this, a caller that
         // gates its settle on dirty_any (the tick top) skips the drain and a
         // process in the NEXT slot reads stale nets.
@@ -63620,7 +63615,14 @@ impl Simulator {
                             // edge-block fix in exec_bytecode.
                             *self.name_resolve_hint.borrow_mut() =
                                 entries[eidx].cold.scope_hint.clone();
+                            // A blocking write the interpreter runs here
+                            // settles (`settle_after_proc_write`), which clears
+                            // the deferral of this settle: keep it, or the
+                            // continuous assignments after this entry see a
+                            // writing process's writes one at a time.
+                            let defer = self.proc_settle_defer;
                             self.eval_ast_comb_entry(&entries[eidx]);
+                            self.proc_settle_defer = defer;
                             if self.proc_depth > 0
                                 && matches!(entries[eidx].item, CombItem::AlwaysBlock { .. })
                             {
@@ -63687,18 +63689,21 @@ impl Simulator {
                                     // resolved the bare array name, found nothing, and
                                     // dropped every write. Pure-bytecode blocks pre-resolve
                                     // their ids, so this costs them one bool test.
+                                    // (A fallback's blocking write clears this
+                                    // settle's deferral, as in the AST arm.)
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
                                         if let Some(sc) = entries[eidx].cold.scope_hint.as_ref() {
                                             *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
                                         }
-                                        Some(prev)
+                                        Some((prev, self.proc_settle_defer))
                                     } else {
                                         None
                                     };
                                     self.exec_insns(insns);
-                                    if let Some(prev) = saved_hint {
+                                    if let Some((prev, defer)) = saved_hint {
                                         *self.name_resolve_hint.borrow_mut() = prev;
+                                        self.proc_settle_defer = defer;
                                     }
                                     self.timescale_scope_override = saved_ts;
                                     n_ab += 1;

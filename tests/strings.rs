@@ -135,3 +135,6 @@ mod compiled_method_test_env;
 mod string_char_select_signed;
 #[path = "strings/string_raw_bytes.rs"]
 mod string_raw_bytes;
+
+#[path = "strings/vpi_clocking_357.rs"]
+mod vpi_clocking_357;

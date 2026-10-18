@@ -16,17 +16,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
-* A bit-, part- or indexed part-select write through the name of a
-  subroutine local or formal, a block or loop variable, or, in a method, a
-  class property writes that variable when a module, package or `$unit`
-  variable has the same name (§23.9, §11.5.1). It wrote the hidden variable
-  instead, while whole writes and reads used the local. Nonblocking writes,
-  concatenation targets, output arguments bound to a select, member selects
-  of a packed struct local and compiled function bodies are fixed too. A
-  variable of a nested block of an `always` or `initial` process that shares
-  a module variable's name now has storage of its own: it lost its value
-  between activations, and a block that suspended wrote the module variable
-  (§6.21). (#344)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -51,6 +40,29 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 * Named blocking `case` branches retain their `%m` scope and `disable`
   targets across suspension (§9.3, §9.6.2).
+
+* Variables declared in a `for` header retain their signed type across
+  suspension and restore the enclosing variable when the loop exits (§12.7.1).
+  (#341, reported by urbanij)
+* Bit and part writes through locals, formals and instance properties use
+  their own storage even when a module variable has the same name (§23.9).
+  (#344, reported by akashlevy)
+* Nonblocking bit- and part-select writes to a local of a task or function,
+  or of a block inside one (`a[3:0] <= v`), update the local. They were lost,
+  or wrote a module variable of the same name (§10.4.2, §23.9). A part-select
+  of a member of a packed struct local (`ps.hi[1:0] = v`) writes the local
+  rather than a same-named module variable (§23.9). (#344)
+* Static `always` block locals retain their values when another task has
+  suspended, and concurrent or nested declarations retain independent
+  storage, widths, signing and string kinds (§6.21, §13.3).
+  (#345, #348 and #350, reported by akashlevy)
+* Compiled typedef locals, formals and results retain their declared width,
+  signing and two-state defaults, including scoped aliases and alias chains (§6.18).
+  (#362, reported by akashlevy)
+* `always` waits on clocking events resume after sampling and NBA updates.
+  Callback-driven clocks deliver those events in the same slot and preserve
+  the slot-entry samples of `#1step` inputs (§14.4, §14.13, §38.36).
+  (#356 and #357, reported by akashlevy)
 
 **Performance**
 

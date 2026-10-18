@@ -311,3 +311,6 @@ mod sva_local_diagnostics;
 mod sva_semantics_reference;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]
 mod waiter_cont_anyedge_wake;
+
+#[path = "scheduling/clocking_delivery_356.rs"]
+mod clocking_delivery_356;

@@ -120,20 +120,25 @@ fn run(name: &str, src: &str) -> String {
 
 /// §3.12.1: `$unit::g` in a named property still names the compilation-unit
 /// variable where the module declares its own `g`. Folding the declaration
-/// must keep the qualifier there, as the elaborator does in process bodies.
+/// (`u.v` makes it fold) must keep the qualifier there, as the elaborator
+/// does in process bodies.
 #[test]
 fn unit_qualified_names_in_named_properties_keep_their_scope() {
     let text = run(
         "unit",
         r#"
 logic g = 0;
+module m;
+  logic v = 0;
+endmodule
 module t;
   logic clk = 0;
   logic g = 1;
   int n = 0, f = 0;
+  m u();
   always #5 clk = ~clk;
   property p_unit;
-    @(posedge clk) $unit::g == 0 && g == 1;
+    @(posedge clk) $unit::g == 0 && g == 1 && u.v == 0;
   endproperty
   a: assert property (p_unit) n++; else f++;
   initial begin

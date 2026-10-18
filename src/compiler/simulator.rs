@@ -50942,6 +50942,11 @@ impl Simulator {
         if self.proc_depth == 0 {
             self.drain_deferred_comb();
             self.drain_timing_pending();
+            // The process waits: what its writes made the combinational
+            // blocks evaluate counts now (see `cov_expr`).
+            if self.code_cov.is_some() {
+                self.cov_flush();
+            }
         }
 
         let mine = std::mem::replace(&mut self.m_scope_stack, outer_m_scope);

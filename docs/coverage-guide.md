@@ -776,11 +776,12 @@ both of its rows are; coverage is the covered terms over all terms.
   b)`) is the reference simulator's `~&` or `~|`: both operands decide as
   for `&` and `|` (the right one is read even when the left decides, if
   that has no side effects).
-- **Bimodal items.** An item with `^` or `~^` counts each row by the item's
-  value too, as the reference simulator does: with `^` a term's two rows
-  can both decide the same value (`a ^ b` at (0, 0) and (1, 1) is always
-  0), so a term is covered when its rows were hit at different values of
-  the item.
+- **Bimodal items.** An item with `^`, `~^` or (in an expression) `?:`
+  counts each row by the item's value too, as the reference simulator does:
+  there a term's two rows can both decide the same value (`a ^ b` at (0, 0)
+  and (1, 1) is always 0; `s ? x : y` with `x` and `y` equal), so a term is
+  covered when its rows were hit at different values of the item. A design
+  unit adds up only the copies of an item that count alike.
 - **Transient states.** The reference simulator evaluates an item each time
   one of its inputs changes, so it also sees the delta cycle in which one
   input has its new value and another not yet: in `assign y = d | ~v`, where
@@ -813,7 +814,10 @@ both of its rows are; coverage is the covered terms over all terms.
   simulation's results do not change. xezim runs combinational blocks after
   each blocking write of a process; the reference simulator once the
   process waits. An item they evaluate meanwhile counts its last such
-  evaluation only, so the process's writes one at a time are not seen.
+  evaluation when the process waits (a `#0` too), so the process's writes
+  one at a time are not seen. Reading what the design skipped (the other
+  operand of a negated `&&`), coverage counts nothing inside it, so the
+  rows don't depend on which kinds are collected.
 
 For example, `if (en && q != 3'd7)` evaluated with `en` at 0 hits `en`'s row 0
 (the right side is not evaluated); with `en` at 1 it hits `en`'s row 1 when
@@ -895,7 +899,7 @@ The results file gains a `code_coverage` member:
 | `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait` |
 | `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count` |
 | `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first |
-| `scopes[].conditions[]`, `.expressions[]` | Every condition and expression item, never-evaluated ones included: `file`, `line`, `kind` (a condition's `if`, `while`, `do` or `ternary`; an expression's `statement`, `assign` or `port`), `block` (the generate block within the scope, when there is one), `text` (the source text) and `terms[]`, each with `term` (its source text), `hits` (the counts of its rows 0 and 1) and, in a bimodal item, `outputs` (`[[row 0 at 0, row 0 at 1], [row 1 at 0, row 1 at 1]]`, by the item's value) |
+| `scopes[].conditions[]`, `.expressions[]` | Every condition and expression item, never-evaluated ones included: `file`, `line`, `kind` (a condition's `if`, `while`, `do` or `ternary`; an expression's `statement`, `assign` or `port`), `block` (the generate block within the scope, when there is one), `text` (the source text) and `terms[]`, each with `term` (its source text), `hits` (the counts of its rows 0 and 1) and, in a bimodal item (one with `^`, `~^` or `?:`), `outputs` (`[[row 0 at 0, row 0 at 1], [row 1 at 0, row 1 at 1]]`, by the item's value) |
 | `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches`, `toggles`, `conditions` and `expressions` with the counts of all its instances added up. A statement, arm, bin or row is covered when any instance covered it |
 
 Only the kinds collected appear. Several statements on one line are separate

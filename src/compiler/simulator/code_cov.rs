@@ -246,10 +246,10 @@ pub(crate) struct ExprSite {
     /// in a `bimodal` item, with the item's value `o`, `row0 + 4 * t + 2 *
     /// v + o`.
     row0: u32,
-    /// The item has a `^` or `~^`: the reference simulator counts its rows
-    /// by the value the item takes, and a term is covered when its two rows
-    /// were hit with the item at different values (with `^` a term's row
-    /// can decide the same value at both values of the term).
+    /// The item has a `^`, `~^` or `?:`: the reference simulator counts its
+    /// rows by the value the item takes, and a term is covered when its two
+    /// rows were hit with the item at different values (with those a term
+    /// can decide the same value at both of its values).
     bimodal: bool,
     nodes: Arc<[Node]>,
     /// A continuous assignment's: the scope its names resolve in (`None`
@@ -1065,8 +1065,8 @@ fn order(steps: &[(u32, u32)], mut terms: Vec<usize>) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Reading `e` has no side effects (no function call), so a replay may
-/// read it again.
+/// Reading `e` has no side effects (no function call), so coverage may read
+/// it again (quietly: the coverage markers in it count nothing then).
 fn pure(e: &Expression) -> bool {
     match &e.kind {
         ExprKind::Number(_) | ExprKind::TypeLiteral(_) => true,
@@ -1098,7 +1098,9 @@ fn pure(e: &Expression) -> bool {
         ExprKind::SystemCall { name, args } => {
             matches!(
                 name.as_str(),
-                "$signed"
+                COND_FN
+                    | EXPR_FN
+                    | "$signed"
                     | "$unsigned"
                     | "$__xz_size_cast"
                     | "$__xz_type_cast"
@@ -1223,6 +1225,9 @@ pub(crate) struct CodeCov {
     /// and constant values.
     #[allow(clippy::type_complexity)]
     pending: Vec<(u32, usize, Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)>,
+    /// Inside a read that only coverage makes (`Simulator::cov_quietly`):
+    /// count nothing.
+    quiet: u32,
 }
 
 /// The instance a block scope (`u0.u1.genblk2`) belongs to, its longest
@@ -2288,7 +2293,7 @@ impl Instr<'_> {
         let bimodal = p
             .nodes
             .iter()
-            .any(|n| matches!(n.op, Op::BitXor | Op::BitXnor));
+            .any(|n| matches!(n.op, Op::BitXor | Op::BitXnor | Op::Mux));
         self.cov.counters += (2 + 2 * bimodal as u32) * p.terms.len() as u32;
         self.cov.exprs.push(ExprSite {
             scope: self.scope,
@@ -2464,11 +2469,18 @@ struct Report {
 /// constants left different terms stay apart by their terms.
 fn merge_items(items: &mut Vec<ItemRow>) {
     let names = |it: &ItemRow| it.terms.iter().map(|t| t.0.clone()).collect::<Vec<_>>();
-    items.sort_by(|a, b| (a.key(), names(a)).cmp(&(b.key(), names(b))));
+    // (Bimodal and other copies of one item count differently: apart.)
+    items.sort_by(|a, b| {
+        (a.key(), names(a), a.outs.len()).cmp(&(b.key(), names(b), b.outs.len()))
+    });
     let mut merged: Vec<ItemRow> = Vec::with_capacity(items.len());
     for it in items.drain(..) {
         match merged.last_mut() {
-            Some(m) if m.key() == it.key() && names(m) == names(&it) => {
+            Some(m)
+                if m.key() == it.key()
+                    && names(m) == names(&it)
+                    && m.outs.len() == it.outs.len() =>
+            {
                 for (x, y) in m.terms.iter_mut().zip(&it.terms) {
                     x.1[0] += y.1[0];
                     x.1[1] += y.1[1];
@@ -2779,6 +2791,7 @@ impl Simulator {
             inverters: Vec::new(),
             assigned: Vec::new(),
             pending: Vec::new(),
+            quiet: 0,
         };
         // Initial blocks and continuous assignments are instrumented where
         // `compile` and `build_comb_entries` take them (`cov_initial`,
@@ -3288,7 +3301,7 @@ impl Simulator {
             return Value::new(1);
         };
         let v = self.eval_expr(cond);
-        if let Some(id) = args.first().and_then(marker_id) {
+        if let Some(id) = args.first().and_then(marker_id).filter(|_| !self.cov_quiet()) {
             let slot = match v.is_nonzero() {
                 Some(true) => Some(id),
                 Some(false) => Some(id + 1),
@@ -3313,7 +3326,7 @@ impl Simulator {
             let replay = s.hint.is_some() || s.proc.is_some();
             Some((id, s.nodes.clone(), (s.row0, s.bimodal), s.hint.clone(), replay))
         });
-        let Some((id, nodes, row0, hint, replay)) = site else {
+        let Some((id, nodes, row0, hint, replay)) = site.filter(|_| !self.cov_quiet()) else {
             return self.eval_expr(e);
         };
         // A compiled continuous assignment reaches here through an
@@ -3394,8 +3407,27 @@ impl Simulator {
         self.cov_count_item(id, &nodes, row0, &vals, terms);
     }
 
-    /// Count every deferred evaluation (see `cov_expr`): at the end of a
-    /// time slot, and before reporting.
+    /// Inside a read that only coverage makes.
+    fn cov_quiet(&self) -> bool {
+        self.code_cov.as_ref().is_some_and(|c| c.quiet > 0)
+    }
+
+    /// Run `f`, a read that only coverage makes (a term or operand the
+    /// design skipped), counting nothing: the branch counters and items
+    /// inside it are not executed by the design.
+    fn cov_quietly<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        if let Some(c) = self.code_cov.as_mut() {
+            c.quiet += 1;
+        }
+        let v = f(self);
+        if let Some(c) = self.code_cov.as_mut() {
+            c.quiet -= 1;
+        }
+        v
+    }
+
+    /// Count every deferred evaluation (see `cov_expr`): when a process
+    /// waits, at the end of a time slot, and before reporting.
     pub(super) fn cov_flush(&mut self) {
         let ids: Vec<u32> = match self.code_cov.as_ref() {
             Some(c) => c.pending.iter().map(|p| p.0).collect(),
@@ -3514,7 +3546,7 @@ impl Simulator {
             let v = match nodes[i].op {
                 Op::Term(t, _) if cur[t as usize] != UNEVALUATED => continue,
                 _ if v != UNEVALUATED => v,
-                _ => match self.eval_expr(x).is_nonzero() {
+                _ => match self.cov_quietly(|me| me.eval_expr(x)).is_nonzero() {
                     Some(true) => 1,
                     Some(false) => 0,
                     None => X,
@@ -3782,7 +3814,7 @@ impl Simulator {
                 // same when that has no side effects.
                 if !l.has_xz() && l.to_u64() == Some(0) {
                     if n.op == Op::AndFull && pure(right) {
-                        self.cov_node(nodes, k1, right, vals);
+                        self.cov_quietly(|me| me.cov_node(nodes, k1, right, vals));
                     }
                     Value::from_u64(0, 1)
                 } else {
@@ -3794,7 +3826,7 @@ impl Simulator {
                 let l = self.cov_node(nodes, k0, left, vals);
                 if l.to_u64().is_some_and(|v| v != 0) {
                     if n.op == Op::OrFull && pure(right) {
-                        self.cov_node(nodes, k1, right, vals);
+                        self.cov_quietly(|me| me.cov_node(nodes, k1, right, vals));
                     }
                     Value::from_u64(1, 1)
                 } else {
@@ -3831,7 +3863,7 @@ impl Simulator {
                     _ => (&**condition, None),
                 };
                 let c = self.cov_node(nodes, k0, c, vals);
-                if let Some(t) = arm {
+                if let Some(t) = arm.filter(|_| !self.cov_quiet()) {
                     let slot = match c.is_nonzero() {
                         Some(true) => Some(t),
                         Some(false) => Some(t + 1),

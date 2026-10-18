@@ -1762,3 +1762,116 @@ endmodule
     assert_eq!(terms(&json, 6, "assign"), t("cs3", [3, 3], "w3", [3, 3]));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A block a process's writes run counts its last run before the process
+/// waits, at each wait (`#0` too: `a` at 0 decides `a && b` there, as in
+/// the reference simulator). A `?:` makes an item bimodal like `^`. And
+/// reading what a negated `&&` or `||` skipped, for its other operand's
+/// rows, counts nothing it holds: the rows are the same with branch
+/// coverage on, whose counter the `?:` condition then carries. Every
+/// item's covered terms are the reference simulator's on this design.
+#[test]
+fn waits_mux_items_and_quiet_reads() {
+    let d = scratch("waits");
+    let src = "\
+module tb;
+  // (b) a block's evaluation between a process's #0 waits
+  logic a = 1, b = 1, y;
+  always_comb y = a && b;
+  // (c) a negated && / || with a ?: in its right operand
+  logic p, q, s, u, v, w;
+  logic y2, y3;
+  always_comb y2 = !(p && (s ? q : u));
+  always_comb y3 = ~(v || (s ? q : w));
+  initial begin
+    {p, q, s, u, v, w} = 6'b0;
+    #1 a = 0;
+    #0 a = 1;
+    #1 p = 0; s = 1; q = 1; u = 0; v = 1; w = 0;
+    #1 q = 0;
+    #1 p = 1; q = 1;
+    #1 v = 0; q = 0;
+    #1 $finish;
+  end
+endmodule
+";
+    let code = |kinds: &str| {
+        let out = run(&d, src, &[kinds]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json = results(&d);
+        json[json.find("\"scopes\"").unwrap()..].to_string()
+    };
+    let json = code("--code-coverage=expr");
+    assert_eq!(
+        terms(&json, 4, "statement"),
+        vec![("a".to_string(), [1, 2]), ("b".to_string(), [0, 2])]
+    );
+    assert!(
+        json.contains(
+            "{\"term\": \"p\", \"hits\": [1, 1], \"outputs\": [[0, 1], [1, 0]]}, \
+             {\"term\": \"s\", \"hits\": [0, 2], \"outputs\": [[0, 0], [1, 1]]}"
+        ),
+        "{json}"
+    );
+    // a; p, q; v.
+    assert!(
+        results(&d).contains("\"expression\": {\"covered\": 4, \"total\": 10, \"percent\": 40.00}"),
+        "{json}"
+    );
+    let all = code("--code-coverage=all");
+    for line in [4, 8, 9] {
+        assert_eq!(terms(&all, line, "statement"), terms(&json, line, "statement"));
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A design unit adds up its instances' copies of an item only when they
+/// count alike: here one instance's parameters fold the `^` away, so its
+/// copy is not bimodal and the other's is.
+#[test]
+fn design_units_keep_bimodal_copies_apart() {
+    let d = scratch("unitbimodal");
+    let src = "\
+module m #(parameter bit P = 0, parameter bit Q = 0) (input logic a, b, output logic y);
+  always_comb y = (a & b & P) | ((a ^ b) & Q);
+endmodule
+module tb;
+  logic a, b, y1, y2;
+  m #(.P(1), .Q(0)) u1(.a(a), .b(b), .y(y1));
+  m #(.P(0), .Q(1)) u2(.a(a), .b(b), .y(y2));
+  initial begin
+    {a, b} = 2'b00;
+    #1 {a, b} = 2'b10;
+    #1 {a, b} = 2'b11;
+    #1 {a, b} = 2'b01;
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let units = &json[json.find("\"design_units\"").unwrap()..];
+    assert!(
+        units.contains(
+            "[{\"term\": \"a\", \"hits\": [1, 1]}, {\"term\": \"b\", \"hits\": [1, 1]}]"
+        ),
+        "{units}"
+    );
+    assert!(
+        units.contains(
+            "[{\"term\": \"a\", \"hits\": [2, 2], \"outputs\": [[1, 1], [1, 1]]}, \
+             {\"term\": \"b\", \"hits\": [2, 2], \"outputs\": [[1, 1], [1, 1]]}]"
+        ),
+        "{units}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

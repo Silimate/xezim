@@ -800,7 +800,7 @@ for this design.
   `case (state)`, or an `if` or `?:` that compares it with constants
   (`state == IDLE`, `state != IDLE`, `&&`, `||` and `!` of those,
   `state inside {...}`). At least one assignment of the state (or of its next
-  value) must be made inside such a test.
+  value) must be made inside such a test; a hold (`next = state`) counts.
 - Every assignment of it yields constants: a parameter or `localparam`, an enum
   member (a package's too), a literal or a `` `define `` of one, a cast of one
   (`state_t'(IDLE)`), the variable itself, a `?:` of those, or an expression
@@ -914,9 +914,11 @@ differences:
   visibility it lists the port in the instance, as xezim does.
 - Toggle counts are not capped at 1.
 - A state process's input check compares values at its runs and at the end of
-  each time slot. An input that changes and changes back within one time slot
-  goes unseen, so a held state can count once less than in the reference
-  simulator. The clock is the edge in the event control on a signal the body
+  each time slot, and follows the next-state variable through each run of its
+  block (`next = go ? A : B; if (state == A) next = state;` changes `next` and
+  changes it back in one run, which counts as a change). Any other input that
+  changes and changes back within one time slot goes unseen, so a held state
+  can count once less than in the reference simulator. The clock is the edge in the event control on a signal the body
   does not read; with none or several, every run counts as a clock run. An
   assignment to part of the state variable (`state[1] <= 1'b1`) is not a state
   assignment; the reference simulator counts a visit of the current state for

@@ -42,9 +42,10 @@ use crate::ast::Span;
 use std::collections::BTreeSet;
 
 /// Coverage marker ids from here up are FSM markers, not counters:
-/// `FSM_MARK + 2p` starts state process `p`, `FSM_MARK + 2f + 1` precedes an
-/// assignment of FSM `f`'s state variable. `cov_count` hands them to
-/// `fsm_mark`.
+/// `FSM_MARK + 4p` starts state process `p`, `FSM_MARK + 4f + 1` precedes an
+/// assignment of FSM `f`'s state variable, `FSM_MARK + 4f + 2` starts its
+/// next-state block and `FSM_MARK + 4f + 3` follows an assignment of its
+/// next-state variable there. `cov_count` hands them to `fsm_mark`.
 pub(crate) const FSM_MARK: u32 = 1 << 29;
 
 /// More states than this and the variable is not taken for an FSM.
@@ -116,6 +117,9 @@ struct Rec {
     span: Span,
     /// In the state process itself, not in the next-state logic.
     direct: bool,
+    /// In the reset branch of the state process (the first `if` of its body,
+    /// when that `if` does not test the variable).
+    reset: bool,
 }
 
 /// System functions of constants that are constants.
@@ -595,6 +599,13 @@ struct Walk<'a> {
     names: HashMap<u64, String>,
     /// An assignment of the target yields something other than constants.
     bad: bool,
+    /// Some assignment of the target, a hold included, is made under a
+    /// test of the variable.
+    guarded: bool,
+    /// The address of the state process's reset `if`, and whether the walk
+    /// is in its first branch.
+    reset_at: usize,
+    resetting: bool,
 }
 
 impl Walk<'_> {
@@ -877,7 +888,11 @@ impl Walk<'_> {
                     }
                     None => ctx.clone(),
                 };
+                let reset = then.is_none() && self.reset_at == s as *const Statement as usize;
+                let was = self.resetting;
+                self.resetting |= reset;
                 self.stmt(then_stmt, &t);
+                self.resetting = was;
                 if let Some(e) = else_stmt {
                     let f = match &pure {
                         Some(p) => ctx.and(&p.not()),
@@ -937,6 +952,7 @@ impl Walk<'_> {
 
     /// An assignment of the target (a statement's, or a continuous one's).
     fn assign(&mut self, rvalue: &Expression, ctx: &Ctx, span: Span) {
+        self.guarded |= ctx.specific();
         if self.loads {
             if let Some(n) = whole(rvalue)
                 .filter(|n| *n != self.var && !self.sim.module.parameters.contains_key(*n))
@@ -948,12 +964,14 @@ impl Walk<'_> {
         match self.eval(rvalue, ctx) {
             Ok(v) => {
                 for (c, x) in v {
+                    self.guarded |= c.specific();
                     if let Some(value) = x {
                         self.recs.push(Rec {
                             ctx: c,
                             value,
                             span,
                             direct: self.loads,
+                            reset: self.resetting,
                         });
                     }
                 }
@@ -987,6 +1005,12 @@ pub(crate) struct Fsm {
     thits: Vec<u64>,
     /// Writes of a known value outside the state set.
     illegal: u64,
+    /// The next-state variable of a two-process FSM computed by an always
+    /// block, and its value when that block's run started.
+    next_sig: Option<usize>,
+    start: (u64, u64),
+    /// This run of the next-state block has moved it off `start`.
+    away: bool,
     /// The state the last sample saw.
     shadow: Option<u32>,
     pending: bool,
@@ -1032,6 +1056,8 @@ pub(crate) struct FsmCov {
     procs: Vec<Proc>,
     /// Always block index -> its process, and the FSMs it assigns.
     blocks: Vec<(usize, u32, Vec<(String, u32)>)>,
+    /// Next-state always block index -> (next-state variable, FSM) pairs.
+    combs: Vec<(usize, Vec<(String, u32)>)>,
     pending: Vec<u32>,
     ran: Vec<u32>,
     scratch: Vec<u64>,
@@ -1202,16 +1228,19 @@ fn mark(id: u32, span: Span) -> Statement {
     )
 }
 
-/// Put a write marker in front of every whole assignment of an FSM's
-/// variable in `s`.
-fn mark_writes(s: Statement, vars: &[(String, u32)]) -> Statement {
+/// Put marker `id` in front of (or, with `after`, behind) every whole
+/// assignment of the variable it is paired with in `vars`.
+fn mark_writes(s: Statement, vars: &[(String, u32)], after: bool) -> Statement {
     let span = s.span;
     let re = |kind| Statement::new(kind, span);
-    let sub = |b: Box<Statement>| Box::new(mark_writes(*b, vars));
+    let sub = |b: Box<Statement>| Box::new(mark_writes(*b, vars, after));
     match s.kind {
         StatementKind::SeqBlock { name, stmts } => re(StatementKind::SeqBlock {
             name,
-            stmts: stmts.into_iter().map(|x| mark_writes(x, vars)).collect(),
+            stmts: stmts
+                .into_iter()
+                .map(|x| mark_writes(x, vars, after))
+                .collect(),
         }),
         StatementKind::If {
             unique_priority,
@@ -1232,7 +1261,7 @@ fn mark_writes(s: Statement, vars: &[(String, u32)]) -> Statement {
         } => {
             for it in items.iter_mut() {
                 let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
-                it.stmt = mark_writes(st, vars);
+                it.stmt = mark_writes(st, vars, after);
             }
             re(StatementKind::Case {
                 unique_priority,
@@ -1283,12 +1312,22 @@ fn mark_writes(s: Statement, vars: &[(String, u32)]) -> Statement {
             let marks: Vec<Statement> = vars
                 .iter()
                 .filter(|(n, _)| Some(n.as_str()) == lv)
-                .map(|(_, f)| mark(2 * f + 1, span))
+                .map(|(_, id)| mark(*id, span))
                 .collect();
-            if marks.is_empty() {
-                re(kind)
-            } else {
-                marked(marks, re(kind))
+            match (marks.is_empty(), after) {
+                (true, _) => re(kind),
+                (false, false) => marked(marks, re(kind)),
+                (false, true) => {
+                    let mut v = vec![re(kind)];
+                    v.extend(marks);
+                    Statement::new(
+                        StatementKind::SeqBlock {
+                            name: None,
+                            stmts: v,
+                        },
+                        span,
+                    )
+                }
             }
         }
         kind => re(kind),
@@ -1308,6 +1347,7 @@ impl Simulator {
             fsms: Vec::new(),
             procs: Vec::new(),
             blocks: Vec::new(),
+            combs: Vec::new(),
             pending: Vec::new(),
             ran: Vec::new(),
             scratch: Vec::new(),
@@ -1365,6 +1405,15 @@ impl Simulator {
                 {
                     continue;
                 }
+                // The reset: a first `if` of the body (tested in the walk not
+                // to be a test of the variable).
+                let first = match &proc_body.kind {
+                    StatementKind::SeqBlock { stmts, .. } => stmts.first(),
+                    _ => Some(proc_body),
+                };
+                let reset_at = first
+                    .filter(|f| matches!(f.kind, StatementKind::If { .. }))
+                    .map_or(0, |f| f as *const Statement as usize);
                 let mut w = Walk {
                     sim: self,
                     var,
@@ -1377,6 +1426,9 @@ impl Simulator {
                     tested: Vec::new(),
                     names: HashMap::default(),
                     bad: false,
+                    guarded: false,
+                    reset_at,
+                    resetting: false,
                 };
                 w.stmt(proc_body, &Ctx::all());
                 if w.bad {
@@ -1393,9 +1445,11 @@ impl Simulator {
                 let mut tested = std::mem::take(&mut w.tested);
                 let mut names = std::mem::take(&mut w.names);
                 let via = std::mem::take(&mut w.via);
+                let mut guarded = w.guarded;
                 // A two-process FSM: the block loads one next-state variable
                 // that a combinational block (or this one) computes.
                 let mut next = None;
+                let mut comb_at = None;
                 if let Some((_, n)) = via.first() {
                     if via.iter().any(|(_, m)| m != n) {
                         continue;
@@ -1447,6 +1501,9 @@ impl Simulator {
                         tested: Vec::new(),
                         names: HashMap::default(),
                         bad: false,
+                        guarded: false,
+                        reset_at: 0,
+                        resetting: false,
                     };
                     match (comb, &assign) {
                         (Some(comb), _) => w.stmt(comb, &Ctx::all()),
@@ -1462,6 +1519,7 @@ impl Simulator {
                             value: r.value,
                             span: r.span,
                             direct: false,
+                            reset: false,
                         }));
                     }
                     // The next-state block's tests name the states.
@@ -1472,13 +1530,15 @@ impl Simulator {
                     for (k, v) in w.names.drain() {
                         names.entry(k).or_insert(v);
                     }
+                    guarded |= w.guarded;
                     next = Some(n.clone());
+                    comb_at = block.filter(|&c| c != i);
                 }
                 // The reference simulator takes a variable for a state only
-                // when some assignment of it (or of its next state) is made
-                // under a test of it: a value register that is compared with
-                // something elsewhere is not a state machine.
-                if !recs.iter().any(|r| r.ctx.specific()) {
+                // when some assignment of it (or of its next state), a hold
+                // included, is made under a test of it: a value register that
+                // is compared with something elsewhere is not a state machine.
+                if !guarded {
                     continue;
                 }
                 let limit = if width >= 64 { u64::MAX } else { 1u64 << width };
@@ -1540,10 +1600,18 @@ impl Simulator {
                 // one; otherwise all are `st0`, `st1`, ... in value order.
                 // Unnamed, they are numbered as the reference simulator lists
                 // them: the constants the variable is compared with, in
-                // source order, then the other values assigned.
+                // source order, then the values the state process assigns
+                // outside its reset branch, those it assigns in it, and the
+                // next-state logic's.
                 let named = values.iter().all(|v| names.contains_key(v));
                 let mut order: Vec<u64> = Vec::new();
-                for v in tested.iter().copied().chain(recs.iter().map(|r| r.value)) {
+                let assigned = recs
+                    .iter()
+                    .filter(|r| r.direct && !r.reset)
+                    .chain(recs.iter().filter(|r| r.direct && r.reset))
+                    .chain(recs.iter().filter(|r| !r.direct))
+                    .map(|r| r.value);
+                for v in tested.iter().copied().chain(assigned) {
                     if values.contains(&v) && !order.contains(&v) {
                         order.push(v);
                     }
@@ -1607,6 +1675,22 @@ impl Simulator {
                     let m = if width >= 64 { u64::MAX } else { limit - 1 };
                     (x & m == 0).then(|| index.get(&(v & m)).copied()).flatten()
                 };
+                // A next-state block's run can change the next state and
+                // change it back; the reference simulator sees that as a
+                // change of the state process's input.
+                let next_sig = comb_at.and(next.as_deref()).and_then(|n| {
+                    self.signal_name_to_id.get(n).copied().or_else(|| {
+                        self.signal_name_to_id
+                            .get(format!("{}{}", top, n).as_str())
+                            .copied()
+                    })
+                });
+                if let (Some(c), Some(n), Some(_)) = (comb_at, next.as_ref(), next_sig) {
+                    match out.combs.iter_mut().find(|b| b.0 == c) {
+                        Some(b) => b.1.push((n.clone(), f)),
+                        None => out.combs.push((c, vec![(n.clone(), f)])),
+                    }
+                }
                 out.fsms.push(Fsm {
                     scope,
                     name: local(var),
@@ -1623,6 +1707,9 @@ impl Simulator {
                     unreachable,
                     proc,
                     illegal: 0,
+                    next_sig,
+                    start: (0, 0),
+                    away: false,
                     shadow,
                     pending: false,
                     counted: false,
@@ -1861,20 +1948,45 @@ impl Simulator {
             let Some(ab) = always.get_mut(*i) else {
                 continue;
             };
+            let vars: Vec<(String, u32)> =
+                vars.iter().map(|(n, f)| (n.clone(), 4 * f + 1)).collect();
             let span = ab.stmt.span;
             let s = std::mem::replace(&mut ab.stmt, Statement::new(StatementKind::Null, span));
             ab.stmt = match s.kind {
                 StatementKind::TimingControl { control, stmt } => {
-                    let inner = mark_writes(*stmt, vars);
+                    let inner = mark_writes(*stmt, &vars, false);
                     Statement::new(
                         StatementKind::TimingControl {
                             control,
-                            stmt: Box::new(marked(vec![mark(2 * p, span)], inner)),
+                            stmt: Box::new(marked(vec![mark(4 * p, span)], inner)),
                         },
                         span,
                     )
                 }
                 kind => Statement::new(kind, span),
+            };
+        }
+        for (c, vars) in &fsm.combs {
+            let Some(ab) = always.get_mut(*c) else {
+                continue;
+            };
+            let starts: Vec<Statement> = vars
+                .iter()
+                .map(|(_, f)| mark(4 * f + 2, ab.stmt.span))
+                .collect();
+            let vars: Vec<(String, u32)> =
+                vars.iter().map(|(n, f)| (n.clone(), 4 * f + 3)).collect();
+            let span = ab.stmt.span;
+            let s = std::mem::replace(&mut ab.stmt, Statement::new(StatementKind::Null, span));
+            ab.stmt = match s.kind {
+                StatementKind::TimingControl { control, stmt } => Statement::new(
+                    StatementKind::TimingControl {
+                        control,
+                        stmt: Box::new(marked(starts, mark_writes(*stmt, &vars, true))),
+                    },
+                    span,
+                ),
+                kind => marked(starts, mark_writes(Statement::new(kind, span), &vars, true)),
             };
         }
     }
@@ -1888,8 +2000,36 @@ impl Simulator {
         let Some(f) = self.code_cov.as_mut().and_then(|c| c.fsm.as_mut()) else {
             return;
         };
-        let k = (m >> 1) as usize;
-        if m & 1 == 0 {
+        let k = (m >> 2) as usize;
+        if m & 3 >= 2 {
+            // A next-state block starting, or assigning the next state. A
+            // run that moves the next state away from its starting value and
+            // back (`next = go ? A : B; if (state == A) next = state;`)
+            // changed the state process's input for the reference
+            // simulator, though the end-of-slot comparison sees no change.
+            // A change that lasts is that comparison's to see.
+            let table = &self.signal_table;
+            let Some(fsm) = f.fsms.get_mut(k) else {
+                return;
+            };
+            let Some(v) = fsm.next_sig.and_then(|id| table.get(id)) else {
+                return;
+            };
+            let now = v.raw_bits();
+            if m & 3 == 2 {
+                fsm.start = now;
+                fsm.away = false;
+            } else if now != fsm.start {
+                fsm.away = true;
+            } else if fsm.away {
+                fsm.away = false;
+                if let Some(p) = f.procs.get_mut(fsm.proc as usize) {
+                    p.stale = true;
+                }
+            }
+            return;
+        }
+        if m & 3 == 0 {
             let Some(p) = f.procs.get_mut(k) else {
                 return;
             };

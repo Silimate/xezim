@@ -1309,6 +1309,80 @@ const VALUES_FSMS: &[Expect] = &[
     ),
 ];
 
+const HOLDS: &str = r#"// A test of the state that controls only a hold of it.
+module h1(input logic clk, rst, go);
+  logic [1:0] st, ns;
+  always_ff @(posedge clk) if (rst) st <= 2'd0; else st <= ns;
+  always_comb begin
+    ns = go ? 2'd1 : 2'd0;
+    if (st == 2'd1) ns = st;
+  end
+endmodule
+module h2(input logic clk, rst, go);
+  logic [1:0] st;
+  always_ff @(posedge clk)
+    if (rst) st <= 2'd0;
+    else if (st == 2'd2) st <= st;
+    else st <= go ? 2'd2 : 2'd1;
+endmodule
+module h3(input logic clk, rst, go);
+  logic [1:0] st, ns;
+  always_ff @(posedge clk) if (rst) st <= 2'd0; else st <= ns;
+  always_comb begin
+    ns = go ? 2'd1 : 2'd2;
+    case (st)
+      2'd1: ns = st;
+      default: ;
+    endcase
+  end
+endmodule
+module tb;
+  logic clk = 0, rst = 1, go = 0;
+  always #5 clk = ~clk;
+  h1 u1(.*); h2 u2(.*); h3 u3(.*);
+  initial begin
+    repeat (2) @(negedge clk);
+    rst = 0;
+    repeat (3) begin go = ~go; repeat (2) @(negedge clk); end
+    $finish;
+  end
+endmodule
+"#;
+
+const HOLDS_FSMS: &[Expect] = &[
+    (
+        "tb.u1",
+        "st",
+        &["st1=0@6:2", "st0=1@4:3"],
+        &["st1>st0@6:1", "st0>st1@4:0"],
+    ),
+    (
+        "tb.u2",
+        "st",
+        &["st2=0@15:2", "st1=1@15:0", "st0=2@13:4"],
+        &[
+            "st2>st1@15:0",
+            "st2>st0@15:1",
+            "st1>st2@13:0",
+            "st1>st0@15:0",
+            "st0>st2@13:0",
+        ],
+    ),
+    (
+        "tb.u3",
+        "st",
+        &["st1=0@21:2", "st0=1@19:3", "st2=2@19:0"],
+        &[
+            "st1>st0@21:1",
+            "st1>st2@21:0",
+            "st0>st1@19:0",
+            "st0>st2@21:0",
+            "st2>st1@19:0",
+            "st2>st0@21:0",
+        ],
+    ),
+];
+
 /// A two-process FSM (`state <= next` and an `always_comb` next-state
 /// `case`): the reset adds a transition to CLOSED from every other state,
 /// held states count on the clock that enters them and the next one (OPEN,
@@ -1454,6 +1528,14 @@ fn signed_constants() {
 #[test]
 fn value_registers() {
     check_lines("values", VALUES, VALUES_FSMS, false);
+}
+
+/// A test of the state that controls only a hold of it (`if (st == 1)
+/// ns = st;`, a `case` item that keeps the state) makes an FSM, as in the
+/// reference simulator; the hold adds no transition.
+#[test]
+fn held_states() {
+    check("holds", HOLDS, HOLDS_FSMS);
 }
 
 /// The transition into the first assignment starts from the value the

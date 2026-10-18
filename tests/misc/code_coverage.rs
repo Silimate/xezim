@@ -1251,15 +1251,17 @@ endmodule
 /// excluded statement or arm ever runs: operands sized by their context
 /// (§11.6.1: `4'hf + 4'h1 == 8'h10` adds in 8 bits and is true, `2'b11 +
 /// 2'b01 > 2'b11` in 2 bits and is false), signed arithmetic (§11.8.1) and
-/// string literals. The right operand of an `&&` whose left operand is
-/// constantly false never runs (§11.4.7), so a `?:` in it is excluded.
+/// string literals. A constant operand of `&` takes the other operand's
+/// width, so `{a, a} & (4'hf + 4'h1)` is not decided by `4'hf + 4'h1`
+/// alone. The right operand of an `&&` whose left operand is constantly
+/// false never runs (§11.4.7), so a `?:` in it is excluded.
 #[test]
 fn constant_decisions_follow_the_run() {
     let d = scratch("sizing");
     let src = "\
 module leaf #(parameter [1:0] P = 2'b11, parameter int S = 0);
   logic [3:0] a = 0;
-  logic [5:0] r;
+  logic [6:0] r;
   always @(*) begin
     if ((4'hf + 4'h1) == 8'h10) r[0] = a[0]; else r[0] = a[1];
     if ((4'hf + 4'h1) == 4'h0) r[1] = a[0]; else r[1] = a[1];
@@ -1267,6 +1269,7 @@ module leaf #(parameter [1:0] P = 2'b11, parameter int S = 0);
     if (~P == 0) r[3] = a[0]; else r[3] = a[1];
     if (S - 1 < 0) r[4] = a[0]; else r[4] = a[1];
     if (\"z\" < \"aa\") r[5] = a[0]; else r[5] = a[1];
+    if ({a, a} & (4'hf + 4'h1)) r[6] = a[0]; else r[6] = a[1];
   end
   wire y = (1'b1 ? 1'b0 : 1'b1) && (a[0] ? a[1] : a[2]);
   initial begin
@@ -1299,6 +1302,10 @@ endmodule
             e.matches("\"kind\": \"ternary\", \"excluded\": \"constant\"")
                 .count(),
             2,
+            "{e}"
+        );
+        assert!(
+            e.contains("\"line\": 11, \"kind\": \"if\", \"arms\""),
             "{e}"
         );
         let arms = e.find("\"branches\"").unwrap();

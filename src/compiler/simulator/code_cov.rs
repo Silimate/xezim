@@ -520,7 +520,12 @@ impl<'a> Instr<'a> {
                         if l.is_ok() && r.is_ok() {
                             return Ok(());
                         }
+                        // An operand of `&` or `|` takes the width of the
+                        // other (§11.6.1), so a constant one is used only
+                        // when its value does not depend on that width.
+                        let bitwise = matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr);
                         let part = |s: Result<(), Cond>, x: &Expression| match s {
+                            Ok(()) if bitwise && !context_free(x) => Cond::Unknown,
                             Ok(()) => Cond::Const(x.clone()),
                             Err(c) => c,
                         };
@@ -1255,6 +1260,47 @@ impl<'a> Instr<'a> {
         {
             self.decide(Choice::Operand(cond, skip), None, vec![r], Vec::new());
         }
+    }
+}
+
+/// Whether `e` has the same value in a wider context (§11.6.1): a
+/// self-determined expression (a literal, a parameter or a select of one,
+/// a concatenation, a system function, a comparison, or a logical or
+/// reduction operator), so that whether it is zero, or has a 1 bit, does
+/// not depend on the operator it is an operand of. `4'hf + 4'h1` is 0 on
+/// its own but 8'h10 beside an 8-bit operand.
+fn context_free(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Paren(x) => context_free(x),
+        ExprKind::Number(_)
+        | ExprKind::StringLiteral(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Index { .. }
+        | ExprKind::RangeSelect { .. }
+        | ExprKind::Concatenation(_)
+        | ExprKind::Replication { .. }
+        | ExprKind::SystemCall { .. } => true,
+        ExprKind::Unary { op, .. } => {
+            !matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot)
+        }
+        ExprKind::Binary { op, .. } => matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr
+                | BinaryOp::LogImplies
+                | BinaryOp::LogEquiv
+        ),
+        _ => false,
     }
 }
 

@@ -588,7 +588,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_METHOD_TIER",
-        "class-perf: compile a class method only after N calls (0 = first call)",
+        "compile a class method after N calls (0 = first call); an explicit setting also attempts compilation on the next call after a wait-free method reaches N measured loop iterations",
     ),
     (
         "XEZIM_NAME_STATS",

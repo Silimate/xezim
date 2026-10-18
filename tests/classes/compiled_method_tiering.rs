@@ -362,6 +362,217 @@ endmodule
     let _ = std::fs::remove_file(&src2);
 }
 
+/// Measure admission from a fresh persistent cache, independent of the
+/// asynchronous profiler. The positive case must contain an actual compiled
+/// block, rather than a cached refusal, and both policies check known results.
+fn run_with_admission(source: &str, tier: &str) -> (String, usize, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "xezim-loop-heat-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).expect("isolated heat test directory");
+    let src = dir.join("input.sv");
+    let cache = dir.join("cache");
+    std::fs::write(&src, source).unwrap();
+    let output = Command::new("timeout")
+        .args(["--kill-after=5s", "60s"])
+        .arg(xezim_bin2())
+        .args(["--simulate", "-s", "top"])
+        .arg(&src)
+        .env("XEZIM_COMPILE_METHODS", "1")
+        .env("XEZIM_METHOD_TIER", tier)
+        .env("XEZIM_METHOD_CACHE", &cache)
+        .env_remove("XEZIM_METHOD_PROFILE")
+        .output()
+        .expect("heat subprocess");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("TAG "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut blocks = 0;
+    let mut refusals = 0;
+    if cache.exists() {
+        for entry in std::fs::read_dir(&cache).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "bin") {
+                let outcome: xezim::compiler::bytecode::PersistedMethodOutcome =
+                    bincode::deserialize(&std::fs::read(path).unwrap())
+                        .expect("valid method cache");
+                if matches!(
+                    outcome,
+                    xezim::compiler::bytecode::PersistedMethodOutcome::Block { .. }
+                ) {
+                    blocks += 1;
+                } else {
+                    refusals += 1;
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    (text, blocks, refusals)
+}
+
+#[test]
+fn measured_loop_heat_admits_only_bodies_with_enough_iterations() {
+    let source = r#"
+class K;
+  int acc = 0;
+  function automatic int step(int v);
+    int t;
+    acc = acc + v;
+    for (t = 0; t < 80; t = t + 1) acc = acc + ((t * v) % 7);
+    return acc;
+  endfunction
+endclass
+module top;
+  integer r = 0;
+  initial begin
+    K k = new;
+    for (int i = 0; i < 30; i++) r = r + k.step(1);
+    $display("TAG r=%0d", r);
+  end
+endmodule
+"#;
+    assert_eq!(
+        run_with_admission(source, "1000000"),
+        ("TAG r=109275".into(), 0, 0)
+    );
+    assert_eq!(
+        run_with_admission(source, "100"),
+        ("TAG r=109275".into(), 1, 0)
+    );
+}
+
+// §12.7.3: all foreach collection shapes contribute executed iterations.
+// Calling twice crosses the heat threshold while remaining below call tier.
+#[test]
+fn foreach_iterations_cross_the_method_heat_threshold() {
+    for (tag, declaration, setup, loop_stmt, expected) in [
+        (
+            "queue",
+            "int q[$];",
+            "for (int i=0;i<2000;i++) c.q.push_back(i);",
+            "foreach(q[k]) n++;",
+            2000,
+        ),
+        (
+            "dynamic",
+            "int q[];",
+            "c.q = new[2000];",
+            "foreach(q[k]) n++;",
+            2000,
+        ),
+        ("fixed", "int q[2000];", "", "foreach(q[k]) n++;", 2000),
+        (
+            "assoc",
+            "int q[int];",
+            "for(int i=0;i<2000;i++) c.q[i*2]=i;",
+            "foreach(q[k]) n++;",
+            2000,
+        ),
+        ("matrix", "int q[40][50];", "", "foreach(q[j,k]) n++;", 2000),
+        (
+            "continue",
+            "int q[$];",
+            "for(int i=0;i<2000;i++) c.q.push_back(i);",
+            "foreach(q[k]) begin if(k%2==0) continue; n++; end",
+            1000,
+        ),
+    ] {
+        let source = format!(
+            r#"
+class C;
+  {declaration}
+  function int step();
+    int n = 0;
+    {loop_stmt}
+    return n;
+  endfunction
+endclass
+module top;
+  initial begin
+    C c = new;
+    {setup}
+    $display("TAG %0d", c.step());
+    $display("TAG %0d", c.step());
+  end
+endmodule
+"#
+        );
+        let output = format!("TAG {expected}\nTAG {expected}");
+        assert_eq!(
+            run_with_admission(&source, "1000000"),
+            (output.clone(), 0, 0),
+            "{tag} cold"
+        );
+        // Multi-index member foreach currently declines bytecode lowering.
+        // A persisted refusal proves heat reached admission while preserving
+        // interpreter execution; it must never count as a compiled block.
+        let (blocks, refusals) = if tag == "matrix" { (0, 1) } else { (1, 0) };
+        assert_eq!(
+            run_with_admission(&source, "100"),
+            (output, blocks, refusals),
+            "{tag} hot"
+        );
+    }
+}
+
+#[test]
+fn foreach_heat_counts_executed_iterations_instead_of_collection_size() {
+    for (tag, setup, loop_stmt, expected) in [
+        ("empty", "", "foreach(q[k]) n++;", 0),
+        (
+            "break",
+            "for(int i=0;i<2000;i++) c.q.push_back(i);",
+            "foreach(q[k]) begin n++; if(k==1) break; end",
+            2,
+        ),
+        (
+            "return",
+            "for(int i=0;i<2000;i++) c.q.push_back(i);",
+            "foreach(q[k]) begin n++; if(k==1) return n; end",
+            2,
+        ),
+    ] {
+        let source = format!(
+            r#"
+class C;
+  int q[$];
+  function int step();
+    int n = 0;
+    {loop_stmt}
+    return n;
+  endfunction
+endclass
+module top;
+  initial begin
+    C c = new;
+    {setup}
+    $display("TAG %0d", c.step());
+    $display("TAG %0d", c.step());
+  end
+endmodule
+"#
+        );
+        assert_eq!(
+            run_with_admission(&source, "100"),
+            (format!("TAG {expected}\nTAG {expected}"), 0, 0),
+            "{tag}"
+        );
+    }
+}
+
 /// Parse the method-profiler histogram for `step` and return its VM counter.
 /// The histogram line has the form `   AST  VM  step`; a positive VM count
 /// means the method was admitted to the compiled bytecode path.

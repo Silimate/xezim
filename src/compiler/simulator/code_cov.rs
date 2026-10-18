@@ -1551,6 +1551,17 @@ impl Simulator {
             return Vec::new();
         };
         let inst_paths: HashSet<&str> = module.instances.iter().map(|i| i.path.as_str()).collect();
+        // Each instance's own name, without its array index (`u` for `u[0]`
+        // and `g[0].u`), and its module.
+        let inst_names: HashSet<(&str, &str)> = module
+            .instances
+            .iter()
+            .map(|i| {
+                let leaf = i.path.rsplit('.').next().unwrap_or_default();
+                let name = leaf.split('[').next().unwrap_or_default();
+                (name, i.def_name.as_str())
+            })
+            .collect();
         let subr_prefixes: Vec<String> = module
             .functions
             .keys()
@@ -1602,6 +1613,17 @@ impl Simulator {
                 }
                 if let Some(t) = &sig.type_name {
                     if module.classes.contains_key(t) || module.interfaces.contains(t) {
+                        return false;
+                    }
+                    // Instances and generate blocks are scopes, not signals
+                    // (§23.6). Elaboration gives the top module a 1-bit
+                    // placeholder signal under each one's name, so that
+                    // hierarchical names through it validate: typed
+                    // `$genblock` for a generate block and by its module for
+                    // an instance, including an instance array and one in a
+                    // generate block, which have no instance path of that
+                    // name.
+                    if t == "$genblock" || inst_names.contains(&(n, t.as_str())) {
                         return false;
                     }
                 }

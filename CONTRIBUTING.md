@@ -82,6 +82,16 @@ when no checkout is found (and the tests clone on demand as a fallback). To use
 an existing checkout instead, set `XEZIM_UVM_DIR` to its root or clone it as a
 `../UVM` sibling of this repository.
 
+### cocotb runner tests
+
+The cocotb runner (`contrib/cocotb/xezim_runner.py`) has a pytest suite in
+`contrib/cocotb/tests`, which `cargo test` does not run. It needs Python with
+cocotb 2 and pytest. From the repository root, after a release build:
+
+```bash
+XEZIM_BIN=$PWD/target/release/xezim python -m pytest contrib/cocotb/tests
+```
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the

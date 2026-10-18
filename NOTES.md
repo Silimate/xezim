@@ -13,9 +13,38 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
+* Toggle coverage no longer lists the names of the top module's instance
+  arrays, instances in generate blocks and generate blocks as 1-bit signals.
+  They are scopes, not signals, so their bins could never be covered and the
+  top instance's toggle score and the design's total read low (§23.6). (#34)
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* A variable declared in a `for` header keeps its declared signedness when
+  the loop body blocks. With a delay or event control in the body,
+  `for (int i = 2; i >= 0; i--)` never ended and `i > -1` stopped after one
+  pass. An unsigned header variable no longer takes its initializer's
+  signedness (§6.11.1, §11.8.1, §12.7.1). (#341, reported by urbanij)
+* After `$finish` or a VPI `vpi_control(vpiFinish)`, which is how cocotb ends
+  a test, no always block runs again in the finishing time slot. Compiled
+  block code used to keep running, updating counters and NBAs while skipping
+  the block's `$display`. A finish raised before the edge's waiting processes
+  resumed, by an always block, an earlier process or a VPI routine, was also
+  deferred to the end of the slot like one of theirs, so later passes ran
+  more blocks. `final` blocks and coverage then counted a clock edge the log
+  never showed. Only a finish from a resumed waiting process is still
+  deferred to the end of the slot. A finish from a cbAfterDelay callback,
+  or from a value-change callback on a clock that callback drives, also stops
+  that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
+* Bit-, part- and indexed part-select writes to a variable of a static task
+  or function, or to a `static` local of any subroutine or class method,
+  update the one variable all calls share. They were lost, so a static
+  function that built a value bit by bit returned its input and
+  `a[15:8] = v` left `a` all X. Member writes, increments and output
+  arguments are fixed too (§6.21, §11.5.1). Nonblocking writes to a local
+  of a static task or function, whole or select, commit in the NBA region;
+  select writes were dropped and whole writes to a local the task wrote
+  first took effect at once (§10.4.2). (#4)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -27,16 +56,23 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   different width. Unsupported variable-length strings are omitted with a
   warning naming them, preserving the rest of the waveform (§6.16, §10.8).
   (#339, reported by Lramseyer)
+* `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
+  adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
+  `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so
+  a cocotb test run with `-sv_seed random` starts instead of failing to parse
+  `+seed=random` as its seed. If both are given, `-sv_seed` wins over
+  `+seed=`. A `+seed=` you write is still a plusarg, and still seeds the RNG
+  (§21.6, §38.17). (Silimate/xezim#2)
 
 * Code coverage leaves out what a constant condition rules out in an
-  instance, as the commercial simulator does: a `case` whose selector and
+  instance, as the reference simulator does: a `case` whose selector and
   items are constants, an `if` chain or `?:` on parameters, genvars or ports
   tied to literals is no branch, and the arms that cannot run and their
-  statements are not counted. `xezim_cov.json` marks those rows `"excluded": "constant"`
-  and counts them in an `excluded` member of the totals; a design unit counts
-  an item that any of its instances counts. `--code-coverage-constant=keep`
-  (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`) counts them as before (§11.2.1,
-  §12.4, §12.5). (#25)
+  statements are not counted. `xezim_cov.json` marks those rows
+  `"excluded": "constant"` and counts them in an `excluded` member of the
+  totals; a design unit counts an item that any of its instances counts.
+  `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`)
+  counts them as before (§11.2.1, §12.4, §12.5). (Silimate/xezim#25)
 
 * Integer `inside` constraints evaluate size-cast bounds in the joint
   comparison context and sample uniformly over distinct legal values,
@@ -47,6 +83,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   key types and independent rows through allocation, copying and resizing
   (§7.5, §7.8). Recompile saved designs to refresh their class metadata.
   (#337, reported by Dragon-Git)
+
+* Toggle coverage counts each instance's input and inout ports in that
+  instance, as commercial simulators do, with the value the connection gives
+  the port: a port connected to a whole net shows that net's counts, one
+  connected to an expression or select toggles as its value, and a constant
+  or unconnected port never toggles (§23.3.3). The ports of a module that is
+  the top of the design, driven through VPI, are now covered too. Instance
+  toggle scores and design totals change accordingly;
+  `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
+  previous counting, where only the driving signal counts.
+* Named blocking `case` branches retain their `%m` scope and `disable`
+  targets across suspension (§9.3, §9.6.2).
 
 **Performance**
 
@@ -65,6 +113,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   paths, preserving comparison results, branch targets and X/Z fallback.
 * Event-reference checks borrow ordinary names and alias targets, reducing
   temporary string allocation during procedural assignments.
+
+* Class-heavy simulations share suspended process frames, reuse object
+  initialization templates, and avoid unnecessary interpreter lookups.
+  An explicit `XEZIM_METHOD_TIER` also attempts compilation on a later call
+  after enough interpreted loop iterations, including `foreach`; default
+  admission continues to use call counts. (#326, contributed by Thomasb81)
+
+**cocotb**
+
+* The cocotb runner (`contrib/cocotb/xezim_runner.py`) applies the options
+  cocotb's other runners do. `parameters` were ignored and now become
+  `-gNAME=VALUE`; a value is any constant expression, such as `{3'd7,3'd5}`.
+  `build_args` and a `timescale` given to `build()` were dropped and now
+  apply at run time. `elab_args` are passed too, and a `string` define becomes
+  a string literal, as with the other runners. The toplevel comes from
+  `test()`, and VHDL sources are an error. `build()` records its arguments,
+  parameters included, in `xezim_build.json` instead of `xezim_sources.f`, so
+  `test()` on another runner uses them too. The runner's tests are in
+  `contrib/cocotb/tests`.
 
 **Maintenance**
 

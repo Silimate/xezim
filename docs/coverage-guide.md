@@ -559,6 +559,12 @@ name below the top) and to the packages named. Without it the whole design is
 covered, except the UVM library package `uvm_pkg` and the built-in `std` package;
 name one of them in the scope to include it.
 
+`--no-toggle-input-ports` (or `XEZIM_TOGGLE_INPUT_PORTS=0`) leaves input and
+inout ports out of toggle coverage, so that only the signal driving a port
+counts its toggles. By default each instance counts its own ports; see
+[Toggles](#toggles). `--toggle-input-ports` restores the default when the
+variable is set.
+
 Code that a constant condition rules out in an instance is left out of the
 totals, as in other simulators: see [Constant conditions](#constant-conditions).
 `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`) counts
@@ -611,9 +617,9 @@ $ xezim --code-coverage cnt_cov.sv
 q = 3
 Simulation finished at time 40 ($finish called)
 $ xezim --code-coverage --verbose cnt_cov.sv 2>&1 | grep '^\[COV\] code\|^\[COV\]  '
-[COV] code coverage: statement 12/12 (100.00%), branch 2/3 (66.67%), toggle 10/18 (55.56%)
+[COV] code coverage: statement 12/12 (100.00%), branch 2/3 (66.67%), toggle 14/24 (58.33%)
 [COV]   tb (tb): statement 9/9 (100.00%), branch 0/0, toggle 7/12 (58.33%)
-[COV]   tb.u_cnt (counter): statement 3/3 (100.00%), branch 2/3 (66.67%), toggle 3/6 (50.00%)
+[COV]   tb.u_cnt (counter): statement 3/3 (100.00%), branch 2/3 (66.67%), toggle 7/12 (58.33%)
 ```
 
 The first line is the design's totals, then one line per scope with its design
@@ -628,18 +634,19 @@ The counter's entry in `xezim_cov.json`:
         "kind": "instance",
         "statement": {"covered": 3, "total": 3, "percent": 100.00},
         "branch": {"covered": 2, "total": 3, "percent": 66.67},
-        "toggle": {"covered": 3, "total": 6, "percent": 50.00},
+        "toggle": {"covered": 7, "total": 12, "percent": 58.33},
         "statements": [{"file": "cnt_cov.sv", "line": 2, "kind": "always_ff", "count": 4}, {"file": "cnt_cov.sv", "line": 4, "kind": "statement", "count": 1}, {"file": "cnt_cov.sv", "line": 6, "kind": "statement", "count": 3}],
         "branches": [{"file": "cnt_cov.sv", "line": 3, "kind": "if", "arms": [{"line": 4, "arm": "if", "count": 1}, {"line": 6, "arm": "else if", "count": 3}, {"line": 3, "arm": "else (implicit)", "count": 0}]}],
-        "toggles": [{"signal": "q", "width": 3, "rise": [2, 1, 0], "fall": [1, 0, 0]}]
+        "toggles": [{"signal": "clk", "width": 1, "rise": [4], "fall": [4]}, {"signal": "en", "width": 1, "rise": [1], "fall": [0]}, {"signal": "q", "width": 3, "rise": [2, 1, 0], "fall": [1, 0, 0]}, {"signal": "rst", "width": 1, "rise": [0], "fall": [1]}]
       }
 ```
 
 The flop ran on four clock edges: once in reset, three times counting. No edge
 came with both `rst` and `en` low, so the implicit `else` of the `if` chain was
 never taken. `q` went 0, 1, 2, 3: bit 2 never toggled and bit 1 never fell, so
-3 of the counter's 6 toggle bins are covered. Its inputs `clk`, `rst` and `en`
-are not listed: their toggles are the testbench's.
+3 of its 6 bins are covered. The inputs count in the counter too, with the
+testbench signals' counts: `clk` rose and fell four times, `rst` only fell and
+`en` only rose, so 7 of the counter's 12 toggle bins are covered.
 
 ### What counts
 
@@ -767,13 +774,21 @@ branch 1/3, and no `excluded` members.
 - Tracked: every net and variable of an integral type declared in a module or
   interface instance: `logic`, `bit` and `reg` vectors, nets, `int`, `integer`,
   `byte`, `shortint`, `longint`, enums and packed structs (both as plain bit
-  vectors), and the members of unpacked structs. Output ports are tracked; when
-  one is connected straight to a parent's signal, both names show the same
-  counts.
-- Not tracked: input and inout ports (the signal that drives one carries its
-  toggles), unpacked arrays, queues, dynamic and associative arrays, `real`,
-  `time`, `string`, `event` and class-handle variables, parameters, variables
-  declared in tasks, functions and procedural blocks, and class properties.
+  vectors), and the members of unpacked structs.
+- Ports are tracked in the instance they belong to, input, output and inout
+  alike (the ports of an interface instance included), with the value their
+  connection gives them. A port connected straight to a parent's signal shows
+  the same counts as that signal, under both names. A port connected to an
+  expression, a select or a concatenation toggles as that value does; the
+  bits a narrower connection leaves at 0 never toggle, and neither does a port
+  tied to a constant or left unconnected, so their bins stay uncovered.
+  `--no-toggle-input-ports` leaves input and inout ports out, so that only the
+  signal driving one counts its toggles.
+- Not tracked: unpacked arrays (unpacked port arrays included), queues, dynamic
+  and associative arrays, `real`, `time`, `string`, `event` and class-handle
+  variables, parameters, interface ports and modports (the interface instance
+  counts its signals), variables declared in tasks, functions and procedural
+  blocks, and class properties.
 - Counts are exact: they do not stop at 1.
 
 #### Scopes
@@ -783,6 +798,11 @@ methods of a class and the tasks and functions of a package belong to a scope
 named after the package (kind `package`); a class declared outside any package
 or module belongs to `$unit` (kind `unit`), and one declared inside a module to a
 scope named after the module (kind `module`), shared by all of its instances.
+
+The signals declared in a generate block are listed in its instance under their
+names below the block (`u_r[0].r`, `u_if.s`). The names of generate blocks and
+instances, instance arrays included, are scopes, not signals, and have no
+toggle bins.
 
 #### Compared with other simulators
 
@@ -815,6 +835,10 @@ differences:
   position instead, and count fewer.
 - Enum variables toggle as bit vectors, not by value, and unused variables stay
   in the toggle list.
+- An input port is always its own entry in its instance. A simulator that
+  optimizes for speed can merge a port connected straight to a parent's net
+  into that net, and then lists it under the parent only; with full signal
+  visibility it lists the port in the instance, as xezim does.
 - Toggle counts are not capped at 1.
 
 ### The code coverage results
@@ -988,6 +1012,7 @@ it.
 | `--error-exit` | Exit nonzero after any `$error`, including one from an assertion's action block, and after an `illegal_bins` hit |
 | `--code-coverage[=<kinds>]`, `XEZIM_CODE_COVERAGE=<kinds>` | Collect code coverage: `stmt`, `branch`, `toggle` or `all` (the default). See [Code coverage](#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees and packages |
+| `--no-toggle-input-ports`, `XEZIM_TOGGLE_INPUT_PORTS=0` | Leave input and inout ports out of toggle coverage; by default each instance counts its own (`--toggle-input-ports`). See [Toggles](#toggles) |
 | `--code-coverage-constant=<exclude\|keep>`, `XEZIM_CODE_COVERAGE_CONSTANT` | Leave out (`exclude`, the default) or count (`keep`) the code that [constant conditions](#constant-conditions) rule out |
 | `+cover`, `+cover=<letters>`, `-coverage` | Other simulators' spellings of `--code-coverage`: `s`, `b` and `t` select the kinds; other letters are ignored with a warning |
 | `+fcover` | Accepted for compatibility with other simulators; no effect |

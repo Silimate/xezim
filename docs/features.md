@@ -98,7 +98,9 @@ See the [coverage guide](coverage-guide.md).
   a VPI tool can walk. See the [DPI and VPI guide](dpi-guide.md).
 * **cocotb** — Python testbenches run against xezim through a runner backend
   (`contrib/cocotb/xezim_runner.py`) on top of the VPI layer, including timed
-  and synchronous callbacks.
+  and synchronous callbacks. `get_runner("xezim")` takes the options of
+  cocotb's other runners: `parameters` become `-g` overrides, and since xezim
+  has no compile step, `build_args` apply when `test()` runs.
 
 ## Performance features
 

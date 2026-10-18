@@ -74,6 +74,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   toggle scores and design totals change accordingly;
   `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
   previous counting, where only the driving signal counts.
+* Toggle coverage leaves out a variable whose value is fixed before the run
+  starts, as the reference simulator does: one only its declaration
+  initializer sets (`reg [4:0] poly = 5'b10011;`), and one only a single
+  constant assignment sets in an `initial` block without timing controls.
+  Such a variable never changes, so its bins could never be covered and
+  held instance scores down (§6.8). Any other write keeps a variable, even
+  one that never runs; writes through VPI don't count. (Silimate/xezim#46)
 * Named blocking `case` branches retain their `%m` scope and `disable`
   targets across suspension (§9.3, §9.6.2).
 

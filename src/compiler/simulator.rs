@@ -50841,6 +50841,8 @@ impl Simulator {
             return;
         }
         let mut pending = std::mem::take(&mut self.deferred_comb);
+        // `usize::MAX`: code coverage's mark (see `cov_expr`).
+        let cov = pending.iter().any(|p| p.0 == usize::MAX);
         for (eidx, snap) in pending.iter() {
             let eidx = *eidx;
             let clobbered = snap
@@ -50892,6 +50894,9 @@ impl Simulator {
         }
         self.deferred_comb_pool
             .extend(pending.into_iter().map(|(_, v)| v));
+        if cov {
+            self.cov_flush();
+        }
     }
 
     /// §4.5 boundary: run the process, then let the ACTIVE-region work its
@@ -50942,11 +50947,6 @@ impl Simulator {
         if self.proc_depth == 0 {
             self.drain_deferred_comb();
             self.drain_timing_pending();
-            // The process waits: what its writes made the combinational
-            // blocks evaluate counts now (see `cov_expr`).
-            if self.code_cov.is_some() {
-                self.cov_flush();
-            }
         }
 
         let mine = std::mem::replace(&mut self.m_scope_stack, outer_m_scope);

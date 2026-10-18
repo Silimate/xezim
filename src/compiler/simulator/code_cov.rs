@@ -3359,6 +3359,11 @@ impl Simulator {
             {
                 self.cov_flush_item(id);
             }
+            // The process's exit counts it (`drain_deferred_comb`, which this
+            // mark wakes, so a run without coverage checks nothing more).
+            if self.code_cov.as_ref().is_some_and(|c| c.pending.is_empty()) {
+                self.deferred_comb.push((usize::MAX, Vec::new()));
+            }
             if let Some(c) = self.code_cov.as_mut() {
                 c.pending.retain(|p| p.0 != id);
                 c.pending.push((id, pid, vals, terms));

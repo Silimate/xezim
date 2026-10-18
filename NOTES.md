@@ -20,6 +20,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* Bit-, part- and indexed part-select writes to a variable of a static task
+  or function, or to a `static` local of any subroutine or class method,
+  update the one variable all calls share. They were lost, so a static
+  function that built a value bit by bit returned its input and
+  `a[15:8] = v` left `a` all X. Member writes, increments and output
+  arguments are fixed too (§6.21, §11.5.1). A nonblocking write to a whole
+  member of a static packed struct (`s.f <= v`) is no longer dropped
+  (§10.4.2), and a block variable that hides a static of the same name no
+  longer reads or writes the static. (#4)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

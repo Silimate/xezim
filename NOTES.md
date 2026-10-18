@@ -27,9 +27,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   before its cbAtStartOfSimTime and cbAfterDelay routines, so a clock edge in
   a later delta of the slot, or a value written in the edge's own
   cbAfterDelay, no longer counts as sampled (§16.5.1, §4.4.2.1). A
-  cbReadWriteSynch due at an assertion's clock edge now runs before the
-  assertions and before that delta's clocking-event waiters (Post-NBA before
-  Observed, §4.4.2), whether a VPI routine or the design drives the clock,
+  cbReadWriteSynch due at an assertion's clock edge now runs, after the
+  slot's remaining Active, NBA and cbNBASynch work, before the assertions and
+  before that delta's clocking-event waiters (Post-NBA before Observed,
+  §4.4.2), whether a VPI routine or the design drives the clock,
   so a reset a cocotb test releases after `RisingEdge` no longer disables
   that edge's attempt, and one a clocking-event waiter raises at the edge
   still does not (§16.12). A clock event is recorded when it happens, so a

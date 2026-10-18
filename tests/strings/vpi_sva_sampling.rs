@@ -30,8 +30,9 @@ use std::process::Command;
 /// lowers the clock again after each rise, in the same time slot. With
 /// `SVA_RWNOP=1`, one that does nothing is queued at each rise, as cocotb
 /// does whenever a test has a write pending or awaits `ReadWrite`. With
-/// `SVA_CHAIN=<n>`, the third rise queues a cbReadWriteSynch that queues
-/// another, `n` times over, all in that time slot.
+/// `SVA_CHAIN=<n>`, the third rise (`SVA_CHAIN_AT`) queues a
+/// cbReadWriteSynch (`SVA_CHAIN_CB=nba`: a cbNBASynch) that queues another,
+/// `n` times over, all in that time slot.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
@@ -147,19 +148,20 @@ static PLI_INT32 nop_vc(p_cb_data cb) {
     return 0;
 }
 
-static int chain, chain_rises;
+static int chain, chain_rises, chain_cb = cbReadWriteSynch;
 
-static PLI_INT32 rw_chain(p_cb_data cb) {
+static PLI_INT32 chain_link(p_cb_data cb) {
     (void)cb;
     if (chain-- > 0)
-        at(rw_chain, cbReadWriteSynch, 0, NULL);
+        at(chain_link, chain_cb, 0, NULL);
     return 0;
 }
 
 static PLI_INT32 chain_vc(p_cb_data cb) {
-    if ((cb->value->value.integer & 1) && ++chain_rises == 3) {
+    if ((cb->value->value.integer & 1) && ++chain_rises == atoi(env("SVA_CHAIN_AT", "3"))) {
         chain = atoi(env("SVA_CHAIN", "0"));
-        at(rw_chain, cbReadWriteSynch, 0, NULL);
+        chain_cb = strcmp(env("SVA_CHAIN_CB", "rw"), "nba") ? cbReadWriteSynch : cbNBASynch;
+        at(chain_link, chain_cb, 0, NULL);
     }
     return 0;
 }
@@ -439,6 +441,34 @@ fn vpi_synch_chain_at_an_edge_runs_iteratively() {
         text.contains("RESULT passes=8 fails=0 rises=10 hits=10"),
         "{text}"
     );
+}
+
+/// §4.4.2: the cbNBASynch routines of a slot belong to its active region
+/// set too. At the second rise, where a cbReadWriteSynch releases `rst`, a
+/// cbNBASynch chain of 1,000 routines (each queues the next) is due as
+/// well. The assertions wait for the chain and the release, so the
+/// attempts from 15 ns on pass, with each clock. The reference simulator
+/// agrees.
+#[test]
+fn vpi_nba_synch_chain_before_reset_release_keeps_its_attempt() {
+    let (dir, so) = setup("nbachain", EDGE_SV);
+    let mut bad = Vec::new();
+    for clk in ["delay", "rw", "vc", "none"] {
+        let env = [
+            ("SVA_CLK", clk),
+            ("SVA_RST", "2"),
+            ("SVA_CHAIN", "1000"),
+            ("SVA_CHAIN_CB", "nba"),
+            ("SVA_CHAIN_AT", "2"),
+        ];
+        let extra: &[&str] = if clk == "none" { &["+hdl"] } else { &[] };
+        let text = run(&dir, &so, &env, extra);
+        if !text.contains("RESULT passes=8 fails=0 rises=10 hits=10") {
+            bad.push(format!("clk={clk}:\n{text}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
 /// §16.5, §4.4.2: a clock event starts the assertion's attempt even when a

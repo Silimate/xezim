@@ -98073,15 +98073,16 @@ impl Simulator {
     // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
     /// §4.4.2: the Observed region of a delta. It follows the whole active
     /// region set, the Post-NBA cbReadWriteSynch routines included, so with
-    /// a cbNBASynch or cbReadWriteSynch due in this slot `sva_post_nba` runs
-    /// the routines first. Inline in both callers, so a design without
+    /// a cbNBASynch or cbReadWriteSynch due in this slot `sva_post_nba`
+    /// finishes that set first; inside it, a delta's Observed region only
+    /// records clock events. Inline in both callers, so a design without
     /// assertions pays one emptiness check per delta.
     #[inline(always)]
     fn sva_observed(&mut self) {
         if self.sva_sites.is_empty() {
             return;
         }
-        if self.vpi_synch_due() {
+        if self.sva_post_nba_busy || self.vpi_synch_due() {
             self.sva_post_nba();
         } else {
             self.tick_sva_sites();

@@ -92,6 +92,11 @@ const MASK_SLOT_END: u64 =
 /// writing the object it watches recurses without bound otherwise).
 const MAX_CB_DEPTH: u32 = 1000;
 
+// silimate: bound on the deltas sva_post_nba runs before evaluating a clock event's assertions
+/// Deltas `sva_post_nba` runs before it evaluates a clock event anyway: a
+/// slot that never settles is the event loop's livelock to report.
+const SVA_POST_NBA_ROUNDS: u32 = 1 << 24;
+
 /// The one-shot, time-ordered reasons, each kept as a `(due tick, id)` set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum TimedSet {
@@ -708,7 +713,7 @@ impl Simulator {
             self.edge_dispatch_phase = saved;
             let _ = self.drain_edge_cascade(self.cascade_limit);
         }
-        // silimate: Reactive work waits for the assertions of a clock event sva_post_nba is still running cbReadWriteSynch routines for
+        // silimate: Reactive work waits for the assertions of a clock event whose slot sva_post_nba is still finishing
         if !self.sva_post_nba_busy {
             self.drain_deferred_clocking_conts();
             self.drain_reactive_region();
@@ -747,21 +752,18 @@ impl Simulator {
     }
 
     /// §4.4.2: the Observed region of a delta in whose slot a cbNBASynch or
-    /// cbReadWriteSynch is still due. The Post-NBA region (cbReadWriteSynch)
-    /// comes before the Observed region, and the Observed region before the
-    /// Reactive work (clocking-event waiters, program code) that
-    /// `run_one_tick` and `vpi_open_delta` run after the assertions, while
-    /// cbReadWriteSynch otherwise runs after that work. So record the clock
-    /// events first (a routine that moves the clock back does not lose one),
-    /// then run the due cbReadWriteSynch batches here, once the Active,
-    /// Inactive and NBA regions are empty and no cbNBASynch is due, and
-    /// evaluate the events after them: `disable iff` reads a reset a cocotb
-    /// test releases after `RisingEdge`, and not one a clocking-event waiter
-    /// raises at that edge. A batch that queues another is run in the same
-    /// loop, not by recursion, and the deltas the batches open leave their
-    /// Reactive work to the caller, which runs it after the assertions.
-    /// With Active work or a cbNBASynch still pending, the events are
-    /// evaluated at once, as without a routine due.
+    /// cbReadWriteSynch is still due. The whole active region set comes
+    /// before the Observed region (its Active, Inactive and NBA work, the
+    /// Pre-NBA cbNBASynch and Post-NBA cbReadWriteSynch routines), and the
+    /// Observed region before the Reactive work (clocking-event waiters,
+    /// program code). xezim runs cbReadWriteSynch at the end of a delta,
+    /// after that Reactive work, so `disable iff` read a reset a cocotb test
+    /// releases after `RisingEdge` too late, or one a clocking-event waiter
+    /// raises at that edge too early. With a clock event recorded, this runs
+    /// the three steps in order, in one loop that a routine queuing another
+    /// cannot turn into recursion: the nested `sva_observed` of a delta
+    /// opened here only records clock events (a routine that moves the clock
+    /// back does not lose one), and that delta holds its Reactive work.
     #[inline(never)]
     pub(super) fn sva_post_nba(&mut self) {
         self.note_sva_edges();
@@ -769,26 +771,60 @@ impl Simulator {
             return;
         }
         self.sva_post_nba_busy = true;
-        while self.sva_owed && !self.finished {
+        // 1. Finish the slot's active region set, one delta at a time: the
+        //    processes due now, the due cbNBASynch batch before the NBA
+        //    region, and once all of that is done the due cbReadWriteSynch
+        //    batch; `vpi_open_delta` runs the Inactive and NBA regions of
+        //    each. A batch that queues another is the next round.
+        let now = self.time;
+        let due = |s: &BTreeSet<(u64, u64)>| s.first().is_some_and(|&(t, _)| t <= now);
+        let mut rounds = 0u32;
+        // A slot that never settles (a zero-delay spinner) is left to the
+        // event loop's livelock handling once the loop gives up.
+        while self.sva_owed
+            && !self.finished
+            && self.time == now
+            && !self.zero_delay_defer_pending
+            && rounds < SVA_POST_NBA_ROUNDS
+            && !crate::compiler::interrupt::interrupt_requested()
+        {
+            rounds += 1;
             self.vpi_checkpoint();
-            let now = self.time;
-            let pending = self.dirty_any
-                || self.event_queue.next_time() == Some(now)
+            let mut work = self.dirty_any
+                || !self.inactive_queue.is_empty()
                 || !self.nba_fast.is_empty()
                 || !self.nba_queue.is_empty()
-                || !self.inactive_queue.is_empty()
-                || (self.vpi_cb_mask & m(CB_NBA_SYNCH) != 0
-                    && self.vpi_cb.nba.first().is_some_and(|&(t, _)| t <= now));
-            if pending
-                || self.vpi_cb_mask & m(CB_READ_WRITE_SYNCH) == 0
-                || !self.vpi_fire_due(TimedSet::Rw)
+                || !self.packed_nba.is_empty();
+            while self.event_queue.next_time() == Some(now)
+                && !self.finished
+                && !self.zero_delay_defer_pending
             {
+                let Some((pid, stmts)) = self.event_queue.pop_front(now) else {
+                    break;
+                };
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+                work = true;
+            }
+            if self.vpi_cb_mask & m(CB_NBA_SYNCH) != 0 && due(&self.vpi_cb.nba) {
+                work |= self.vpi_fire_due(TimedSet::Nba);
+            }
+            if !work && self.vpi_cb_mask & m(CB_READ_WRITE_SYNCH) != 0 && due(&self.vpi_cb.rw) {
+                work = self.vpi_fire_due(TimedSet::Rw);
+            }
+            if !work {
                 break;
             }
             self.vpi_open_delta();
         }
         self.sva_post_nba_busy = false;
+        // 2. Evaluate the recorded clock events.
         self.tick_sva_sites();
+        // 3. The caller then resumes the Reactive work: clocking-event
+        //    waiters, program code and Re-NBA waiters, held by the deltas
+        //    above.
     }
     // /silimate
 

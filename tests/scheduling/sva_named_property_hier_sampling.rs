@@ -245,3 +245,78 @@ endmodule
         "{text}"
     );
 }
+
+/// Silimate/xezim#68: a generate-block net named through the block index
+/// (`g[0].addr`) is sampled like any other operand (§16.5.1), inline, in a
+/// named property, and through a bound checker's port connected to it.
+/// It read the value the edge's updates had just given it, so each check
+/// failed at every edge where `pr` changed. The reference simulator reports
+/// no failure in either design.
+#[test]
+fn generate_block_signals_named_through_the_index_are_sampled() {
+    let text = run(
+        "gen_index",
+        r#"
+module t;
+  logic clk = 0, pr = 0;
+  int fails = 0, n = 0;
+  always #5 clk = ~clk;
+  always @(posedge clk) pr <= ~pr;
+  for (genvar j = 0; j < 2; j++) begin : g
+    logic [1:0] addr;
+    assign addr = pr * 2 + j;
+  end
+  a_gen: assert property (@(posedge clk) g[0].addr == 2'(pr * 2)) else fails++;
+  c_n: cover property (@(posedge clk) 1) n++;
+  initial begin
+    #50;
+    $display("RESULT n=%0d fails=%0d", n, fails);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("RESULT n=5 fails=0"), "{text}");
+    let text = run(
+        "gen_bound",
+        r#"
+module chk(input logic clk, input logic pr, input logic [1:0] a0);
+  int fails = 0, n = 0;
+  property p_a0;
+    @(posedge clk) a0 == 2'(pr * 2);
+  endproperty
+  a_bound: assert property (p_a0) n++; else fails++;
+endmodule
+module dut(input logic clk);
+  logic pr = 0;
+  always @(posedge clk) pr <= ~pr;
+  for (genvar j = 0; j < 2; j++) begin : g
+    logic [1:0] addr;
+    assign addr = pr * 2 + j;
+  end
+endmodule
+module t;
+  logic clk = 0;
+  int fn = 0, nn = 0, fi = 0, ni = 0;
+  always #5 clk = ~clk;
+  dut d(.clk(clk));
+  bind dut chk u_chk(.clk(clk), .pr(pr), .a0(g[0].addr));
+  property p_gen;
+    @(posedge clk) d.g[0].addr == 2'(d.pr * 2);
+  endproperty
+  a_named: assert property (p_gen) nn++; else fn++;
+  a_inline: assert property (@(posedge clk) d.g[0].addr == 2'(d.pr * 2)) ni++; else fi++;
+  initial begin
+    #50;
+    $display("named pass=%0d fail=%0d inline pass=%0d fail=%0d bound pass=%0d fail=%0d",
+             nn, fn, ni, fi, d.u_chk.n, d.u_chk.fails);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(
+        text.contains("named pass=5 fail=0 inline pass=5 fail=0 bound pass=5 fail=0"),
+        "{text}"
+    );
+}

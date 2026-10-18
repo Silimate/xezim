@@ -54,8 +54,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   inline, and a hierarchical clock (`@(posedge u.clk)`) there ticks; it
   named no signal, so the property never ran. A reference into a generate
   block or an instance-array element (`blk[1].sig`, `ra[0].sig`) is now
-  sampled too, inline and in a named property, and `$past` of it keeps a
-  history as for any other variable (§16.5.1). (Silimate/xezim#52)
+  sampled too, inline, in a named property and through a bound checker's
+  port connected to it, and `$past` of it keeps a history as for any other
+  variable (§16.5.1). (Silimate/xezim#52, Silimate/xezim#68)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

@@ -229,6 +229,40 @@ endmodule
     assert_eq!(result(src), "RESULT n=19 const=0 var=0");
 }
 
+/// The bounds of an `inside` range are sampled like any other operand: an
+/// array element and a plain variable, both written at the edge.
+#[test]
+fn inside_range_bounds_are_sampled() {
+    let src = r#"
+module top;
+  logic clk = 0, v = 0;
+  logic [7:0] s = 0;
+  logic [7:0] b [0:1] = '{0, 0};
+  logic [7:0] lo = 0, hi = 0;
+  int f_arr = 0, f_sig = 0, n = 0;
+  always #5 clk = ~clk;
+  always @(negedge clk) s <= s + 3;
+  // The bounds bracket the s of the next edge.
+  always_ff @(posedge clk) begin
+    b[0] <= s + 3;
+    b[1] <= s + 4;
+    lo <= s + 3;
+    hi <= s + 4;
+    v <= 1;
+  end
+  a_arr: assert property (@(posedge clk) v |-> s inside {[b[0]:b[1]]}) else f_arr++;
+  a_sig: assert property (@(posedge clk) v |-> s inside {[lo:hi]}) else f_sig++;
+  c_n: cover property (@(posedge clk) v) n++;
+  initial begin
+    #120;
+    $display("RESULT n=%0d arr=%0d sig=%0d", n, f_arr, f_sig);
+    $finish;
+  end
+endmodule
+"#;
+    assert_eq!(result(src), "RESULT n=11 arr=0 sig=0");
+}
+
 /// A forced element follows its force expression within the time slot, so
 /// its sampled value is still the old one (§10.6.2, §16.5.1). The large array
 /// lives in the packed arena, where swapping in the sample has to get past

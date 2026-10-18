@@ -95864,6 +95864,11 @@ impl Simulator {
                 sub(expr);
                 ranges.iter().for_each(&mut sub);
             }
+            // The bounds of an `inside` range (`[a[0]:a[1]]`).
+            ExprKind::Range(lo, hi) => {
+                sub(lo);
+                sub(hi);
+            }
             ExprKind::SvaClocked { body, .. } => sub(body),
             _ => {}
         }
@@ -96092,6 +96097,11 @@ impl Simulator {
                 for r in ranges {
                     self.collect_sva_signal_ids(r, out);
                 }
+            }
+            // The bounds of an `inside` range are sampled too (§16.5.1).
+            ExprKind::Range(lo, hi) => {
+                self.collect_sva_signal_ids(lo, out);
+                self.collect_sva_signal_ids(hi, out);
             }
             ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
             _ => {}

@@ -49904,8 +49904,9 @@ impl Simulator {
         };
         let t = t.as_bytes();
         let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
-        // The words of the text, and the brackets, semicolons and colons
-        // (not `::`) around them, with their offsets; strings left out.
+        // The words of the text, and the brackets, semicolons, colons (not
+        // `::`) and `?` around them, with their offsets; strings and based
+        // literals (whose `?` is a digit: `2'b1?`) left out.
         let mut toks: Vec<(usize, &[u8])> = Vec::new();
         let mut i = 0;
         while i < t.len() {
@@ -49929,8 +49930,30 @@ impl Simulator {
                         i += 1;
                     }
                 }
+                b'\'' => {
+                    let mut j = i + 1;
+                    if t.get(j).is_some_and(|c| c.eq_ignore_ascii_case(&b's')) {
+                        j += 1;
+                    }
+                    if t.get(j).is_some_and(|c| {
+                        matches!(c.to_ascii_lowercase(), b'b' | b'o' | b'd' | b'h')
+                    }) {
+                        j += 1;
+                        while j < t.len() && t[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        while j < t.len()
+                            && (t[j].is_ascii_alphanumeric() || matches!(t[j], b'_' | b'?'))
+                        {
+                            j += 1;
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
                 b':' if t.get(i + 1) == Some(&b':') => i += 2,
-                b'(' | b'[' | b'{' | b')' | b']' | b'}' | b';' | b':' => {
+                b'(' | b'[' | b'{' | b')' | b']' | b'}' | b';' | b':' | b'?' => {
                     toks.push((i, &t[i..i + 1]));
                     i += 1;
                 }
@@ -49946,12 +49969,15 @@ impl Simulator {
             )
         };
         // An open case body: the bracket depth of its keyword, whether its
-        // `(...)` header is still open, and whether an item (not the item's
-        // statement) comes next. `None` is a begin-end or fork-join block.
+        // `(...)` header is still open, whether an item (not the item's
+        // statement) comes next, and the conditional operators of that item
+        // still waiting for their `:`. `None` is a begin-end or fork-join
+        // block.
         struct Case {
             at: usize,
             header: bool,
             item: bool,
+            ternary: usize,
         }
         let mut blocks: Vec<Option<Case>> = Vec::new();
         let mut brackets = 0usize;
@@ -49990,6 +50016,13 @@ impl Simulator {
                 b";" => {
                     if let Some(c) = case.filter(|c| !c.header && c.at == brackets) {
                         c.item = true;
+                        c.ternary = 0;
+                    }
+                    continue;
+                }
+                b"?" => {
+                    if let Some(c) = case.filter(|c| c.item && c.at == brackets) {
+                        c.ternary += 1;
                     }
                     continue;
                 }
@@ -49998,8 +50031,12 @@ impl Simulator {
                     {
                         plain = n;
                     } else if let Some(c) = case.filter(|c| c.item && c.at == brackets) {
-                        c.item = false;
-                        plain = n;
+                        if c.ternary > 0 {
+                            c.ternary -= 1;
+                        } else {
+                            c.item = false;
+                            plain = n;
+                        }
                     }
                     continue;
                 }
@@ -50009,6 +50046,7 @@ impl Simulator {
                         at: brackets,
                         header,
                         item: !header,
+                        ternary: 0,
                     }));
                     continue;
                 }
@@ -50024,6 +50062,7 @@ impl Simulator {
                         .filter(|c| c.at == brackets)
                     {
                         c.item = true;
+                        c.ternary = 0;
                     }
                     continue;
                 }

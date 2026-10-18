@@ -600,6 +600,13 @@ const CASES: &str = r#"module top;
         assert property (b || !b);
       end : blk
     endcase
+    case (sel)
+      a ? 2'd0 : 2'd3: assert property (a |-> b);
+      default: assert property (a || !a);
+    endcase
+    casez (sel)
+      2'b1?: assert property (b || !b);
+    endcase
   end
   assert property (@(posedge clk) a || !a);
   initial begin
@@ -619,9 +626,11 @@ endmodule
 /// file. A case item is not a label: `2'd1 : assert property ...` is the
 /// second unlabeled statement, `assert__1`, whether or not the first item
 /// ever runs, and `lab_d`, labeled after an item and an `if`, takes no
-/// number though it never runs (the reference simulator also lists the
-/// unreached `assert__0` and `lab_d` with zero counts; xezim lists a
-/// procedural statement once reached).
+/// number though it never runs. Neither do the colon of a conditional
+/// operator in an item nor the `?` digit of a `casez` item end the item.
+/// (The reference simulator also lists the unreached `assert__0`,
+/// `assert__3` and `lab_d` with zero counts; xezim lists a procedural
+/// statement once reached.)
 #[test]
 fn class_methods_and_case_items_keep_their_own_entries() {
     let (json, _) = run(
@@ -636,7 +645,9 @@ fn class_methods_and_case_items_keep_their_own_entries() {
         ("top", "assert__1", [2, 2, 0, 0, 0]),
         ("top", "lab_c", [2, 0, 0, 2, 0]),
         ("top", "blk.assert__2", [4, 4, 0, 0, 0]),
-        ("top", "assert__3", [4, 4, 0, 0, 0]),
+        ("top", "assert__4", [4, 4, 0, 0, 0]),
+        ("top", "assert__5", [2, 2, 0, 0, 0]),
+        ("top", "assert__6", [4, 4, 0, 0, 0]),
     ] {
         assert_eq!(counts(&json, inst, name), want, "{inst} {name}:\n{json}");
     }
@@ -644,8 +655,10 @@ fn class_methods_and_case_items_keep_their_own_entries() {
         entry(&json, "pb", "cb.f.a_c").contains("cb.sv\", \"line\": 4, "),
         "{json}"
     );
-    assert!(
-        !json.contains("\"instance\": \"top\", \"name\": \"assert__0\""),
-        "{json}"
-    );
+    for name in ["assert__0", "assert__3", "lab_d"] {
+        assert!(
+            !json.contains(&format!("\"instance\": \"top\", \"name\": \"{name}\"")),
+            "{json}"
+        );
+    }
 }

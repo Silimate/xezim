@@ -12,7 +12,8 @@
 //! has no width, so the operation ran at the operands' own width: over
 //! 16-bit `a` and `b`, `a * b == 32'sh0001_0000` multiplied at 16 bits and
 //! failed. A match item `x = u + v` also added at the operands' width, not
-//! at the width of the local variable `x`.
+//! at the width of the local variable `x`. A size cast to a parameter width
+//! (`W'(r)`) lost its width: its parameter was resolved like a signal read.
 //!
 //! Every expression below holds under those rules and fails at a narrower
 //! width or with the other signedness. The reference simulator prints `PASS`
@@ -117,6 +118,19 @@ const EXPRS: &[(&str, &str)] = &[
     ("select_mul", "a[15:0] * b == 32'h0001_0000"),
     // a sized bound is truncated to its size: `3'd15` is 7, so 8 bits
     ("sized_bound", "(@u[3'd15:0] + 8'd1) == 8'h00"),
+    // size casts: N bits wide, N a literal or a parameter (§6.24.1)
+    ("mul_wide", "p32 == r16 * k16"),
+    ("param_cast", "p32 == PW'(r16) * PW'(k16)"),
+    (
+        "cast_element",
+        "PW'(mem[1]) * PW'(16'hffff) == 32'h00fe_ff01",
+    ),
+    ("param_cast_signed", "PW'(q) * PW'(t) == -32'sd128"),
+    ("param_cast_operand", "(PW'(r16) + 16'd1) == 33'h1_0000"),
+    (
+        "size_cast_sum",
+        "(32'(r16) + 32'hffff_0001) == 33'h1_0000_0000",
+    ),
 ];
 
 /// Each expression as an assertion, a cover, a named sequence, a `disable
@@ -134,6 +148,9 @@ fn operands_take_the_context_width_in_every_assertion_form() {
   logic [7:0] mem [0:3] = '{8'h00, 8'hff, 8'h00, 8'h00};
   typedef struct packed { logic [3:0] g; logic [7:0] f; } st_t;
   st_t st = 12'h0ff;
+  localparam int PW = 32;
+  logic [15:0] r16 = 16'hffff, k16 = 16'h0002;
+  logic [31:0] p32 = 32'h0001_fffe;
   int passes = 0, covers = 0, fails = 0;
   function void bad(string what);
     fails++;

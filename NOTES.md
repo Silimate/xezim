@@ -18,10 +18,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and failed. This holds in properties, sequences, `disable iff`, clocking
   event guards and cover properties, for the results of `$past`, and for
   property local variables, whose match item assignments (`x = a + b`) are
-  now sized with `x`. The evaluator now also sizes a select, an array
+  now sized with `x`. A size cast to a parameter width (`W'(r)`) keeps its
+  width in an assertion; its parameter was read like a signal and the cast
+  lost its width. The evaluator now also sizes a size cast, a select, an array
   element, a struct member and a concatenation in a comparison, which
   corrects them in procedural code it runs, such as an `initial` block
-  (§11.6.1, §11.8.2, §16.10). (Silimate/xezim#55)
+  (§6.24.1, §11.6.1, §11.8.2, §16.10). (Silimate/xezim#55)
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).

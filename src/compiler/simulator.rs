@@ -96188,7 +96188,12 @@ impl Simulator {
                 ) {
                     return;
                 }
-                for a in args {
+                // The width or type of a cast (`W'(x)`) is read by name.
+                let skip = usize::from(matches!(
+                    name.as_str(),
+                    "$__xz_size_cast" | "$__xz_named_cast" | "$__xz_type_cast"
+                ));
+                for a in args.iter_mut().skip(skip) {
                     self.sva_resolve_signals(a);
                 }
             }
@@ -102235,6 +102240,12 @@ impl Simulator {
                 (self.active_sva_site.is_some() && Self::cond_expr_is_effect_free(expr, false))
                     .then(|| self.eval_expr(expr).width)
             }
+            // §6.24.1: a size cast `N'(x)` is N bits wide.
+            ExprKind::SystemCall { name, args }
+                if name == "$__xz_size_cast" || name == "$__xz_named_cast" =>
+            {
+                self.size_cast_width(name, args)
+            }
             // §11.4.12: the operands of a concatenation side by side, `count`
             // times over for a replication.
             ExprKind::Concatenation(parts) => parts
@@ -102325,6 +102336,29 @@ impl Simulator {
         let w = bits.unwrap_or(1);
         expr.cached_width.set(Some(w));
         Some(w)
+    }
+
+    /// The width of a size cast `N'(x)` (§6.24.1): N, a literal or a name
+    /// that is a constant (a parameter), as the cast's evaluation reads it.
+    /// None for a cast to a type.
+    fn size_cast_width(&mut self, name: &str, args: &[Expression]) -> Option<u32> {
+        let n = args.first()?;
+        if name == "$__xz_named_cast" {
+            let key = self.named_cast_key(n)?;
+            let constant = !self.module.typedef_types.contains_key(&key)
+                && !self.module.typedefs.contains_key(&key)
+                && (self.module.parameters.contains_key(&key)
+                    || self.get_signal_value_by_name(&key).is_some()
+                    || self.class_value_param_in_scope(&key));
+            if !constant {
+                return None;
+            }
+        }
+        let v = self.eval_expr(n);
+        if v.has_xz() {
+            return None;
+        }
+        u32::try_from(v.to_u64()?).ok().filter(|&w| w > 0)
     }
 
     /// The width of a packed struct or union member (`s.f`), which has no

@@ -29,7 +29,9 @@ use std::process::Command;
 /// `RisingEdge`. With `SVA_GLITCH=1`, a cbReadWriteSynch queued the same way
 /// lowers the clock again after each rise, in the same time slot. With
 /// `SVA_RWNOP=1`, one that does nothing is queued at each rise, as cocotb
-/// does whenever a test has a write pending or awaits `ReadWrite`.
+/// does whenever a test has a write pending or awaits `ReadWrite`. With
+/// `SVA_CHAIN=<n>`, the third rise queues a cbReadWriteSynch that queues
+/// another, `n` times over, all in that time slot.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
@@ -145,6 +147,23 @@ static PLI_INT32 nop_vc(p_cb_data cb) {
     return 0;
 }
 
+static int chain, chain_rises;
+
+static PLI_INT32 rw_chain(p_cb_data cb) {
+    (void)cb;
+    if (chain-- > 0)
+        at(rw_chain, cbReadWriteSynch, 0, NULL);
+    return 0;
+}
+
+static PLI_INT32 chain_vc(p_cb_data cb) {
+    if ((cb->value->value.integer & 1) && ++chain_rises == 3) {
+        chain = atoi(env("SVA_CHAIN", "0"));
+        at(rw_chain, cbReadWriteSynch, 0, NULL);
+    }
+    return 0;
+}
+
 static PLI_INT32 start(p_cb_data cb) {
     const char *f = env("SVA_FLAG", "nodelay");
     (void)cb;
@@ -169,6 +188,8 @@ static PLI_INT32 start(p_cb_data cb) {
         at(glitch_vc, cbValueChange, 0, clk);
     if (*env("SVA_RWNOP", ""))
         at(nop_vc, cbValueChange, 0, clk);
+    if (*env("SVA_CHAIN", ""))
+        at(chain_vc, cbValueChange, 0, clk);
     return 0;
 }
 
@@ -396,6 +417,28 @@ fn vpi_synch_routine_keeps_observed_before_reactive() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A cbReadWriteSynch chain at an assertion clock edge (each routine queues
+/// the next, 100,000 in all, at the third rise) runs before the edge's
+/// assertions one batch after another, not by recursion: the run completes
+/// in an 8 MiB stack, and the attempts from the second rise on pass as in
+/// the reset test. The reference simulator gives the same counts.
+#[test]
+fn vpi_synch_chain_at_an_edge_runs_iteratively() {
+    let (dir, so) = setup("chain", EDGE_SV);
+    let env = [
+        ("SVA_CLK", "none"),
+        ("SVA_RST", "2"),
+        ("SVA_CHAIN", "100000"),
+        ("XEZIM_STACK_MB", "8"),
+    ];
+    let text = run(&dir, &so, &env, &["+hdl"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        text.contains("RESULT passes=8 fails=0 rises=10 hits=10"),
+        "{text}"
+    );
 }
 
 /// §16.5, §4.4.2: a clock event starts the assertion's attempt even when a

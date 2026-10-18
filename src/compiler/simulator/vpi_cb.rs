@@ -708,16 +708,20 @@ impl Simulator {
             self.edge_dispatch_phase = saved;
             let _ = self.drain_edge_cascade(self.cascade_limit);
         }
-        self.drain_deferred_clocking_conts();
-        self.drain_reactive_region();
-        self.drain_nba_region_waiters();
+        // silimate: Reactive work waits for the assertions of a clock event sva_post_nba is still running cbReadWriteSynch routines for
+        if !self.sva_post_nba_busy {
+            self.drain_deferred_clocking_conts();
+            self.drain_reactive_region();
+            self.drain_nba_region_waiters();
+        }
+        // /silimate
         self.snapshot_edge_signals();
         self.vpi_same_time_work()
     }
 
     // silimate: assertions tick in the slot of a clock edge a VPI routine makes
     /// A cbNBASynch or cbReadWriteSynch due now: the active region set
-    /// (§4.4.2) still has work, and the Observed region waits for it.
+    /// (§4.4.2) still has work, which comes before the Observed region.
     #[inline]
     pub(super) fn vpi_synch_due(&self) -> bool {
         let now = self.time;
@@ -728,9 +732,9 @@ impl Simulator {
 
     /// §16.5.1, §4.4.2: the Observed region of a delta a VPI routine opened.
     /// cocotb's Clock writes the clock from cbReadWriteSynch; the concurrent
-    /// assertions tick in that slot, with its Preponed samples, once the
-    /// active region set is done (`sva_observed`). Without this they ticked
-    /// in a later delta or the next slot and read every flop's new value. A
+    /// assertions tick in that slot, with its Preponed samples
+    /// (`sva_observed`). Without this they ticked in a later delta or the
+    /// next slot and read every flop's new value. A
     /// slot the nested scheduler ran took no samples. Once a routine has
     /// finished the run nothing is evaluated (§38.14): cocotb ends a test
     /// from the value-change callback of the edge, and the reference
@@ -742,43 +746,49 @@ impl Simulator {
         self.sva_observed();
     }
 
-    /// §4.4.2: an assertion clock event in a slot where a cbNBASynch or
+    /// §4.4.2: the Observed region of a delta in whose slot a cbNBASynch or
     /// cbReadWriteSynch is still due. The Post-NBA region (cbReadWriteSynch)
     /// comes before the Observed region, and the Observed region before the
     /// Reactive work (clocking-event waiters, program code) that
     /// `run_one_tick` and `vpi_open_delta` run after the assertions, while
-    /// cbReadWriteSynch otherwise runs after that work. So record the events
-    /// first (a routine that moves the clock back does not lose one), then
-    /// run the due cbReadWriteSynch routines here, once the Active, Inactive
-    /// and NBA regions are empty: `disable iff` then reads a reset a cocotb
+    /// cbReadWriteSynch otherwise runs after that work. So record the clock
+    /// events first (a routine that moves the clock back does not lose one),
+    /// then run the due cbReadWriteSynch batches here, once the Active,
+    /// Inactive and NBA regions are empty and no cbNBASynch is due, and
+    /// evaluate the events after them: `disable iff` reads a reset a cocotb
     /// test releases after `RisingEdge`, and not one a clocking-event waiter
-    /// raises at that edge. The delta their writes open evaluates the
-    /// events. Until those regions are empty, or while a cbNBASynch is due,
-    /// the events wait for a later delta's Observed region.
+    /// raises at that edge. A batch that queues another is run in the same
+    /// loop, not by recursion, and the deltas the batches open leave their
+    /// Reactive work to the caller, which runs it after the assertions.
+    /// With Active work or a cbNBASynch still pending, the events are
+    /// evaluated at once, as without a routine due.
     #[inline(never)]
     pub(super) fn sva_post_nba(&mut self) {
         self.note_sva_edges();
-        if !self.sva_owed {
+        if self.sva_post_nba_busy {
             return;
         }
-        self.vpi_checkpoint();
-        let now = self.time;
-        let active = self.dirty_any
-            || self.event_queue.next_time() == Some(now)
-            || !self.nba_fast.is_empty()
-            || !self.nba_queue.is_empty()
-            || !self.inactive_queue.is_empty()
-            || (self.vpi_cb_mask & m(CB_NBA_SYNCH) != 0
-                && self.vpi_cb.nba.first().is_some_and(|&(t, _)| t <= now));
-        if !active
-            && self.vpi_cb_mask & m(CB_READ_WRITE_SYNCH) != 0
-            && self.vpi_fire_due(TimedSet::Rw)
-        {
+        self.sva_post_nba_busy = true;
+        while self.sva_owed && !self.finished {
+            self.vpi_checkpoint();
+            let now = self.time;
+            let pending = self.dirty_any
+                || self.event_queue.next_time() == Some(now)
+                || !self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                || !self.inactive_queue.is_empty()
+                || (self.vpi_cb_mask & m(CB_NBA_SYNCH) != 0
+                    && self.vpi_cb.nba.first().is_some_and(|&(t, _)| t <= now));
+            if pending
+                || self.vpi_cb_mask & m(CB_READ_WRITE_SYNCH) == 0
+                || !self.vpi_fire_due(TimedSet::Rw)
+            {
+                break;
+            }
             self.vpi_open_delta();
         }
-        if self.sva_owed && !self.finished && !self.vpi_synch_due() {
-            self.tick_sva_sites();
-        }
+        self.sva_post_nba_busy = false;
+        self.tick_sva_sites();
     }
     // /silimate
 
@@ -887,14 +897,6 @@ impl Simulator {
         }
         let mut fired = self.vpi_checkpoint();
         for set in [TimedSet::Nba, TimedSet::Rw, TimedSet::AtEnd] {
-            // silimate: assertions tick in the slot of a clock edge a VPI routine makes
-            // The active region set is done before cbAtEndOfSimTime: tick an
-            // edge whose assertions waited for a cbReadWriteSynch that was
-            // removed instead of run.
-            if matches!(set, TimedSet::AtEnd) {
-                self.vpi_observed();
-            }
-            // /silimate
             if self.vpi_fire_due(set) {
                 fired = true;
                 if self.vpi_open_delta() {

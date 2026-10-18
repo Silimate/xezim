@@ -6390,6 +6390,8 @@ pub struct Simulator {
     // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
     /// A site's clock event is recorded (`fired`) and not evaluated yet.
     sva_owed: bool,
+    /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
+    sva_post_nba_busy: bool,
     // /silimate
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
@@ -13099,6 +13101,7 @@ impl Simulator {
             sva_preponed: HashMap::default(),
             sva_preponed_slot: None,
             sva_owed: false,
+            sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
@@ -47962,7 +47965,7 @@ impl Simulator {
         }
         // LRM §16.5 SVA clocked property evaluation. Detects edges on
         // each registered clock signal and ticks pending consequents.
-        // silimate: assertions wait for the slot's cbNBASynch/cbReadWriteSynch routines
+        // silimate: a cbReadWriteSynch due at an assertion clock edge runs before the assertions (sva_post_nba)
         self.sva_observed();
         if self.finished {
             return;
@@ -48282,10 +48285,6 @@ impl Simulator {
         }
         while !self.finished && iters < max_iters {
             iters += 1;
-            // silimate: a recorded assertion clock event is evaluated in its own slot even when its VPI synch routine was removed instead of run
-            if self.sva_owed && !self.vpi_synch_due() {
-                self.tick_sva_sites();
-            }
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
                 && HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
             {
@@ -98073,10 +98072,10 @@ impl Simulator {
 
     // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
     /// §4.4.2: the Observed region of a delta. It follows the whole active
-    /// region set, the Post-NBA cbReadWriteSynch routines included, so while
-    /// a cbNBASynch or cbReadWriteSynch is due in this slot the assertions
-    /// wait for it (`sva_post_nba`). Inline in both callers, so a design
-    /// without assertions pays one emptiness check per delta.
+    /// region set, the Post-NBA cbReadWriteSynch routines included, so with
+    /// a cbNBASynch or cbReadWriteSynch due in this slot `sva_post_nba` runs
+    /// the routines first. Inline in both callers, so a design without
+    /// assertions pays one emptiness check per delta.
     #[inline(always)]
     fn sva_observed(&mut self) {
         if self.sva_sites.is_empty() {
@@ -98090,8 +98089,8 @@ impl Simulator {
     }
 
     /// Record the assertion clocks' events now, for a tick deferred until
-    /// the active region set is done (`sva_post_nba`): an edge a same-slot
-    /// cbReadWriteSynch routine moves back still starts its attempts.
+    /// the slot's due cbReadWriteSynch routines have run (`sva_post_nba`): an
+    /// edge such a routine moves back still starts its attempts.
     fn note_sva_edges(&mut self) {
         if self.finished || self.sva_sites.is_empty() {
             return;

@@ -628,10 +628,21 @@ impl Walk<'_> {
         if v.has_xz() || v.is_real {
             return None;
         }
-        // In the variable's context: an unbased unsized literal (`'1`)
-        // fills its width and a narrower signed constant extends its sign.
-        // Assignments truncate wider ones; comparisons do not.
-        let v = v.resize_for_assign(v.width.max(self.width)).to_u64()?;
+        // A constant is its own bits, zero-extended: the reference simulator
+        // takes a narrower signed parameter as its bit pattern in
+        // comparisons and assignments alike. An unbased unsized literal
+        // (`'1`) fills the variable's width. Assignments truncate wider
+        // constants; comparisons do not.
+        let v = if v.is_fill {
+            v.resize_for_assign(self.width).to_u64()?
+        } else {
+            let m = if v.width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << v.width) - 1
+            };
+            v.to_u64()? & m
+        };
         let mut inner = e;
         loop {
             match &inner.kind {

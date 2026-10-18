@@ -1138,6 +1138,42 @@ const FILL_FSMS: &[Expect] = &[
     ),
 ];
 
+const SIGNED: &str = r#"// Signed constants: a comparison zero-extends a signed constant against an
+// unsigned state, an assignment sign-extends it.
+module sgn(input logic clk, rst, go);
+  localparam logic signed [1:0] K = 2'b11;
+  localparam logic [2:0] A = 3'd0, B = 3'd1;
+  logic [2:0] st;
+  always_ff @(posedge clk)
+    if (rst) st <= A;
+    else if (st == A) begin if (go) st <= B; end
+    else if (st == B) st <= 3'd3;
+    else if (st == K) st <= K;
+    else st <= A;
+endmodule
+module tb;
+  logic clk = 0, rst = 1, go = 0;
+  always #5 clk = ~clk;
+  sgn us(.*);
+  initial begin
+    repeat (2) @(negedge clk);
+    rst = 0;
+    repeat (2) begin
+      go = 1; @(negedge clk); go = 0;
+      repeat (4) @(negedge clk);
+    end
+    $finish;
+  end
+endmodule
+"#;
+
+const SIGNED_FSMS: &[Expect] = &[(
+    "tb.us",
+    "st",
+    &["A=0@9:4", "B=1@10:2", "K=3@8:2"],
+    &["A>B@9:2", "B>A@8:0", "B>K@10:2", "K>A@8:0"],
+)];
+
 /// A two-process FSM (`state <= next` and an `always_comb` next-state
 /// `case`): the reset adds a transition to CLOSED from every other state,
 /// held states count on the clock that enters them and the next one (OPEN,
@@ -1260,6 +1296,17 @@ fn fill_literals_and_parameterized_instances() {
         unit.contains("{\"name\": \"st2\", \"value\": 3, \"line\": 20, \"count\": 5}"),
         "{unit}"
     );
+}
+
+/// A signed constant narrower than the state is its own bits: `K` of
+/// `2'b11` is state 3 in `st == K` (§11.8.1: the comparison is unsigned)
+/// and also in `st <= K`, which the reference simulator takes as a hold of
+/// state 3 although the assignment writes 7 (§10.7), a value outside the
+/// state set.
+#[test]
+fn signed_constants() {
+    let json = check("signed", SIGNED, SIGNED_FSMS);
+    assert!(json.contains("\"illegal\": 2}"), "{json}");
 }
 
 /// The transition into the first assignment starts from the value the

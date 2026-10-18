@@ -1426,13 +1426,60 @@ module k3 #(parameter logic [7:0] P = 8'd255) (input logic clk, rst, go);
       default: st <= 2'd0;
     endcase
 endmodule
+module k4 #(parameter logic [1:0] P = 2'd0) (input logic clk, rst, go);
+  logic [1:0] st;         // a label wider than 64 bits after the one that matches
+  always_ff @(posedge clk)
+    if (rst) st <= 2'd0;
+    else case (st)
+      2'd0: if (go) st <= 2'd1;
+      2'd1: case (P)
+              2'd0: st <= 2'd2;
+              128'd1: st <= 2'd3;
+              default: st <= 2'd0;
+            endcase
+      default: st <= 2'd0;
+    endcase
+endmodule
+module k5 #(parameter logic [1:0] P = 2'd0) (input logic clk, rst, go, input logic [1:0] v);
+  localparam logic [1:0] S0 = 2'd0, S1 = 2'd1, S2 = 2'd2, S3 = 2'd3;
+  logic [1:0] st;         // a label that is not constant: not folded
+  always_ff @(posedge clk)
+    if (rst) st <= S0;
+    else case (st)
+      S0: if (go) st <= S1;
+      S1: case (P)
+            2'd0: st <= S2;
+            v: st <= S3;
+            default: st <= S0;
+          endcase
+      default: st <= S0;
+    endcase
+endmodule
+module k6 #(parameter logic [1:0] P = 2'b10) (input logic clk, rst, go);
+  logic [1:0] st;         // casez wildcards
+  always_ff @(posedge clk)
+    if (rst) st <= 2'd0;
+    else case (st)
+      2'd0: if (go) st <= 2'd1;
+      2'd1: casez (P)
+              2'b0?: st <= 2'd3;
+              2'b1?: st <= 2'd2;
+              default: st <= 2'd0;
+            endcase
+      default: st <= 2'd0;
+    endcase
+endmodule
 module tb;
   logic clk = 0, rst = 1, go = 0;
+  logic [1:0] v = 2'd3;
   always #5 clk = ~clk;
   k1 #(.MODE(1), .STOPS(1)) ua(.*);
   k1 #(.MODE(0), .STOPS(2)) ub(.*);
   k2 #(.SEL(2'd2)) uc(.*);
   k3 ud(.*);
+  k4 ue(.*);
+  k5 uf(.*);
+  k6 ug(.*);
   initial begin
     repeat (2) @(negedge clk);
     rst = 0;
@@ -1502,6 +1549,41 @@ const PARAM_BRANCHES_FSMS: &[Expect] = &[
             "st1>st0@34:0",
             "st1>st2@38:4",
             "st2>st0@41:4",
+        ],
+    ),
+    (
+        "tb.ue",
+        "st",
+        &["st0=0@49:6", "st1=1@50:4", "st2=2@55:4"],
+        &[
+            "st0>st1@49:4",
+            "st1>st0@47:0",
+            "st1>st2@51:4",
+            "st2>st0@55:4",
+        ],
+    ),
+    (
+        "tb.uf",
+        "st",
+        &["S0=0@64:6", "S1=1@65:4", "S2=2@70:4", "S3=3@70:0"],
+        &[
+            "S0>S1@64:4",
+            "S1>S0@68:0",
+            "S1>S2@66:4",
+            "S1>S3@67:0",
+            "S2>S0@70:4",
+            "S3>S0@70:0",
+        ],
+    ),
+    (
+        "tb.ug",
+        "st",
+        &["st0=0@78:6", "st1=1@79:4", "st2=2@84:4"],
+        &[
+            "st0>st1@78:4",
+            "st1>st0@76:0",
+            "st1>st2@81:4",
+            "st2>st0@84:4",
         ],
     ),
 ];
@@ -1721,9 +1803,11 @@ fn held_states() {
 /// An `if`, `?:` or `case` that only parameters decide contributes only
 /// the branch they select (`A -> C` is no transition when `MODE` is 1, nor
 /// `B -> D` when `STOPS` is 1); the states the other branches name stay
-/// states when a `case` lists them. A `case` on parameters compares at the
-/// widest of its selector and labels (§12.5: `P + 8'd1` with `P` 255 is
-/// 256). As in the reference simulator.
+/// states when a `case` lists them. A `case` on parameters matches as in
+/// simulation: at the widest of its selector and labels (§12.5: `P + 8'd1`
+/// with `P` 255 is 256), past a label wider than 64 bits, with `casez`
+/// wildcards; one with a label that is not constant is not folded. As in
+/// the reference simulator.
 #[test]
 fn parameter_branches() {
     check("parameter_branches", PARAM_BRANCHES, PARAM_BRANCHES_FSMS);

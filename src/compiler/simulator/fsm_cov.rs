@@ -630,34 +630,32 @@ impl Walk<'_> {
     }
 
     /// The item a `case` on parameters selects (`Some(None)`: none does),
-    /// when its selector and labels are all constants. As in simulation, the
-    /// selector and the labels compare at the widest of their widths
-    /// (§12.5): `case (P + 8'd1)` with an item `256` sums at 32 bits.
-    fn fold_case(&mut self, expr: &Expression, items: &[CaseItem]) -> Option<Option<usize>> {
+    /// when its selector and labels are all constants. The items are tried
+    /// in order and matched as simulation matches them: the selector sized
+    /// at the widest of it and its labels (§12.5: `case (P + 8'd1)` with an
+    /// item `256` sums at 32 bits), `casez`/`casex` wildcards, any width. A
+    /// label that is not constant leaves the whole `case` unfolded, even
+    /// after an item that matches, as in the reference simulator.
+    fn fold_case(
+        &mut self,
+        kind: &CaseKind,
+        expr: &Expression,
+        items: &[CaseItem],
+    ) -> Option<Option<usize>> {
         if self.mentions(expr) || !self.constant(expr) {
             return None;
         }
-        let mut labels = Vec::new();
         for it in items {
             if it.pattern.is_some() || it.guard.is_some() {
                 return None;
             }
             for p in &it.patterns {
-                if matches!(p.kind, ExprKind::Range(..)) || !self.constant(p) {
+                if !self.constant(p) {
                     return None;
                 }
-                labels.push(p);
             }
         }
-        let mut width = self.sim.eval_expr(expr).width;
-        for p in labels {
-            width = width.max(self.sim.eval_expr(p).width);
-        }
-        if width > 64 {
-            return None;
-        }
-        let known = |v: Value| (!v.has_xz()).then(|| v.to_u64()).flatten();
-        let sel = known(self.sim.eval_expr_ctx(expr, width))?;
+        let sel = self.sim.case_selector_value(kind, expr, items);
         let mut default = None;
         for (k, it) in items.iter().enumerate() {
             if it.is_default {
@@ -665,7 +663,13 @@ impl Walk<'_> {
                 continue;
             }
             for p in &it.patterns {
-                if known(self.sim.eval_expr_ctx(p, width))? == sel {
+                let hit = match kind {
+                    CaseKind::CaseInside => self.sim.case_inside_match(&sel, p),
+                    CaseKind::Casez => sel.casez_eq(&self.sim.eval_expr(p)).is_true(),
+                    CaseKind::Casex => sel.casex_eq(&self.sim.eval_expr(p)).is_true(),
+                    _ => sel.case_eq(&self.sim.eval_expr(p)).is_true(),
+                };
+                if hit {
                     return Some(Some(k));
                 }
             }
@@ -975,7 +979,9 @@ impl Walk<'_> {
                     self.stmt(e, &f);
                 }
             }
-            StatementKind::Case { expr, items, .. } => {
+            StatementKind::Case {
+                kind, expr, items, ..
+            } => {
                 let labels = if self.is_var(expr) {
                     self.labels(items)
                 } else {
@@ -983,7 +989,7 @@ impl Walk<'_> {
                 };
                 let Some(labels) = labels else {
                     // A `case` on parameters: only the item they select.
-                    if let Some(k) = self.fold_case(expr, items) {
+                    if let Some(k) = self.fold_case(kind, expr, items) {
                         if let Some(it) = k.and_then(|k| items.get(k)) {
                             self.stmt(&it.stmt, ctx);
                         }

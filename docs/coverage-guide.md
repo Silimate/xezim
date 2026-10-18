@@ -823,7 +823,10 @@ the tests compare with. An enum member that no assignment or test names is not a
 state. Each state is named after the parameter or enum member that gives it
 when every state has such a name, and the states are `st0`, `st1`, ...
 otherwise (the constants the variable is compared with first, in source
-order, then the other values assigned). A constant's value is its own bits,
+order, then the other values assigned). The reference simulator numbers values
+assigned under one branch of another test differently (an `else` before its
+`if`, a `case`'s items last to first), so such numbered names can differ from
+its report; the values and counts do not. A constant's value is its own bits,
 zero-extended to the state variable's width even when the constant is signed
 (a 2-bit signed `K` of `2'b11` is state 3, also in `state <= K`), and an
 unbased unsized literal (`'1`) fills that width, as in the reference simulator.
@@ -839,7 +842,10 @@ OPENING -> CLOSED and OPEN -> CLOSED. A `default` case item applies to the
 states the other items do not list. An `if`, `?:` or `case` that only
 parameters decide (`if (PARITY != 0)`, `case (MODE)`) contributes only the
 branch they select, as in the reference simulator: the other branches' states
-and transitions are not bins. Assignments that keep the state
+and transitions are not bins. Such a `case` selects the item simulation would
+(the widest of its selector and labels sets the width, `casez`/`casex`
+wildcards apply); one with a label that is not a constant contributes all its
+items, as in the reference simulator. Assignments that keep the state
 (`next = state`, `IDLE: next = IDLE`) are not transitions. A transition's `line`
 is the assignment that makes it: one inside a test of the variable before a
 reset or default, then one in the state process before one in the next-state

@@ -544,3 +544,99 @@ endmodule
     ];
     assert_eq!(t_lines(src), expected);
 }
+
+/// A scalar loop variable / local in a call frame or scalar class property
+/// shadows a same-named package or block-local collection across queue
+/// `push_back`, direct/concat/slice property assignments, queue concatenation,
+/// type casts (`int'(c1.bits)`), equality comparisons (`==`/`!=`), and `inside`
+/// set membership.
+#[test]
+fn scalar_local_and_class_member_shadow_same_named_collection() {
+    let src = r#"package p;
+  int map[int];
+  int fa[2] = '{100, 200};
+  class item_map;
+    string name;
+    function new(string n = "m"); name = n; endfunction
+  endclass
+  class item_holder;
+    protected bit m_maps[item_map];
+    bit [6:0] bits;
+    int fa;
+    int map;
+    function new(bit [6:0] b = 0, int f = 0, int m = 0);
+      bits = b; fa = f; map = m;
+    endfunction
+    function void add_map(item_map map);
+      m_maps[map] = 1;
+    endfunction
+    virtual function void get_maps(ref item_map maps[$]);
+      foreach (m_maps[map]) begin
+        maps.push_back(map);
+      end
+    endfunction
+    function int check_self(int map, int bits);
+      int q[$];
+      q = {q, map, this.fa};
+      return (this.fa == fa) * 1000 + (map == bits) * 100 + q[0] * 10 + q[1];
+    endfunction
+  endclass
+endpackage
+
+module top;
+  import p::*;
+  initial begin
+    item_holder h1 = new(7'h09, 11, 22);
+    item_holder h2 = new(7'h05, 33, 44);
+    item_map m = new("my_map");
+    bit [15:0] vec = 16'h005a;
+    int qi[$];
+    int cmp_bits, cmp_fa, in1, in2, self_res;
+    h2.bits = h1.bits;
+    $display("T|direct bits=%0h/%0h", h1.bits, h2.bits);
+    h1.add_map(m);
+    begin
+      bit bits[];
+      int fa[2];
+      item_map q[$];
+      bits = new[3];
+      fa = '{7, 8};
+      h1.get_maps(q);
+      $display("T|queue size=%0d same=%0d name=%s dyn=%0d bits=%0h",
+               q.size(), q[0] == m, q[0].name, bits.size(), h2.bits);
+
+      h2.bits = {4'h2, 3'h3};
+      $display("T|concat c2.bits=%0h bits.size=%0d", h2.bits, bits.size());
+      h2.bits = vec[6:0];
+      $display("T|slice  c2.bits=%0h bits.size=%0d", h2.bits, bits.size());
+
+      qi = {qi, int'(h1.bits), h1.fa};
+      $display("T|qconcat sz=%0d q0=%0d q1=%0d", qi.size(), qi[0], qi[1]);
+
+      cmp_bits = (h1.bits == h2.bits);
+      cmp_fa   = (h1.fa == h2.fa);
+      $display("T|cmp bits_eq=%0d fa_eq=%0d", cmp_bits, cmp_fa);
+
+      in1 = (h1.bits inside {7'h09, 7'h01});
+      in2 = (7'h09 inside {h1.bits});
+      $display("T|inside in1=%0d in2=%0d", in1, in2);
+
+      self_res = h1.check_self(3, 4);
+      $display("T|self res=%0d", self_res);
+    end
+  end
+endmodule
+"#;
+    // Expected values from the reference simulator.
+    let expected = [
+        "T|direct bits=9/9",
+        "T|queue size=1 same=1 name=my_map dyn=3 bits=9",
+        "T|concat c2.bits=13 bits.size=3",
+        "T|slice  c2.bits=5a bits.size=3",
+        "T|qconcat sz=2 q0=9 q1=11",
+        "T|cmp bits_eq=0 fa_eq=0",
+        "T|inside in1=1 in2=1",
+        "T|self res=1041",
+    ];
+    assert_eq!(t_lines(src), expected);
+}

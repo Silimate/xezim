@@ -69,6 +69,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   toggle scores and design totals change accordingly;
   `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
   previous counting, where only the driving signal counts.
+* Named blocking `case` branches retain their `%m` scope and `disable`
+  targets across suspension (§9.3, §9.6.2).
 
 **Performance**
 
@@ -87,6 +89,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   paths, preserving comparison results, branch targets and X/Z fallback.
 * Event-reference checks borrow ordinary names and alias targets, reducing
   temporary string allocation during procedural assignments.
+
+* Class-heavy simulations share suspended process frames, reuse object
+  initialization templates, and avoid unnecessary interpreter lookups.
+  An explicit `XEZIM_METHOD_TIER` also attempts compilation on a later call
+  after enough interpreted loop iterations, including `foreach`; default
+  admission continues to use call counts. (#326, contributed by Thomasb81)
 
 **cocotb**
 

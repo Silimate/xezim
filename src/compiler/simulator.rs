@@ -94658,6 +94658,91 @@ impl Simulator {
         hit
     }
 
+    /// §16.5.1: a reference into a generate block or an instance-array
+    /// element (`blk[1].sig`, `blk[1].mem[2]`) parses as a member access over
+    /// a select, which the elaborator leaves alone even in a process body.
+    /// Unfolded, the assertion neither sampled it nor kept a `$past` history
+    /// of it. Fold each one that names a signal or an unpacked array into
+    /// the flat name the scope's own code uses (`blk[1].sig`).
+    fn sva_fold_scopes(&self, e: &mut Expression) {
+        if matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            if let Some(name) = self.sva_scope_name(e) {
+                let span = e.span;
+                let seg = crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier { name, span },
+                    selects: Vec::new(),
+                };
+                *e = Self::hier_ident_expr(vec![seg], span);
+                return;
+            }
+        }
+        let mut sub = |x: &mut Expression| self.sva_fold_scopes(x);
+        match &mut e.kind {
+            ExprKind::Unary { operand: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::SvaClocked { body: x, .. } => sub(x),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Index {
+                expr: left,
+                index: right,
+            }
+            | ExprKind::Range(left, right) => {
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Conditional {
+                condition: a,
+                then_expr: b,
+                else_expr: c,
+            }
+            | ExprKind::RangeSelect {
+                expr: a,
+                left: b,
+                right: c,
+                ..
+            } => {
+                sub(a);
+                sub(b);
+                sub(c);
+            }
+            ExprKind::Concatenation(xs)
+            | ExprKind::SystemCall { args: xs, .. }
+            | ExprKind::Call { args: xs, .. } => xs.iter_mut().for_each(&mut sub),
+            ExprKind::Replication {
+                count: x,
+                exprs: xs,
+            }
+            | ExprKind::Inside {
+                expr: x,
+                ranges: xs,
+            } => {
+                sub(x);
+                xs.iter_mut().for_each(&mut sub);
+            }
+            _ => {}
+        }
+    }
+
+    /// The storage `blk[1].sig` names (see `sva_fold_scopes`): `None` unless
+    /// the chain has a select and names a signal or an unpacked array.
+    fn sva_scope_name(&self, e: &Expression) -> Option<String> {
+        let flat = self.member_chain_ident(e)?;
+        let ExprKind::Ident(h) = &flat.kind else {
+            return None;
+        };
+        if !h.path.iter().any(|s| s.name.name.ends_with(']')) {
+            return None;
+        }
+        let name = self.resolve_hier_name(h).into_owned();
+        let known = self.signal_name_to_id.contains_key(name.as_str())
+            || self.array_first_id.contains_key(name.as_str())
+            || self.module.arrays.contains_key(&name)
+            || self.module.arrays_2d.contains_key(&name)
+            || self.module.arrays_nd.contains_key(&name);
+        known.then_some(name)
+    }
+
     fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
@@ -95598,6 +95683,7 @@ impl Simulator {
         // Named sequence / property instances INSIDE the body (`a |=> s`)
         // expand here, once.
         let mut body_expanded = self.sva_expand_named(&body, 0);
+        self.sva_fold_scopes(&mut body_expanded);
         let mut lv_init: Vec<Value> = Vec::new();
         let mut lv_types =
             self.sva_bind_locals(&mut body_expanded, &HashMap::default(), &mut lv_init);
@@ -95797,14 +95883,6 @@ impl Simulator {
             ExprKind::Ident(_) => {
                 if let Some(id) = self.get_lhs_signal_id(expr) {
                     out.push(id);
-                }
-            }
-            // A reference into a generate block or an instance-array element
-            // (`blk[1].sig`) stays a member access over a select, in a process
-            // body and in a named property alike: sample the signal it names.
-            ExprKind::MemberAccess { .. } => {
-                if let Some(flat) = self.member_chain_ident(expr) {
-                    self.collect_sva_signal_ids(&flat, out);
                 }
             }
             ExprKind::Unary { operand, .. } => self.collect_sva_signal_ids(operand, out),

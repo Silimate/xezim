@@ -12,7 +12,8 @@
 //! hierarchical clock (`p_clk`) named no signal, so that property never
 //! ticked. A reference into a generate block or an instance-array element
 //! (`stg[1].r`) stays a member access over a select even in a process
-//! body, so it was not sampled inline either (`a13`).
+//! body, so it was not sampled inline either (`a13`), and `$past` of it had
+//! no history (`a16`).
 //!
 //! `u.st` goes 0 -> 1 at the 15 ns edge and back to 0 at 25 ns. Each
 //! assertion below has exactly one nonvacuous success and no failure; the
@@ -45,7 +46,7 @@ module chk(input logic clk, input logic go);    // a named property below the to
 endmodule
 module t;
   logic clk = 0, go = 0;
-  int n [16], f [16];
+  int n [17], f [17];
   core u(.clk(clk), .go(go));
   core ua [1:0] (.clk(clk), .go(go));
   chk c(.clk(clk), .go(go));
@@ -99,6 +100,9 @@ module t;
   property p_arr;                               // into an instance-array element
     @(posedge clk) (ua[1].st == 0 && go) |=> ua[1].st == 1;
   endproperty
+  property p_genpast;                           // $past of a generate-block reference
+    @(posedge clk) stg[1].r == 1 |-> $past(stg[1].r) == 0 && $past(go);
+  endproperty
   a0: assert property (p_start) n[0]++; else f[0]++;
   a1: assert property (p_cons) n[1]++; else f[1]++;
   a2: assert property (p_bit) n[2]++; else f[2]++;
@@ -115,11 +119,12 @@ module t;
   a13: assert property (@(posedge clk) (stg[1].r == 0 && go) |=> stg[1].r == 1) n[13]++; else f[13]++;
   a14: assert property (p_subgen) n[14]++; else f[14]++;
   a15: assert property (p_arr) n[15]++; else f[15]++;
+  a16: assert property (p_genpast) n[16]++; else f[16]++;
   initial begin
     @(negedge clk) go = 1;
     @(negedge clk) go = 0;
     repeat (3) @(negedge clk);
-    for (int i = 0; i < 16; i++)
+    for (int i = 0; i < 17; i++)
       $display("a%0d %s pass=%0d fail=%0d", i, n[i] == 1 && f[i] == 0 ? "PASS" : "FAIL", n[i], f[i]);
     $display("a_sub %s pass=%0d fail=%0d", c.sn == 1 && c.sf == 0 ? "PASS" : "FAIL", c.sn, c.sf);
     $finish;
@@ -179,7 +184,7 @@ endmodule
 #[test]
 fn hierarchical_references_in_named_properties_are_sampled() {
     let text = run("hier", DESIGN);
-    let names = (0..16)
+    let names = (0..17)
         .map(|i| format!("a{i}"))
         .chain(["a_sub".to_string()]);
     for name in names {

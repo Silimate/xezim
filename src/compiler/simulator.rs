@@ -6987,9 +6987,10 @@ pub struct Simulator {
     /// `assert_insts` index by statement key, instance and path.
     assert_inst_ix: HashMap<(usize, String, String), usize>,
     /// Immediate and deferred assertions: `assert_insts` index by statement
-    /// span and the id of the running instance scope (`assert_scope_ids`),
-    /// so an evaluation finds its entry without building the `%m` path.
-    assert_imm_ix: HashMap<(usize, usize, u8, u32), usize>,
+    /// span, the id of the scope `%m` names it after and, in a class method,
+    /// the id of the class (`assert_scope_ids`), so an evaluation finds its
+    /// entry without building the `%m` path.
+    assert_imm_ix: HashMap<(usize, usize, u8, u32, u32), usize>,
     assert_scope_ids: HashMap<String, u32>,
     /// Code coverage sites and toggle state (`--code-coverage`); `None` when
     /// the run collects none. See `code_cov`.
@@ -47234,7 +47235,20 @@ impl Simulator {
                 s
             }
         };
-        let ix = (a.span.start, a.span.end, tag, sid);
+        // The objects of two classes can share a creating scope, and their
+        // statements a span (in different files): the class tells them apart.
+        let class = match (tag, self.class_context_stack.last()) {
+            (2, Some(Some(c))) => match self.assert_scope_ids.get(c.as_str()) {
+                Some(&s) => s,
+                None => {
+                    let s = self.assert_scope_ids.len() as u32;
+                    self.assert_scope_ids.insert(c.clone(), s);
+                    s
+                }
+            },
+            _ => u32::MAX,
+        };
+        let ix = (a.span.start, a.span.end, tag, sid, class);
         if let Some(&i) = self.assert_imm_ix.get(&ix) {
             return i;
         }
@@ -49918,6 +49932,8 @@ impl Simulator {
         let closes = |w: &[u8]| matches!(w, b"endmodule" | b"endinterface" | b"endprogram");
         let mut out = Vec::new();
         let mut depth = 0usize;
+        // The open case bodies (true) and begin-end or fork-join blocks.
+        let mut blocks: Vec<bool> = Vec::new();
         for (n, &(off, w)) in words.iter().enumerate() {
             if depth == 0 {
                 let name = || {
@@ -49940,6 +49956,18 @@ impl Simulator {
                 }
             }
             let kind = match w {
+                b"case" | b"casex" | b"casez" | b"randcase" => {
+                    blocks.push(true);
+                    continue;
+                }
+                b"begin" | b"fork" => {
+                    blocks.push(false);
+                    continue;
+                }
+                b"end" | b"endcase" | b"join" | b"join_any" | b"join_none" => {
+                    blocks.pop();
+                    continue;
+                }
                 b"assert" => 0,
                 b"assume" => 1,
                 b"cover" => 2,
@@ -49949,22 +49977,25 @@ impl Simulator {
                 continue;
             }
             // `<label> :` before the keyword (not `::`, nor a case's
-            // `default :`).
-            let mut j = off;
-            while j > 0 && t[j - 1].is_ascii_whitespace() {
-                j -= 1;
-            }
-            let colon = j > 0 && t[j - 1] == b':' && (j < 2 || t[j - 2] != b':');
-            let labeled = colon && {
-                j -= 1;
+            // `default :`). Directly in a case body, `<item> :` is the case
+            // item, and a label follows it: `2'd1 : lab : assert ...`.
+            let skip = |mut j: usize| {
                 while j > 0 && t[j - 1].is_ascii_whitespace() {
                     j -= 1;
                 }
+                j
+            };
+            let colon = |j: usize| j > 0 && t[j - 1] == b':' && (j < 2 || t[j - 2] != b':');
+            let mut j = skip(off);
+            let labeled = colon(j) && {
+                j = skip(j - 1);
                 let end = j;
                 while j > 0 && word(t[j - 1]) {
                     j -= 1;
                 }
-                j < end && &t[j..end] != b"default"
+                j < end
+                    && &t[j..end] != b"default"
+                    && (blocks.last() != Some(&true) || colon(skip(j)))
             };
             if !labeled {
                 out.push((kind, off));

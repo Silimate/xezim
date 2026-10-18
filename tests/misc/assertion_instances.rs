@@ -561,3 +561,82 @@ fn followed_by_settles_at_the_first_consequent_that_holds() {
         .collect();
     assert_eq!(actions, ["35 PASS f_multi", "35 PASS f_multi"], "{out}");
 }
+
+const CLASS_A: &str = r#"package pa;
+  class ca;
+    function void f(int v);
+      a_c : assert (v != 1);
+      assert (v != 3);
+    endfunction
+  endclass
+endpackage
+"#;
+
+const CLASS_B: &str = r#"package pb;
+  class cb;
+    function void f(int v);
+      a_c : assert (v != 2);
+      assert (v != 0);
+    endfunction
+  endclass
+endpackage
+"#;
+
+const CASES: &str = r#"module top;
+  logic clk = 0, a = 0, b = 0;
+  logic [1:0] sel = 2'd1;
+  always #5 clk = ~clk;
+  pa::ca x = new;
+  pb::cb y = new;
+  always @(posedge clk) begin
+    case (sel)
+      2'd0: assert property (a |-> b);
+      2'd1: assert property (b || !b);
+      2'b10, 2'b11: lab_c : assert property (a);
+    endcase
+  end
+  assert property (@(posedge clk) a || !a);
+  initial begin
+    for (int i = 0; i < 4; i++) begin
+      x.f(i);
+      y.f(i);
+    end
+    #22 sel = 2'd2;
+    #20 $finish;
+  end
+endmodule
+"#;
+
+/// The methods of two classes declared in different files, with their
+/// statements at the same offsets and their objects created in the same
+/// instance, keep an entry each, under their package and with their own
+/// file. A case item is not a label: `2'd1 : assert property ...` is the
+/// second unlabeled statement, `assert__1`, whether or not the first item
+/// ever runs (the reference simulator also lists the unreached `assert__0`
+/// with zero counts; xezim lists a procedural statement once reached).
+#[test]
+fn class_methods_and_case_items_keep_their_own_entries() {
+    let (json, _) = run(
+        "classes",
+        &[("ca.sv", CLASS_A), ("cb.sv", CLASS_B), ("top.sv", CASES)],
+    );
+    for (inst, name, want) in [
+        ("pa", "ca.f.a_c", [4, 3, 0, 1, 0]),
+        ("pa", "ca.f.immed__5", [4, 3, 0, 1, 0]),
+        ("pb", "cb.f.a_c", [4, 3, 0, 1, 0]),
+        ("pb", "cb.f.immed__5", [4, 3, 0, 1, 0]),
+        ("top", "assert__1", [2, 2, 0, 0, 0]),
+        ("top", "lab_c", [2, 0, 0, 2, 0]),
+        ("top", "assert__2", [4, 4, 0, 0, 0]),
+    ] {
+        assert_eq!(counts(&json, inst, name), want, "{inst} {name}:\n{json}");
+    }
+    assert!(
+        entry(&json, "pb", "cb.f.a_c").contains("cb.sv\", \"line\": 4, "),
+        "{json}"
+    );
+    assert!(
+        !json.contains("\"instance\": \"top\", \"name\": \"assert__0\""),
+        "{json}"
+    );
+}

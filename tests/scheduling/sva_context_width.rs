@@ -115,6 +115,8 @@ const EXPRS: &[(&str, &str)] = &[
     ("element", "mem[1] + v == 9'h100"),
     ("member", "st.f + v == 9'h100"),
     ("select_mul", "a[15:0] * b == 32'h0001_0000"),
+    // a sized bound is truncated to its size: `3'd15` is 7, so 8 bits
+    ("sized_bound", "(@u[3'd15:0] + 8'd1) == 8'h00"),
 ];
 
 /// Each expression as an assertion, a cover, a named sequence, a `disable

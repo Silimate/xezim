@@ -102257,15 +102257,18 @@ impl Simulator {
     /// declaration alone: a bit of a vector, an element of an array, `|l - r|
     /// + 1` bits for a part-select `[l:r]` and `w` for `[i +: w]`. None for
     /// any other base (a packed array of vectors, a local variable) and for
-    /// bounds that are not literals. A select of a vector is as wide as its
-    /// value always is, so the answer is kept on the node, as `infer_width`
-    /// keeps its own.
+    /// bounds that are not unsized decimal literals. A select of a vector is
+    /// as wide as its value always is, so the answer is kept on the node, as
+    /// `infer_width` keeps its own.
     fn select_width(&mut self, expr: &Expression) -> Option<u32> {
         if let Some(w) = expr.cached_width.get() {
             return Some(w);
         }
+        // An unsized decimal literal is its digits. A sized one can be
+        // truncated (`3'd15` is 7), so it is left to the caller.
         let lit = |e: &Expression| match &e.kind {
             ExprKind::Number(NumberLiteral::Integer {
+                size: None,
                 base: NumberBase::Decimal,
                 value,
                 ..

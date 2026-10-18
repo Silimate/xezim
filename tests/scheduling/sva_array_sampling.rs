@@ -9,7 +9,7 @@
 //! never copied.
 //!
 //! Each design checks itself and prints its failure counts. The expected
-//! lines are the commercial simulator's.
+//! lines are the reference simulator's.
 
 use xezim::simulate;
 
@@ -151,7 +151,7 @@ endmodule
 /// An index read from a sequence local variable (§16.10) or a procedure's
 /// loop variable (§16.14.6.1) is only known when the property is evaluated,
 /// so the whole array is sampled. The `disable iff` condition reads current
-/// values (§16.12), the body sampled ones: the commercial simulator reports
+/// values (§16.12), the body sampled ones: the reference simulator reports
 /// the five failures below.
 #[test]
 fn indices_the_preponed_region_cannot_evaluate() {
@@ -227,6 +227,39 @@ module top;
 endmodule
 "#;
     assert_eq!(result(src), "RESULT n=19 const=0 var=0");
+}
+
+/// A forced element follows its force expression within the time slot, so
+/// its sampled value is still the old one (§10.6.2, §16.5.1). The large array
+/// lives in the packed arena, where swapping in the sample has to get past
+/// the force. The reference simulator gives this count for `regs`.
+#[test]
+fn forced_elements_are_sampled() {
+    let src = r#"
+module top;
+  logic clk = 0;
+  logic [31:0] ram [0:(1<<17)-1];
+  logic [31:0] regs [0:255];
+  logic [31:0] s = 1;
+  int f_ram = 0, f_regs = 0, n = 0;
+  always #5 clk = ~clk;
+  always_ff @(posedge clk) s <= s * 3 + 1;
+  initial begin
+    force ram[5] = s;
+    force regs[5] = s;
+  end
+  // A forced element follows s, and both are sampled before the edge.
+  a_ram:  assert property (@(posedge clk) ram[5] == s) else f_ram++;
+  a_regs: assert property (@(posedge clk) regs[5] == s) else f_regs++;
+  c_n: cover property (@(posedge clk) 1) n++;
+  initial begin
+    #100;
+    $display("RESULT n=%0d ram=%0d regs=%0d", n, f_ram, f_regs);
+    $finish;
+  end
+endmodule
+"#;
+    assert_eq!(result(src), "RESULT n=10 ram=0 regs=0");
 }
 
 /// Elements of a dynamic array and of a queue, written with blocking

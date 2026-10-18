@@ -5013,6 +5013,16 @@ impl PackedMem {
         true
     }
 
+    /// Land `(v, x)` in the cell even if it is forced, leaving the force as
+    /// it is: for a swap undone before anything else reads the cell (a
+    /// concurrent assertion's sampled values, §16.5.1).
+    fn put_raw(&mut self, id: usize, v: u64, x: u64) {
+        if let Some((seg, at)) = self.locate(id) {
+            let seg = *seg;
+            self.store_at(&seg, at, v, x);
+        }
+    }
+
     /// §10.6.2 `force`: land `(v, x)` in the cell even if it is already
     /// forced, and pin it there until `release_forced`.
     pub(crate) fn force_raw(&mut self, id: usize, v: u64, x: u64) -> bool {
@@ -95529,7 +95539,9 @@ impl Simulator {
                     RangeKind::IndexedUp => (l, l + r - 1),
                     RangeKind::IndexedDown => (l - r + 1, l),
                 };
-                for i in lo..=hi {
+                // Only the indices the array has.
+                let (alo, ahi) = self.sva_slice_bounds(&base)?;
+                for i in lo.max(alo)..=hi.min(ahi) {
                     if let Some(id) = self.resolve_signal_id(&Self::name_with_index(&base, i)) {
                         out.push(id);
                     }
@@ -95542,6 +95554,20 @@ impl Simulator {
             out.push(id);
         }
         Some(name)
+    }
+
+    /// The index range of the unpacked array or sub-array `base` (`a`, or
+    /// `m[1]` of a two-dimensional `m`).
+    fn sva_slice_bounds(&self, base: &str) -> Option<(i64, i64)> {
+        if let Some(&(_, lo, hi)) = self.array_first_id.get(base) {
+            return Some((lo, hi));
+        }
+        if let Some(&(l, r, _)) = self.module.arrays.get(base) {
+            return Some((l.min(r), l.max(r)));
+        }
+        let (root, _) = base.split_once('[')?;
+        let &(_, (l, r), _) = self.module.arrays_2d.get(root)?;
+        Some((l.min(r), l.max(r)))
     }
 
     /// Every cell of the array select chain `e` reads, for an index the
@@ -95816,8 +95842,11 @@ impl Simulator {
                 if id < self.signal_table.len() {
                     saved.push((id, std::mem::replace(&mut self.signal_table[id], pre)));
                 } else {
+                    // Past a `force` too: a forced cell's value can change
+                    // within the slot like any other.
                     saved.push((id, self.packed.read(id)));
-                    self.packed.write(id, &pre);
+                    let (v, x) = pre.raw_bits();
+                    self.packed.put_raw(id, v, x);
                 }
             }
         }
@@ -95831,7 +95860,8 @@ impl Simulator {
                 self.signal_table[id] = v;
                 self.sync_mirror(id);
             } else {
-                self.packed.write(id, &v);
+                let (v, x) = v.raw_bits();
+                self.packed.put_raw(id, v, x);
             }
         }
     }

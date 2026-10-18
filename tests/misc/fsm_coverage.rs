@@ -1413,12 +1413,26 @@ module k2 #(parameter logic [1:0] SEL = 2'd2) (input logic clk, rst, go);
       default: st <= 2'd0;
     endcase
 endmodule
+module k3 #(parameter logic [7:0] P = 8'd255) (input logic clk, rst, go);
+  logic [1:0] st;         // the selector sums at the labels' width
+  always_ff @(posedge clk)
+    if (rst) st <= 2'd0;
+    else case (st)
+      2'd0: if (go) st <= 2'd1;
+      2'd1: case (P + 8'd1)
+              256: st <= 2'd2;
+              default: st <= 2'd3;
+            endcase
+      default: st <= 2'd0;
+    endcase
+endmodule
 module tb;
   logic clk = 0, rst = 1, go = 0;
   always #5 clk = ~clk;
   k1 #(.MODE(1), .STOPS(1)) ua(.*);
   k1 #(.MODE(0), .STOPS(2)) ub(.*);
   k2 #(.SEL(2'd2)) uc(.*);
+  k3 ud(.*);
   initial begin
     repeat (2) @(negedge clk);
     rst = 0;
@@ -1477,6 +1491,17 @@ const PARAM_BRANCHES_FSMS: &[Expect] = &[
             "st1>st0@20:0",
             "st1>st2@25:4",
             "st2>st0@28:4",
+        ],
+    ),
+    (
+        "tb.ud",
+        "st",
+        &["st0=0@36:6", "st1=1@37:4", "st2=2@41:4"],
+        &[
+            "st0>st1@36:4",
+            "st1>st0@34:0",
+            "st1>st2@38:4",
+            "st2>st0@41:4",
         ],
     ),
 ];
@@ -1696,7 +1721,9 @@ fn held_states() {
 /// An `if`, `?:` or `case` that only parameters decide contributes only
 /// the branch they select (`A -> C` is no transition when `MODE` is 1, nor
 /// `B -> D` when `STOPS` is 1); the states the other branches name stay
-/// states when a `case` lists them. As in the reference simulator.
+/// states when a `case` lists them. A `case` on parameters compares at the
+/// widest of its selector and labels (§12.5: `P + 8'd1` with `P` 255 is
+/// 256). As in the reference simulator.
 #[test]
 fn parameter_branches() {
     check("parameter_branches", PARAM_BRANCHES, PARAM_BRANCHES_FSMS);

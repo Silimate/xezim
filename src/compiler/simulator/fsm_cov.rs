@@ -630,34 +630,42 @@ impl Walk<'_> {
     }
 
     /// The item a `case` on parameters selects (`Some(None)`: none does),
-    /// when its selector and labels are all constants.
+    /// when its selector and labels are all constants. As in simulation, the
+    /// selector and the labels compare at the widest of their widths
+    /// (§12.5): `case (P + 8'd1)` with an item `256` sums at 32 bits.
     fn fold_case(&mut self, expr: &Expression, items: &[CaseItem]) -> Option<Option<usize>> {
         if self.mentions(expr) || !self.constant(expr) {
             return None;
         }
-        let sel = self.sim.eval_expr(expr);
-        if sel.has_xz() {
-            return None;
-        }
-        let sel = sel.to_u64()?;
-        let mut default = None;
-        for (k, it) in items.iter().enumerate() {
+        let mut labels = Vec::new();
+        for it in items {
             if it.pattern.is_some() || it.guard.is_some() {
                 return None;
-            }
-            if it.is_default {
-                default = Some(k);
-                continue;
             }
             for p in &it.patterns {
                 if matches!(p.kind, ExprKind::Range(..)) || !self.constant(p) {
                     return None;
                 }
-                let v = self.sim.eval_expr(p);
-                if v.has_xz() {
-                    return None;
-                }
-                if v.to_u64() == Some(sel) {
+                labels.push(p);
+            }
+        }
+        let mut width = self.sim.eval_expr(expr).width;
+        for p in labels {
+            width = width.max(self.sim.eval_expr(p).width);
+        }
+        if width > 64 {
+            return None;
+        }
+        let known = |v: Value| (!v.has_xz()).then(|| v.to_u64()).flatten();
+        let sel = known(self.sim.eval_expr_ctx(expr, width))?;
+        let mut default = None;
+        for (k, it) in items.iter().enumerate() {
+            if it.is_default {
+                default = Some(k);
+                continue;
+            }
+            for p in &it.patterns {
+                if known(self.sim.eval_expr_ctx(p, width))? == sel {
                     return Some(Some(k));
                 }
             }

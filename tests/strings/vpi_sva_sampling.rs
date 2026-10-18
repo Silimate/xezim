@@ -9,7 +9,7 @@
 //! clock writes it from cbAfterDelay. Under the first, the assertions ticked
 //! in the next delta or the next slot and read every flop's new value; a
 //! value written in the edge's own cbAfterDelay counted as already sampled.
-//! The commercial simulator reports no failure in any of these runs.
+//! The reference simulator reports no failure in any of these runs.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -283,7 +283,7 @@ fn vpi_driven_clock_samples_preponed_values() {
 
 /// A routine that ends the run from the clock's value-change callback, as
 /// cocotb does when a test returns on `RisingEdge`, ends it in that delta:
-/// the assertions do not tick at that edge. The commercial simulator ticks
+/// the assertions do not tick at that edge. The reference simulator ticks
 /// at 5 to 85 and not at 95, where the run ends.
 #[test]
 fn vpi_finish_at_an_edge_ticks_no_assertion() {
@@ -301,7 +301,7 @@ fn vpi_finish_at_an_edge_ticks_no_assertion() {
 /// cbReadWriteSynch included. A reset released from a cbReadWriteSynch
 /// queued at the second rising edge (15 ns), as cocotb writes after
 /// `RisingEdge`, therefore does not cancel that edge's attempt: attempts from
-/// 15 to 85 ns pass. The commercial simulator agrees for each clock.
+/// 15 to 85 ns pass. The reference simulator agrees for each clock.
 #[test]
 fn vpi_reset_release_at_an_edge_keeps_its_attempt() {
     let (dir, so) = setup("reset", RST_SV);

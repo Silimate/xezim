@@ -82,7 +82,7 @@ endmodule
 /// `$rose(q)`, `$fell(q)`, `$stable(q)` and `$changed(q)` see `q` from before
 /// the edge that updates it. Its history used to record the value the flop
 /// took at the edge, so `$past(q)` returned the current sample and `$rose`
-/// fired a cycle early. The commercial simulator: 6 changes, no failure.
+/// fired a cycle early. The reference simulator: 6 changes, no failure.
 #[test]
 fn sampled_value_functions_read_preponed_flop_values() {
     let o = out(r#"
@@ -125,7 +125,7 @@ endmodule
 /// process that the NBA update of `d` wakes, and `d` is still sampled with
 /// its value from the start of the slot. The samples used to be retaken in
 /// every delta the scheduler re-entered, which saw the new `d`. The
-/// commercial simulator: 10 ticks, no failure.
+/// reference simulator: 10 ticks, no failure.
 #[test]
 fn clock_in_a_later_delta_samples_slot_entry_values() {
     let o = out(r#"

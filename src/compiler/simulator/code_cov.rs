@@ -34,11 +34,14 @@ const LIBRARY_PACKAGES: [&str; 2] = ["std", "uvm_pkg"];
 
 /// What the command line asked for. `scopes` limits every kind to the
 /// instances at or below the listed paths and to the listed packages (empty:
-/// the whole design).
+/// the whole design). `exclude_input_ports` leaves input and inout ports out
+/// of toggle coverage, so the net that drives one carries its toggles
+/// (`--no-toggle-input-ports`); by default each instance counts its own.
 #[derive(Clone, Debug, Default)]
 pub struct CodeCoverage {
     pub kinds: u8,
     pub scopes: Vec<String>,
+    pub exclude_input_ports: bool,
 }
 
 static CONFIG: Mutex<Option<CodeCoverage>> = Mutex::new(None);
@@ -1535,15 +1538,30 @@ impl Simulator {
 
     /// Nets and variables toggle coverage tracks, by name, taken while the
     /// elaboration signal table still holds their declarations: the integral
-    /// ones of instances, without input and inout ports (the parent's signal
-    /// carries those toggles), unpacked arrays, `time` variables, subroutine
-    /// variables and class properties.
+    /// ones of instances, ports included, without unpacked arrays, `time`
+    /// variables, subroutine variables and class properties. An input or
+    /// inout port is a net of its instance holding the value its connection
+    /// gives it (§23.3.3): a whole-net connection collapsed onto the actual
+    /// shares the actual's counts, an expression or select toggles as its
+    /// value, and a constant or open port never toggles.
+    /// `exclude_input_ports` leaves input and inout ports to the signal that
+    /// drives them.
     pub(super) fn cov_toggle_candidates(module: &ElaboratedModule) -> Vec<String> {
-        let wants = code_coverage().is_some_and(|c| c.kinds & KIND_TOGGLE != 0);
-        if !wants {
+        let Some(cfg) = code_coverage().filter(|c| c.kinds & KIND_TOGGLE != 0) else {
             return Vec::new();
-        }
+        };
         let inst_paths: HashSet<&str> = module.instances.iter().map(|i| i.path.as_str()).collect();
+        // Each instance's own name, without its array index (`u` for `u[0]`
+        // and `g[0].u`), and its module.
+        let inst_names: HashSet<(&str, &str)> = module
+            .instances
+            .iter()
+            .map(|i| {
+                let leaf = i.path.rsplit('.').next().unwrap_or_default();
+                let name = leaf.split('[').next().unwrap_or_default();
+                (name, i.def_name.as_str())
+            })
+            .collect();
         let subr_prefixes: Vec<String> = module
             .functions
             .keys()
@@ -1557,10 +1575,11 @@ impl Simulator {
                 if sig.is_const
                     || sig.is_real
                     || sig.width == 0
-                    || matches!(
-                        sig.direction,
-                        Some(PortDirection::Input) | Some(PortDirection::Inout)
-                    )
+                    || (cfg.exclude_input_ports
+                        && matches!(
+                            sig.direction,
+                            Some(PortDirection::Input) | Some(PortDirection::Inout)
+                        ))
                 {
                     return false;
                 }
@@ -1594,6 +1613,17 @@ impl Simulator {
                 }
                 if let Some(t) = &sig.type_name {
                     if module.classes.contains_key(t) || module.interfaces.contains(t) {
+                        return false;
+                    }
+                    // Instances and generate blocks are scopes, not signals
+                    // (§23.6). Elaboration gives the top module a 1-bit
+                    // placeholder signal under each one's name, so that
+                    // hierarchical names through it validate: typed
+                    // `$genblock` for a generate block and by its module for
+                    // an instance, including an instance array and one in a
+                    // generate block, which have no instance path of that
+                    // name.
+                    if t == "$genblock" || inst_names.contains(&(n, t.as_str())) {
                         return false;
                     }
                 }

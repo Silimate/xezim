@@ -714,7 +714,7 @@ impl Simulator {
     /// flop's new value. A slot run by the nested scheduler took no samples.
     /// Once a routine has finished the run nothing is evaluated (§38.14):
     /// cocotb ends a test from the value-change callback of the edge, and the
-    /// commercial simulator reports no assertion at that edge.
+    /// reference simulator reports no assertion at that edge.
     fn vpi_observed(&mut self) {
         if !self.finished && self.sva_preponed_time == Some(self.time) && !self.vpi_synch_due() {
             self.tick_sva_sites();

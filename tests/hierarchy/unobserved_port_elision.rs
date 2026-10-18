@@ -488,12 +488,37 @@ endmodule
     assert_eq!(n, 3);
 }
 
-/// Code coverage enumerates nets: no elision.
+/// Code coverage enumerates nets: no elision, and each port a plain run
+/// leaves out counts in its own instance's toggle coverage, with the counts
+/// of the net or select it is connected to (`d[0]`, `rs[0]`, `we`, `wl[0]`).
 #[test]
 fn code_coverage_keeps_ports() {
     let dir = scratch("cov");
-    let r = run_in(&dir, &cells(""), &["--code-coverage=toggle"], &[]);
+    let db = dir.join("cov.json");
+    let r = run_in(
+        &dir,
+        &cells(""),
+        &["--code-coverage=toggle"],
+        &[
+            ("XEZIM_COV_DB", db.to_str().unwrap()),
+            ("XEZIM_TOGGLE_INPUT_PORTS", "1"),
+        ],
+    );
     assert_eq!(elided(&r), 0);
+    let json = std::fs::read_to_string(&db).unwrap();
+    let key = "\"scope\": \"top.r0.u_c[0].bitc\",";
+    let cell = &json[json.find(key).expect("leaf cell scope")..];
+    let cell = &cell[..cell[key.len()..]
+        .find("\"scope\": ")
+        .map_or(cell.len(), |e| e + key.len())];
+    for row in [
+        "{\"signal\": \"d\", \"width\": 1, \"rise\": [2], \"fall\": [2]}",
+        "{\"signal\": \"rs\", \"width\": 1, \"rise\": [1], \"fall\": [2]}",
+        "{\"signal\": \"we\", \"width\": 1, \"rise\": [4], \"fall\": [4]}",
+        "{\"signal\": \"wl\", \"width\": 1, \"rise\": [1], \"fall\": [1]}",
+    ] {
+        assert!(cell.contains(row), "{row}: {cell}");
+    }
 }
 
 /// §5.6.1: an escaped port name is the same identifier as its plain

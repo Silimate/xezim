@@ -15977,18 +15977,7 @@ impl Simulator {
         // Ident. Resolve it as the hierarchical name it spells; without this
         // `$readmemh("f", r.mem)` in a task loaded nothing.
         if matches!(expr.kind, ExprKind::MemberAccess { .. }) {
-            if let Some(mut flat) = Self::member_chain_as_hier_ident(expr) {
-                // An instance-array select names one element instance, whose
-                // scope is `ra[1]`: fold the (constant) index into the
-                // segment name, the spelling the element's storage uses.
-                if let ExprKind::Ident(h) = &mut flat.kind {
-                    for seg in h.path.iter_mut() {
-                        for sel in std::mem::take(&mut seg.selects) {
-                            let i = self.eval_scalar_self(&sel)?;
-                            seg.name.name = format!("{}[{}]", seg.name.name, i);
-                        }
-                    }
-                }
+            if let Some(flat) = self.member_chain_ident(expr) {
                 return self.resolve_array_name_from_expr(&flat);
             }
         }
@@ -16068,6 +16057,23 @@ impl Simulator {
         self.record_output(m.clone());
         self.stdout_writeln(&m);
         None
+    }
+
+    /// [`member_chain_as_hier_ident`] with each select folded into its
+    /// segment's name: an instance-array element or a generate block scope
+    /// is `ra[1]` / `blk[1]`, the spelling its storage uses. `None` when a
+    /// select is not constant.
+    fn member_chain_ident(&self, e: &Expression) -> Option<Expression> {
+        let mut flat = Self::member_chain_as_hier_ident(e)?;
+        if let ExprKind::Ident(h) = &mut flat.kind {
+            for seg in h.path.iter_mut() {
+                for sel in std::mem::take(&mut seg.selects) {
+                    let i = self.eval_scalar_self(&sel)?;
+                    seg.name.name = format!("{}[{}]", seg.name.name, i);
+                }
+            }
+        }
+        Some(flat)
     }
 
     /// A dotted chain of names and constant-indexed instance-array elements
@@ -95791,6 +95797,14 @@ impl Simulator {
             ExprKind::Ident(_) => {
                 if let Some(id) = self.get_lhs_signal_id(expr) {
                     out.push(id);
+                }
+            }
+            // A reference into a generate block or an instance-array element
+            // (`blk[1].sig`) stays a member access over a select, in a process
+            // body and in a named property alike: sample the signal it names.
+            ExprKind::MemberAccess { .. } => {
+                if let Some(flat) = self.member_chain_ident(expr) {
+                    self.collect_sva_signal_ids(&flat, out);
                 }
             }
             ExprKind::Unary { operand, .. } => self.collect_sva_signal_ids(operand, out),

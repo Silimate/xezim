@@ -52,7 +52,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the assertion passed only vacuously, and a consequent on such a state
   failed. `$past` and `$rose` of such a reference also behave as they do
   inline, and a hierarchical clock (`@(posedge u.clk)`) there ticks; it
-  named no signal, so the property never ran (§16.5.1). (Silimate/xezim#52)
+  named no signal, so the property never ran. A reference into a generate
+  block or an instance-array element (`blk[1].sig`, `ra[0].sig`) is now
+  sampled too, inline and in a named property (§16.5.1). (Silimate/xezim#52)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

@@ -130,6 +130,11 @@ fn fsms(json: &str) -> Vec<Found> {
 /// Run `src` with FSM coverage and check its FSMs, all of them, against the
 /// reference simulator's.
 fn check(tag: &str, src: &str, want: &[Expect]) -> String {
+    check_lines(tag, src, want, true)
+}
+
+/// `check`, optionally leaving out the states' lines.
+fn check_lines(tag: &str, src: &str, want: &[Expect], state_lines: bool) -> String {
     let d = scratch(tag);
     let out = run(&d, src, &["--code-coverage=fsm"], &[]);
     assert!(
@@ -150,7 +155,20 @@ fn check(tag: &str, src: &str, want: &[Expect]) -> String {
         })
         .collect();
     want.sort();
-    assert_eq!(fsms(&json), want, "{json}");
+    let mut got = fsms(&json);
+    if !state_lines {
+        let strip = |v: &mut Vec<String>| {
+            for x in v.iter_mut() {
+                let (a, b) = x.split_once('@').unwrap();
+                let (_, c) = b.split_once(':').unwrap();
+                *x = format!("{a}:{c}");
+            }
+        };
+        for f in got.iter_mut().chain(want.iter_mut()) {
+            strip(&mut f.2);
+        }
+    }
+    assert_eq!(got, want, "{json}");
     let _ = std::fs::remove_dir_all(&d);
     json
 }
@@ -1174,6 +1192,123 @@ const SIGNED_FSMS: &[Expect] = &[(
     &["A>B@9:2", "B>A@8:0", "B>K@10:2", "K>A@8:0"],
 )];
 
+const VALUES: &str = r#"// Which tests make a register an FSM: a test of it that controls nothing
+// assigned to it (p1, p3), and one that does (p2, p4).
+module p1(input logic clk, rst, input logic [1:0] sel, output logic flag);
+  logic [2:0] v;        // value register, tested only to drive flag
+  always_ff @(posedge clk)
+    if (rst) v <= 3'd0;
+    else case (sel)
+      2'd0: v <= 3'd1;
+      2'd1: v <= 3'd2;
+      default: v <= 3'd4;
+    endcase
+  always_ff @(posedge clk) flag <= (v == 3'd2);
+endmodule
+module p2(input logic clk, rst, input logic [1:0] sel);
+  logic [2:0] v;        // as p1, plus an assignment under a test of v
+  always_ff @(posedge clk)
+    if (rst) v <= 3'd0;
+    else if (v == 3'd4) v <= 3'd0;
+    else case (sel)
+      2'd0: v <= 3'd1;
+      2'd1: v <= 3'd2;
+      default: v <= 3'd4;
+    endcase
+endmodule
+module p3(input logic clk, rst, input logic [1:0] sel, output logic flag);
+  logic [2:0] v, nv;    // two-process value register, tested for another output
+  always_ff @(posedge clk) if (rst) v <= 3'd0; else v <= nv;
+  always_comb begin
+    nv = v;
+    flag = 1'b0;
+    case (sel)
+      2'd0: nv = 3'd1;
+      2'd1: nv = 3'd2;
+      default: ;
+    endcase
+    if (v == 3'd2) flag = 1'b1;
+  end
+endmodule
+module p4(input logic clk, rst, input logic [1:0] sel, output logic flag);
+  logic [2:0] v, nv;    // as p3, with nv assigned under the test of v
+  always_ff @(posedge clk) if (rst) v <= 3'd0; else v <= nv;
+  always_comb begin
+    nv = v;
+    flag = 1'b0;
+    case (sel)
+      2'd0: nv = 3'd1;
+      2'd1: nv = 3'd2;
+      default: ;
+    endcase
+    if (v == 3'd2) begin flag = 1'b1; nv = 3'd0; end
+  end
+endmodule
+module p5(input logic clk, rst, input logic [1:0] sel, output logic flag);
+  logic [2:0] v;        // value register tested in its own block, controlling another register
+  always_ff @(posedge clk)
+    if (rst) begin v <= 3'd0; flag <= 1'b0; end
+    else begin
+      if (v == 3'd2) flag <= 1'b1;
+      case (sel)
+        2'd0: v <= 3'd1;
+        2'd1: v <= 3'd2;
+        default: v <= 3'd4;
+      endcase
+    end
+endmodule
+module tb;
+  logic clk = 0, rst = 1;
+  logic [1:0] sel = 0;
+  logic f1, f3, f4, f5;
+  always #5 clk = ~clk;
+  p1 u1(.clk, .rst, .sel, .flag(f1));
+  p2 u2(.clk, .rst, .sel);
+  p3 u3(.clk, .rst, .sel, .flag(f3));
+  p4 u4(.clk, .rst, .sel, .flag(f4));
+  p5 u5(.clk, .rst, .sel, .flag(f5));
+  initial begin
+    repeat (2) @(negedge clk);
+    rst = 0;
+    repeat (8) begin @(negedge clk); sel = sel + 1; end
+    $finish;
+  end
+endmodule
+"#;
+
+const VALUES_FSMS: &[Expect] = &[
+    (
+        "tb.u2",
+        "v",
+        &["st1=0@20:4", "st2=1@21:2", "st3=2@20:2", "st0=4@18:2"],
+        &[
+            "st1>st2@20:2",
+            "st1>st3@21:0",
+            "st1>st0@22:0",
+            "st2>st1@17:0",
+            "st2>st3@21:2",
+            "st2>st0@22:0",
+            "st3>st1@17:0",
+            "st3>st2@20:0",
+            "st3>st0@22:2",
+            "st0>st1@18:2",
+        ],
+    ),
+    (
+        "tb.u4",
+        "v",
+        &["st1=0@47:6", "st2=1@41:2", "st0=2@50:2"],
+        &[
+            "st1>st2@46:2",
+            "st1>st0@47:0",
+            "st2>st1@41:0",
+            "st2>st0@47:2",
+            "st0>st1@50:2",
+            "st0>st2@46:0",
+        ],
+    ),
+];
+
 /// A two-process FSM (`state <= next` and an `always_comb` next-state
 /// `case`): the reset adds a transition to CLOSED from every other state,
 /// held states count on the clock that enters them and the next one (OPEN,
@@ -1307,6 +1442,18 @@ fn fill_literals_and_parameterized_instances() {
 fn signed_constants() {
     let json = check("signed", SIGNED, SIGNED_FSMS);
     assert!(json.contains("\"illegal\": 2}"), "{json}");
+}
+
+/// A register assigned constants from a `case` on another signal is a value,
+/// not a state, even when something compares it with a constant (`u1`, `u3`,
+/// `u5`). It is an FSM once one of its assignments, or one of its next
+/// value's, is made under a test of it (`u2`, `u4`), as in the reference
+/// simulator. Unnamed states are numbered as it lists them: compared
+/// constants first. (Lines of states whose transitions are all made outside
+/// a test of the variable are not compared; see the coverage guide.)
+#[test]
+fn value_registers() {
+    check_lines("values", VALUES, VALUES_FSMS, false);
 }
 
 /// The transition into the first assignment starts from the value the

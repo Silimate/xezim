@@ -799,7 +799,8 @@ for this design.
 - The state process, or the block that computes its next value, tests it: a
   `case (state)`, or an `if` or `?:` that compares it with constants
   (`state == IDLE`, `state != IDLE`, `&&`, `||` and `!` of those,
-  `state inside {...}`).
+  `state inside {...}`). At least one assignment of the state (or of its next
+  value) must be made inside such a test.
 - Every assignment of it yields constants: a parameter or `localparam`, an enum
   member (a package's too), a literal or a `` `define `` of one, a cast of one
   (`state_t'(IDLE)`), the variable itself, a `?:` of those, or an expression
@@ -811,19 +812,23 @@ for this design.
   rule. That is the two-process style of the example.
 
 A register that nothing tests (`mode <= 2'd1;` under unrelated conditions), a
-state loaded from an input or any other variable, and a cast of a `?:`
-(`state_t'(sel ? A : B)`) do not make an FSM; neither does a 1-bit variable.
+value register that is compared with a constant only to drive something else
+(`price <= next_price;` with `next_price` set from a `case` on another signal,
+and `if (price == 0) ...` elsewhere), a state loaded from an input or any other
+variable, and a cast of a `?:` (`state_t'(sel ? A : B)`) do not make an FSM;
+neither does a 1-bit variable.
 
 **States.** The states are the values the assignments yield and the constants
 the tests compare with. An enum member that no assignment or test names is not a
 state. Each state is named after the parameter or enum member that gives it
-when every state has such a name, and the states are `st0`, `st1`, ... in value
-order otherwise. A constant's value is its own bits, zero-extended to the
-state variable's width even when the constant is signed (a 2-bit signed `K` of
-`2'b11` is state 3, also in `state <= K`), and an unbased unsized literal (`'1`)
-fills that width, as in the reference simulator. Each state's `line` is that of
-the first transition out of it (preferring one inside a test of the variable),
-as in the reference simulator's report.
+when every state has such a name, and the states are `st0`, `st1`, ...
+otherwise (the constants the variable is compared with first, in source
+order, then the other values assigned). A constant's value is its own bits,
+zero-extended to the state variable's width even when the constant is signed
+(a 2-bit signed `K` of `2'b11` is state 3, also in `state <= K`), and an
+unbased unsized literal (`'1`) fills that width, as in the reference simulator.
+Each state's `line` is that of the first transition out of it (preferring one
+inside a test of the variable), as in the reference simulator's report.
 
 **Transitions.** A transition from S to T is an assignment that yields T in a
 branch where the variable can be S. An assignment outside every test of the
@@ -916,6 +921,9 @@ differences:
   assignment to part of the state variable (`state[1] <= 1'b1`) is not a state
   assignment; the reference simulator counts a visit of the current state for
   it.
+- The `line` of a state with no transition out of it made inside a test of the
+  variable can differ from the reference simulator's, which takes it from its
+  own ordering of the transitions.
 
 ### The code coverage results
 

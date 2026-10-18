@@ -924,7 +924,7 @@ impl Report {
                 + r.fall.iter().filter(|&&c| c > 0).count() as u64;
         }
         let [s, x] = self.fsm_split();
-        t[3] = Tally {
+        t[KIND_FSM.trailing_zeros() as usize] = Tally {
             covered: s.covered + x.covered,
             total: s.total + x.total,
         };

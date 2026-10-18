@@ -9,6 +9,8 @@
 //! whole, where
 //! - that block, or the combinational block computing the value it loads
 //!   (`state <= next_state`), tests the variable in a `case` or an `if`, and
+//!   makes at least one assignment of it (or of the next state) under such
+//!   a test, and
 //! - every assignment of the variable (and of the next-state variable)
 //!   yields constants: parameters, enum members, literals, the variable
 //!   itself, an expression of the variable under a branch that fixes its
@@ -588,11 +590,9 @@ struct Walk<'a> {
     /// Case items and `if` branches that test the variable, in order.
     handlers: Vec<(Ctx, Span)>,
     /// Constants the variable is compared with.
-    tested: BTreeSet<u64>,
+    tested: Vec<u64>,
     /// Names of constants, from the identifiers that gave them.
     names: HashMap<u64, String>,
-    /// Some branch tests the variable.
-    refined: bool,
     /// An assignment of the target yields something other than constants.
     bad: bool,
 }
@@ -602,6 +602,13 @@ impl Walk<'_> {
         match &e.kind {
             ExprKind::Paren(i) => self.is_var(i),
             _ => whole(e) == Some(self.var),
+        }
+    }
+
+    /// Note a constant the variable is compared with, in source order.
+    fn test(&mut self, k: u64) {
+        if !self.tested.contains(&k) {
+            self.tested.push(k);
         }
     }
 
@@ -736,7 +743,7 @@ impl Walk<'_> {
                     } else {
                         return None;
                     };
-                    self.tested.insert(k);
+                    self.test(k);
                     Some(if matches!(op, BinaryOp::Eq | BinaryOp::CaseEq) {
                         Ctx::one(k)
                     } else {
@@ -753,9 +760,10 @@ impl Walk<'_> {
                     if matches!(r.kind, ExprKind::Range(..)) {
                         return None;
                     }
-                    set.insert(self.value(r)?);
+                    let k = self.value(r)?;
+                    self.test(k);
+                    set.insert(k);
                 }
-                self.tested.extend(set.iter().copied());
                 Some(Ctx::Set(set))
             }
             _ => None,
@@ -797,14 +805,8 @@ impl Walk<'_> {
                 else_expr,
             } => {
                 let (t, f) = match (self.pure(condition), self.then(condition)) {
-                    (Some(p), _) => {
-                        self.refined = true;
-                        (ctx.and(&p), ctx.and(&p.not()))
-                    }
-                    (None, Some(t)) => {
-                        self.refined = true;
-                        (ctx.and(&t), ctx.clone())
-                    }
+                    (Some(p), _) => (ctx.and(&p), ctx.and(&p.not())),
+                    (None, Some(t)) => (ctx.and(&t), ctx.clone()),
                     (None, None) => (ctx.clone(), ctx.clone()),
                 };
                 let mut v = self.eval(then_expr, &t)?;
@@ -869,7 +871,6 @@ impl Walk<'_> {
                 let then = pure.clone().or_else(|| self.then(condition));
                 let t = match &then {
                     Some(c) => {
-                        self.refined = true;
                         let t = ctx.and(c);
                         self.handlers.push((t.clone(), s.span));
                         t
@@ -897,9 +898,10 @@ impl Walk<'_> {
                     }
                     return;
                 };
-                self.refined = true;
                 let every: BTreeSet<u64> = labels.iter().flatten().copied().collect();
-                self.tested.extend(every.iter().copied());
+                for &k in labels.iter().flatten() {
+                    self.test(k);
+                }
                 let mut seen = BTreeSet::new();
                 for (it, set) in items.iter().zip(labels) {
                     let c = if it.is_default {
@@ -1372,9 +1374,8 @@ impl Simulator {
                     recs: Vec::new(),
                     via: Vec::new(),
                     handlers: Vec::new(),
-                    tested: BTreeSet::new(),
+                    tested: Vec::new(),
                     names: HashMap::default(),
-                    refined: false,
                     bad: false,
                 };
                 w.stmt(proc_body, &Ctx::all());
@@ -1391,7 +1392,6 @@ impl Simulator {
                 let mut handlers = std::mem::take(&mut w.handlers);
                 let mut tested = std::mem::take(&mut w.tested);
                 let mut names = std::mem::take(&mut w.names);
-                let mut refined = w.refined;
                 let via = std::mem::take(&mut w.via);
                 // A two-process FSM: the block loads one next-state variable
                 // that a combinational block (or this one) computes.
@@ -1444,9 +1444,8 @@ impl Simulator {
                         recs: Vec::new(),
                         via: Vec::new(),
                         handlers: Vec::new(),
-                        tested: BTreeSet::new(),
+                        tested: Vec::new(),
                         names: HashMap::default(),
-                        refined: false,
                         bad: false,
                     };
                     match (comb, &assign) {
@@ -1473,10 +1472,13 @@ impl Simulator {
                     for (k, v) in w.names.drain() {
                         names.entry(k).or_insert(v);
                     }
-                    refined |= w.refined;
                     next = Some(n.clone());
                 }
-                if !refined {
+                // The reference simulator takes a variable for a state only
+                // when some assignment of it (or of its next state) is made
+                // under a test of it: a value register that is compared with
+                // something elsewhere is not a state machine.
+                if !recs.iter().any(|r| r.ctx.specific()) {
                     continue;
                 }
                 let limit = if width >= 64 { u64::MAX } else { 1u64 << width };
@@ -1536,14 +1538,23 @@ impl Simulator {
                 }
                 // States take their constants' names when every state has
                 // one; otherwise all are `st0`, `st1`, ... in value order.
+                // Unnamed, they are numbered as the reference simulator lists
+                // them: the constants the variable is compared with, in
+                // source order, then the other values assigned.
                 let named = values.iter().all(|v| names.contains_key(v));
+                let mut order: Vec<u64> = Vec::new();
+                for v in tested.iter().copied().chain(recs.iter().map(|r| r.value)) {
+                    if values.contains(&v) && !order.contains(&v) {
+                        order.push(v);
+                    }
+                }
                 let states: Vec<(u64, String, Span)> = values
                     .iter()
                     .enumerate()
                     .map(|(k, &v)| {
                         let name = match names.get(&v) {
                             Some(s) if named => s.clone(),
-                            _ => format!("st{}", k),
+                            _ => format!("st{}", order.iter().position(|&o| o == v).unwrap_or(0)),
                         };
                         let span = out_of(k as u32, true)
                             .or_else(|| out_of(k as u32, false))

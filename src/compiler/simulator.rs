@@ -47476,16 +47476,6 @@ impl Simulator {
         if self.fire_due_after_delay_cbs() {
             self.dirty_any = true;
         }
-        // §38.14: `vpi_control(vpiFinish)` from one of these callbacks is
-        // `$finish` once the routine returns, so nothing the callback woke may
-        // run: no always block, NBA, assertion or monitor of this slot. cocotb
-        // ends every test this way, from the `Timer` or clock-edge callback
-        // that resumed it. Only a VPI routine can have ended the run this
-        // early in the slot. The values it wrote are still dumped.
-        if self.finished {
-            self.dump_write_changes();
-            return;
-        }
         self.fire_timing_timers();
         // LRM §16.5.1: capture Preponed (slot-entry) samples of every
         // SVA-referenced signal BEFORE the active/NBA regions run, so a
@@ -59963,8 +59953,6 @@ impl Simulator {
             self.sample_edge_covergroups();
         }
         if waiters_first && !self.event_waiters.is_empty() {
-            // Only a finish these continuations raise is deferred below.
-            let finished_before = self.finished;
             let _t_w = self.profile_timing.then(std::time::Instant::now);
             // Drain and run triggered waiters, then RE-DRAIN: a resumed
             // continuation may `-> ev` or write a signal that triggers ANOTHER
@@ -60009,7 +59997,7 @@ impl Simulator {
             // this edge delivery completes: the same edge's always blocks
             // still fire once (reference-simulator behavior — a final-cycle
             // `$display` monitor racing the testbench's `$finish` prints).
-            if self.finished && !finished_before {
+            if self.finished {
                 self.finish_deferred = true;
                 self.finished = false;
             }
@@ -60768,14 +60756,7 @@ impl Simulator {
             }
         }
 
-        // §20.2: after `$finish` (or `vpi_control(vpiFinish)`, §38.14) no
-        // process runs again. The interpreter already refuses every statement
-        // once `finished` is set, but compiled block code does not check it:
-        // an always block dispatched after the finish ran its compiled
-        // statements while its interpreted ones (`$display`, ...) were
-        // skipped, so `final` blocks and coverage saw updates the log never
-        // showed.
-        if !triggered.is_empty() && !self.finished {
+        if !triggered.is_empty() {
             if let Some(pat) = self.edge_fire_trace.clone() {
                 // One-time: precompute which blocks match, and resolve the
                 // watch list. Per-dispatch cost is then a bitmap index per
@@ -61263,12 +61244,6 @@ impl Simulator {
             // no StmtFallback insns (common case: 99%+ of edges don't fall
             // back to AST exec, since bytecode pre-resolves signal IDs).
             for &bi in &sequential_blocks {
-                // A block before this one may have ended the run: `$finish`,
-                // or a write a VPI value-change callback answered with
-                // `vpi_control(vpiFinish)`.
-                if self.finished {
-                    break;
-                }
                 let needs_hint =
                     bi < self.edge_block_needs_hint.len() && self.edge_block_needs_hint[bi];
                 let t_seq = if self.edge_block_stats_enabled {
@@ -61413,10 +61388,6 @@ impl Simulator {
         // post-#0 write executed — losing exactly the event this exists for.
         let __prev_edge_cont = self.in_edge_cont;
         self.in_edge_cont = true;
-        // A finish raised before the continuations below (by an always block
-        // of this pass, an earlier process, or a VPI routine) stays a finish:
-        // only one the continuations raise is deferred to the end of the slot.
-        let finished_before_conts = self.finished;
         let mut triggered_conts = triggered_conts;
         for (pid, stmts) in triggered_conts.drain(..) {
             if self.finished {
@@ -61503,7 +61474,7 @@ impl Simulator {
             }
         }
         self.in_edge_cont = __prev_edge_cont;
-        if !waiters_first && active_region && self.finished && !finished_before_conts {
+        if !waiters_first && active_region && self.finished {
             // A `$finish` from a continuation resumed AFTER this edge's
             // blocks stops the run once the slot completes: its SVA ticks
             // (tick_sva_sites runs after this pass returns) and postponed

@@ -827,15 +827,19 @@ order, then the other values assigned). A constant's value is its own bits,
 zero-extended to the state variable's width even when the constant is signed
 (a 2-bit signed `K` of `2'b11` is state 3, also in `state <= K`), and an
 unbased unsized literal (`'1`) fills that width, as in the reference simulator.
-Each state's `line` is that of the first transition out of it (preferring one
-inside a test of the variable), as in the reference simulator's report.
+Each state's `line` is where the first transition out of it starts (the case
+item or `if` testing the variable that holds the assignment, preferring a
+transition inside such a test), as in the reference simulator's report.
 
 **Transitions.** A transition from S to T is an assignment that yields T in a
 branch where the variable can be S. An assignment outside every test of the
 variable, such as the reset `state <= CLOSED` or a `next = IDLE` default, is a
 transition from every state but its own: the example's reset adds
 OPENING -> CLOSED and OPEN -> CLOSED. A `default` case item applies to the
-states the other items do not list. Assignments that keep the state
+states the other items do not list. An `if`, `?:` or `case` that only
+parameters decide (`if (PARITY != 0)`, `case (MODE)`) contributes only the
+branch they select, as in the reference simulator: the other branches' states
+and transitions are not bins. Assignments that keep the state
 (`next = state`, `IDLE: next = IDLE`) are not transitions. A transition's `line`
 is the assignment that makes it: one inside a test of the variable before a
 reset or default, then one in the state process before one in the next-state
@@ -1027,6 +1031,10 @@ Only `1: acc = 2;` never ran. Toggles add up per bit in the same way, from
   than 64 bits or of one bit, an element of an array or a member of a struct, a
   state computed by a function call, next-state logic spread over several
   blocks, and assignments made in a task or function the state process calls.
+  The reference simulator also takes for a state machine a register loaded
+  from a counter under a test of it inside another state machine's branches
+  (`root <= next_free;` under `if (root == NULL)` in a `case (build_state)`
+  item); xezim does not.
   The FSM extraction of the reference simulator recognizes some of these.
 - Instrumented code leaves some of xezim's fast paths: the optional native code
   generators, gate fusion for instrumented continuous assignments, table

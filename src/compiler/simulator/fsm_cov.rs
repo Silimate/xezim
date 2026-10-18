@@ -120,6 +120,9 @@ struct Rec {
     /// In the reset branch of the state process (the first `if` of its body,
     /// when that `if` does not test the variable).
     reset: bool,
+    /// The case item or `if` testing the variable that the assignment is
+    /// in, else the assignment itself: where the transition starts.
+    from: Span,
 }
 
 /// System functions of constants that are constants.
@@ -606,6 +609,8 @@ struct Walk<'a> {
     /// is in its first branch.
     reset_at: usize,
     resetting: bool,
+    /// The innermost case item or `if` testing the variable around the walk.
+    at: Option<Span>,
 }
 
 impl Walk<'_> {
@@ -614,6 +619,50 @@ impl Walk<'_> {
             ExprKind::Paren(i) => self.is_var(i),
             _ => whole(e) == Some(self.var),
         }
+    }
+
+    /// The value of a condition that only parameters decide.
+    fn fold(&mut self, cond: &Expression) -> Option<bool> {
+        if self.mentions(cond) || !self.constant(cond) {
+            return None;
+        }
+        self.sim.eval_expr(cond).is_nonzero()
+    }
+
+    /// The item a `case` on parameters selects (`Some(None)`: none does),
+    /// when its selector and labels are all constants.
+    fn fold_case(&mut self, expr: &Expression, items: &[CaseItem]) -> Option<Option<usize>> {
+        if self.mentions(expr) || !self.constant(expr) {
+            return None;
+        }
+        let sel = self.sim.eval_expr(expr);
+        if sel.has_xz() {
+            return None;
+        }
+        let sel = sel.to_u64()?;
+        let mut default = None;
+        for (k, it) in items.iter().enumerate() {
+            if it.pattern.is_some() || it.guard.is_some() {
+                return None;
+            }
+            if it.is_default {
+                default = Some(k);
+                continue;
+            }
+            for p in &it.patterns {
+                if matches!(p.kind, ExprKind::Range(..)) || !self.constant(p) {
+                    return None;
+                }
+                let v = self.sim.eval_expr(p);
+                if v.has_xz() {
+                    return None;
+                }
+                if v.to_u64() == Some(sel) {
+                    return Some(Some(k));
+                }
+            }
+        }
+        Some(default)
     }
 
     /// Note a constant the variable is compared with, in source order.
@@ -815,6 +864,9 @@ impl Walk<'_> {
                 then_expr,
                 else_expr,
             } => {
+                if let Some(taken) = self.fold(condition) {
+                    return self.eval(if taken { then_expr } else { else_expr }, ctx);
+                }
                 let (t, f) = match (self.pure(condition), self.then(condition)) {
                     (Some(p), _) => (ctx.and(&p), ctx.and(&p.not())),
                     (None, Some(t)) => (ctx.and(&t), ctx.clone()),
@@ -878,6 +930,15 @@ impl Walk<'_> {
                 else_stmt,
                 ..
             } => {
+                // A branch on parameters: only the branch they select is code.
+                if let Some(taken) = self.fold(condition) {
+                    match (taken, else_stmt) {
+                        (true, _) => self.stmt(then_stmt, ctx),
+                        (false, Some(e)) => self.stmt(e, ctx),
+                        (false, None) => {}
+                    }
+                    return;
+                }
                 let pure = self.pure(condition);
                 let then = pure.clone().or_else(|| self.then(condition));
                 let t = match &then {
@@ -891,7 +952,12 @@ impl Walk<'_> {
                 let reset = then.is_none() && self.reset_at == s as *const Statement as usize;
                 let was = self.resetting;
                 self.resetting |= reset;
+                let outer = self.at;
+                if then.is_some() {
+                    self.at = Some(s.span);
+                }
                 self.stmt(then_stmt, &t);
+                self.at = outer;
                 self.resetting = was;
                 if let Some(e) = else_stmt {
                     let f = match &pure {
@@ -908,6 +974,13 @@ impl Walk<'_> {
                     None
                 };
                 let Some(labels) = labels else {
+                    // A `case` on parameters: only the item they select.
+                    if let Some(k) = self.fold_case(expr, items) {
+                        if let Some(it) = k.and_then(|k| items.get(k)) {
+                            self.stmt(&it.stmt, ctx);
+                        }
+                        return;
+                    }
                     for it in items {
                         self.stmt(&it.stmt, ctx);
                     }
@@ -926,7 +999,9 @@ impl Walk<'_> {
                     };
                     seen.extend(set);
                     self.handlers.push((c.clone(), it.span));
+                    let outer = self.at.replace(it.span);
                     self.stmt(&it.stmt, &c);
+                    self.at = outer;
                 }
             }
             StatementKind::For { body, .. }
@@ -972,6 +1047,7 @@ impl Walk<'_> {
                             span,
                             direct: self.loads,
                             reset: self.resetting,
+                            from: self.at.unwrap_or(span),
                         });
                     }
                 }
@@ -1429,6 +1505,7 @@ impl Simulator {
                     guarded: false,
                     reset_at,
                     resetting: false,
+                    at: None,
                 };
                 w.stmt(proc_body, &Ctx::all());
                 if w.bad {
@@ -1504,6 +1581,7 @@ impl Simulator {
                         guarded: false,
                         reset_at: 0,
                         resetting: false,
+                        at: None,
                     };
                     match (comb, &assign) {
                         (Some(comb), _) => w.stmt(comb, &Ctx::all()),
@@ -1520,6 +1598,7 @@ impl Simulator {
                             span: r.span,
                             direct: false,
                             reset: false,
+                            from: r.from,
                         }));
                     }
                     // The next-state block's tests name the states.
@@ -1562,7 +1641,8 @@ impl Simulator {
                 // variable over one outside (a reset, a default), then one in
                 // the state process over one in the next-state logic, then
                 // the last in the source.
-                let mut best: BTreeMap<(u32, u32), ((bool, bool, usize), Span)> = BTreeMap::new();
+                let mut best: BTreeMap<(u32, u32), ((bool, bool, usize), Span, Span)> =
+                    BTreeMap::new();
                 for r in &recs {
                     let Some(&to) = index.get(&r.value) else {
                         continue;
@@ -1572,25 +1652,28 @@ impl Simulator {
                         if v == r.value || !r.ctx.holds(v) {
                             continue;
                         }
-                        let e = best.entry((from, to)).or_insert((rank, r.span));
+                        let e = best.entry((from, to)).or_insert((rank, r.span, r.from));
                         if rank >= e.0 {
-                            *e = (rank, r.span);
+                            *e = (rank, r.span, r.from);
                         }
                     }
                 }
                 if best.is_empty() {
                     continue;
                 }
-                let trans: Vec<(u32, u32, Span)> =
-                    best.iter().map(|(&(f, t), &(_, sp))| (f, t, sp)).collect();
-                // A state's line is that of the first transition out of it
-                // made inside a test of the variable, else of the first out
-                // of it at all, else of the case item or branch handling it.
+                let trans: Vec<(u32, u32, Span)> = best
+                    .iter()
+                    .map(|(&(f, t), &(_, sp, _))| (f, t, sp))
+                    .collect();
+                // A state's line is where the first transition out of it
+                // starts (the case item or `if` testing the variable that the
+                // assignment is in), preferring one inside such a test, else
+                // the case item or branch handling the state.
                 let out_of = |k: u32, tested: bool| {
                     best.iter()
-                        .filter(|((f, _), (rank, _))| *f == k && (rank.0 || !tested))
-                        .map(|(_, (_, sp))| *sp)
-                        .min_by_key(|sp| sp.start)
+                        .filter(|((f, _), (rank, _, _))| *f == k && (rank.0 || !tested))
+                        .min_by_key(|(_, (_, sp, _))| sp.start)
+                        .map(|(_, (_, _, from))| *from)
                 };
                 let mut tmap = vec![u32::MAX; n * n];
                 for (k, (f, t, _)) in trans.iter().enumerate() {

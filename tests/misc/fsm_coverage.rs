@@ -1383,6 +1383,161 @@ const HOLDS_FSMS: &[Expect] = &[
     ),
 ];
 
+const PARAM_BRANCHES: &str = r#"// Branches on parameters: only the branch the parameters select is code.
+module k1 #(parameter int MODE = 1, parameter int STOPS = 1) (input logic clk, rst, go);
+  typedef enum logic [2:0] {IDLE, A, B, C, D} st_t;
+  st_t cs, ns;
+  always_ff @(posedge clk) if (rst) cs <= IDLE; else cs <= ns;
+  always_comb begin
+    ns = cs;
+    case (cs)
+      IDLE: if (go) ns = A;
+      A: if (MODE != 0) ns = B; else ns = C;
+      B: ns = (STOPS == 1) ? IDLE : D;
+      C: ns = IDLE;
+      D: ns = IDLE;
+    endcase
+  end
+endmodule
+module k2 #(parameter logic [1:0] SEL = 2'd2) (input logic clk, rst, go);
+  logic [1:0] st;
+  always_ff @(posedge clk)
+    if (rst) st <= 2'd0;
+    else case (st)
+      2'd0: if (go) st <= 2'd1;
+      2'd1: case (SEL)
+              2'd1: st <= 2'd2;
+              2'd2: st <= 2'd3;
+              default: st <= 2'd0;
+            endcase
+      default: st <= 2'd0;
+    endcase
+endmodule
+module tb;
+  logic clk = 0, rst = 1, go = 0;
+  always #5 clk = ~clk;
+  k1 #(.MODE(1), .STOPS(1)) ua(.*);
+  k1 #(.MODE(0), .STOPS(2)) ub(.*);
+  k2 #(.SEL(2'd2)) uc(.*);
+  initial begin
+    repeat (2) @(negedge clk);
+    rst = 0;
+    repeat (4) begin go = 1; @(negedge clk); go = 0; repeat (3) @(negedge clk); end
+    $finish;
+  end
+endmodule
+"#;
+
+const PARAM_BRANCHES_FSMS: &[Expect] = &[
+    (
+        "tb.ua",
+        "cs",
+        &[
+            "IDLE=0@9:10",
+            "A=1@10:4",
+            "B=2@11:4",
+            "C=3@12:0",
+            "D=4@13:0",
+        ],
+        &[
+            "IDLE>A@9:4",
+            "A>IDLE@5:0",
+            "A>B@10:4",
+            "B>IDLE@11:4",
+            "C>IDLE@12:0",
+            "D>IDLE@13:0",
+        ],
+    ),
+    (
+        "tb.ub",
+        "cs",
+        &[
+            "IDLE=0@9:10",
+            "A=1@10:4",
+            "B=2@11:0",
+            "C=3@12:4",
+            "D=4@13:0",
+        ],
+        &[
+            "IDLE>A@9:4",
+            "A>IDLE@5:0",
+            "A>C@10:4",
+            "B>IDLE@5:0",
+            "B>D@11:0",
+            "C>IDLE@12:4",
+            "D>IDLE@13:0",
+        ],
+    ),
+    (
+        "tb.uc",
+        "st",
+        &["st0=0@22:6", "st1=1@23:4", "st2=3@28:4"],
+        &[
+            "st0>st1@22:4",
+            "st1>st0@20:0",
+            "st1>st2@25:4",
+            "st2>st0@28:4",
+        ],
+    ),
+];
+
+const NOT_CONSTANT: &str = r#"// Next-state variables with assignments that are not constants.
+module q1(input logic clk, rst, go, input logic [1:0] din);
+  logic [1:0] cs, ns;     // two-process; one arm loads an input
+  always_ff @(posedge clk) if (rst) cs <= 2'd0; else cs <= ns;
+  always_comb begin
+    ns = cs;
+    case (cs)
+      2'd0: if (go) ns = 2'd1;
+      2'd1: ns = din;
+      2'd2: ns = 2'd0;
+      default: ns = 2'd0;
+    endcase
+  end
+endmodule
+module q2(input logic clk, rst, go);
+  logic [2:0] r, nf;      // a register loaded from a counter in its own block
+  always @(posedge clk or posedge rst)
+    if (rst) begin r <= 3'd7; nf <= 3'd0; end
+    else if (go) begin r <= 3'd7; nf <= 3'd0; end
+    else if (r == 3'd7) begin r <= nf; nf <= nf + 3'd1; end
+endmodule
+module q3(input logic clk, rst, go);
+  logic [1:0] cs, ns, cnt;   // two-process; the next state loads a counter
+  always_ff @(posedge clk) if (rst) cnt <= 2'd0; else cnt <= cnt + 2'd1;
+  always_ff @(posedge clk) if (rst) cs <= 2'd0; else cs <= ns;
+  always_comb begin
+    ns = cs;
+    if (cs == 2'd0) ns = cnt;
+    else if (go) ns = 2'd0;
+  end
+endmodule
+module q4(input logic clk, rst, go, input logic [1:0] din);
+  logic [1:0] st;         // one-process; one arm loads an input
+  always_ff @(posedge clk)
+    if (rst) st <= 2'd0;
+    else case (st)
+      2'd0: if (go) st <= 2'd1;
+      2'd1: st <= din;
+      default: st <= 2'd0;
+    endcase
+endmodule
+module tb;
+  logic clk = 0, rst = 1, go = 0;
+  logic [1:0] din = 0;
+  always #5 clk = ~clk;
+  q1 u1(.*); q2 u2(.clk, .rst, .go); q3 u3(.clk, .rst, .go); q4 u4(.*);
+  initial begin
+    repeat (2) @(negedge clk);
+    rst = 0;
+    repeat (6) begin go = ~go; din = din + 1; repeat (3) @(negedge clk); end
+    $finish;
+  end
+endmodule
+"#;
+
+const NOT_CONSTANT_FSMS: &[Expect] = &[];
+
 /// A two-process FSM (`state <= next` and an `always_comb` next-state
 /// `case`): the reset adds a transition to CLOSED from every other state,
 /// held states count on the clock that enters them and the next one (OPEN,
@@ -1536,6 +1691,23 @@ fn value_registers() {
 #[test]
 fn held_states() {
     check("holds", HOLDS, HOLDS_FSMS);
+}
+
+/// An `if`, `?:` or `case` that only parameters decide contributes only
+/// the branch they select (`A -> C` is no transition when `MODE` is 1, nor
+/// `B -> D` when `STOPS` is 1); the states the other branches name stay
+/// states when a `case` lists them. As in the reference simulator.
+#[test]
+fn parameter_branches() {
+    check("parameter_branches", PARAM_BRANCHES, PARAM_BRANCHES_FSMS);
+}
+
+/// A next state loaded from an input or a counter, in a two-process FSM,
+/// a one-process one or a register's own block, makes no FSM, as in the
+/// reference simulator.
+#[test]
+fn non_constant_next_states() {
+    check("non_constant_next_states", NOT_CONSTANT, NOT_CONSTANT_FSMS);
 }
 
 /// The transition into the first assignment starts from the value the

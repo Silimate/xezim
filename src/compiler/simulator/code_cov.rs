@@ -21,7 +21,9 @@
 //! interpreter evaluates itself (the bytecode hands it over): it walks the
 //! item's logic tree (`ExprSite::nodes`) in the order the interpreter would,
 //! with the same short-circuits, and then marks the rows whose term is not
-//! masked.
+//! masked. An item of a continuous assignment or at the top level of a
+//! combinational block also counts the transient states its inputs went
+//! through since its last evaluation (`Simulator::cov_replay`).
 use super::*;
 use crate::ast::Span;
 use crate::compiler::elaborate::InitialBlock;
@@ -244,6 +246,15 @@ pub(crate) struct ExprSite {
     /// Tells apart the copies a generate loop makes of one continuous
     /// assignment (its expression with the loop index in place).
     copy: String,
+    /// An item at the top level of a combinational `always` block (it runs
+    /// each time the block does): the block's scope and source offset.
+    proc: Option<(String, usize)>,
+    /// A continuous assignment's, or a `proc` item's: the term values of
+    /// its last evaluation (empty before the first), and when each term
+    /// settles (`None` until first needed, empty when the item has nothing
+    /// to replay); see `Simulator::cov_replay`.
+    last: Vec<u8>,
+    steps: Option<Vec<u32>>,
 }
 
 /// An item's logic tree while it is built.
@@ -906,6 +917,163 @@ fn sensitize(nodes: &[Node], i: u32, vals: &[u8], rows: &mut [u8]) {
     }
 }
 
+/// The leaves of node `i`'s subtree (`e` is its expression): each term and
+/// constant node, with its expression.
+fn leaves_of<'e>(nodes: &[Node], i: u32, e: &'e Expression, out: &mut Vec<(u32, &'e Expression)>) {
+    let e = unparen(e);
+    let n = nodes[i as usize];
+    let [k0, k1, k2] = n.kids;
+    match (n.op, &e.kind) {
+        (Op::Term(..) | Op::Const, _) => out.push((i, e)),
+        (Op::Not, ExprKind::Unary { operand, .. }) => leaves_of(nodes, k0, operand, out),
+        (
+            Op::Mux,
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            },
+        ) => {
+            let c = match &unparen(condition).kind {
+                ExprKind::SystemCall { name, args } if name == COND_FN && args.len() == 2 => &args[1],
+                _ => &**condition,
+            };
+            leaves_of(nodes, k0, c, out);
+            leaves_of(nodes, k1, then_expr, out);
+            leaves_of(nodes, k2, else_expr, out);
+        }
+        (_, ExprKind::Binary { left, right, .. }) => {
+            leaves_of(nodes, k0, left, out);
+            leaves_of(nodes, k1, right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Evaluate node `i` of an item's tree from the values of its terms
+/// (`terms[t]`) and constants (`konst`, by node) with the operators and
+/// short-circuits of `Simulator::cov_node`, noting each node's value in
+/// `vals`.
+fn replay(nodes: &[Node], i: u32, terms: &[u8], konst: &[u8], vals: &mut [u8]) -> u8 {
+    let n = nodes[i as usize];
+    let [k0, k1, k2] = n.kids;
+    let v = match n.op {
+        Op::Term(t, inv) => match terms[t as usize] {
+            v @ 0..=1 => v ^ inv as u8,
+            _ => X,
+        },
+        Op::Const => konst[i as usize],
+        Op::Not => match replay(nodes, k0, terms, konst, vals) {
+            v @ 0..=1 => v ^ 1,
+            _ => X,
+        },
+        Op::And | Op::Or => {
+            // The value that decides alone: 0 for `&&`, 1 for `||`.
+            let d = (n.op == Op::Or) as u8;
+            let l = replay(nodes, k0, terms, konst, vals);
+            if l == d {
+                d
+            } else {
+                let r = replay(nodes, k1, terms, konst, vals);
+                if r == d {
+                    d
+                } else if l == d ^ 1 && r == d ^ 1 {
+                    d ^ 1
+                } else {
+                    X
+                }
+            }
+        }
+        Op::BitAnd | Op::BitOr => {
+            let d = (n.op == Op::BitOr) as u8;
+            let l = replay(nodes, k0, terms, konst, vals);
+            let r = replay(nodes, k1, terms, konst, vals);
+            if l == d || r == d {
+                d
+            } else if l == d ^ 1 && r == d ^ 1 {
+                d ^ 1
+            } else {
+                X
+            }
+        }
+        Op::BitXor | Op::BitXnor => {
+            let l = replay(nodes, k0, terms, konst, vals);
+            let r = replay(nodes, k1, terms, konst, vals);
+            if l > 1 || r > 1 {
+                X
+            } else {
+                l ^ r ^ (n.op == Op::BitXnor) as u8
+            }
+        }
+        Op::Mux => match replay(nodes, k0, terms, konst, vals) {
+            c @ 0..=1 => {
+                let (taken, other) = if c == 1 { (k1, k2) } else { (k2, k1) };
+                let v = replay(nodes, taken, terms, konst, vals);
+                if nodes[other as usize].op == Op::Const {
+                    replay(nodes, other, terms, konst, vals);
+                }
+                v
+            }
+            _ => {
+                let t = replay(nodes, k1, terms, konst, vals);
+                let f = replay(nodes, k2, terms, konst, vals);
+                if t == f { t } else { X }
+            }
+        },
+    };
+    vals[i as usize] = v;
+    v
+}
+
+/// Reading `e` has no side effects (no function call), so a replay may
+/// read it again.
+fn pure(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Number(_) | ExprKind::TypeLiteral(_) => true,
+        ExprKind::Ident(h) => h
+            .path
+            .iter()
+            .all(|s| s.selects.iter().all(pure)),
+        ExprKind::Unary { op, operand } => {
+            !matches!(
+                op,
+                UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
+            ) && pure(operand)
+        }
+        ExprKind::Binary { left, right, .. } => pure(left) && pure(right),
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => pure(condition) && pure(then_expr) && pure(else_expr),
+        ExprKind::Concatenation(v) => v.iter().all(pure),
+        ExprKind::Replication { count, exprs } => pure(count) && exprs.iter().all(pure),
+        ExprKind::Inside { expr, ranges } => pure(expr) && ranges.iter().all(pure),
+        ExprKind::Range(a, b) => pure(a) && pure(b),
+        ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => pure(expr),
+        ExprKind::Index { expr, index } => pure(expr) && pure(index),
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => pure(expr) && pure(left) && pure(right),
+        ExprKind::SystemCall { name, args } => {
+            matches!(
+                name.as_str(),
+                "$signed"
+                    | "$unsigned"
+                    | "$__xz_size_cast"
+                    | "$__xz_type_cast"
+                    | "$__xz_named_cast"
+                    | "$bits"
+                    | "$countones"
+                    | "$onehot"
+                    | "$onehot0"
+                    | "$isunknown"
+            ) && args.iter().all(pure)
+        }
+        _ => false,
+    }
+}
+
 /// A reported scope: a module instance, or the package (or `$unit`, or the
 /// declaring module) that holds classes and subroutines outside instances.
 struct Scope {
@@ -998,6 +1166,16 @@ pub(crate) struct CodeCov {
     /// Instance paths below the top.
     inst_paths: HashSet<String>,
     pub(crate) toggle: Option<Toggle>,
+    /// Signal id -> its settle step, and the scope and source offset of the
+    /// combinational `always` block that writes it (see
+    /// `Simulator::cov_steps`).
+    steps: Vec<u32>,
+    writers: HashMap<usize, (String, usize)>,
+    /// The names clocked `always` blocks write, by scope, and the
+    /// continuous assignments that invert a signal (target, operand,
+    /// scope), for `cov_steps`.
+    clocked: Vec<(String, HashSet<String>)>,
+    inverters: Vec<(String, String, String)>,
 }
 
 /// The instance a block scope (`u0.u1.genblk2`) belongs to, its longest
@@ -1013,6 +1191,30 @@ fn split_scope<'s>(inst_paths: &HashSet<String>, scope: &'s str) -> (&'s str, &'
     }
 }
 
+/// How an `always` block (`kind`, body `s`) runs: `Some(true)` when it is
+/// combinational (`always_comb`, `always @*`, `always @(a or b)`),
+/// `Some(false)` when clocked (`always_ff`, `always @(posedge clk)`), and
+/// `None` otherwise (a delay loop).
+fn combinational(kind: &str, s: &Statement) -> Option<bool> {
+    match (kind, &s.kind) {
+        ("always_comb" | "always_latch", _) => Some(true),
+        ("always_ff", _) => Some(false),
+        (
+            _,
+            StatementKind::TimingControl {
+                control: TimingControl::Event(ev),
+                ..
+            },
+        ) => match ev {
+            EventControl::Star | EventControl::ParenStar => Some(true),
+            EventControl::EventExpr(es) if es.iter().any(|e| e.edge.is_some()) => Some(false),
+            EventControl::EventExpr(es) if es.iter().all(|e| e.iff.is_none()) => Some(true),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Rewrites one scope's statements; see the module docs.
 struct Instr<'a> {
     cov: &'a mut CodeCov,
@@ -1025,6 +1227,10 @@ struct Instr<'a> {
     block: String,
     /// The items' `ExprSite::hint`.
     hint: Option<Option<String>>,
+    /// At the top level of a combinational `always` block, where each
+    /// statement runs every time the block does: the block's source offset
+    /// (for `ExprSite::proc`).
+    top: Option<usize>,
 }
 
 impl<'a> Instr<'a> {
@@ -1048,6 +1254,7 @@ impl<'a> Instr<'a> {
             },
             block,
             hint: None,
+            top: None,
         }
     }
 
@@ -1093,7 +1300,9 @@ impl Instr<'_> {
     fn wrap(&mut self, s: Statement) -> Statement {
         let span = s.span;
         let mut v = Vec::new();
+        let top = self.top.take();
         self.stmt(s, &mut v);
+        self.top = top;
         block(v, span)
     }
 
@@ -1101,7 +1310,9 @@ impl Instr<'_> {
     fn arm(&mut self, s: Statement, counter: u32) -> Statement {
         let span = s.span;
         let mut v = vec![hit(counter, span)];
+        let top = self.top.take();
         self.stmt(s, &mut v);
+        self.top = top;
         block(v, span)
     }
 
@@ -1119,13 +1330,16 @@ impl Instr<'_> {
     fn always(&mut self, s: Statement, kind: &'static str) -> Statement {
         let span = s.span;
         let mut v = Vec::new();
+        let top = (combinational(kind, &s) == Some(true)).then_some(span.start);
         match s.kind {
             StatementKind::TimingControl {
                 control,
                 stmt: inner,
             } => {
                 self.count(span, kind, &mut v);
+                self.top = top;
                 self.stmt(*inner, &mut v);
+                self.top = None;
                 Statement::new(
                     StatementKind::TimingControl {
                         control,
@@ -1136,7 +1350,9 @@ impl Instr<'_> {
             }
             other => {
                 self.count(span, kind, &mut v);
+                self.top = top;
                 self.stmt(Statement::new(other, span), &mut v);
+                self.top = None;
                 block(v, span)
             }
         }
@@ -1441,6 +1657,8 @@ impl Instr<'_> {
         });
         let mut arms = Vec::new();
         self.cond(&mut condition, "if", true);
+        // (An `else if` condition does not run each time the `if` does.)
+        let top = self.top.take();
         let rewritten = self.if_arms(
             unique_priority,
             condition,
@@ -1450,6 +1668,7 @@ impl Instr<'_> {
             true,
             &mut arms,
         );
+        self.top = top;
         if implicit {
             arms.push(Arm {
                 span,
@@ -2025,6 +2244,12 @@ impl Instr<'_> {
             } else {
                 String::new()
             },
+            proc: self
+                .top
+                .filter(|_| matches!(kind, "if" | "statement"))
+                .map(|s| (self.here.path.clone(), s)),
+            last: Vec::new(),
+            steps: None,
         });
         let span = e.span;
         let inner = std::mem::replace(e, Expression::new(ExprKind::Empty, span));
@@ -2463,6 +2688,10 @@ impl Simulator {
             ca_counter: HashMap::default(),
             inst_paths: inst_paths.clone(),
             toggle: None,
+            steps: Vec::new(),
+            writers: HashMap::default(),
+            clocked: Vec::new(),
+            inverters: Vec::new(),
         };
         // Initial blocks and continuous assignments are instrumented where
         // `compile` and `build_comb_entries` take them (`cov_initial`,
@@ -2489,15 +2718,27 @@ impl Simulator {
                     }
                 }
                 for ab in always.iter_mut() {
+                    let kind = match ab.kind {
+                        crate::ast::decl::AlwaysKind::Always => "always",
+                        crate::ast::decl::AlwaysKind::AlwaysComb => "always_comb",
+                        crate::ast::decl::AlwaysKind::AlwaysFf => "always_ff",
+                        crate::ast::decl::AlwaysKind::AlwaysLatch => "always_latch",
+                    };
+                    // What clocked blocks write (see `cov_steps`).
+                    if kinds & (KIND_CONDITION | KIND_EXPRESSION) != 0
+                        && combinational(kind, &ab.stmt) == Some(false)
+                    {
+                        let body = match &ab.stmt.kind {
+                            StatementKind::TimingControl { stmt, .. } => stmt,
+                            _ => &ab.stmt,
+                        };
+                        let mut writes = HashSet::default();
+                        Self::collect_stmt_rw(body, &self.module, None, &mut writes, None);
+                        cov.clocked.push((ab.scope.clone(), writes));
+                    }
                     if let Some(sc) =
                         Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &ab.scope)
                     {
-                        let kind = match ab.kind {
-                            crate::ast::decl::AlwaysKind::Always => "always",
-                            crate::ast::decl::AlwaysKind::AlwaysComb => "always_comb",
-                            crate::ast::decl::AlwaysKind::AlwaysFf => "always_ff",
-                            crate::ast::decl::AlwaysKind::AlwaysLatch => "always_latch",
-                        };
                         let span = ab.stmt.span;
                         let s = std::mem::replace(
                             &mut ab.stmt,
@@ -2668,6 +2909,22 @@ impl Simulator {
             }
             None => return None,
         };
+        // An inverter, `assign n = ~x` (see `cov_steps`).
+        if let (false, true, ExprKind::Ident(_), ExprKind::Unary { op, operand }) = (
+            port,
+            kinds & (KIND_CONDITION | KIND_EXPRESSION) != 0,
+            &ca.lhs.kind,
+            &unparen(&ca.rhs).kind,
+        ) {
+            if let (UnaryOp::BitNot | UnaryOp::LogNot, ExprKind::Ident(h)) =
+                (op, &unparen(operand).kind)
+            {
+                if let Some(n) = Self::cov_lhs_base(&ca.lhs) {
+                    let x = Self::resolve_hier_name_static(h, module);
+                    cov.inverters.push((n, x, scope.clone()));
+                }
+            }
+        }
         let paths = std::mem::take(&mut cov.inst_paths);
         let sc = Self::cov_instance_scope(module, cov, &paths, &scope);
         let ctx = Ctx {
@@ -2960,9 +3217,10 @@ impl Simulator {
         };
         let site = args.first().and_then(marker_id).and_then(|id| {
             let s = self.code_cov.as_ref()?.exprs.get(id as usize)?;
-            Some((s.nodes.clone(), s.row0, s.terms.len(), s.hint.clone()))
+            let replay = s.hint.is_some() || s.proc.is_some();
+            Some((id, s.nodes.clone(), s.row0, s.hint.clone(), replay))
         });
-        let Some((nodes, row0, terms, hint)) = site else {
+        let Some((id, nodes, row0, hint, replay)) = site else {
             return self.eval_expr(e);
         };
         // A compiled continuous assignment reaches here through an
@@ -2973,11 +3231,21 @@ impl Simulator {
         let saved = hint.map(|h| self.name_resolve_hint.replace(h));
         let mut vals = vec![UNEVALUATED; nodes.len()];
         let v = self.cov_node(&nodes, 0, e, &mut vals);
+        if replay {
+            self.cov_replay(id, &nodes, e, &vals);
+        }
         if let Some(s) = saved {
             *self.name_resolve_hint.borrow_mut() = s;
         }
-        let mut rows = vec![0u8; terms];
-        sensitize(&nodes, 0, &vals, &mut rows);
+        self.cov_rows(&nodes, &vals, row0);
+        v
+    }
+
+    /// Count the rows of the terms that decide an item's value, given its
+    /// node values.
+    fn cov_rows(&mut self, nodes: &[Node], vals: &[u8], row0: u32) {
+        let mut rows = [0u8; MAX_TERMS];
+        sensitize(nodes, 0, vals, &mut rows);
         for (t, r) in rows.iter().enumerate() {
             for b in 0..2 {
                 if r & (1 << b) != 0 {
@@ -2987,7 +3255,260 @@ impl Simulator {
                 }
             }
         }
-        v
+    }
+
+    /// A continuous assignment's item, or one at the top level of a
+    /// combinational `always` block, after evaluation `vals`: count the
+    /// states its inputs passed through since the last one. The reference
+    /// simulator evaluates the item at each of its inputs' changes, so also
+    /// in a delta cycle where one input has its new value and another not
+    /// yet, while xezim settles combinational logic in dependency order and
+    /// evaluates it once all have theirs. The terms that changed are
+    /// replayed in the order they settle in (`cov_term_steps`): at each
+    /// step but the last, those of that step or an earlier one have their
+    /// new values and the others their old ones.
+    fn cov_replay(&mut self, id: u32, nodes: &[Node], e: &Expression, vals: &[u8]) {
+        let Some(site) = self
+            .code_cov
+            .as_ref()
+            .and_then(|c| c.exprs.get(id as usize))
+        else {
+            return;
+        };
+        if site.steps.as_ref().is_some_and(|s| s.is_empty()) {
+            return;
+        }
+        let (n, row0) = (site.terms.len(), site.row0);
+        let mut leaves = Vec::new();
+        leaves_of(nodes, 0, e, &mut leaves);
+        if site.steps.is_none() {
+            let (hint, proc) = (site.hint.clone().flatten(), site.proc.clone());
+            let steps = self.cov_term_steps(nodes, &leaves, n, hint.as_deref(), proc.as_ref());
+            if let Some(s) = self
+                .code_cov
+                .as_mut()
+                .and_then(|c| c.exprs.get_mut(id as usize))
+            {
+                s.steps = Some(steps);
+            }
+            return self.cov_replay(id, nodes, e, vals);
+        }
+        // The term values, and those of the constants that decide whether a
+        // `?:` condition is masked: what the evaluation saw, and what it
+        // skipped (all of it reads without side effects: `cov_term_steps`).
+        let mut cur = vec![UNEVALUATED; n];
+        let mut konst = vec![UNEVALUATED; nodes.len()];
+        for &(i, x) in &leaves {
+            let i = i as usize;
+            let v = vals[i];
+            let v = match nodes[i].op {
+                Op::Term(t, _) if cur[t as usize] != UNEVALUATED => continue,
+                _ if v != UNEVALUATED => v,
+                _ => match self.eval_expr(x).is_nonzero() {
+                    Some(true) => 1,
+                    Some(false) => 0,
+                    None => X,
+                },
+            };
+            match nodes[i].op {
+                Op::Term(t, inv) => cur[t as usize] = if v <= 1 { v ^ inv as u8 } else { X },
+                _ => konst[i] = v,
+            }
+        }
+        let Some(site) = self
+            .code_cov
+            .as_mut()
+            .and_then(|c| c.exprs.get_mut(id as usize))
+        else {
+            return;
+        };
+        let last = std::mem::replace(&mut site.last, cur.clone());
+        let Some(steps) = site.steps.as_ref().filter(|_| last.len() == n) else {
+            return;
+        };
+        let mut ks: Vec<u32> = (0..n)
+            .filter(|&t| cur[t] != last[t])
+            .map(|t| steps[t])
+            .collect();
+        ks.sort_unstable();
+        ks.dedup();
+        // (The last step is the evaluation itself.)
+        ks.pop();
+        let states: Vec<Vec<u8>> = ks
+            .iter()
+            .map(|&k| {
+                (0..n)
+                    .map(|t| if steps[t] <= k { cur[t] } else { last[t] })
+                    .collect()
+            })
+            .collect();
+        for state in states {
+            let mut v = vec![UNEVALUATED; nodes.len()];
+            replay(nodes, 0, &state, &konst, &mut v);
+            self.cov_rows(nodes, &v, row0);
+        }
+    }
+
+    /// When each term of an item settles, for `cov_replay`: in a continuous
+    /// assignment, at the latest settle step (`cov_steps`) of the signals
+    /// it reads. A block runs after the continuous assignments of its
+    /// inputs' delta cycle (`step / 2`), and sees the outputs of the blocks
+    /// of its own instance written above it that ran in that cycle too.
+    /// Empty when the item has nothing to replay: its terms all settle
+    /// together, a leaf has side effects (a function call) and can't be
+    /// read again, or a term reads what its own block writes.
+    fn cov_term_steps(
+        &self,
+        nodes: &[Node],
+        leaves: &[(u32, &Expression)],
+        n: usize,
+        hint: Option<&str>,
+        proc: Option<&(String, usize)>,
+    ) -> Vec<u32> {
+        let Some(cov) = self.code_cov.as_ref() else {
+            return Vec::new();
+        };
+        if cov.steps.is_empty() || leaves.iter().any(|(_, x)| !pure(x)) {
+            return Vec::new();
+        }
+        let hint = proc.map(|p| p.0.as_str()).or(hint);
+        let mut steps = vec![0u32; n];
+        for &(i, x) in leaves {
+            let Op::Term(t, _) = nodes[i as usize].op else {
+                continue;
+            };
+            let mut names = HashSet::default();
+            Self::collect_expr_reads(x, &self.module, &mut names);
+            for id in names.iter().filter_map(|name| self.cov_signal(name, hint)) {
+                let Some(&s) = cov.steps.get(id) else {
+                    continue;
+                };
+                let s = match (proc, cov.writers.get(&id)) {
+                    (Some(p), Some(w)) if w == p => return Vec::new(),
+                    (Some(p), Some(w)) if w.0 == p.0 && w.1 < p.1 && s >= 2 => s / 2 - 1,
+                    (Some(_), _) => s / 2,
+                    (None, _) => s,
+                };
+                steps[t as usize] = steps[t as usize].max(s);
+            }
+        }
+        if steps.iter().all(|&s| s == steps[0]) {
+            return Vec::new();
+        }
+        steps
+    }
+
+    /// The signal a name read in scope `hint` (or one of its parents) is.
+    fn cov_signal(&self, name: &str, hint: Option<&str>) -> Option<usize> {
+        let mut scope = hint.unwrap_or("");
+        while !scope.is_empty() {
+            if let Some(&id) = self.signal_name_to_id.get(format!("{scope}.{name}").as_str()) {
+                return Some(id);
+            }
+            scope = scope.rsplit_once('.').map_or("", |(p, _)| p);
+        }
+        self.resolve_read_name(name, "")
+    }
+
+    /// Each signal's settle step, after the comb entries are built, for
+    /// `cov_replay`: how many delta cycles after a change of the signals no
+    /// combinational logic drives (the outputs of clocked and initial
+    /// blocks, and testbench inputs) the reference simulator updates it, in
+    /// half cycles. An `always_comb` or `always @*` output is 2 later than
+    /// the latest signal its block reads. A net driven by a continuous
+    /// assignment (a gate, a port connection) is 1 later than a variable it
+    /// reads, and as late as a net: the reference simulator updates a
+    /// network of continuous assignments together. An inverter of an
+    /// `always` block's output updates with it (the block computes it), one
+    /// of a variable an `initial` block or the testbench writes 1 later.
+    /// Also notes which block writes each combinational block output.
+    pub(super) fn cov_steps(&mut self) {
+        let (inverters, clocked) = match self.code_cov.as_mut() {
+            Some(c) if c.exprs.iter().any(|s| s.hint.is_some() || s.proc.is_some()) => {
+                (std::mem::take(&mut c.inverters), std::mem::take(&mut c.clocked))
+            }
+            _ => return,
+        };
+        let n = self.signal_table.len();
+        // Outputs of `always` blocks (the combinational ones below).
+        let mut always = vec![false; n];
+        for (scope, names) in &clocked {
+            for id in names.iter().filter_map(|x| self.cov_signal(x, Some(scope))) {
+                if id < n {
+                    always[id] = true;
+                }
+            }
+        }
+        // Inverter target -> operand.
+        let inv: HashMap<usize, usize> = inverters
+            .iter()
+            .filter_map(|(d, x, scope)| {
+                Some((
+                    self.cov_signal(d, Some(scope))?,
+                    self.cov_signal(x, Some(scope))?,
+                ))
+            })
+            .filter(|&(d, x)| d < n && x < n)
+            .collect();
+        let Some(cov) = self.code_cov.as_mut() else {
+            return;
+        };
+        let kinds: Vec<Option<bool>> = self
+            .comb_entries
+            .iter()
+            .map(|e| match e.item {
+                CombItem::Noop | CombItem::TimingCheck { .. } => None,
+                CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. } => Some(true),
+                _ => Some(false),
+            })
+            .collect();
+        let mut net = vec![false; n];
+        for (e, k) in self.comb_entries.iter().zip(&kinds) {
+            for &w in e.cold.write_signal_ids.iter().filter(|&&w| w < n) {
+                match k {
+                    Some(false) => net[w] = true,
+                    Some(true) => {
+                        always[w] = true;
+                        let scope = e.cold.scope_hint.clone().unwrap_or_default();
+                        cov.writers.insert(w, (scope, e.cold.span.start));
+                    }
+                    None => {}
+                }
+            }
+        }
+        // Longest paths; a loop stops growing after a few rounds.
+        let mut steps = vec![0u32; n];
+        for _ in 0..16 {
+            let mut moved = false;
+            for (e, k) in self.comb_entries.iter().zip(&kinds) {
+                let Some(process) = *k else {
+                    continue;
+                };
+                let writes = &e.cold.write_signal_ids;
+                let s = e
+                    .cold
+                    .read_signal_ids
+                    .iter()
+                    .filter(|&&r| r < n && !writes.contains(&r))
+                    .map(|&r| steps[r] + if process { 2 } else { u32::from(!net[r]) })
+                    .max()
+                    .unwrap_or(0);
+                for &w in writes.iter().filter(|&&w| w < n) {
+                    let s = match inv.get(&w) {
+                        Some(&x) if !process && always[x] => steps[x],
+                        _ => s,
+                    };
+                    if steps[w] < s {
+                        steps[w] = s;
+                        moved = true;
+                    }
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        cov.steps = steps;
     }
 
     /// Evaluate node `i` of an item's tree (`e` is its expression) with the

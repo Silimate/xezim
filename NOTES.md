@@ -77,10 +77,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `--code-coverage`, `+cover` and `-coverage` now collect them too. Each
   scope in `xezim_cov.json` gains `condition` and `expression` totals
   (covered terms) and `conditions[]`/`expressions[]`, every item with its
-  terms and their row counts. On the design instances of 23 CVDP designs,
-  the items and terms match the reference simulator's report on 22 and the
-  covered terms on 17. Off by default; a run without it compiles and runs as
-  before. (#48)
+  terms and their row counts. An item of a continuous assignment, or at the
+  top level of a combinational `always` block, also counts the transient
+  states its inputs pass through in a time slot, replayed in the reference
+  simulator's delta-cycle order (#75). On the design instances of 23 CVDP
+  designs, the items and terms match the reference simulator's report on 22
+  and the covered terms on 18. Off by default; a run without it compiles and
+  runs as before. (#48)
 
 **Performance**
 

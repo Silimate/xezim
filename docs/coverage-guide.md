@@ -773,8 +773,24 @@ both of its rows are; coverage is the covered terms over all terms.
   arm is a constant equal to the taken arm, and each arm decides when the
   condition selects it. A decision passes up through the operators above it.
   An x or z term gives no row.
+- **Transient states.** The reference simulator evaluates an item each time
+  one of its inputs changes, so it also sees the delta cycle in which one
+  input has its new value and another not yet: in `assign y = d | ~v`, where
+  `d` follows `v` through another block, `v` at 1 with `d` still 0. xezim
+  settles combinational logic in dependency order and evaluates the item once
+  all of its inputs have changed, so for an item of a continuous assignment,
+  or at the top level of a combinational `always` block (not under an `if`
+  or `case`, nor in a loop), it replays the inputs' changes in the order the
+  reference simulator makes them, and counts the rows of each state between.
+  A block's output changes one delta cycle after the block's inputs. A net
+  driven by continuous assignments (a port connection, a gate) changes half
+  a cycle after the variables it reads, but together with the nets it reads;
+  an inverter of an `always` block's output (`assign q_n = ~q`) with that
+  output. A combinational block runs after the continuous assignments of its
+  inputs' cycle, and sees the outputs of the blocks above it in its module
+  that ran in that cycle too. Inputs one process writes change together.
 - **Counts** are the evaluations in which the row was hit, one per
-  evaluation however many times the term appears.
+  evaluation (or replayed state) however many times the term appears.
 - **Evaluation.** The interpreter evaluates each item, operator by operator
   as the design would (the right of `&&` is evaluated only when needed, so a
   function call's side effects happen as often as without coverage), so the
@@ -827,10 +843,13 @@ differences:
     once, an input port tied to a constant (here only a constant written
     directly in the port connection folds), or a `for` loop's index. Here
     the items of such code still count.
-  - A row hit only in a transient state of combinational logic, between two
-    evaluations in one time slot, may not count: xezim evaluates
-    combinational logic in dependency order, so `assign y = a | ~b` where
-    `a` follows `b` (through another block) sees `a` and `b` agree.
+  - Transient states (see [Conditions and expressions](#conditions-and-expressions))
+    follow a model of the reference simulator's delta cycles, measured on
+    small designs, not its scheduler. Not replayed: an item under an `if` or
+    `case` or in a loop of a combinational block (the reference simulator
+    counts those states too when the item runs in them), in a function or
+    task, with a function call in a term, or with a term that reads what its
+    own block writes.
   - Each iteration of a generate loop has its own items, as there. Those of
     procedural code name their generate block (`block`); those of continuous
     assignments share `file`, `line` and `text`.

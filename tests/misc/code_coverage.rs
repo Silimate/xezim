@@ -1306,3 +1306,138 @@ endmodule
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Issue #75: the reference simulator evaluates a continuous assignment's
+/// item at each change of its inputs, so it also sees the delta cycle in
+/// which one input has its new value and another not yet: here `v` has
+/// changed and `d`, one block behind, not yet. xezim settles in dependency
+/// order and replays those states (both terms covered, as there).
+#[test]
+fn transient_states() {
+    let d = scratch("glitch");
+    let src = "\
+// A continuous assignment's expression item is evaluated whenever an input changes,
+// also in a delta cycle where one input has its new value and another not yet.
+module lane(input logic valid, output logic ready);
+  always_comb ready = valid;          // follows valid one delta later
+endmodule
+module t;
+  logic v = 0;
+  logic d;
+  lane u(.valid(v), .ready(d));
+  wire y = d | ~v;                    // rows d=0 and v=1 only between v's change and d's
+  initial begin
+    #1 v = 1;
+    #1 v = 0;
+    #1 v = 1;
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let t = scope(&json, "t");
+    assert_eq!(
+        terms(t, 10, "assign"),
+        vec![("d".to_string(), [2, 2]), ("v".to_string(), [2, 2])]
+    );
+    assert!(
+        t.contains("\"expression\": {\"covered\": 2, \"total\": 2, \"percent\": 100.00}"),
+        "{t}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Which transient states an item sees, as the reference simulator does on
+/// this design (every item's covered terms are its). A continuous
+/// assignment sees each delta cycle in which its inputs change: a block
+/// output one cycle after the block's inputs, a net driven by continuous
+/// assignments half a cycle after the variables it reads but with the
+/// other nets, and an inverter of a block's output with the output. A
+/// combinational block runs after the continuous assignments of its
+/// inputs' cycle, and sees the outputs of the blocks above it in its
+/// module that ran in that cycle too. One process writing both inputs
+/// changes them together.
+#[test]
+fn transient_state_rules() {
+    let d = scratch("glitchrules");
+    let src = "\
+module lane(input logic valid, output logic ready);
+  always_comb ready = valid;
+endmodule
+module tb;
+  logic v = 0, clk = 0;
+  logic d;
+  lane u(.valid(v), .ready(d));
+  wire y1 = d | ~v;
+  logic a, b;
+  always_comb a = v;
+  always_comb b = v;
+  wire y2 = a | ~b;
+  wire n1 = v;
+  wire n2 = ~n1;
+  wire y3 = n2 | ~n1;
+  logic f, g;
+  always_ff @(posedge clk) begin f <= v; g <= v; end
+  wire fl = ~f;
+  wire y4 = fl | g;
+  logic z1, z2, z3, p, q;
+  always_comb z1 = d | ~v;
+  always_comb p = v;
+  always_comb z2 = p | ~v;
+  always_comb z3 = q | ~v;
+  always_comb q = v;
+  logic s, t;
+  wire y5 = s | ~t;
+  logic z5;
+  always_comb if (d || !v) z5 = 1; else z5 = 0;
+  initial begin
+    repeat (2) begin
+      #1 v = 1; s = 1; t = 1;
+      #1 clk = 1;
+      #1 clk = 0;
+      #1 v = 0; s = 0; t = 0;
+      #1 clk = 1;
+      #1 clk = 0;
+    end
+    #1 $finish;
+  end
+endmodule
+";
+    let code = |extra: &[(&str, &str)]| {
+        std::fs::write(d.join("t.sv"), src).unwrap();
+        let out = Command::new(xezim())
+            .current_dir(&d)
+            .env("XEZIM_COV_DB", d.join("cov.json"))
+            .envs(extra.iter().copied())
+            .args(["--code-coverage=cond,expr", "t.sv"])
+            .output()
+            .expect("run xezim");
+        assert!(out.status.success());
+        let json = results(&d);
+        json[json.find("\"code_coverage\"").unwrap()..].to_string()
+    };
+    let json = code(&[]);
+    assert_eq!(json, code(&[("XEZIM_TWO_STATE", "0")]));
+    let t = |a: &str, x: [u64; 2], b: &str, y: [u64; 2]| {
+        vec![(a.to_string(), x), (b.to_string(), y)]
+    };
+    // `d` is a block and a port connection behind `v`.
+    assert_eq!(terms(&json, 8, "assign"), t("d", [2, 2], "v", [3, 2]));
+    // Two block outputs of one cycle, two nets: no state between them.
+    assert_eq!(terms(&json, 12, "assign"), t("a", [0, 2], "b", [3, 0]));
+    assert_eq!(terms(&json, 15, "assign"), t("n2", [2, 0], "n1", [0, 2]));
+    assert_eq!(terms(&json, 19, "assign"), t("fl", [0, 2], "g", [0, 2]));
+    // Blocks: `d` is late, `p`'s block is above, `q`'s below.
+    assert_eq!(terms(&json, 21, "statement"), t("d", [2, 2], "v", [3, 2]));
+    assert_eq!(terms(&json, 23, "statement"), t("p", [0, 2], "v", [3, 0]));
+    assert_eq!(terms(&json, 24, "statement"), t("q", [2, 2], "v", [3, 2]));
+    assert_eq!(terms(&json, 27, "assign"), t("s", [0, 2], "t", [2, 0]));
+    assert_eq!(terms(&json, 29, "if"), t("d", [2, 4], "v", [3, 2]));
+    let _ = std::fs::remove_dir_all(&d);
+}

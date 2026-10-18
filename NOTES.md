@@ -78,7 +78,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   scope in `xezim_cov.json` gains `condition` and `expression` totals
   (covered terms) and `conditions[]`/`expressions[]`, every item with its
   terms and their row counts. On the design instances of 23 CVDP designs,
-  the items and terms match the commercial simulator's report on 22 and the
+  the items and terms match the reference simulator's report on 22 and the
   covered terms on 17. Off by default; a run without it compiles and runs as
   before. (#48)
 

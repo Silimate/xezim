@@ -819,7 +819,7 @@ differences:
   into that net, and then lists it under the parent only; with full signal
   visibility it lists the port in the instance, as xezim does.
 - Toggle counts are not capped at 1.
-- Condition and expression items match the commercial simulator's focused
+- Condition and expression items match the reference simulator's focused
   expression coverage report item for item, term for term and row for row on
   most designs. The differences:
   - Another simulator folds what it can prove constant: the code of a

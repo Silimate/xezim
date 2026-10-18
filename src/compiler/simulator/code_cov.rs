@@ -483,6 +483,32 @@ impl Ctx<'_> {
         (w, bits && w > 0)
     }
 
+    /// A `foreach` index variable's width and bit-select (as `local`): `int`
+    /// for an array of the design, an associative array's key type when it
+    /// is integral; `(0, false)` for any other collection.
+    fn index_type(&self, array: &Expression, at: &Here) -> (u32, bool) {
+        let ExprKind::Ident(h) = &unparen(array).kind else {
+            return (0, false);
+        };
+        let Some(n) = Self::ident_name(h) else {
+            return (0, false);
+        };
+        if at.locals.contains_key(&n) {
+            return (0, false);
+        }
+        let m = self.module;
+        for c in self.candidates(&n, &at.path) {
+            let c = c.as_str();
+            if m.associative_arrays.contains_key(c) {
+                return match m.assoc_index_widths.get(c) {
+                    Some(&(w, _)) if w > 0 => (w, true),
+                    _ => (0, false),
+                };
+            }
+        }
+        (32, true)
+    }
+
     fn relational(op: BinaryOp) -> bool {
         matches!(
             op,
@@ -1214,10 +1240,12 @@ impl Instr<'_> {
             }
             StatementKind::Foreach { array, vars, body } => {
                 self.count(span, "foreach", out);
-                // Index variables take the array's index type: unknown here.
+                // Index variables take the array's index type (§12.7.3):
+                // `int`, or an associative array's key type.
                 let outer = self.here.locals.clone();
+                let index = self.ctx.index_type(&array, &self.here);
                 for v in vars.iter().flatten() {
-                    self.here.locals.insert(v.name.clone(), (0, false));
+                    self.here.locals.insert(v.name.clone(), index);
                 }
                 let body = Box::new(self.wrap(*body));
                 self.here.locals = outer;
@@ -1339,7 +1367,7 @@ impl Instr<'_> {
                         ..
                     } => self.expr(right),
                     // A `?:` in a message is not a branch, but its condition
-                    // is a condition, as in the commercial simulator.
+                    // is a condition, as in the reference simulator.
                     ExprKind::SystemCall { name, args }
                         if DISPLAY_TASKS.contains(&name.as_str()) =>
                     {
@@ -1736,14 +1764,14 @@ impl Instr<'_> {
     /// The logic tree of `e` when it is a condition or expression item: it
     /// has a logic operator on two non-constant operands (or a `?:` in an
     /// expression), or it is a relation (`a == b`; a negated one, `!(a ==
-    /// b)`, is not, as in the commercial simulator), and at most `MAX_TERMS`
+    /// b)`, is not, as in the reference simulator), and at most `MAX_TERMS`
     /// input terms.
     fn plan(&self, e: &Expression, mux: bool) -> Option<Plan> {
         let mut p = Plan::default();
         let text = self.ctx.source(e, self.cov.scopes[self.scope as usize].src);
         self.build(e, text, mux, &mut p);
         // A system function as a term (`!$isunknown(x) && y`) leaves the
-        // expression out, as in the commercial simulator.
+        // expression out, as in the reference simulator.
         if p.terms.is_empty() || p.terms.len() > MAX_TERMS || p.system {
             return None;
         }
@@ -1760,7 +1788,7 @@ impl Instr<'_> {
 
     /// Fold node `i` of `p` (its kids built) to a constant when its value
     /// is: a constant operand that decides it (`x & 0`, `x || 1`), or
-    /// constant operands only. The commercial simulator leaves such parts of
+    /// constant operands only. The reference simulator leaves such parts of
     /// an expression out; their terms (those after the first `terms`) go
     /// with them.
     fn fold(p: &mut Plan, i: usize, op: Op, kids: [u32; 3], terms: usize) -> Op {
@@ -1819,7 +1847,7 @@ impl Instr<'_> {
         };
         let t = text.as_deref();
         let (op, kids): (Op, Vec<(&Expression, Option<String>)>) = match &e.kind {
-            // Folded away, as by the commercial simulator: no term.
+            // Folded away, as by the reference simulator: no term.
             _ if p.konst[i].is_some() => (Op::Const, Vec::new()),
             ExprKind::Unary {
                 op: UnaryOp::LogNot,
@@ -1888,7 +1916,7 @@ impl Instr<'_> {
 
     /// The term `e` (node `i` of `p`, source text `text`) stands for. A
     /// 1-bit `t == 0` (or `t != 1`, either way round) is the term `t`,
-    /// inverted, as in the commercial simulator; another relation is a term
+    /// inverted, as in the reference simulator; another relation is a term
     /// of its own.
     fn term(&self, e: &Expression, text: Option<&str>, p: &mut Plan, i: usize) -> Op {
         let mut named = text.map(str::to_string);

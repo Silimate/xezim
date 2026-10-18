@@ -813,7 +813,7 @@ fn has_item(json: &str, line: u32) -> bool {
 /// (IEEE 1800-2023 §11.3.5: `&&` skips its right operand after a 0, `||`
 /// after a 1): a term's row counts when the term alone decides the result.
 /// The left of `&&` decides at 0 whatever the right would be; at 1 only
-/// when the right is 1. Rows and terms covered are the commercial
+/// when the right is 1. Rows and terms covered are the reference
 /// simulator's on this design (4 of 6 terms; `half` never sees x or y at 1
 /// deciding).
 #[test]
@@ -875,7 +875,7 @@ endmodule
 /// when the other arm was not evaluated, and an item whose code never ran
 /// is listed with no hits. Vector `&` and a lone reduction are not
 /// expressions. The items, terms and covered terms (8 of 10) are the
-/// commercial simulator's; continuous evaluations are not counted the same,
+/// reference simulator's; continuous evaluations are not counted the same,
 /// so only rows hit are compared there.
 #[test]
 fn expression_items() {
@@ -941,7 +941,7 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// Which expressions are items, as in the commercial simulator's report on
+/// Which expressions are items, as in the reference simulator's report on
 /// this design: a condition or value with a logic operator on two
 /// non-constant operands, or a relation; not a lone (possibly negated)
 /// signal, nor a 1-bit signal compared with a constant (it is that signal),
@@ -1075,7 +1075,7 @@ endmodule
 /// testbench's `$monitor` of its own `op_select` and `start`, also the names
 /// of ports of the two instances, keeps its bindings (once, it printed the
 /// second instance's ports instead, `5 op_select=5 start=1`). The items of
-/// the two iterations of a generate loop stay apart, as in the commercial
+/// the two iterations of a generate loop stay apart, as in the reference
 /// simulator.
 #[test]
 fn items_in_instances() {
@@ -1188,10 +1188,11 @@ endmodule
 
 /// A part of an item that folds to a constant still has its `?:` branch; a
 /// block's local declaration ends with the block (`p` is the task's 1-bit
-/// argument again after it, so `p & q` is an item), and a `for` loop's
-/// variable is its body's (the `int p` there makes `p & q` a vector
-/// operation, no item); and the instances of a module whose parameters fold
-/// different terms away keep separate items in the design unit.
+/// argument again after it, so `p & q` is an item), a `for` loop's variable
+/// is its body's (the `int p` there makes `p & q` a vector operation, no
+/// item) and a `foreach` index is an `int` (§12.7.3: `k[0] & q` is an item);
+/// and the instances of a module whose parameters fold different terms away
+/// keep separate items in the design unit.
 #[test]
 fn folded_parts_locals_and_units() {
     let d = scratch("fold");
@@ -1200,7 +1201,7 @@ module m #(parameter bit P = 1, parameter bit Q = 0) (input logic a, b, c, d, ou
   assign y = (a & b & P) | (c & d & Q);
 endmodule
 module tb;
-  logic a, b, c, e, y, y1, y2;
+  logic a, b, c, e, y, y1, y2; logic [3:0] arr [3];
   m #(.P(1), .Q(0)) u1(.a, .b, .c, .d(e), .y(y1));
   m #(.P(0), .Q(1)) u2(.a, .b, .c, .d(e), .y(y2));
   task automatic t(input logic p, input logic q);
@@ -1210,6 +1211,7 @@ module tb;
     end
     y = p & q;
     for (int p = 0; p < 2; p++) y = p & q;
+    foreach (arr[k]) y = k[0] & q;
   endtask
   initial begin
     {a, b, c, e} = 4'b1010;
@@ -1242,7 +1244,8 @@ endmodule
     };
     assert_eq!(names(13, "statement"), ["p", "q"]);
     assert!(!has_item(&json, 14), "{json}");
-    assert_eq!(names(18, "statement"), ["a", "b"]);
+    assert_eq!(names(15, "statement"), ["k[0]", "q"]);
+    assert_eq!(names(19, "statement"), ["a", "b"]);
     let unit = &json[json
         .find("\"design_unit\": \"m\",\n        \"instances\": 2")
         .unwrap()..];

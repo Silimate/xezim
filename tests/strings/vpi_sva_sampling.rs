@@ -166,6 +166,28 @@ static PLI_INT32 chain_vc(p_cb_data cb) {
     return 0;
 }
 
+static PLI_INT32 nba_read(p_cb_data cb) {
+    s_vpi_value v;
+    (void)cb;
+    v.format = vpiIntVal;
+    vpi_get_value(vpi_handle_by_name("top.ready", NULL), &v);
+    put(vpi_handle_by_name("top.seen", NULL), v.value.integer);
+    return 0;
+}
+
+static PLI_INT32 nba_go(p_cb_data cb) {
+    (void)cb;
+    put(vpi_handle_by_name("top.go", NULL), 1);
+    at(nba_read, cbNBASynch, 0, NULL);
+    return 0;
+}
+
+static PLI_INT32 go_vc(p_cb_data cb) {
+    if ((cb->value->value.integer & 1) && ++chain_rises == 3)
+        at(nba_go, cbNBASynch, 0, NULL);
+    return 0;
+}
+
 static PLI_INT32 start(p_cb_data cb) {
     const char *f = env("SVA_FLAG", "nodelay");
     (void)cb;
@@ -192,6 +214,8 @@ static PLI_INT32 start(p_cb_data cb) {
         at(nop_vc, cbValueChange, 0, clk);
     if (*env("SVA_CHAIN", ""))
         at(chain_vc, cbValueChange, 0, clk);
+    if (*env("SVA_GO", ""))
+        at(go_vc, cbValueChange, 0, clk);
     return 0;
 }
 
@@ -284,6 +308,22 @@ module top;
   end
   initial #100 $finish;
   final $display("RESULT passes=%0d", passes);
+endmodule
+"#;
+
+/// `go` rises from a cbNBASynch at the third clock rise (`SVA_GO`); the
+/// process it wakes forks a child that sets `ready` after `#0`. A second
+/// cbNBASynch, queued by the first, copies `ready` to `seen`.
+const GO_SV: &str = r#"
+module top;
+  logic clk = 0, d = 0, rst = 0, tick = 0, go = 0, ready = 0, seen = 0;
+  int hits = 0;
+  initial if ($test$plusargs("hdl")) begin #5 clk = 1; forever #5 clk = ~clk; end
+  always #5 tick = ~tick;
+  c_hit: cover property (@(posedge clk) 1) hits++;
+  always @(posedge go) fork begin #0 ready = 1; end join_none
+  initial #100 $finish;
+  final $display("RESULT hits=%0d seen=%0d", hits, seen);
 endmodule
 "#;
 
@@ -443,12 +483,13 @@ fn vpi_synch_chain_at_an_edge_runs_iteratively() {
     );
 }
 
-/// §4.4.2: the cbNBASynch routines of a slot belong to its active region
-/// set too. At the second rise, where a cbReadWriteSynch releases `rst`, a
-/// cbNBASynch chain of 1,000 routines (each queues the next) is due as
-/// well. The assertions wait for the chain and the release, so the
-/// attempts from 15 ns on pass, with each clock. The reference simulator
-/// agrees.
+/// §4.4.2, §4.4.3.3: the cbNBASynch routines of a slot belong to its active
+/// region set too. At the second rise, where a cbReadWriteSynch releases
+/// `rst`, a cbNBASynch chain of 1,000 routines (each queues the next) is due
+/// as well. The assertions wait for the chain and the release, so the
+/// attempts from 15 ns on pass, with each clock. (The reference simulator
+/// accepts cbNBASynch routines but never calls them, so this rests on the
+/// LRM's region order.)
 #[test]
 fn vpi_nba_synch_chain_before_reset_release_keeps_its_attempt() {
     let (dir, so) = setup("nbachain", EDGE_SV);
@@ -464,6 +505,28 @@ fn vpi_nba_synch_chain_before_reset_release_keeps_its_attempt() {
         let extra: &[&str] = if clk == "none" { &["+hdl"] } else { &[] };
         let text = run(&dir, &so, &env, extra);
         if !text.contains("RESULT passes=8 fails=0 rises=10 hits=10") {
+            bad.push(format!("clk={clk}:\n{text}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// §4.4.2, §4.4.3.3: a cbNBASynch routine runs once the Active and Inactive
+/// regions are empty, also while the assertions of a clock edge wait for
+/// the slot's synch routines. The second routine sees the `#0` write of the
+/// child the first one's write forks, with each clock, as without an
+/// assertion clock event. (The reference simulator never calls cbNBASynch
+/// routines, so this rests on the LRM's region order.)
+#[test]
+fn vpi_nba_synch_follows_inactive_work() {
+    let (dir, so) = setup("nbaorder", GO_SV);
+    let mut bad = Vec::new();
+    for clk in ["delay", "rw", "vc", "none"] {
+        let env = [("SVA_CLK", clk), ("SVA_GO", "1")];
+        let extra: &[&str] = if clk == "none" { &["+hdl"] } else { &[] };
+        let text = run(&dir, &so, &env, extra);
+        if !text.contains("RESULT hits=10 seen=1") {
             bad.push(format!("clk={clk}:\n{text}"));
         }
     }

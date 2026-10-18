@@ -771,11 +771,14 @@ impl Simulator {
             return;
         }
         self.sva_post_nba_busy = true;
-        // 1. Finish the slot's active region set, one delta at a time: the
-        //    processes due now, the due cbNBASynch batch before the NBA
-        //    region, and once all of that is done the due cbReadWriteSynch
-        //    batch; `vpi_open_delta` runs the Inactive and NBA regions of
-        //    each. A batch that queues another is the next round.
+        // 1. Finish the slot's active region set, one delta at a time, in
+        //    region order: the Active and Inactive work until none is left
+        //    (as `run_one_tick` runs it: the processes due now, the `wait`
+        //    conditions they satisfy, the `#0` continuations they park),
+        //    then the due cbNBASynch batch, then the NBA region
+        //    (`vpi_open_delta`), and once all of that is done the due
+        //    cbReadWriteSynch batch. A batch that queues another is the
+        //    next round.
         let now = self.time;
         let due = |s: &BTreeSet<(u64, u64)>| s.first().is_some_and(|&(t, _)| t <= now);
         let mut rounds = 0u32;
@@ -790,27 +793,52 @@ impl Simulator {
         {
             rounds += 1;
             self.vpi_checkpoint();
-            let mut work = self.dirty_any
-                || !self.inactive_queue.is_empty()
-                || !self.nba_fast.is_empty()
-                || !self.nba_queue.is_empty()
-                || !self.packed_nba.is_empty();
-            while self.event_queue.next_time() == Some(now)
-                && !self.finished
-                && !self.zero_delay_defer_pending
-            {
-                let Some((pid, stmts)) = self.event_queue.pop_front(now) else {
-                    break;
-                };
-                self.run_scheduled_process(pid, &stmts);
-                if !self.is_pid_suspended(pid) {
-                    self.child_finished(pid);
+            let mut work = false;
+            loop {
+                while self.event_queue.next_time() == Some(now)
+                    && !self.finished
+                    && !self.zero_delay_defer_pending
+                {
+                    let Some((pid, stmts)) = self.event_queue.pop_front(now) else {
+                        break;
+                    };
+                    self.run_scheduled_process(pid, &stmts);
+                    if !self.is_pid_suspended(pid) {
+                        self.child_finished(pid);
+                    }
+                    work = true;
                 }
+                if self.finished || self.zero_delay_defer_pending {
+                    break;
+                }
+                self.drain_condition_waiters(true, false);
+                if self.event_queue.next_time() == Some(now) {
+                    continue;
+                }
+                if self.promote_inactive_to_active() {
+                    if self.dirty_any {
+                        self.settle_combinatorial();
+                    }
+                    self.check_edges();
+                    work = true;
+                    continue;
+                }
+                break;
+            }
+            if !self.inactive_queue.is_empty() {
+                self.drain_inactive_pre_nba();
                 work = true;
+            }
+            if self.finished {
+                break;
             }
             if self.vpi_cb_mask & m(CB_NBA_SYNCH) != 0 && due(&self.vpi_cb.nba) {
                 work |= self.vpi_fire_due(TimedSet::Nba);
             }
+            work |= self.dirty_any
+                || !self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                || !self.packed_nba.is_empty();
             if !work && self.vpi_cb_mask & m(CB_READ_WRITE_SYNCH) != 0 && due(&self.vpi_cb.rw) {
                 work = self.vpi_fire_due(TimedSet::Rw);
             }

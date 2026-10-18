@@ -1220,14 +1220,21 @@ pub(crate) struct CodeCov {
     inverters: Vec<(String, String, String)>,
     /// The targets of `assign` statements (name, scope), for `cov_steps`.
     assigned: Vec<(String, String)>,
-    /// Item evaluations not counted yet (see `Simulator::cov_expr`): the
-    /// item, the process whose write ran it and the settle that did, its
-    /// node values, and its term and constant values.
-    #[allow(clippy::type_complexity)]
-    pending: Vec<(u32, usize, u64, Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)>,
+    /// Item evaluations not counted yet, by item (see `Simulator::cov_expr`).
+    pending: HashMap<u32, Pending>,
     /// Inside a read that only coverage makes (`Simulator::cov_quietly`):
     /// count nothing.
     quiet: u32,
+}
+
+/// An item's evaluations not counted yet: the process whose write ran its
+/// block and the settle that did, and each evaluation's node values and
+/// term and constant values.
+#[allow(clippy::type_complexity)]
+struct Pending {
+    pid: usize,
+    run: u64,
+    evals: Vec<(Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)>,
 }
 
 /// The instance a block scope (`u0.u1.genblk2`) belongs to, its longest
@@ -2790,7 +2797,7 @@ impl Simulator {
             clocked: Vec::new(),
             inverters: Vec::new(),
             assigned: Vec::new(),
-            pending: Vec::new(),
+            pending: HashMap::default(),
             quiet: 0,
         };
         // Initial blocks and continuous assignments are instrumented where
@@ -3358,7 +3365,8 @@ impl Simulator {
             if self
                 .code_cov
                 .as_ref()
-                .is_some_and(|c| c.pending.iter().any(|p| p.0 == id && p.1 != pid))
+                .and_then(|c| c.pending.get(&id))
+                .is_some_and(|p| p.pid != pid)
             {
                 self.cov_flush_item(id);
             }
@@ -3370,16 +3378,28 @@ impl Simulator {
             if let Some(c) = self.code_cov.as_mut() {
                 // A later run of the block replaces an earlier one; a loop in
                 // it evaluates the item more than once in one run.
-                c.pending.retain(|p| p.0 != id || p.2 == run);
-                c.pending.push((id, pid, run, vals, terms));
+                let p = c.pending.entry(id).or_insert(Pending {
+                    pid,
+                    run,
+                    evals: Vec::new(),
+                });
+                if p.run != run {
+                    p.run = run;
+                    p.evals.clear();
+                }
+                p.evals.push((vals, terms));
             }
             return v;
         }
         // (Deferred evaluations this one starts again: the block runs again
         // on the same inputs, and counts now.)
         if let Some(c) = self.code_cov.as_mut() {
-            if c.pending.iter().find(|p| p.0 == id).is_some_and(|p| p.3 == vals) {
-                c.pending.retain(|p| p.0 != id);
+            if c.pending
+                .get(&id)
+                .and_then(|p| p.evals.first())
+                .is_some_and(|e| e.0 == vals)
+            {
+                c.pending.remove(&id);
             }
         }
         self.cov_flush_item(id);
@@ -3411,16 +3431,12 @@ impl Simulator {
         if c.pending.is_empty() {
             return;
         }
-        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut c.pending)
-            .into_iter()
-            .partition(|p| p.0 == id);
-        c.pending = rest;
-        if mine.is_empty() {
+        let Some(p) = c.pending.remove(&id) else {
             return;
-        }
+        };
         let s = &c.exprs[id as usize];
         let (nodes, row0) = (s.nodes.clone(), (s.row0, s.bimodal));
-        for (id, _, _, vals, terms) in mine {
+        for (vals, terms) in p.evals {
             self.cov_count_item(id, &nodes, row0, &vals, terms);
         }
     }
@@ -3447,11 +3463,10 @@ impl Simulator {
     /// Count every deferred evaluation (see `cov_expr`): when a process
     /// waits, at the end of a time slot, and before reporting.
     pub(super) fn cov_flush(&mut self) {
-        let mut ids: Vec<u32> = match self.code_cov.as_ref() {
-            Some(c) => c.pending.iter().map(|p| p.0).collect(),
+        let ids: Vec<u32> = match self.code_cov.as_ref() {
+            Some(c) => c.pending.keys().copied().collect(),
             None => return,
         };
-        ids.dedup();
         for id in ids {
             self.cov_flush_item(id);
         }

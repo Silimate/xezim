@@ -628,7 +628,10 @@ impl Walk<'_> {
         if v.has_xz() || v.is_real {
             return None;
         }
-        let v = v.to_u64()?;
+        // In the variable's context: an unbased unsized literal (`'1`)
+        // fills its width and a narrower signed constant extends its sign.
+        // Assignments truncate wider ones; comparisons do not.
+        let v = v.resize_for_assign(v.width.max(self.width)).to_u64()?;
         let mut inner = e;
         loop {
             match &inner.kind {
@@ -1520,13 +1523,15 @@ impl Simulator {
                 for (k, (f, t, _)) in trans.iter().enumerate() {
                     tmap[*f as usize * n + *t as usize] = k as u32;
                 }
-                let anon = values.iter().all(|v| !names.contains_key(v));
+                // States take their constants' names when every state has
+                // one; otherwise all are `st0`, `st1`, ... in value order.
+                let named = values.iter().all(|v| names.contains_key(v));
                 let states: Vec<(u64, String, Span)> = values
                     .iter()
                     .enumerate()
                     .map(|(k, &v)| {
                         let name = match names.get(&v) {
-                            Some(s) if !anon => s.clone(),
+                            Some(s) if named => s.clone(),
                             _ => format!("st{}", k),
                         };
                         let span = out_of(k as u32, true)

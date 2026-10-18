@@ -1055,6 +1055,89 @@ const ASYNC_FSMS: &[Expect] = &[
     ),
 ];
 
+const FILL: &str = r#"// Unbased unsized literals as states, and a parameterized FSM whose
+// instances have two different state sets.
+module fill(input logic clk, rst, go);
+  logic [1:0] st;
+  always_ff @(posedge clk)
+    if (rst) st <= '0;
+    else case (st)
+      '0: if (go) st <= 2'd1;
+      2'd1: st <= '1;
+      '1: st <= '0;
+    endcase
+endmodule
+module shaped #(parameter logic [1:0] LAST = 2'd2) (input logic clk, rst, go);
+  logic [1:0] st;
+  always_ff @(posedge clk)
+    if (rst) st <= 2'd0;
+    else case (st)
+      2'd0: if (go) st <= 2'd1;
+      2'd1: st <= LAST;
+      LAST: st <= 2'd0;
+    endcase
+endmodule
+module tb;
+  logic clk = 0, rst = 1, go = 0;
+  always #5 clk = ~clk;
+  fill uf(.*);
+  shaped #(.LAST(2'd2)) ua(.*);
+  shaped #(.LAST(2'd3)) ub(.*);
+  shaped #(.LAST(2'd3)) uc(.clk, .rst, .go(1'b1));
+  initial begin
+    repeat (2) @(negedge clk);
+    rst = 0;
+    repeat (2) begin
+      go = 1; @(negedge clk); go = 0;
+      repeat (3) @(negedge clk);
+    end
+    $finish;
+  end
+endmodule
+"#;
+
+const FILL_FSMS: &[Expect] = &[
+    (
+        "tb.ua",
+        "st",
+        &["st0=0@18:4", "st1=1@19:2", "st2=2@20:2"],
+        &[
+            "st0>st1@18:2",
+            "st1>st0@16:0",
+            "st1>st2@19:2",
+            "st2>st0@20:2",
+        ],
+    ),
+    (
+        "tb.ub",
+        "st",
+        &["st0=0@18:4", "st1=1@19:2", "st2=3@20:2"],
+        &[
+            "st0>st1@18:2",
+            "st1>st0@16:0",
+            "st1>st2@19:2",
+            "st2>st0@20:2",
+        ],
+    ),
+    (
+        "tb.uc",
+        "st",
+        &["st0=0@18:4", "st1=1@19:3", "st2=3@20:3"],
+        &[
+            "st0>st1@18:3",
+            "st1>st0@16:0",
+            "st1>st2@19:3",
+            "st2>st0@20:2",
+        ],
+    ),
+    (
+        "tb.uf",
+        "st",
+        &["st0=0@8:4", "st1=1@9:2", "st2=3@10:2"],
+        &["st0>st1@8:2", "st1>st0@6:0", "st1>st2@9:2", "st2>st0@10:2"],
+    ),
+];
+
 /// A two-process FSM (`state <= next` and an `always_comb` next-state
 /// `case`): the reset adds a transition to CLOSED from every other state,
 /// held states count on the clock that enters them and the next one (OPEN,
@@ -1153,6 +1236,30 @@ fn styles_and_rejections() {
 #[test]
 fn async_reset_runs() {
     check("async", ASYNC, ASYNC_FSMS);
+}
+
+/// An unbased unsized literal is its value in the state variable's width
+/// (`'1` is state 3 of a 2-bit variable), and states are named `st0`,
+/// `st1`, ... unless every state has a parameter's name. Instances of one
+/// FSM whose parameters give different states stay separate in the design
+/// unit's entry; those with the same states add up.
+#[test]
+fn fill_literals_and_parameterized_instances() {
+    let json = check("fill", FILL, FILL_FSMS);
+    let units = &json[json.find("\"design_units\"").unwrap()..];
+    let unit = &units[units.find("\"design_unit\": \"shaped\"").unwrap()..];
+    let unit = &unit[unit.find("\"fsms\": [").unwrap()..];
+    let unit = &unit[..unit.find('\n').unwrap()];
+    assert_eq!(unit.matches("{\"variable\": \"st\"").count(), 2, "{unit}");
+    // ua alone, then ub and uc together.
+    assert!(
+        unit.contains("{\"name\": \"st2\", \"value\": 2, \"line\": 20, \"count\": 2}"),
+        "{unit}"
+    );
+    assert!(
+        unit.contains("{\"name\": \"st2\", \"value\": 3, \"line\": 20, \"count\": 5}"),
+        "{unit}"
+    );
 }
 
 /// The transition into the first assignment starts from the value the

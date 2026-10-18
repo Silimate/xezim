@@ -816,8 +816,10 @@ state loaded from an input or any other variable, and a cast of a `?:`
 
 **States.** The states are the values the assignments yield and the constants
 the tests compare with. An enum member that no assignment or test names is not a
-state. Each state is named after the parameter or enum member that gives it, or
-`st0`, `st1`, ... in value order when none has a name. Its `line` is that of
+state. Each state is named after the parameter or enum member that gives it
+when every state has such a name, and the states are `st0`, `st1`, ... in value
+order otherwise. An unbased unsized literal (`'1`) is the value it has in the
+state variable's width. Its `line` is that of
 the first transition out of it (preferring one inside a test of the variable),
 as in the reference simulator's report.
 

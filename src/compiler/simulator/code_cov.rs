@@ -1016,9 +1016,15 @@ impl Report {
                 }
             }
         }
+        // Instances of one FSM in different parameterizations can differ in
+        // their states: add to the row of the same shape, if any.
         for f in &o.fsms {
-            let same = self.fsms.iter_mut().find(|m| m.key() == f.key());
-            if !same.is_some_and(|m| m.add(f)) {
+            let added = self
+                .fsms
+                .iter_mut()
+                .filter(|m| m.key() == f.key())
+                .any(|m| m.add(f));
+            if !added {
                 self.fsms.push(f.clone());
             }
         }

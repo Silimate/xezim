@@ -16,6 +16,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* A variable declared in a `for` header whose body does not block takes its
+  declared signedness, not its initializer's, as it already did when the
+  body blocks. `for (bit [3:0] i = 2; i > -1; i--)` ran three times instead
+  of never, and with a typedef of `int`, `for (sint_t i = 2'd2; i >= 0; i--)`
+  never ended (§6.11.1, §11.8.1, §12.7.1).
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

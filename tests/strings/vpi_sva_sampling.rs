@@ -27,7 +27,9 @@ use std::process::Command;
 /// `SVA_RST=<k>`, `rst` is released at the clock's k-th rise instead, from a
 /// cbReadWriteSynch its cbValueChange queues: a cocotb write after
 /// `RisingEdge`. With `SVA_GLITCH=1`, a cbReadWriteSynch queued the same way
-/// lowers the clock again after each rise, in the same time slot.
+/// lowers the clock again after each rise, in the same time slot. With
+/// `SVA_RWNOP=1`, one that does nothing is queued at each rise, as cocotb
+/// does whenever a test has a write pending or awaits `ReadWrite`.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
@@ -135,6 +137,14 @@ static PLI_INT32 glitch_vc(p_cb_data cb) {
     return 0;
 }
 
+static PLI_INT32 rw_nop(p_cb_data cb) { (void)cb; return 0; }
+
+static PLI_INT32 nop_vc(p_cb_data cb) {
+    if (cb->value->value.integer & 1)
+        at(rw_nop, cbReadWriteSynch, 0, NULL);
+    return 0;
+}
+
 static PLI_INT32 start(p_cb_data cb) {
     const char *f = env("SVA_FLAG", "nodelay");
     (void)cb;
@@ -157,6 +167,8 @@ static PLI_INT32 start(p_cb_data cb) {
         at(rst_vc, cbValueChange, 0, clk);
     if (*env("SVA_GLITCH", ""))
         at(glitch_vc, cbValueChange, 0, clk);
+    if (*env("SVA_RWNOP", ""))
+        at(nop_vc, cbValueChange, 0, clk);
     return 0;
 }
 
@@ -224,6 +236,31 @@ module top;
   c_hit: cover property (@(posedge clk) 1) hits++;
   initial #100 $finish;
   final $display("RESULT passes=%0d fails=%0d rises=%0d hits=%0d", passes, fails, rises, hits);
+endmodule
+"#;
+
+/// A single-cycle attempt per rising edge, and a clocking-event waiter that
+/// raises `res` at the third rise (25 ns) and lowers it at the fourth: a
+/// write after that edge's Observed region (§14.13, §4.4.2).
+const CB_SV: &str = r#"
+module top;
+  logic clk = 0, d = 0, rst = 0, tick = 0, res = 0;
+  int passes = 0;
+  initial if ($test$plusargs("hdl")) begin #5 clk = 1; forever #5 clk = ~clk; end
+  always #5 tick = ~tick;
+  clocking cb @(posedge clk); endclocking
+  a_now: assert property (@(posedge clk) disable iff (res) 1'b1) begin
+    passes++;
+    $display("P t=%0t", $time);
+  end
+  initial begin
+    repeat (3) @(cb);
+    res = 1;
+    @(cb);
+    res = 0;
+  end
+  initial #100 $finish;
+  final $display("RESULT passes=%0d", passes);
 endmodule
 "#;
 
@@ -326,6 +363,35 @@ fn vpi_reset_release_at_an_edge_keeps_its_attempt() {
         let text = run(&dir, &so, &env, extra);
         if !text.contains("RESULT passes=8 fails=0 rises=10 hits=10") {
             bad.push(format!("clk={clk}:\n{text}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// §4.4.2: the Observed region comes before the Reactive work of its slot,
+/// whether or not a cbReadWriteSynch is due there. The attempt at 25 ns
+/// passes before the clocking-event waiter raises `res` at that edge, and
+/// the one at 35 ns is disabled; a no-op cbReadWriteSynch queued at each
+/// rise used to hold the assertions back until after the waiter. The
+/// reference simulator agrees for each clock, with and without it.
+#[test]
+fn vpi_synch_routine_keeps_observed_before_reactive() {
+    let (dir, so) = setup("reactive", CB_SV);
+    let mut bad = Vec::new();
+    let want: Vec<String> = [5, 15, 25, 45, 55, 65, 75, 85, 95]
+        .iter()
+        .map(|t| format!("P t={t}"))
+        .collect();
+    for clk in ["delay", "rw", "vc", "none"] {
+        for nop in ["", "1"] {
+            let env = [("SVA_CLK", clk), ("SVA_RWNOP", nop)];
+            let extra: &[&str] = if clk == "none" { &["+hdl"] } else { &[] };
+            let text = run(&dir, &so, &env, extra);
+            let got: Vec<&str> = text.lines().filter(|l| l.starts_with("P t=")).collect();
+            if got != want {
+                bad.push(format!("clk={clk} nop={nop}:\n{text}"));
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

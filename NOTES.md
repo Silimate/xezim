@@ -28,10 +28,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   a later delta of the slot, or a value written in the edge's own
   cbAfterDelay, no longer counts as sampled (§16.5.1, §4.4.2.1). Assertions
   tick only once the slot's cbNBASynch and cbReadWriteSynch routines have
-  run, whether a VPI routine or the design drives the clock, so a reset a
-  cocotb test releases after `RisingEdge` no longer disables that edge's
-  attempt (§4.4.2, §16.12); a clock event is recorded when it happens, so a
-  routine that moves the clock back in the same slot does not lose it.
+  run, whether a VPI routine or the design drives the clock: a
+  cbReadWriteSynch due at an assertion's clock edge now runs before the
+  assertions and that delta's clocking-event waiters, so a reset a cocotb
+  test releases after `RisingEdge` no longer disables that edge's attempt,
+  and one a clocking-event waiter raises at the edge still does not
+  (§4.4.2, §16.12). A clock event is recorded when it happens, so a routine
+  that moves the clock back in the same slot does not lose it.
   (Silimate/xezim#11, Silimate/xezim#56)
 
 * Class task handles and local variables remain alive across same-slot

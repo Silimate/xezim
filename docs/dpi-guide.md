@@ -532,10 +532,13 @@ table. A value written from any of them except `cbReadOnlySynch` opens a
 fresh delta in the same step, so edge-sensitive processes see it. Concurrent
 assertions are evaluated in the step of their clock edge, also when a routine
 writes the clock, once no `cbNBASynch` or `cbReadWriteSynch` is left to run in
-the step (the Observed region follows them, §4.4.2): a reset a
-`cbReadWriteSynch` routine releases at a clock edge, as a cocotb test does
-after `RisingEdge`, does not disable that edge's attempt (`disable iff` reads
-current values). They sample the values the step began with (§16.5.1), from
+the step (the Observed region follows them, §4.4.2). A `cbReadWriteSynch` due
+at an assertion's clock edge therefore runs before the assertions and before
+that delta's clocking-event waiters, instead of after them: a reset it
+releases at the edge, as a cocotb test does after `RisingEdge`, does not
+disable that edge's attempt (`disable iff` reads current values), and one a
+clocking-event waiter raises at the edge comes after it. They sample the values the
+step began with (§16.5.1), from
 before even `cbNextSimTime`, `cbAtStartOfSimTime` and `cbAfterDelay` run, so
 a clock written from `cbReadWriteSynch`, as cocotb's `Clock` does, samples
 like one driven from HDL. A pending callback holds the scheduler at its time

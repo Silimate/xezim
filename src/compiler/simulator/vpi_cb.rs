@@ -741,6 +741,45 @@ impl Simulator {
         }
         self.sva_observed();
     }
+
+    /// §4.4.2: an assertion clock event in a slot where a cbNBASynch or
+    /// cbReadWriteSynch is still due. The Post-NBA region (cbReadWriteSynch)
+    /// comes before the Observed region, and the Observed region before the
+    /// Reactive work (clocking-event waiters, program code) that
+    /// `run_one_tick` and `vpi_open_delta` run after the assertions, while
+    /// cbReadWriteSynch otherwise runs after that work. So record the events
+    /// first (a routine that moves the clock back does not lose one), then
+    /// run the due cbReadWriteSynch routines here, once the Active, Inactive
+    /// and NBA regions are empty: `disable iff` then reads a reset a cocotb
+    /// test releases after `RisingEdge`, and not one a clocking-event waiter
+    /// raises at that edge. The delta their writes open evaluates the
+    /// events. Until those regions are empty, or while a cbNBASynch is due,
+    /// the events wait for a later delta's Observed region.
+    #[inline(never)]
+    pub(super) fn sva_post_nba(&mut self) {
+        self.note_sva_edges();
+        if !self.sva_owed {
+            return;
+        }
+        self.vpi_checkpoint();
+        let now = self.time;
+        let active = self.dirty_any
+            || self.event_queue.next_time() == Some(now)
+            || !self.nba_fast.is_empty()
+            || !self.nba_queue.is_empty()
+            || !self.inactive_queue.is_empty()
+            || (self.vpi_cb_mask & m(CB_NBA_SYNCH) != 0
+                && self.vpi_cb.nba.first().is_some_and(|&(t, _)| t <= now));
+        if !active
+            && self.vpi_cb_mask & m(CB_READ_WRITE_SYNCH) != 0
+            && self.vpi_fire_due(TimedSet::Rw)
+        {
+            self.vpi_open_delta();
+        }
+        if self.sva_owed && !self.finished && !self.vpi_synch_due() {
+            self.tick_sva_sites();
+        }
+    }
     // /silimate
 
     /// Earliest tick a pending simulation-time callback holds the scheduler

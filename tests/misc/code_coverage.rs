@@ -783,6 +783,41 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// An instance that a path-specific `bind` targets runs a specialized copy of
+/// its module; its ports are still typed by the source declaration, so
+/// `--no-toggle-integers` leaves its `int` port out too (§23.11, §6.11).
+#[test]
+fn toggle_integers_left_out_of_bound_instance_ports() {
+    let d = scratch("integer-bound");
+    let src = "\
+module target(input int k, input logic [1:0] l);
+endmodule
+module mon(input int m);
+endmodule
+module tb;
+  int a = 0;
+  logic [1:0] b = 0;
+  target u(.k(a), .l(b));
+  bind target: tb.u mon m0(.m(k));
+  initial begin #1 a = 3; b = 3; #1 $finish; end
+endmodule
+";
+    let k = "{\"signal\": \"k\", \"width\": 32, \"type\": \"int\", ";
+    let l = "{\"signal\": \"l\", \"width\": 2, \"type\": \"logic\", ";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let all = results(&d);
+    let u = scope(&all, "tb.u");
+    assert!(u.contains(k) && u.contains(l), "{u}");
+
+    let out = run(&d, src, &["--code-coverage=toggle", "--no-toggle-integers"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let some = results(&d);
+    let u = scope(&some, "tb.u");
+    assert!(!u.contains(k) && u.contains(l), "{u}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The two-state executors take back a count when they hand a block to the
 /// four-state VM, so both give the same counts (the flop reads x before
 /// `d` is driven).

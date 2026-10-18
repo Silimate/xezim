@@ -1730,10 +1730,12 @@ impl Simulator {
             .collect();
         let types = ToggleTypes {
             module,
+            // A path-specific bind runs a specialized copy of its target
+            // ("target__bind0"); its ports are declared under the source name.
             defs: module
                 .instances
                 .iter()
-                .map(|i| (i.path.as_str(), i.def_name.as_str()))
+                .map(|i| (i.path.as_str(), xezim_core::bind_spec_base(&i.def_name)))
                 .collect(),
             ports: std::cell::OnceCell::new(),
         };

@@ -709,14 +709,21 @@ impl Simulator {
     /// concurrent assertions tick in that slot, with its Preponed samples,
     /// once the active region set is done: after the cbReadWriteSynch
     /// routines still due, whose writes `disable iff` reads (cocotb releases
-    /// a reset after `RisingEdge` that way). Without this they ticked in a
-    /// later delta, after a resample, or in the next slot, and read every
-    /// flop's new value. A slot run by the nested scheduler took no samples.
-    /// Once a routine has finished the run nothing is evaluated (§38.14):
-    /// cocotb ends a test from the value-change callback of the edge, and the
-    /// reference simulator reports no assertion at that edge.
+    /// a reset after `RisingEdge` that way). Until then the clock events are
+    /// only recorded, so a routine that moves the clock back does not lose
+    /// one. Without this the assertions ticked in a later delta, after a
+    /// resample, or in the next slot, and read every flop's new value. A slot
+    /// run by the nested scheduler took no samples. Once a routine has
+    /// finished the run nothing is evaluated (§38.14): cocotb ends a test from
+    /// the value-change callback of the edge, and the reference simulator
+    /// reports no assertion at that edge.
     fn vpi_observed(&mut self) {
-        if !self.finished && self.sva_preponed_time == Some(self.time) && !self.vpi_synch_due() {
+        if self.finished || self.sva_preponed_time != Some(self.time) {
+            return;
+        }
+        if self.vpi_synch_due() {
+            self.note_sva_edges();
+        } else {
             self.tick_sva_sites();
         }
     }

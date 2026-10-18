@@ -26,7 +26,8 @@ use std::process::Command;
 /// at or after `t`, as cocotb does when a test ends on `RisingEdge`. With
 /// `SVA_RST=<k>`, `rst` is released at the clock's k-th rise instead, from a
 /// cbReadWriteSynch its cbValueChange queues: a cocotb write after
-/// `RisingEdge`.
+/// `RisingEdge`. With `SVA_GLITCH=1`, a cbReadWriteSynch queued the same way
+/// lowers the clock again after each rise, in the same time slot.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +127,14 @@ static PLI_INT32 rst_vc(p_cb_data cb) {
     return 0;
 }
 
+static PLI_INT32 rw_low(p_cb_data cb) { (void)cb; put(clk, 0); return 0; }
+
+static PLI_INT32 glitch_vc(p_cb_data cb) {
+    if (cb->value->value.integer & 1)
+        at(rw_low, cbReadWriteSynch, 0, NULL);
+    return 0;
+}
+
 static PLI_INT32 start(p_cb_data cb) {
     const char *f = env("SVA_FLAG", "nodelay");
     (void)cb;
@@ -146,6 +155,8 @@ static PLI_INT32 start(p_cb_data cb) {
         at(fin_vc, cbValueChange, 0, clk);
     if (rst_edge)
         at(rst_vc, cbValueChange, 0, clk);
+    if (*env("SVA_GLITCH", ""))
+        at(glitch_vc, cbValueChange, 0, clk);
     return 0;
 }
 
@@ -198,18 +209,21 @@ endmodule
 "#;
 
 /// One attempt per rising edge (5, 15, ..., 95 ns), each passing at the next
-/// edge unless `disable iff (rst)` cancels it. The clock is the driver's, or
-/// with `+hdl` the design's own.
-const RST_SV: &str = r#"
+/// edge unless `disable iff (rst)` cancels it, and a cover that counts the
+/// edges against the design's own count. The clock is the driver's, or with
+/// `+hdl` the design's own, toggling every 5 ns.
+const EDGE_SV: &str = r#"
 module top;
   logic clk = 0, d = 0, rst = 1, tick = 0;
-  int passes = 0, fails = 0;
+  int passes = 0, fails = 0, rises = 0, hits = 0;
   initial if ($test$plusargs("hdl")) begin #5 clk = 1; forever #5 clk = ~clk; end
   always #5 tick = ~tick;
+  always @(posedge clk) rises++;
   a_rel: assert property (@(posedge clk) disable iff (rst) 1'b1 |=> 1'b1) passes++;
     else fails++;
+  c_hit: cover property (@(posedge clk) 1) hits++;
   initial #100 $finish;
-  final $display("RESULT passes=%0d fails=%0d", passes, fails);
+  final $display("RESULT passes=%0d fails=%0d rises=%0d hits=%0d", passes, fails, rises, hits);
 endmodule
 "#;
 
@@ -304,13 +318,40 @@ fn vpi_finish_at_an_edge_ticks_no_assertion() {
 /// 15 to 85 ns pass. The reference simulator agrees for each clock.
 #[test]
 fn vpi_reset_release_at_an_edge_keeps_its_attempt() {
-    let (dir, so) = setup("reset", RST_SV);
+    let (dir, so) = setup("reset", EDGE_SV);
     let mut bad = Vec::new();
     for clk in ["delay", "rw", "vc", "none"] {
         let env = [("SVA_CLK", clk), ("SVA_RST", "2")];
         let extra: &[&str] = if clk == "none" { &["+hdl"] } else { &[] };
         let text = run(&dir, &so, &env, extra);
-        if !text.contains("RESULT passes=8 fails=0") {
+        if !text.contains("RESULT passes=8 fails=0 rises=10 hits=10") {
+            bad.push(format!("clk={clk}:\n{text}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// §16.5, §4.4.2: a clock event starts the assertion's attempt even when a
+/// cbReadWriteSynch routine of the same slot moves the clock back before the
+/// Observed region. The rise is recorded when it happens and evaluated after
+/// those routines, with the design's own clock (19 rises) and with the
+/// driver's cbReadWriteSynch clock (10 rises; `rst` falls at 40 ns, so the
+/// attempts from 45 to 85 ns pass). The reference simulator gives the same
+/// counts.
+#[test]
+fn vpi_clock_moved_back_in_its_slot_keeps_its_event() {
+    let (dir, so) = setup("glitch", EDGE_SV);
+    let mut bad = Vec::new();
+    let runs = [
+        ("none", "RESULT passes=0 fails=0 rises=19 hits=19"),
+        ("rw", "RESULT passes=5 fails=0 rises=10 hits=10"),
+    ];
+    for (clk, want) in runs {
+        let env = [("SVA_CLK", clk), ("SVA_GLITCH", "1")];
+        let extra: &[&str] = if clk == "none" { &["+hdl"] } else { &[] };
+        let text = run(&dir, &so, &env, extra);
+        if !text.contains(want) {
             bad.push(format!("clk={clk}:\n{text}"));
         }
     }

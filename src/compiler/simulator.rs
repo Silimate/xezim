@@ -3439,6 +3439,9 @@ struct SvaClockedSite {
     /// LSB of the most recent observed clock value. Initialised to a
     /// sentinel (2) so the first tick is treated as "no edge".
     prev_clock: u8,
+    /// The clock event happened and the attempts it starts have not been
+    /// evaluated yet (`sva_note_edges`).
+    fired: bool,
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
@@ -47740,10 +47743,13 @@ impl Simulator {
         self.drain_observed_region();
         // LRM §16.5 SVA clocked property evaluation. Detects edges on
         // each registered clock signal and ticks pending consequents.
-        // §4.4.2: not while a cbNBASynch/cbReadWriteSynch is still due now;
-        // the Observed region follows the whole active region set, and
-        // `vpi_open_delta` ticks the assertions after those routines.
-        if !self.vpi_synch_due() {
+        // §4.4.2: while a cbNBASynch/cbReadWriteSynch is still due now, only
+        // record the clock events: the Observed region follows the whole
+        // active region set, and `vpi_open_delta` evaluates the attempts
+        // after those routines.
+        if self.vpi_synch_due() {
+            self.note_sva_edges();
+        } else {
             self.tick_sva_sites();
         }
         // LRM §14.3 clocking-block input snapshot — refresh per-cycle
@@ -95652,6 +95658,7 @@ impl Simulator {
             node: std::sync::Arc::new(node),
             disable,
             prev_clock,
+            fired: false,
             attempts: Vec::new(),
             past_snapshots: HashMap::default(),
             pass_action: a.action.as_deref().cloned(),
@@ -95970,19 +95977,22 @@ impl Simulator {
         self.class_context_stack = saved_cls;
     }
 
-    fn tick_sva_sites_inner(&mut self) {
-        // §16.14.6.2: the procedural instances queued so far mature (no
-        // flush point can drop them any more); each starts an attempt at the
-        // next tick of its leading clock.
-        if !self.sva_proc_pending.is_empty() {
-            for (idx, _, env) in std::mem::take(&mut self.sva_proc_pending) {
-                if let Some(site) = self.sva_sites.get_mut(idx) {
-                    site.matured.push(env);
-                }
-            }
+    /// Record the assertion clocks' edges now, for a tick deferred until the
+    /// active region set is done (`vpi_observed`): an edge a same-slot
+    /// cbReadWriteSynch routine moves back still starts its attempts.
+    fn note_sva_edges(&mut self) {
+        if self.sva_sites.is_empty() {
+            return;
         }
-        // Use indices so we can call &mut self methods inside the loop
-        // without holding a borrow on self.sva_sites.
+        let saved_this = std::mem::take(&mut self.this_stack);
+        let saved_cls = std::mem::take(&mut self.class_context_stack);
+        self.sva_note_edges();
+        self.this_stack = saved_this;
+        self.class_context_stack = saved_cls;
+    }
+
+    /// Mark each site whose clock event happened since the last call.
+    fn sva_note_edges(&mut self) {
         for i in 0..self.sva_sites.len() {
             let clk_name = &self.sva_sites[i].clock_signal;
             if clk_name.is_empty() {
@@ -96010,6 +96020,29 @@ impl Simulator {
                 if !self.eval_expr(&g).is_true() {
                     continue;
                 }
+            }
+            self.sva_sites[i].fired = true;
+        }
+    }
+
+    fn tick_sva_sites_inner(&mut self) {
+        // §16.14.6.2: the procedural instances queued so far mature (no
+        // flush point can drop them any more); each starts an attempt at the
+        // next tick of its leading clock.
+        if !self.sva_proc_pending.is_empty() {
+            for (idx, _, env) in std::mem::take(&mut self.sva_proc_pending) {
+                if let Some(site) = self.sva_sites.get_mut(idx) {
+                    site.matured.push(env);
+                }
+            }
+        }
+        // Edges since the last call, with those a deferred tick recorded.
+        self.sva_note_edges();
+        // Use indices so we can call &mut self methods inside the loop
+        // without holding a borrow on self.sva_sites.
+        for i in 0..self.sva_sites.len() {
+            if !std::mem::take(&mut self.sva_sites[i].fired) {
+                continue;
             }
             let span_key = self.sva_sites[i].stat_key;
             let site_loc = self.sva_sites[i].stat_loc;

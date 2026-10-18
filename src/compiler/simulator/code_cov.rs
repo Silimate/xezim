@@ -3378,9 +3378,11 @@ impl Simulator {
     /// assignments of its inputs' delta cycle (`step / 2`), and sees the
     /// outputs of the blocks of its own instance written above it that ran
     /// in that cycle too. A term that reads no signal could settle at any
-    /// step. Empty when the item has nothing to replay: the order of its
-    /// terms is never certain, a leaf has side effects (a function call)
-    /// and can't be read again, or a term reads what its own block writes.
+    /// step. Empty when the item has nothing to replay: no two of its terms
+    /// ever change in a certain order, a leaf has side effects (a function
+    /// call) and can't be read again, or a term reads what its own block
+    /// writes. Which terms change together is decided at each evaluation,
+    /// from those that changed (`cov_replay`).
     fn cov_term_steps(
         &self,
         nodes: &[Node],
@@ -3422,7 +3424,10 @@ impl Simulator {
         for s in steps.iter_mut().filter(|s| s.0 > s.1) {
             *s = (0, u32::MAX);
         }
-        if order(&steps, (0..n).collect()).last().is_none_or(|g| g.1 == 0) {
+        // (Some step is in every term's range, so no two of them ever have
+        // a certain order.)
+        let lo = steps.iter().map(|s| s.0).max().unwrap_or(0);
+        if steps.iter().all(|s| s.1 >= lo) {
             return Vec::new();
         }
         steps

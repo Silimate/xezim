@@ -1443,48 +1443,55 @@ endmodule
 }
 
 /// A transient state is counted only when the order of the inputs'
-/// changes is certain whichever signals upstream changed. `a` reads a
-/// deep input that does not change, so its block can settle late, but
-/// when `v` changes, `a` and `b` change together, as the reference
-/// simulator shows: no state with `a` at 0 and `b` at 1 (in an
-/// assignment or a block). `c3` is two blocks behind `a` whatever
-/// changed, so the state between its change and `b`'s counts.
+/// changes is certain whichever signals upstream changed, decided from the
+/// inputs that changed. `a` reads a deep input that does not change, so its
+/// block can settle late, but when `v` changes, `a` and `b` change
+/// together, as the reference simulator shows: no state with `a` at 0 and
+/// `b` at 1 (in an assignment or a block). `c3` is two blocks behind `b`
+/// whatever changed, so the state between their changes counts. `r` could
+/// settle with `p` or with `q`, but it does not change, so the state
+/// between `p`'s change and `q`'s counts (`r` at 0 decides only there).
+/// Every item's covered terms are the reference simulator's with full
+/// signal visibility (it folds `s & enable`, constant here, otherwise).
 #[test]
 fn transient_state_order() {
     let d = scratch("glitchorder");
     let src = "\
 module tb;
-  logic v = 0;
+  logic v = 0, s = 0;
   logic en0 = 1;
   logic e1, e2, e3, enable;
   always_comb e1 = en0;
   always_comb e2 = e1;
   always_comb e3 = e2;
   always_comb enable = e3;
-  // G1: a's block also reads a deep input that does not change
+  // a's block also reads a deep input that does not change
   logic a, b;
   always_comb a = v & enable;
   always_comb b = v;
   wire y1 = a | ~b;
-  // G2: the same with a deep net
-  wire n1 = ~e3;
-  wire n2 = v & n1;
-  wire n3 = v;
-  wire y2 = n2 | ~n3;
-  // G3: a later block of a's, against b: changes after b whichever input changed
+  // a later block of a's, against b: changes after b whichever input changed
   logic c1, c2, c3;
   always_comb c1 = v & enable;
   always_comb c2 = c1;
   always_comb c3 = c2;
-  wire y3 = c3 | ~b;
-  // G4: a combinational block's item on G1's inputs
-  logic z4;
-  always_comb z4 = a | ~b;
+  wire y2 = c3 | ~b;
+  // a combinational block's item on a and b
+  logic z3;
+  always_comb z3 = a | ~b;
+  // a term that does not change beside two that change in order
+  logic p, q, r;
+  always_comb p = v;
+  always_comb q = p;
+  always_comb r = s & enable;
+  wire y4 = q | ~p | r;
   initial begin
     repeat (3) begin
       #1 v = 1;
       #1 v = 0;
     end
+    s = 0;
+    en0 = 1;
     #1 $finish;
   end
 endmodule
@@ -1500,7 +1507,15 @@ endmodule
         vec![(a.to_string(), x), (b.to_string(), y)]
     };
     assert_eq!(terms(&json, 13, "assign"), t("a", [0, 3], "b", [4, 0]));
-    assert_eq!(terms(&json, 27, "statement"), t("a", [0, 3], "b", [4, 0]));
-    assert_eq!(terms(&json, 24, "assign"), t("c3", [3, 3], "b", [4, 3]));
+    assert_eq!(terms(&json, 22, "statement"), t("a", [0, 3], "b", [4, 0]));
+    assert_eq!(terms(&json, 19, "assign"), t("c3", [3, 3], "b", [4, 3]));
+    assert_eq!(
+        terms(&json, 28, "assign"),
+        vec![
+            ("q".to_string(), [3, 3]),
+            ("p".to_string(), [4, 3]),
+            ("r".to_string(), [3, 0])
+        ]
+    );
     let _ = std::fs::remove_dir_all(&d);
 }

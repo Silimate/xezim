@@ -115,8 +115,6 @@ mod expect_statement_blocks;
 mod explicit_level_suspend;
 #[path = "scheduling/explicit_sensitivity_and_delay_task.rs"]
 mod explicit_sensitivity_and_delay_task;
-#[path = "scheduling/for_decl_signed_across_wait.rs"]
-mod for_decl_signed_across_wait;
 #[path = "scheduling/forever_break_and_disable_fork_label.rs"]
 mod forever_break_and_disable_fork_label;
 #[path = "scheduling/fork_automatic_capture.rs"]

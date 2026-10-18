@@ -13,31 +13,37 @@
 //! ports connected to variables, then reads every element back. The expected
 //! lines are the reference simulator's with the ports of net kind, as
 //! §23.2.2.3 declares an `input logic` port.
+//!
+//! tests/dpi/vpi_array_ports_kept.c covers the ports that keep storage of
+//! their own: a two-state port on a four-state actual, and a port with a
+//! second continuous driver on one element.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn setup() -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("xezim_vpi_array_ports_{}", std::process::id()));
+/// A scratch directory and `tests/dpi/<stem>.c` built into it.
+fn setup(stem: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("xezim_{}_{}", stem, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let so = dir.join("vpi_array_ports.so");
+    let so = dir.join(format!("{stem}.so"));
     let ok = Command::new("cc")
         .args(["-shared", "-fPIC", "-Wall", "-Werror", "-I"])
         .arg(root.join("include"))
-        .arg(root.join("tests/dpi/vpi_array_ports.c"))
+        .arg(root.join(format!("tests/dpi/{stem}.c")))
         .arg("-o")
         .arg(&so)
         .status()
         .expect("failed to launch cc")
         .success();
-    assert!(ok, "cc failed for vpi_array_ports.c");
+    assert!(ok, "cc failed for {stem}.c");
     (dir, so)
 }
 
-fn run(dir: &Path, so: &Path, env: &[(&str, &str)]) -> String {
-    let sv = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dpi/vpi_array_ports.sv");
+/// Run `tests/dpi/<stem>.sv` with the library loaded, `env` set.
+fn run(dir: &Path, so: &Path, stem: &str, env: &[(&str, &str)]) -> String {
+    let sv = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/dpi/{stem}.sv"));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.arg("--vpi-lib")
         .arg(so)
@@ -101,11 +107,17 @@ fn expect(text: &str) {
 
 #[test]
 fn vpi_writes_reach_unpacked_array_ports() {
-    let (dir, so) = setup();
+    let stem = "vpi_array_ports";
+    let (dir, so) = setup(stem);
     // Element names stored, as for arrays of this size by default.
-    expect(&run(&dir, &so, &[]));
+    expect(&run(&dir, &so, stem, &[]));
     // Virtual element names (computed from the array's first cell).
-    expect(&run(&dir, &so, &[("XEZIM_VIRTUAL_NAME_MIN_CELLS", "0")]));
+    expect(&run(
+        &dir,
+        &so,
+        stem,
+        &[("XEZIM_VIRTUAL_NAME_MIN_CELLS", "0")],
+    ));
     // No element names for arrays over four elements: the ports of `peek`
     // reach their cells through `array_first_id` alone, and the variables
     // they connect to live in the packed memory arena. Elements are looked
@@ -113,6 +125,7 @@ fn vpi_writes_reach_unpacked_array_ports() {
     let packed = run(
         &dir,
         &so,
+        stem,
         &[
             ("XEZIM_LARGE_ARRAY_NAME_THRESHOLD", "4"),
             ("XEZIM_PACKED_MEM", "1"),
@@ -126,4 +139,31 @@ fn vpi_writes_reach_unpacked_array_ports() {
         packed.contains("[PACKED-MEM] arrays=3 cells=24"),
         "the variables are not in the packed arena:\n{packed}"
     );
+}
+
+/// A port whose cells cannot hold its actual's values, or with a driver of
+/// its own beside its connection, is not collapsed: only `uk` is. The
+/// two-state port keeps the write and its conversion of the actual's z, the
+/// actual keeps its z, and the port with the second driver still follows
+/// its actual through its connection, as the instance reading the actual
+/// does.
+#[test]
+fn unpacked_array_ports_kept_apart() {
+    let stem = "vpi_array_ports_kept";
+    let (dir, so) = setup(stem);
+    let text = run(&dir, &so, stem, &[("XEZIM_DEBUG", "1")]);
+    let _ = std::fs::remove_dir_all(&dir);
+    for line in [
+        "CHK|top.up.a[0]",
+        "CHK|top.up.a[1]",
+        "CHK|top.p[0]",
+        "CHK|top.p[1]",
+        "CHK|top.ue.a[0]",
+        "CHK|top.uk.a[0]",
+        "CHK|top.k[0]",
+        "T|kept|52 86",
+        "[ARRAY-PORT-COLLAPSE] 1 unpacked-array ports collapsed",
+    ] {
+        assert!(text.contains(line), "missing `{line}`:\n{text}");
+    }
 }

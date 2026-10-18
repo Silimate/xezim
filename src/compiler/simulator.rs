@@ -30491,9 +30491,10 @@ impl Simulator {
             .map(|(p, _)| p)
             .collect();
         let mut settled = false;
+        let mut collapsed = vec![false; ports.len()];
         for _ in 0..8 {
             let mut changed = false;
-            for &(port, elems) in &ports {
+            for (k, &(port, elems)) in ports.iter().enumerate() {
                 // The actual's cells sit at one fixed offset from the port's
                 // own, which are consecutive.
                 let mut delta = None;
@@ -30534,12 +30535,17 @@ impl Simulator {
                 }
                 // Typed as a wire in a dump, as a collapsed scalar port is.
                 self.collapsed_port_children.insert(port.to_string());
+                collapsed[k] = true;
                 changed = true;
             }
             if !changed {
                 settled = true;
                 break;
             }
+        }
+        let n = collapsed.iter().filter(|&&c| c).count();
+        if n > 0 && std::env::var_os("XEZIM_DEBUG").is_some() {
+            eprintln!("[ARRAY-PORT-COLLAPSE] {} unpacked-array ports collapsed", n);
         }
         settled
     }

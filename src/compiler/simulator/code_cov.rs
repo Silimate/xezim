@@ -1221,10 +1221,10 @@ pub(crate) struct CodeCov {
     /// The targets of `assign` statements (name, scope), for `cov_steps`.
     assigned: Vec<(String, String)>,
     /// Item evaluations not counted yet (see `Simulator::cov_expr`): the
-    /// item, the process whose write ran it, its node values, and its term
-    /// and constant values.
+    /// item, the process whose write ran it and the settle that did, its
+    /// node values, and its term and constant values.
     #[allow(clippy::type_complexity)]
-    pending: Vec<(u32, usize, Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)>,
+    pending: Vec<(u32, usize, u64, Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)>,
     /// Inside a read that only coverage makes (`Simulator::cov_quietly`):
     /// count nothing.
     quiet: u32,
@@ -3348,10 +3348,13 @@ impl Simulator {
         // A combinational block run while a process is still writing (the
         // settle after one of its blocking writes): the reference simulator
         // runs it once the process waits, on what the process wrote by then.
-        // Its last such evaluation counts then (`cov_flush`).
-        if self.proc_settle_defer {
-            let pid = self.current_pid;
-            // (Another process's last evaluation counts first.)
+        // The evaluations of its last such run count then (`cov_flush`).
+        // (Any settle inside a process is such a one: an interpreted write in
+        // the block clears `proc_settle_defer` for the block's later
+        // statements.)
+        if self.proc_settle_defer || (self.settling && self.proc_depth > 0) {
+            let (pid, run) = (self.current_pid, self.settle_calls);
+            // (Another process's evaluations count first.)
             if self
                 .code_cov
                 .as_ref()
@@ -3359,20 +3362,25 @@ impl Simulator {
             {
                 self.cov_flush_item(id);
             }
-            // The process's exit counts it (`drain_deferred_comb`, which this
+            // The process's exit counts them (`drain_deferred_comb`, which this
             // mark wakes, so a run without coverage checks nothing more).
             if self.code_cov.as_ref().is_some_and(|c| c.pending.is_empty()) {
                 self.deferred_comb.push((usize::MAX, Vec::new()));
             }
             if let Some(c) = self.code_cov.as_mut() {
-                c.pending.retain(|p| p.0 != id);
-                c.pending.push((id, pid, vals, terms));
+                // A later run of the block replaces an earlier one; a loop in
+                // it evaluates the item more than once in one run.
+                c.pending.retain(|p| p.0 != id || p.2 == run);
+                c.pending.push((id, pid, run, vals, terms));
             }
             return v;
         }
-        // (A deferred evaluation of this state is this one, run again.)
+        // (Deferred evaluations this one starts again: the block runs again
+        // on the same inputs, and counts now.)
         if let Some(c) = self.code_cov.as_mut() {
-            c.pending.retain(|p| p.0 != id || p.2 != vals);
+            if c.pending.iter().find(|p| p.0 == id).is_some_and(|p| p.3 == vals) {
+                c.pending.retain(|p| p.0 != id);
+            }
         }
         self.cov_flush_item(id);
         self.cov_count_item(id, &nodes, row0, &vals, terms);
@@ -3395,7 +3403,7 @@ impl Simulator {
         self.cov_rows(nodes, vals, row0);
     }
 
-    /// Count the deferred evaluation of item `id`, if any.
+    /// Count the deferred evaluations of item `id`, if any, in order.
     fn cov_flush_item(&mut self, id: u32) {
         let Some(c) = self.code_cov.as_mut() else {
             return;
@@ -3403,13 +3411,18 @@ impl Simulator {
         if c.pending.is_empty() {
             return;
         }
-        let Some(i) = c.pending.iter().position(|p| p.0 == id) else {
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut c.pending)
+            .into_iter()
+            .partition(|p| p.0 == id);
+        c.pending = rest;
+        if mine.is_empty() {
             return;
-        };
-        let (id, _, vals, terms) = c.pending.remove(i);
+        }
         let s = &c.exprs[id as usize];
         let (nodes, row0) = (s.nodes.clone(), (s.row0, s.bimodal));
-        self.cov_count_item(id, &nodes, row0, &vals, terms);
+        for (id, _, _, vals, terms) in mine {
+            self.cov_count_item(id, &nodes, row0, &vals, terms);
+        }
     }
 
     /// Inside a read that only coverage makes.
@@ -3434,10 +3447,11 @@ impl Simulator {
     /// Count every deferred evaluation (see `cov_expr`): when a process
     /// waits, at the end of a time slot, and before reporting.
     pub(super) fn cov_flush(&mut self) {
-        let ids: Vec<u32> = match self.code_cov.as_ref() {
+        let mut ids: Vec<u32> = match self.code_cov.as_ref() {
             Some(c) => c.pending.iter().map(|p| p.0).collect(),
             None => return,
         };
+        ids.dedup();
         for id in ids {
             self.cov_flush_item(id);
         }

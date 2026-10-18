@@ -1875,3 +1875,78 @@ endmodule
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Every statement of a combinational block run between a process's
+/// writes counts its last run only, also the ones after a statement whose
+/// write the interpreter settles (an item makes each of these one): `y`
+/// never sees `a` and `b` apart, as in the reference simulator.
+#[test]
+fn block_statements_after_a_write_count_once() {
+    let d = scratch("blockwrites");
+    let src = "\
+module tb;
+  logic a = 0, b = 0, x, y;
+  always_comb begin
+    x = a & b;
+    y = a & b;
+  end
+  initial begin
+    repeat (3) begin
+      #1 a = 1; b = 1;
+      #1 a = 0; b = 0;
+    end
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    for line in [4, 5] {
+        assert_eq!(
+            terms(&json, line, "statement"),
+            vec![("a".to_string(), [0, 3]), ("b".to_string(), [0, 3])]
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A loop evaluates an item once per iteration: a block's run between a
+/// process's writes keeps all of them, not only the last (every row is hit
+/// here, as in the reference simulator).
+#[test]
+fn loop_items_in_process_writes() {
+    let d = scratch("loopwrites");
+    let src = "\
+module tb;
+  logic [1:0] v = 2'b00;
+  logic e = 0, t;
+  always_comb begin
+    t = 1'b1;
+    for (int i = 0; i < 2; i++) t = t & v[i];
+  end
+  initial begin
+    #1 v = 2'b01; e = 1;
+    #1 v = 2'b11; e = 0;
+    #1 v = 2'b10; e = 1;
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    assert_eq!(
+        terms(&json, 6, "statement"),
+        vec![("t".to_string(), [1, 3]), ("v[i]".to_string(), [3, 3])]
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

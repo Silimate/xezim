@@ -772,7 +772,15 @@ both of its rows are; coverage is the covered terms over all terms.
   known for `^` and `~^`. A multiplexer's condition decides unless its other
   arm is a constant equal to the taken arm, and each arm decides when the
   condition selects it. A decision passes up through the operators above it.
-  An x or z term gives no row.
+  An x or z term gives no row. A negated `&&` or `||` (`!(a && b)`, `~(a ||
+  b)`) is the reference simulator's `~&` or `~|`: both operands decide as
+  for `&` and `|` (the right one is read even when the left decides, if
+  that has no side effects).
+- **Bimodal items.** An item with `^` or `~^` counts each row by the item's
+  value too, as the reference simulator does: with `^` a term's two rows
+  can both decide the same value (`a ^ b` at (0, 0) and (1, 1) is always
+  0), so a term is covered when its rows were hit at different values of
+  the item.
 - **Transient states.** The reference simulator evaluates an item each time
   one of its inputs changes, so it also sees the delta cycle in which one
   input has its new value and another not yet: in `assign y = d | ~v`, where
@@ -789,6 +797,9 @@ both of its rows are; coverage is the covered terms over all terms.
   output. A combinational block runs after the continuous assignments of its
   inputs' cycle, and sees the outputs of the blocks above it in its module
   that ran in that cycle too. Inputs one process writes change together.
+  A variable an `assign` drives from the top's inputs only changes with
+  them or after them (the testbench writes those through the simulator's
+  interface; cocotb's writes change it with them).
   How late a signal changes depends on which signals upstream changed, so
   each input has an earliest and a latest step (the shortest and the longest
   path to it), and a state between two inputs' changes counts only when one
@@ -799,7 +810,10 @@ both of its rows are; coverage is the covered terms over all terms.
 - **Evaluation.** The interpreter evaluates each item, operator by operator
   as the design would (the right of `&&` is evaluated only when needed, so a
   function call's side effects happen as often as without coverage), so the
-  simulation's results do not change.
+  simulation's results do not change. xezim runs combinational blocks after
+  each blocking write of a process; the reference simulator once the
+  process waits. An item they evaluate meanwhile counts its last such
+  evaluation only, so the process's writes one at a time are not seen.
 
 For example, `if (en && q != 3'd7)` evaluated with `en` at 0 hits `en`'s row 0
 (the right side is not evaluated); with `en` at 1 it hits `en`'s row 1 when
@@ -881,7 +895,7 @@ The results file gains a `code_coverage` member:
 | `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait` |
 | `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count` |
 | `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first |
-| `scopes[].conditions[]`, `.expressions[]` | Every condition and expression item, never-evaluated ones included: `file`, `line`, `kind` (a condition's `if`, `while`, `do` or `ternary`; an expression's `statement`, `assign` or `port`), `block` (the generate block within the scope, when there is one), `text` (the source text) and `terms[]`, each with `term` (its source text) and `hits` (the counts of its rows 0 and 1) |
+| `scopes[].conditions[]`, `.expressions[]` | Every condition and expression item, never-evaluated ones included: `file`, `line`, `kind` (a condition's `if`, `while`, `do` or `ternary`; an expression's `statement`, `assign` or `port`), `block` (the generate block within the scope, when there is one), `text` (the source text) and `terms[]`, each with `term` (its source text), `hits` (the counts of its rows 0 and 1) and, in a bimodal item, `outputs` (`[[row 0 at 0, row 0 at 1], [row 1 at 0, row 1 at 1]]`, by the item's value) |
 | `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches`, `toggles`, `conditions` and `expressions` with the counts of all its instances added up. A statement, arm, bin or row is covered when any instance covered it |
 
 Only the kinds collected appear. Several statements on one line are separate

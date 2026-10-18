@@ -1519,3 +1519,246 @@ endmodule
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// An item with `^` or `~^` is bimodal, as in the reference simulator: its
+/// rows count by the item's value too (`outputs`: row 0 at 0 and at 1, row
+/// 1 at 0 and at 1), and a term is covered when its two rows were hit at
+/// different values of the item (`a1` hits both rows, always at 0). A
+/// negated `&&` or `||` is the reference simulator's `~&` or `~|`: both
+/// operands decide as for `&` and `|` (`p6` at 0 decides only with `q6` at
+/// 1). Every item's covered terms are the reference simulator's on this
+/// design.
+#[test]
+fn bimodal_and_negated_items() {
+    let d = scratch("bimodal");
+    let src = "\
+module tb;
+  // XOR items, each with its own inputs
+  logic a1, b1, a2, b2, a3, b3, c3, a4, b4, a5, b5;
+  wire y1 = a1 ^ b1;            // only (0,0), (1,1): every row at output 0
+  wire y2 = a2 ^ b2;            // (0,0), (1,0): a2 both outputs, b2 only row 0
+  wire y3 = (a3 ^ b3) & c3;     // a3, b3 at (0,0),(1,1) with c3=1; c3 both values with xor 1
+  wire y4 = a4 ~^ b4;           // (0,1), (1,0): every row at output 0
+  logic k5;
+  always_comb if (a5 ^ b5) k5 = 1; else k5 = 0;   // (0,0), (1,1)
+  // negated && and ||
+  logic p6, q6, p7, q7, p8, q8, p9, q9, p10, q10;
+  wire y6 = ~(p6 && q6);        // (0,0), (1,0), (1,1): p6 row 0 only with q6 at 0
+  wire y7 = !(p7 && q7);        // same
+  wire y8 = ~(p8 || q8);        // (1,1), (0,1), (0,0)
+  logic k9, k10;
+  always_comb if (!(p9 && q9)) k9 = 1; else k9 = 0;   // (0,0), (1,0), (1,1)
+  always_comb if (!(p10 || q10)) k10 = 1; else k10 = 0; // (1,1), (0,1), (0,0)
+  initial begin
+    {a1, b1} = 2'b00; {a2, b2} = 2'b00; {a3, b3, c3} = 3'b001; {a4, b4} = 2'b01; {a5, b5} = 2'b00;
+    {p6, q6} = 2'b00; {p7, q7} = 2'b00; {p8, q8} = 2'b11; {p9, q9} = 2'b00; {p10, q10} = 2'b11;
+    #1;
+    {a1, b1} = 2'b11; {a2, b2} = 2'b10; {a3, b3, c3} = 3'b111; {a4, b4} = 2'b10; {a5, b5} = 2'b11;
+    {p6, q6} = 2'b10; {p7, q7} = 2'b10; {p8, q8} = 2'b01; {p9, q9} = 2'b10; {p10, q10} = 2'b01;
+    #1;
+    {a3, b3, c3} = 3'b100; {p6, q6} = 2'b11; {p7, q7} = 2'b11; {p8, q8} = 2'b00; {p9, q9} = 2'b11; {p10, q10} = 2'b00;
+    #1;
+    {a3, b3, c3} = 3'b101;
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=cond,expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    // A bimodal item lists each term's rows by the item's value.
+    assert!(
+        json.contains(
+            "{\"term\": \"a2\", \"hits\": [1, 1], \"outputs\": [[1, 0], [0, 1]]}, \
+             {\"term\": \"b2\", \"hits\": [2, 0], \"outputs\": [[1, 1], [0, 0]]}"
+        ),
+        "{json}"
+    );
+    let t = |a: &str, x: [u64; 2], b: &str, y: [u64; 2]| {
+        vec![(a.to_string(), x), (b.to_string(), y)]
+    };
+    assert_eq!(terms(&json, 12, "assign"), t("p6", [0, 1], "q6", [1, 1]));
+    assert_eq!(terms(&json, 13, "assign"), t("p7", [0, 1], "q7", [1, 1]));
+    assert_eq!(terms(&json, 14, "assign"), t("p8", [1, 0], "q8", [1, 1]));
+    assert_eq!(terms(&json, 16, "if"), t("p9", [0, 1], "q9", [1, 1]));
+    assert_eq!(terms(&json, 17, "if"), t("p10", [1, 0], "q10", [1, 1]));
+    // Covered: a2, a3, b3, c3 and q6, q7, q8 of 15 expression terms; q9
+    // and q10 of 6 condition terms.
+    assert!(
+        json.contains("\"expression\": {\"covered\": 7, \"total\": 15, \"percent\": 46.67}"),
+        "{json}"
+    );
+    assert!(
+        json.contains("\"condition\": {\"covered\": 2, \"total\": 6, \"percent\": 33.33}"),
+        "{json}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The reference simulator runs a continuous assignment, and a
+/// combinational block, once a process writing its inputs waits, so it
+/// never sees the process's writes one at a time (`p = 1; q = 1;`): no row
+/// of `p` or `q` at 0 here. xezim runs the blocks after each blocking
+/// write, and counts their last run only. Every item's covered terms are
+/// the reference simulator's on this design.
+#[test]
+fn process_writes_count_once() {
+    let d = scratch("procwrites");
+    let src = "\
+module tb;
+  logic p = 0, q = 0, w = 0;
+  // V1: a variable driven by a continuous assignment, read by one below it
+  logic cs1;
+  assign cs1 = p & q;
+  logic y1;
+  assign y1 = cs1 & w;
+  // V2: the same with the reader above the driver
+  logic y2, cs2;
+  assign y2 = cs2 & w;
+  assign cs2 = p & q;
+  // V3: a net item reading the variable
+  wire y3 = cs1 & w;
+  // V4: a variable item reading a net
+  wire cs4 = p & q;
+  logic y4;
+  assign y4 = cs4 & w;
+  // V5: a variable item reading an always_comb output above it
+  logic cs5;
+  always_comb cs5 = p & q;
+  logic y5;
+  assign y5 = cs5 & w;
+  initial begin
+    repeat (3) begin
+      #1 p = 1; q = 1; w = 1;
+      #1 p = 0; q = 0; w = 0;
+    end
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let t = |a: &str, x: [u64; 2], b: &str, y: [u64; 2]| {
+        vec![(a.to_string(), x), (b.to_string(), y)]
+    };
+    for line in [5, 11, 15] {
+        assert_eq!(terms(&json, line, "assign"), t("p", [0, 3], "q", [0, 3]));
+    }
+    assert_eq!(terms(&json, 20, "statement"), t("p", [0, 3], "q", [0, 3]));
+    // The states between the continuous assignments' updates still count.
+    assert_eq!(terms(&json, 7, "assign"), t("cs1", [3, 3], "w", [3, 3]));
+    assert_eq!(terms(&json, 22, "assign"), t("cs5", [3, 3], "w", [3, 3]));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A testbench writing the top's inputs through the simulator's interface
+/// the way cocotb does (deposits in the read-write phase, with inertial
+/// delay): a variable an `assign` drives from those inputs changes with
+/// them in the reference simulator, a net one half a cycle later. Every
+/// item's covered terms are the reference simulator's on this design and
+/// library.
+#[test]
+fn testbench_interface_writes() {
+    let d = scratch("vpiwrites");
+    let c = d.join("drive.c");
+    std::fs::write(
+        &c,
+        r#"#include <stddef.h>
+#include "vpi_user.h"
+static vpiHandle h[6];
+static const char *names[6] = {"top.p", "top.q", "top.w", "top.p3", "top.q3", "top.w3"};
+static int step = 0;
+static PLI_INT32 tick(p_cb_data d);
+static void at(PLI_UINT32 t) {
+    s_vpi_time tm = {vpiSimTime, 0, t, 0.0};
+    s_cb_data cb = {cbAfterDelay, tick, NULL, &tm, NULL, 0, NULL};
+    vpi_free_object(vpi_register_cb(&cb));
+}
+static void put_all(int v) {
+    for (int i = 0; i < 6; i++) {
+        s_vpi_value val;
+        val.format = vpiIntVal;
+        val.value.integer = v;
+        s_vpi_time tm = {vpiSimTime, 0, 0, 0.0};
+        vpi_put_value(h[i], &val, &tm, vpiInertialDelay);
+    }
+}
+static PLI_INT32 write(p_cb_data d) {
+    (void)d;
+    put_all(step & 1);
+    return 0;
+}
+static PLI_INT32 tick(p_cb_data d) {
+    (void)d;
+    step++;
+    s_vpi_time tm = {vpiSimTime, 0, 0, 0.0};
+    s_cb_data cb = {cbReadWriteSynch, write, NULL, &tm, NULL, 0, NULL};
+    vpi_free_object(vpi_register_cb(&cb));
+    if (step < 6)
+        at(1);
+    return 0;
+}
+static PLI_INT32 start(p_cb_data d) {
+    (void)d;
+    for (int i = 0; i < 6; i++)
+        h[i] = vpi_handle_by_name((char *)names[i], NULL);
+    put_all(0);
+    at(1);
+    return 0;
+}
+static void reg(void) {
+    s_cb_data cb = {cbStartOfSimulation, start, NULL, NULL, NULL, 0, NULL};
+    vpi_free_object(vpi_register_cb(&cb));
+}
+void (*vlog_startup_routines[])(void) = {reg, 0};
+"#,
+    )
+    .unwrap();
+    let so = d.join("drive.so");
+    let include = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
+    let ok = Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Werror", "-I"])
+        .arg(&include)
+        .arg(&c)
+        .arg("-o")
+        .arg(&so)
+        .status()
+        .expect("failed to launch cc")
+        .success();
+    assert!(ok, "cc failed");
+    let src = "\
+module top(input logic p, q, w, p3, q3, w3, output logic cs, output wire cs3);
+  assign cs = p & q;
+  logic y1;
+  assign y1 = cs & w;
+  assign cs3 = p3 & q3;
+  wire y3 = cs3 & w3;
+endmodule
+";
+    let out = run(
+        &d,
+        src,
+        &["--code-coverage=expr", "--vpi-lib", so.to_str().unwrap(), "-s", "top"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let t = |a: &str, x: [u64; 2], b: &str, y: [u64; 2]| {
+        vec![(a.to_string(), x), (b.to_string(), y)]
+    };
+    assert_eq!(terms(&json, 4, "assign"), t("cs", [0, 3], "w", [0, 3]));
+    assert_eq!(terms(&json, 6, "assign"), t("cs3", [3, 3], "w3", [3, 3]));
+    let _ = std::fs::remove_dir_all(&d);
+}

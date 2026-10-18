@@ -46213,9 +46213,14 @@ impl Simulator {
             return;
         }
         let __sc_before = self.settle_calls;
+        // A blocking write interpreted inside a combinational block that
+        // this kind of settle is running (a `StmtFallback`) gets here too:
+        // keep the outer settle deferring, or the continuous assignments
+        // after that block in its pass see the process's writes so far.
+        let outer = self.proc_settle_defer;
         self.proc_settle_defer = true;
         self.settle_combinatorial();
-        self.proc_settle_defer = false;
+        self.proc_settle_defer = outer;
         // The deferred updates are PENDING WORK: without this, a caller that
         // gates its settle on dirty_any (the tick top) skips the drain and a
         // process in the NEXT slot reads stale nets.
@@ -103580,6 +103585,7 @@ impl Simulator {
             self.fst_write_changes();
         }
         if self.code_cov.is_some() {
+            self.cov_flush();
             self.cov_toggle_sample();
         }
         if self.dump_dirty_active {

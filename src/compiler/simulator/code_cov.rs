@@ -203,6 +203,12 @@ pub(crate) enum Op {
     Not,
     And,
     Or,
+    /// `&&` and `||` under a negation (`!(a && b)`, `~(a || b)`): the
+    /// reference simulator takes them for `~&` and `~|`, so each operand
+    /// decides as for `&` and `|` (both are evaluated when they read
+    /// without side effects).
+    AndFull,
+    OrFull,
     /// `&`, `|`, `^` and `~^` on 1-bit operands.
     BitAnd,
     BitOr,
@@ -236,8 +242,15 @@ pub(crate) struct ExprSite {
     block: String,
     text: String,
     terms: Vec<String>,
-    /// Counter of term `t`'s row `v` (`v` = 0 or 1): `row0 + 2 * t + v`.
+    /// Counter of term `t`'s row `v` (`v` = 0 or 1): `row0 + 2 * t + v`;
+    /// in a `bimodal` item, with the item's value `o`, `row0 + 4 * t + 2 *
+    /// v + o`.
     row0: u32,
+    /// The item has a `^` or `~^`: the reference simulator counts its rows
+    /// by the value the item takes, and a term is covered when its two rows
+    /// were hit with the item at different values (with `^` a term's row
+    /// can decide the same value at both values of the term).
+    bimodal: bool,
     nodes: Arc<[Node]>,
     /// A continuous assignment's: the scope its names resolve in (`None`
     /// inside for the top; see `Simulator::cov_expr`). `None` in a process,
@@ -892,11 +905,11 @@ fn sensitize(nodes: &[Node], i: u32, vals: &[u8], rows: &mut [u8]) {
             go(k0, l == 1 || (l == 0 && r == 0));
             go(k1, l == 0);
         }
-        Op::BitAnd => {
+        Op::BitAnd | Op::AndFull => {
             go(k0, r == 1);
             go(k1, l == 1);
         }
-        Op::BitOr => {
+        Op::BitOr | Op::OrFull => {
             go(k0, r == 0);
             go(k1, l == 0);
         }
@@ -985,8 +998,8 @@ fn replay(nodes: &[Node], i: u32, terms: &[u8], konst: &[u8], vals: &mut [u8]) -
                 }
             }
         }
-        Op::BitAnd | Op::BitOr => {
-            let d = (n.op == Op::BitOr) as u8;
+        Op::BitAnd | Op::BitOr | Op::AndFull | Op::OrFull => {
+            let d = matches!(n.op, Op::BitOr | Op::OrFull) as u8;
             let l = replay(nodes, k0, terms, konst, vals);
             let r = replay(nodes, k1, terms, konst, vals);
             if l == d || r == d {
@@ -1203,6 +1216,13 @@ pub(crate) struct CodeCov {
     /// scope), for `cov_steps`.
     clocked: Vec<(String, HashSet<String>)>,
     inverters: Vec<(String, String, String)>,
+    /// The targets of `assign` statements (name, scope), for `cov_steps`.
+    assigned: Vec<(String, String)>,
+    /// Item evaluations not counted yet (see `Simulator::cov_expr`): the
+    /// item, the process whose write ran it, its node values, and its term
+    /// and constant values.
+    #[allow(clippy::type_complexity)]
+    pending: Vec<(u32, usize, Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)>,
 }
 
 /// The instance a block scope (`u0.u1.genblk2`) belongs to, its longest
@@ -2023,9 +2043,14 @@ impl Instr<'_> {
         }
         let constant = |k: u32| p.nodes[k as usize].op == Op::Const;
         let operators = p.nodes.iter().any(|n| match n.op {
-            Op::And | Op::Or | Op::BitAnd | Op::BitOr | Op::BitXor | Op::BitXnor => {
-                !constant(n.kids[0]) && !constant(n.kids[1])
-            }
+            Op::And
+            | Op::Or
+            | Op::AndFull
+            | Op::OrFull
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::BitXnor => !constant(n.kids[0]) && !constant(n.kids[1]),
             Op::Mux => !constant(n.kids[0]),
             _ => false,
         });
@@ -2041,8 +2066,8 @@ impl Instr<'_> {
         let k = |j: usize| p.konst[kids[j] as usize];
         let value = match op {
             Op::Not => k(0).map(|v| v.map(|v| (v == 0) as u64)),
-            Op::And | Op::BitAnd | Op::Or | Op::BitOr => {
-                let decides = matches!(op, Op::Or | Op::BitOr) as u64;
+            Op::And | Op::BitAnd | Op::AndFull | Op::Or | Op::BitOr | Op::OrFull => {
+                let decides = matches!(op, Op::Or | Op::BitOr | Op::OrFull) as u64;
                 let ctl = |c: Option<Option<u64>>| {
                     c.flatten().is_some_and(|v| (v != 0) as u64 == decides)
                 };
@@ -2151,6 +2176,14 @@ impl Instr<'_> {
         for (j, (k, kt)) in kids.into_iter().enumerate() {
             ks[j] = self.build(k, kt, mux, p);
         }
+        if op == Op::Not {
+            let k = &mut p.nodes[ks[0] as usize].op;
+            *k = match *k {
+                Op::And => Op::AndFull,
+                Op::Or => Op::OrFull,
+                k => k,
+            };
+        }
         let op = Self::fold(p, i, op, ks, terms);
         if op == Op::Const {
             p.system = system;
@@ -2252,7 +2285,11 @@ impl Instr<'_> {
         let src = self.cov.scopes[self.scope as usize].src;
         let id = self.cov.exprs.len() as u32;
         let row0 = self.cov.counters;
-        self.cov.counters += 2 * p.terms.len() as u32;
+        let bimodal = p
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, Op::BitXor | Op::BitXnor));
+        self.cov.counters += (2 + 2 * bimodal as u32) * p.terms.len() as u32;
         self.cov.exprs.push(ExprSite {
             scope: self.scope,
             span: e.span,
@@ -2262,6 +2299,7 @@ impl Instr<'_> {
             text: self.ctx.text(e, src),
             terms: p.terms,
             row0,
+            bimodal,
             nodes: p.nodes.into(),
             hint: self.hint.clone(),
             copy: if self.hint.is_some() {
@@ -2371,7 +2409,9 @@ struct ToggleRow {
 }
 
 /// A condition or expression item: each term with the counts of its two
-/// rows (the term at 0, and at 1, deciding the result).
+/// rows (the term at 0, and at 1, deciding the result), and in a bimodal
+/// item those by the item's value too (row 0 at 0, row 0 at 1, row 1 at 0,
+/// row 1 at 1; see `ExprSite::bimodal`).
 #[derive(Clone)]
 struct ItemRow {
     file: String,
@@ -2382,9 +2422,19 @@ struct ItemRow {
     copy: String,
     text: String,
     terms: Vec<(String, [u64; 2])>,
+    outs: Vec<[u64; 4]>,
 }
 
 impl ItemRow {
+    /// Term `t` is covered: both of its rows were hit, at different values
+    /// of the item when it is bimodal.
+    fn covered(&self, t: usize) -> bool {
+        match self.outs.get(t) {
+            Some(o) => (o[0] > 0 && o[3] > 0) || (o[1] > 0 && o[2] > 0),
+            None => self.terms[t].1[0] > 0 && self.terms[t].1[1] > 0,
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn key(&self) -> (&String, u32, usize, &str, &String, &String, &String) {
         (
@@ -2423,6 +2473,11 @@ fn merge_items(items: &mut Vec<ItemRow>) {
                     x.1[0] += y.1[0];
                     x.1[1] += y.1[1];
                 }
+                for (x, y) in m.outs.iter_mut().zip(&it.outs) {
+                    for (a, b) in x.iter_mut().zip(y) {
+                        *a += b;
+                    }
+                }
             }
             _ => merged.push(it),
         }
@@ -2448,12 +2503,19 @@ fn items_json(items: &[ItemRow], out: &mut String) {
         ));
         for (j, (t, h)) in it.terms.iter().enumerate() {
             out.push_str(&format!(
-                "{}{{\"term\": \"{}\", \"hits\": [{}, {}]}}",
+                "{}{{\"term\": \"{}\", \"hits\": [{}, {}]",
                 if j == 0 { "" } else { ", " },
                 json_escape(t),
                 h[0],
                 h[1]
             ));
+            if let Some(o) = it.outs.get(j) {
+                out.push_str(&format!(
+                    ", \"outputs\": [[{}, {}], [{}, {}]]",
+                    o[0], o[1], o[2], o[3]
+                ));
+            }
+            out.push('}');
         }
         out.push_str("]}");
     }
@@ -2519,11 +2581,7 @@ impl Report {
         for (k, items) in [(3, &self.conds), (4, &self.exprs)] {
             for it in items {
                 t[k].total += it.terms.len() as u64;
-                t[k].covered += it
-                    .terms
-                    .iter()
-                    .filter(|(_, h)| h[0] > 0 && h[1] > 0)
-                    .count() as u64;
+                t[k].covered += (0..it.terms.len()).filter(|&j| it.covered(j)).count() as u64;
             }
         }
         t
@@ -2719,6 +2777,8 @@ impl Simulator {
             writers: HashMap::default(),
             clocked: Vec::new(),
             inverters: Vec::new(),
+            assigned: Vec::new(),
+            pending: Vec::new(),
         };
         // Initial blocks and continuous assignments are instrumented where
         // `compile` and `build_comb_entries` take them (`cov_initial`,
@@ -2936,6 +2996,12 @@ impl Simulator {
             }
             None => return None,
         };
+        // The target of an `assign` (see `cov_steps`).
+        if !port && kinds & (KIND_CONDITION | KIND_EXPRESSION) != 0 {
+            if let Some(n) = Self::cov_lhs_base(&ca.lhs) {
+                cov.assigned.push((n, scope.clone()));
+            }
+        }
         // An inverter, `assign n = ~x` (see `cov_steps`).
         if let (false, true, ExprKind::Ident(_), ExprKind::Unary { op, operand }) = (
             port,
@@ -3245,7 +3311,7 @@ impl Simulator {
         let site = args.first().and_then(marker_id).and_then(|id| {
             let s = self.code_cov.as_ref()?.exprs.get(id as usize)?;
             let replay = s.hint.is_some() || s.proc.is_some();
-            Some((id, s.nodes.clone(), s.row0, s.hint.clone(), replay))
+            Some((id, s.nodes.clone(), (s.row0, s.bimodal), s.hint.clone(), replay))
         });
         let Some((id, nodes, row0, hint, replay)) = site else {
             return self.eval_expr(e);
@@ -3258,25 +3324,108 @@ impl Simulator {
         let saved = hint.map(|h| self.name_resolve_hint.replace(h));
         let mut vals = vec![UNEVALUATED; nodes.len()];
         let v = self.cov_node(&nodes, 0, e, &mut vals);
-        if replay {
-            self.cov_replay(id, &nodes, e, &vals);
-        }
+        let terms = if replay {
+            self.cov_terms(id, &nodes, e, &vals)
+        } else {
+            None
+        };
         if let Some(s) = saved {
             *self.name_resolve_hint.borrow_mut() = s;
         }
-        self.cov_rows(&nodes, &vals, row0);
+        // A combinational block run while a process is still writing (the
+        // settle after one of its blocking writes): the reference simulator
+        // runs it once the process waits, on what the process wrote by then.
+        // Its last such evaluation counts then (`cov_flush`).
+        if self.proc_settle_defer {
+            let pid = self.current_pid;
+            // (Another process's last evaluation counts first.)
+            if self
+                .code_cov
+                .as_ref()
+                .is_some_and(|c| c.pending.iter().any(|p| p.0 == id && p.1 != pid))
+            {
+                self.cov_flush_item(id);
+            }
+            if let Some(c) = self.code_cov.as_mut() {
+                c.pending.retain(|p| p.0 != id);
+                c.pending.push((id, pid, vals, terms));
+            }
+            return v;
+        }
+        // (A deferred evaluation of this state is this one, run again.)
+        if let Some(c) = self.code_cov.as_mut() {
+            c.pending.retain(|p| p.0 != id || p.2 != vals);
+        }
+        self.cov_flush_item(id);
+        self.cov_count_item(id, &nodes, row0, &vals, terms);
         v
     }
 
+    /// Count an evaluation of item `id` (`vals`), with the states its
+    /// terms (`terms`, from `cov_terms`) passed through before it.
+    fn cov_count_item(
+        &mut self,
+        id: u32,
+        nodes: &[Node],
+        row0: (u32, bool),
+        vals: &[u8],
+        terms: Option<(Vec<u8>, Vec<u8>)>,
+    ) {
+        if let Some((cur, konst)) = terms {
+            self.cov_replay(id, nodes, cur, &konst);
+        }
+        self.cov_rows(nodes, vals, row0);
+    }
+
+    /// Count the deferred evaluation of item `id`, if any.
+    fn cov_flush_item(&mut self, id: u32) {
+        let Some(c) = self.code_cov.as_mut() else {
+            return;
+        };
+        if c.pending.is_empty() {
+            return;
+        }
+        let Some(i) = c.pending.iter().position(|p| p.0 == id) else {
+            return;
+        };
+        let (id, _, vals, terms) = c.pending.remove(i);
+        let s = &c.exprs[id as usize];
+        let (nodes, row0) = (s.nodes.clone(), (s.row0, s.bimodal));
+        self.cov_count_item(id, &nodes, row0, &vals, terms);
+    }
+
+    /// Count every deferred evaluation (see `cov_expr`): at the end of a
+    /// time slot, and before reporting.
+    pub(super) fn cov_flush(&mut self) {
+        let ids: Vec<u32> = match self.code_cov.as_ref() {
+            Some(c) => c.pending.iter().map(|p| p.0).collect(),
+            None => return,
+        };
+        for id in ids {
+            self.cov_flush_item(id);
+        }
+    }
+
     /// Count the rows of the terms that decide an item's value, given its
-    /// node values.
-    fn cov_rows(&mut self, nodes: &[Node], vals: &[u8], row0: u32) {
+    /// node values (`row0`: the item's first counter, and whether it is
+    /// bimodal: then by the item's value, and not when that is unknown).
+    fn cov_rows(&mut self, nodes: &[Node], vals: &[u8], row0: (u32, bool)) {
+        let (row0, bimodal) = (row0.0 as usize, row0.1);
+        let out = vals[0] as usize;
+        if bimodal && out > 1 {
+            return;
+        }
         let mut rows = [0u8; MAX_TERMS];
         sensitize(nodes, 0, vals, &mut rows);
         for (t, r) in rows.iter().enumerate() {
             for b in 0..2 {
                 if r & (1 << b) != 0 {
-                    if let Some(h) = self.code_cov_hits.get_mut(row0 as usize + 2 * t + b) {
+                    let c = if bimodal {
+                        row0 + 4 * t + 2 * b + out
+                    } else {
+                        row0 + 2 * t + b
+                    };
+                    if let Some(h) = self.code_cov_hits.get_mut(c) {
                         *h += 1;
                     }
                 }
@@ -3295,18 +3444,54 @@ impl Simulator {
     /// order is certain whichever signals upstream changed (`order`): after
     /// each group but the last, its terms and the earlier ones have their
     /// new values and the others their old ones.
-    fn cov_replay(&mut self, id: u32, nodes: &[Node], e: &Expression, vals: &[u8]) {
+    fn cov_replay(&mut self, id: u32, nodes: &[Node], cur: Vec<u8>, konst: &[u8]) {
         let Some(site) = self
             .code_cov
-            .as_ref()
-            .and_then(|c| c.exprs.get(id as usize))
+            .as_mut()
+            .and_then(|c| c.exprs.get_mut(id as usize))
         else {
             return;
         };
-        if site.steps.as_ref().is_some_and(|s| s.is_empty()) {
+        let (n, row0) = (site.terms.len(), (site.row0, site.bimodal));
+        let last = std::mem::replace(&mut site.last, cur.clone());
+        let Some(steps) = site.steps.as_ref().filter(|_| last.len() == n) else {
             return;
+        };
+        let groups = order(steps, (0..n).filter(|&t| cur[t] != last[t]).collect());
+        // (The last group's state is the evaluation itself.)
+        let states: Vec<Vec<u8>> = (0..groups.last().map_or(0, |g| g.1))
+            .map(|k| {
+                let mut state = last.clone();
+                for &(t, _) in groups.iter().filter(|g| g.1 <= k) {
+                    state[t] = cur[t];
+                }
+                state
+            })
+            .collect();
+        for state in states {
+            let mut v = vec![UNEVALUATED; nodes.len()];
+            replay(nodes, 0, &state, konst, &mut v);
+            self.cov_rows(nodes, &v, row0);
         }
-        let (n, row0) = (site.terms.len(), site.row0);
+    }
+
+    /// The values of item `id`'s terms in evaluation `vals`, and those of
+    /// its constants that decide whether a `?:` condition is masked, for
+    /// `cov_replay`: what the evaluation saw, and what it skipped (all of
+    /// it reads without side effects: `cov_term_steps`). `None` when the
+    /// item has nothing to replay.
+    fn cov_terms(
+        &mut self,
+        id: u32,
+        nodes: &[Node],
+        e: &Expression,
+        vals: &[u8],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let site = self.code_cov.as_ref()?.exprs.get(id as usize)?;
+        if site.steps.as_ref().is_some_and(|s| s.is_empty()) {
+            return None;
+        }
+        let n = site.terms.len();
         let mut leaves = Vec::new();
         leaves_of(nodes, 0, e, &mut leaves);
         if site.steps.is_none() {
@@ -3319,11 +3504,8 @@ impl Simulator {
             {
                 s.steps = Some(steps);
             }
-            return self.cov_replay(id, nodes, e, vals);
+            return self.cov_terms(id, nodes, e, vals);
         }
-        // The term values, and those of the constants that decide whether a
-        // `?:` condition is masked: what the evaluation saw, and what it
-        // skipped (all of it reads without side effects: `cov_term_steps`).
         let mut cur = vec![UNEVALUATED; n];
         let mut konst = vec![UNEVALUATED; nodes.len()];
         for &(i, x) in &leaves {
@@ -3343,33 +3525,7 @@ impl Simulator {
                 _ => konst[i] = v,
             }
         }
-        let Some(site) = self
-            .code_cov
-            .as_mut()
-            .and_then(|c| c.exprs.get_mut(id as usize))
-        else {
-            return;
-        };
-        let last = std::mem::replace(&mut site.last, cur.clone());
-        let Some(steps) = site.steps.as_ref().filter(|_| last.len() == n) else {
-            return;
-        };
-        let groups = order(steps, (0..n).filter(|&t| cur[t] != last[t]).collect());
-        // (The last group's state is the evaluation itself.)
-        let states: Vec<Vec<u8>> = (0..groups.last().map_or(0, |g| g.1))
-            .map(|k| {
-                let mut state = last.clone();
-                for &(t, _) in groups.iter().filter(|g| g.1 <= k) {
-                    state[t] = cur[t];
-                }
-                state
-            })
-            .collect();
-        for state in states {
-            let mut v = vec![UNEVALUATED; nodes.len()];
-            replay(nodes, 0, &state, &konst, &mut v);
-            self.cov_rows(nodes, &v, row0);
-        }
+        Some((cur, konst))
     }
 
     /// When each term of an item can settle, for `cov_replay`: the earliest
@@ -3460,10 +3616,12 @@ impl Simulator {
     /// `initial` block or the testbench writes 1 later. Also notes which
     /// block writes each combinational block output.
     pub(super) fn cov_steps(&mut self) {
-        let (inverters, clocked) = match self.code_cov.as_mut() {
-            Some(c) if c.exprs.iter().any(|s| s.hint.is_some() || s.proc.is_some()) => {
-                (std::mem::take(&mut c.inverters), std::mem::take(&mut c.clocked))
-            }
+        let (inverters, clocked, assigned) = match self.code_cov.as_mut() {
+            Some(c) if c.exprs.iter().any(|s| s.hint.is_some() || s.proc.is_some()) => (
+                std::mem::take(&mut c.inverters),
+                std::mem::take(&mut c.clocked),
+                std::mem::take(&mut c.assigned),
+            ),
             _ => return,
         };
         let n = self.signal_table.len();
@@ -3473,6 +3631,26 @@ impl Simulator {
             for id in names.iter().filter_map(|x| self.cov_signal(x, Some(scope))) {
                 if id < n {
                     always[id] = true;
+                }
+            }
+        }
+        // A variable an `assign` drives from the top's inputs only: with the
+        // testbench writing those through the simulator's interface, the
+        // reference simulator updates it with them, so it can change with
+        // them or after.
+        let mut loose = vec![false; n];
+        for id in assigned.iter().filter_map(|(x, scope)| self.cov_signal(x, Some(scope))) {
+            if id < n && !self.module.nets.contains(self.name_for_id(id)) {
+                loose[id] = true;
+            }
+        }
+        let mut top = vec![false; n];
+        for (name, _) in self.vpi_port_directions.iter().filter(|(name, dir)| {
+            !name.contains('.') && matches!(dir, PortDirection::Input | PortDirection::Inout)
+        }) {
+            if let Some(&id) = self.signal_name_to_id.get(&**name) {
+                if id < n {
+                    top[id] = true;
                 }
             }
         }
@@ -3530,19 +3708,35 @@ impl Simulator {
                     continue;
                 };
                 let writes = &e.cold.write_signal_ids;
-                let reads: Vec<(u32, u32)> = e
+                let reads: Vec<(u32, u32, u32)> = e
                     .cold
                     .read_signal_ids
                     .iter()
                     .filter(|&&r| r < n && !writes.contains(&r))
                     .map(|&r| {
                         let d = if process { 2 } else { u32::from(!net[r]) };
-                        (steps[r].0.saturating_add(d), steps[r].1 + d)
+                        (steps[r].0, steps[r].1, d)
                     })
                     .collect();
-                let lo = reads.iter().map(|r| r.0).min().unwrap_or(0);
-                let hi = reads.iter().map(|r| r.1).max().unwrap_or(0);
+                let inputs = e
+                    .cold
+                    .read_signal_ids
+                    .iter()
+                    .all(|&r| r < n && top[r]);
                 for &w in writes.iter().filter(|&&w| w < n) {
+                    let soon = |r: &(u32, u32, u32)| {
+                        if loose[w] && inputs && !process {
+                            0
+                        } else {
+                            r.2
+                        }
+                    };
+                    let lo = reads
+                        .iter()
+                        .map(|r| r.0.saturating_add(soon(r)))
+                        .min()
+                        .unwrap_or(0);
+                    let hi = reads.iter().map(|r| r.1 + r.2).max().unwrap_or(0);
                     let (lo, hi) = match inv.get(&w) {
                         Some(&x) if !process && always[x] => steps[x],
                         _ => (lo, hi),
@@ -3581,19 +3775,27 @@ impl Simulator {
                     o.bitwise_not()
                 }
             }
-            (Op::And, ExprKind::Binary { left, right, .. }) => {
+            (Op::And | Op::AndFull, ExprKind::Binary { left, right, .. }) => {
                 let l = self.cov_node(nodes, k0, left, vals);
-                // §11.3.5: only a known 0 on the left skips the right.
+                // §11.3.5: only a known 0 on the left skips the right. Under
+                // a negation the right decides too, so it is read all the
+                // same when that has no side effects.
                 if !l.has_xz() && l.to_u64() == Some(0) {
+                    if n.op == Op::AndFull && pure(right) {
+                        self.cov_node(nodes, k1, right, vals);
+                    }
                     Value::from_u64(0, 1)
                 } else {
                     let r = self.cov_node(nodes, k1, right, vals);
                     l.logic_and(&r)
                 }
             }
-            (Op::Or, ExprKind::Binary { left, right, .. }) => {
+            (Op::Or | Op::OrFull, ExprKind::Binary { left, right, .. }) => {
                 let l = self.cov_node(nodes, k0, left, vals);
                 if l.to_u64().is_some_and(|v| v != 0) {
+                    if n.op == Op::OrFull && pure(right) {
+                        self.cov_node(nodes, k1, right, vals);
+                    }
                     Value::from_u64(1, 1)
                 } else {
                     let r = self.cov_node(nodes, k1, right, vals);
@@ -3925,7 +4127,17 @@ impl Simulator {
         for x in &cov.exprs {
             let src = cov.scopes[x.scope as usize].src;
             let (file, line) = lines.locate(x.span, src).unwrap_or_default();
-            let row = |t: usize, v: usize| count(x.row0 + 2 * t as u32 + v as u32);
+            let outs: Vec<[u64; 4]> = if x.bimodal {
+                (0..x.terms.len() as u32)
+                    .map(|t| std::array::from_fn(|j| count(x.row0 + 4 * t + j as u32)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let row = |t: usize, v: usize| match outs.get(t) {
+                Some(o) => o[2 * v] + o[2 * v + 1],
+                None => count(x.row0 + 2 * t as u32 + v as u32),
+            };
             let item = ItemRow {
                 file,
                 line,
@@ -3940,6 +4152,7 @@ impl Simulator {
                     .enumerate()
                     .map(|(t, name)| (name.clone(), [row(t, 0), row(t, 1)]))
                     .collect(),
+                outs,
             };
             let r = &mut reports[x.scope as usize];
             if x.condition {

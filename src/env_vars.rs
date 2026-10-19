@@ -188,6 +188,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Coverage: exclude (default) or keep the code a constant condition rules out, like --code-coverage-constant; the flag wins",
     ),
     (
+        "XEZIM_CODE_COVERAGE_EXPRESSIONS",
+        "Coverage: all (default) or logical, like --code-coverage-expressions; logical scores only the conditions with && or ||, a term covered once it was 0 and 1; the flag wins",
+    ),
+    (
+        "XEZIM_CODE_COVERAGE_GRANULARITY",
+        "Coverage: statement (default) or block, like --code-coverage-granularity; block counts straight-line blocks, implicit else and default arms included; the flag wins",
+    ),
+    (
         "XEZIM_COMB_GRAPH",
         "Profiling: write the comb operand graph (entry read/write ids, edge-block write ids) to the given path",
     ),
@@ -408,6 +416,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_FOREACH_REPLAY_LIMIT",
         "Bytecode: max foreach unroll replay count",
+    ),
+    (
+        "XEZIM_FSM_RESET_TRANSITIONS",
+        "Coverage: =0 leaves out the FSM transitions only a reset makes, like --no-fsm-reset-transitions; the flag wins",
     ),
     (
         "XEZIM_FST_COMMIT_LOG",
@@ -814,6 +826,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_TEMPLATE_CENSUS",
         "Profiling: group compiled blocks by canonical shape; report repeated-template dynamic coverage (wants COMB_PATHS + EDGE_BLOCK_STATS)",
+    ),
+    (
+        "XEZIM_TOGGLE_ENUMS",
+        "Coverage: =0 leaves enum variables out of toggle coverage, like --no-toggle-enums; the flag wins",
+    ),
+    (
+        "XEZIM_TOGGLE_GENERATE",
+        "Coverage: =0 leaves the signals declared in generate blocks out of toggle coverage, like --no-toggle-generate; the flag wins",
     ),
     (
         "XEZIM_TOGGLE_INPUT_PORTS",

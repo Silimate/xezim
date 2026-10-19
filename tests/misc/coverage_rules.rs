@@ -1,0 +1,385 @@
+//! The other counting rules of code coverage (docs/coverage-guide.md,
+//! "Counting rules"), each off by default: `--no-toggle-enums`,
+//! `--no-toggle-generate`, `--code-coverage-expressions=logical`,
+//! `--code-coverage-granularity=block` and `--no-fsm-reset-transitions`.
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn xezim() -> String {
+    let mut p = std::env::current_exe().expect("current_exe");
+    p.pop();
+    if p.ends_with("deps") {
+        p.pop();
+    }
+    p.join("xezim").to_string_lossy().into_owned()
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("xezim_cov_rules_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Run xezim on `src` in `dir` with `args`, and return the results file.
+fn run(dir: &Path, src: &str, args: &[&str]) -> String {
+    std::fs::write(dir.join("t.sv"), src).unwrap();
+    let out = Command::new(xezim())
+        .current_dir(dir)
+        .env("XEZIM_COV_DB", dir.join("cov.json"))
+        .env_remove("XEZIM_CODE_COVERAGE")
+        .env_remove("XEZIM_TOGGLE_ENUMS")
+        .env_remove("XEZIM_TOGGLE_GENERATE")
+        .env_remove("XEZIM_TOGGLE_INTEGERS")
+        .env_remove("XEZIM_TOGGLE_INPUT_PORTS")
+        .env_remove("XEZIM_CODE_COVERAGE_EXPRESSIONS")
+        .env_remove("XEZIM_CODE_COVERAGE_GRANULARITY")
+        .env_remove("XEZIM_FSM_RESET_TRANSITIONS")
+        .args(args)
+        .arg("t.sv")
+        .output()
+        .expect("run xezim");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(dir.join("cov.json")).unwrap()
+}
+
+/// The text of scope `name`'s entry in a results file.
+fn scope<'a>(json: &'a str, name: &str) -> &'a str {
+    let at = json
+        .find(&format!("\"scope\": \"{name}\","))
+        .unwrap_or_else(|| panic!("no scope {name}: {json}"));
+    let rest = &json[at..];
+    let end = [
+        rest[1..].find("\"scope\": \""),
+        rest.find("\"design_units\""),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The values of `key` (a string field) in the order they appear.
+fn strings<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
+    let pat = format!("\"{key}\": \"");
+    text.split(&pat)
+        .skip(1)
+        .map(|s| &s[..s.find('"').unwrap()])
+        .collect()
+}
+
+const TOGGLES: &str = "\
+typedef enum logic [1:0] {A, B, C} st_t;
+module sub #(parameter N = 2) (input logic clk, output logic [1:0] o);
+  logic [1:0] r;
+  if (N > 1) begin
+    logic [1:0] ub;
+    always @(posedge clk) ub <= ub + 1;
+  end
+  if (N > 1) begin : lb
+    logic [1:0] lab;
+    always @(posedge clk) lab <= lab + 1;
+  end
+  for (genvar i = 0; i < 2; i++) begin : fl
+    logic f;
+    always @(posedge clk) f <= ~f;
+  end
+  always @(posedge clk) r <= r + 1;
+  assign o = r;
+endmodule
+module tb;
+  logic clk = 0;
+  st_t st;
+  struct { logic m; logic [1:0] k; } us;
+  wire [1:0] o;
+  sub u(.clk, .o);
+  always #5 clk = ~clk;
+  initial begin st = A; us.m = 0; us.k = 0; #12 st = C; us.m = 1; us.k = 3; #20 $finish; end
+endmodule
+";
+
+/// `--no-toggle-enums` leaves enum variables out of toggle coverage;
+/// `--no-toggle-generate` leaves out the signals declared in a generate
+/// block: an unlabeled branch's (`ub`, bare in its instance), a labeled
+/// one's (`lb.lab`) and a loop's (`fl[0].f`). Module-scope signals, ports
+/// and the members of an unpacked struct stay. By default both are counted.
+#[test]
+fn toggle_enums_and_generate_blocks_left_out() {
+    let d = scratch("toggles");
+    let all = run(&d, TOGGLES, &["--code-coverage=toggle"]);
+    assert_eq!(
+        strings(scope(&all, "tb"), "signal"),
+        ["clk", "o", "st", "us", "us.k", "us.m"]
+    );
+    assert_eq!(
+        strings(scope(&all, "tb.u"), "signal"),
+        ["clk", "fl[0].f", "fl[1].f", "lb.lab", "o", "r", "ub"]
+    );
+    let enums = run(
+        &d,
+        TOGGLES,
+        &["--code-coverage=toggle", "--no-toggle-enums"],
+    );
+    assert_eq!(
+        strings(scope(&enums, "tb"), "signal"),
+        ["clk", "o", "us", "us.k", "us.m"]
+    );
+    let generate = run(
+        &d,
+        TOGGLES,
+        &["--code-coverage=toggle", "--no-toggle-generate"],
+    );
+    assert_eq!(
+        strings(scope(&generate, "tb"), "signal"),
+        ["clk", "o", "st", "us", "us.k", "us.m"]
+    );
+    assert_eq!(
+        strings(scope(&generate, "tb.u"), "signal"),
+        ["clk", "o", "r"]
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const ITEMS: &str = "\
+module m(input logic clk, input logic a, b, c, input logic [1:0] v, output logic y, z);
+  assign y = a && b;
+  always @(posedge clk) begin
+    if (a && b) z <= 1;
+    if (a) z <= 0;
+    if (v == 2'd1) z <= 1;
+    if ((a & b) || c) z <= 0;
+    if (!a && v) z <= 1;
+  end
+endmodule
+module tb;
+  logic clk = 0, a = 0, b = 0, c = 0; logic [1:0] v = 0; wire y, z;
+  m u(.clk, .a, .b, .c, .v, .y, .z);
+  always #5 clk = ~clk;
+  initial begin #17 a = 1; b = 0; #10 c = 1; v = 2; #10 $finish; end
+endmodule
+";
+
+/// `--code-coverage-expressions=logical` scores only the conditions that
+/// hold a `&&` or `||`, with their operands as terms: `(a & b) || c` has
+/// the terms `a & b` and `c`, `!a && v` has `!a` and `v`. A condition
+/// without one (`if (a)`, `if (v == 2'd1)`) and an assignment's value
+/// (`assign y = a && b`) are no items. A term is covered once it has been
+/// 0 and 1, whether or not it decided the value: `a` of `a && b` is 1 only
+/// while `b` is 0, which the default rules (the term must decide) don't
+/// count.
+#[test]
+fn logical_conditions_scored_by_term_values() {
+    let d = scratch("logical");
+    let all = run(&d, ITEMS, &["--code-coverage=cond,expr"]);
+    let u = scope(&all, "tb.u");
+    assert_eq!(
+        strings(u, "text"),
+        ["a && b", "v == 2'd1", "(a & b) || c", "!a && v", "a && b"]
+    );
+    assert!(u.contains("{\"term\": \"a\", \"hits\": [2, 0]}"), "{u}");
+    let logical = run(
+        &d,
+        ITEMS,
+        &[
+            "--code-coverage=cond,expr",
+            "--code-coverage-expressions=logical",
+        ],
+    );
+    let u = scope(&logical, "tb.u");
+    assert_eq!(strings(u, "text"), ["a && b", "(a & b) || c", "!a && v"]);
+    assert_eq!(strings(u, "term"), ["a", "b", "a & b", "c", "!a", "v"]);
+    assert!(u.contains("{\"term\": \"a\", \"hits\": [2, 2]}"), "{u}");
+    assert!(
+        u.contains("\"condition\": {\"covered\": 3, \"total\": 6, \"percent\": 50.00}"),
+        "{u}"
+    );
+    assert!(
+        u.contains("\"expression\": {\"covered\": 0, \"total\": 0"),
+        "{u}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const BLOCKS: &str = "\
+module m(input logic clk, input logic rst, input logic [1:0] s, output logic [3:0] q);
+  logic x, y, z;
+  assign z = x ^ y;
+  always @(posedge clk) begin
+    x <= 1;
+    if (rst) q <= 0;
+    else begin
+      q <= q + 1;
+      case (s)
+        2'd0: q <= 1;
+        2'd1: q <= 2;
+      endcase
+    end
+    y <= x;
+  end
+  always @(posedge clk)
+    if (s == 2'd3) x <= 0;
+  initial begin
+    for (int i = 0; i < 2; i++) begin
+      y = i[0];
+    end
+    #1 y = 0;
+    z = 1;
+  end
+endmodule
+module tb;
+  logic clk = 0, rst = 1; logic [1:0] s = 0; wire [3:0] q;
+  m u(.clk, .rst, .s, .q);
+  always #5 clk = ~clk;
+  initial begin #12 rst = 0; s = 0; #10 s = 1; #10 s = 2; #10 $finish; end
+endmodule
+";
+
+/// `--code-coverage-granularity=block` counts straight-line blocks, each
+/// at its first statement: a process body up to its first branch (5), each
+/// arm (6, 8, 10, 11), the code after a branch (14) or a loop, a loop body
+/// (20) and the code after a delay (22, with 23). An implicit `else` or
+/// `default` is a block of its own (9, 17), run when no written arm is. A
+/// continuous assignment (3) and the `always` construct itself are no
+/// blocks.
+#[test]
+fn block_granularity() {
+    let d = scratch("blocks");
+    let json = run(
+        &d,
+        BLOCKS,
+        &[
+            "--code-coverage=stmt,branch",
+            "--code-coverage-granularity=block",
+        ],
+    );
+    let u = scope(&json, "tb.u");
+    let rows: Vec<(u32, &str)> = u
+        .split("{\"file\": \"t.sv\", \"line\": ")
+        .skip(1)
+        .take_while(|r| r.contains("\"count\"") && !r.contains("\"arms\""))
+        .map(|r| {
+            let line = r[..r.find(',').unwrap()].parse().unwrap();
+            let kind = strings(r, "kind")[0];
+            (line, kind)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (5, "block"),
+            (6, "block"),
+            (8, "block"),
+            (9, "default (implicit)"),
+            (10, "block"),
+            (11, "block"),
+            (14, "block"),
+            (17, "block"),
+            (17, "else (implicit)"),
+            (17, "block"),
+            (19, "block"),
+            (20, "block"),
+            (22, "block"),
+        ],
+        "{u}"
+    );
+    assert!(
+        u.contains("\"statement\": {\"covered\": 12, \"total\": 13, \"percent\": 92.31}"),
+        "{u}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const FSM: &str = "\
+module m(input logic clk, input logic rst, input logic go, output logic busy);
+  typedef enum logic [1:0] {IDLE, RUN, DONE} st_t;
+  st_t st;
+  always @(posedge clk or posedge rst)
+    if (rst) st <= IDLE;
+    else case (st)
+      IDLE: if (go) st <= RUN;
+      RUN: st <= DONE;
+      DONE: if (!go) st <= RUN;
+    endcase
+  assign busy = st != IDLE;
+endmodule
+module tb;
+  logic clk = 0, rst = 1, go = 0; wire busy;
+  m u(.clk, .rst, .go, .busy);
+  always #5 clk = ~clk;
+  initial begin #12 rst = 0; go = 1; #30 go = 0; #20 rst = 1; #10 rst = 0; #20 $finish; end
+endmodule
+";
+
+/// `--no-fsm-reset-transitions` leaves out the transitions that only the
+/// state process's reset branch makes (`RUN -> IDLE`, `DONE -> IDLE`); the
+/// others stay. A state that stays put is never a transition.
+#[test]
+fn fsm_reset_transitions_left_out() {
+    let d = scratch("fsm");
+    let all = run(&d, FSM, &["--code-coverage=fsm"]);
+    let pairs = |json: &str| {
+        let u = scope(json, "tb.u");
+        strings(u, "from")
+            .into_iter()
+            .zip(strings(u, "to"))
+            .map(|(f, t)| format!("{f}->{t}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        pairs(&all),
+        [
+            "IDLE->RUN",
+            "RUN->IDLE",
+            "RUN->DONE",
+            "DONE->IDLE",
+            "DONE->RUN"
+        ]
+    );
+    let logic = run(
+        &d,
+        FSM,
+        &["--code-coverage=fsm", "--no-fsm-reset-transitions"],
+    );
+    assert_eq!(pairs(&logic), ["IDLE->RUN", "RUN->DONE", "DONE->RUN"]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Each switch is also an environment variable, which the flag overrides.
+#[test]
+fn rules_from_the_environment() {
+    let d = scratch("env");
+    std::fs::write(d.join("t.sv"), TOGGLES).unwrap();
+    let out = Command::new(xezim())
+        .current_dir(&d)
+        .env("XEZIM_COV_DB", d.join("cov.json"))
+        .env("XEZIM_TOGGLE_ENUMS", "0")
+        .env("XEZIM_TOGGLE_GENERATE", "0")
+        .args(["--code-coverage=toggle", "--toggle-enums", "t.sv"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let json = std::fs::read_to_string(d.join("cov.json")).unwrap();
+    assert!(
+        strings(scope(&json, "tb"), "signal").contains(&"st"),
+        "{json}"
+    );
+    assert_eq!(strings(scope(&json, "tb.u"), "signal"), ["clk", "o", "r"]);
+    let bad = Command::new(xezim())
+        .current_dir(&d)
+        .env("XEZIM_CODE_COVERAGE_GRANULARITY", "line")
+        .args(["--code-coverage", "t.sv"])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("want statement or block"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

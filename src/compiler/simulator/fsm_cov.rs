@@ -1442,6 +1442,7 @@ impl Simulator {
             ran: Vec::new(),
             scratch: Vec::new(),
         };
+        let reset_transitions = super::code_cov::code_coverage().is_none_or(|c| c.fsm_reset);
         // Who assigns what: variable -> blocks assigning it whole, and the
         // variables some block assigns in part.
         let mut writers: HashMap<&str, Vec<usize>> = HashMap::default();
@@ -1657,6 +1658,9 @@ impl Simulator {
                 // the last in the source.
                 let mut best: BTreeMap<(u32, u32), ((bool, bool, usize), Span, Span)> =
                     BTreeMap::new();
+                // The transitions some assignment outside the reset branch
+                // makes.
+                let mut logic: HashSet<(u32, u32)> = HashSet::default();
                 for r in &recs {
                     let Some(&to) = index.get(&r.value) else {
                         continue;
@@ -1666,11 +1670,19 @@ impl Simulator {
                         if v == r.value || !r.ctx.holds(v) {
                             continue;
                         }
+                        if !r.reset {
+                            logic.insert((from, to));
+                        }
                         let e = best.entry((from, to)).or_insert((rank, r.span, r.from));
                         if rank >= e.0 {
                             *e = (rank, r.span, r.from);
                         }
                     }
+                }
+                // `--no-fsm-reset-transitions`: a transition only the reset
+                // branch makes is no transition.
+                if !reset_transitions {
+                    best.retain(|k, _| logic.contains(k));
                 }
                 if best.is_empty() {
                     continue;

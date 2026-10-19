@@ -358,6 +358,8 @@ mod static_collection_per_spec;
 mod static_init_sysfuncs;
 #[path = "misc/static_local_per_spec.rs"]
 mod static_local_per_spec;
+#[path = "misc/static_local_select_write.rs"]
+mod static_local_select_write;
 #[path = "misc/static_method_via_handle.rs"]
 mod static_method_via_handle;
 #[path = "misc/static_property_access.rs"]

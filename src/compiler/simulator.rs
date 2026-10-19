@@ -53968,7 +53968,7 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_expr(&args[3]);
+                        let val = self.eval_target_rhs(lvalue, &args[3]);
                         let saved = self.make_intra_saved_expr(val, rvalue.span);
                         let assign = Statement::new(
                             StatementKind::BlockingAssign {
@@ -89375,7 +89375,7 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(1) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_expr(&args[3]);
+                        let val = self.eval_target_rhs(packed_lvalue, &args[3]);
                         let saved = self.make_intra_saved_expr(val, rvalue.span);
                         let edge = match edge_code {
                             1 => Some(Edge::Posedge),
@@ -89493,7 +89493,7 @@ impl Simulator {
                         .packed_pattern_for_lhs(lvalue, items)
                         .or_else(|| self.eval_packed_struct_pattern(lvalue, items))
                         .unwrap_or_else(|| self.eval_expr(rvalue)),
-                    _ => self.eval_expr(rvalue),
+                    _ => self.eval_target_rhs(packed_lvalue, rvalue),
                 };
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
@@ -125197,6 +125197,23 @@ impl Simulator {
             w
         };
         self.eval_expr_ctx(rvalue, w)
+    }
+
+    /// The right-hand side of an assignment the interpreter evaluates apart
+    /// from the blocking path: a nonblocking one (§10.4.2) and an
+    /// intra-assignment event control (§9.4.5). Its operators still take the
+    /// target's width as context (§11.6.1), so `s <= a16 + b16` into an
+    /// 18-bit `s` keeps the carry. Evaluated self-determined, the sum lost
+    /// it whenever the statement ran here instead of as bytecode, for
+    /// example in a `for` loop bounded by `$clog2(...)`.
+    fn eval_target_rhs(&mut self, lvalue: &Expression, rvalue: &Expression) -> Value {
+        if !Self::rhs_takes_context(rvalue) {
+            return self.eval_expr(rvalue);
+        }
+        match self.infer_lhs_width(lvalue) {
+            0 => self.eval_expr(rvalue),
+            w => self.eval_assign_rhs(lvalue, rvalue, w),
+        }
     }
 
     /// Only an operator takes a width from its context; a plain operand

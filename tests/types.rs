@@ -157,6 +157,8 @@ mod lrm_struct_union_dims;
 mod module_type_param_behavioral;
 #[path = "types/multi_dim_elem_read_and_param_dims.rs"]
 mod multi_dim_elem_read_and_param_dims;
+#[path = "types/nba_context_width.rs"]
+mod nba_context_width;
 #[path = "types/nested_packed_member_lvalue.rs"]
 mod nested_packed_member_lvalue;
 #[path = "types/nested_packed_struct_array_access.rs"]

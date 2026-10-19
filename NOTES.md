@@ -333,6 +333,27 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§6.16, §6.18, §6.24.3, §11.4.12).
   (#391, reported by urbanij; #396, contributed by Ganesh-TNL)
 
+* Code coverage collects condition and expression coverage, as focused
+  expression coverage: each logic condition (`if`, `while`, `?:`) and 1-bit
+  logic value (procedural and continuous assignments, input ports connected
+  to expressions) is split into input terms, and each term's rows at 0 and
+  at 1 count when the term alone decides the result, short-circuit aware
+  (§11.3.5). `--code-coverage=cond,expr`, `+cover=ce` and `-coverage E`
+  select them; bare `--code-coverage`, `+cover` and `-coverage` (or
+  `-coverage all`) now collect them too. Each
+  scope in `xezim_cov.json` gains `condition` and `expression` totals
+  (covered terms) and `conditions[]`/`expressions[]`, every item with its
+  terms and their row counts. An item of a continuous assignment, or at the
+  top level of a combinational `always` block, also counts the transient
+  states its inputs pass through in a time slot, replayed in the reference
+  simulator's delta-cycle order (#75). Items with `^`, `~^` or `?:` count rows
+  by the item's value (bimodal), and a negated `&&`/`||` decides as
+  `~&`/`~|`, as in the reference simulator. On the design instances of 23 CVDP
+  designs, the items and terms match the reference simulator's report on 22
+  and the covered terms on 18. The items in code that a constant condition
+  rules out are left out, like its statements and arms. Off by default; a run
+  without it compiles and runs as before. (#48)
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and

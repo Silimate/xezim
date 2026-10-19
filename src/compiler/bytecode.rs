@@ -1912,6 +1912,13 @@ pub struct BytecodeCompiler<'a> {
     /// interpreted fragment would stop the entry re-firing. Off by default;
     /// enabled only at the edge-block compile site.
     allow_expr_fallback: bool,
+    /// Compile a code coverage item (`$__xz_cove`) as an expression
+    /// fallback even where those are off, instead of failing the whole
+    /// statement over to the AST interpreter (whose continuous assignments
+    /// leave their scope behind for later name resolution). Set at the
+    /// continuous-assignment compile sites, where it is safe: an
+    /// assignment's reads come from its expression, not its compiled stream.
+    cov_fallback: bool,
     /// User-task table for inlining zero-arg, non-blocking task bodies.
     /// Task-enable (`task_name;`) statements that resolve here get their
     /// bodies compiled in place instead of emitting a single StmtFallback
@@ -2171,6 +2178,7 @@ impl<'a> BytecodeCompiler<'a> {
             inline_foreign: 0,
             reg_var_loop_depth: 0,
             allow_expr_fallback: false,
+            cov_fallback: false,
             tasks: None,
             functions: None,
             dpi_import_fds: None,
@@ -2781,6 +2789,11 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_expr_fallback(&mut self, allow: bool) {
         self.allow_expr_fallback = allow;
+    }
+
+    /// See `cov_fallback`.
+    pub fn set_cov_fallback(&mut self, on: bool) {
+        self.cov_fallback = on;
     }
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
@@ -14684,6 +14697,21 @@ impl<'a> BytecodeCompiler<'a> {
                     None
                 }
                 crate::compiler::simulator::COV_COND_FN => self.compile_cov_cond(args),
+                // A condition or expression coverage item: the interpreter
+                // evaluates it term by term (see `simulator::code_cov`).
+                crate::compiler::simulator::COV_EXPR_FN => {
+                    let saved = (self.allow_ast_fallback, self.allow_expr_fallback);
+                    if self.cov_fallback {
+                        self.allow_ast_fallback = true;
+                        self.allow_expr_fallback = true;
+                    }
+                    let r = self.emit_expr_fallback(expr, ctx_width, "cov_expr");
+                    (self.allow_ast_fallback, self.allow_expr_fallback) = saved;
+                    if r.is_none() {
+                        self.bail("cov_expr");
+                    }
+                    r
+                }
                 // §21.3.3 `$sformatf` with a LITERAL template and specs the
                 // native filler covers exactly — parsed once here, filled
                 // from register Values at exec. Anything else (non-literal
@@ -27907,6 +27935,9 @@ pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
         "$urandom" | "$urandom_range" | "$stime" | "$shortrealtobits" => (32, false),
         "$onehot" | "$onehot0" | "$isunknown" | "$isunbounded" | "$rose" | "$fell" | "$stable"
         | "$changed" => (1, false),
+        // A code coverage item: a 1-bit logic expression. Sized here so
+        // that no width probe evaluates (and counts) it a second time.
+        crate::compiler::simulator::COV_EXPR_FN => (1, false),
         "$time" | "$realtobits" => (64, false),
         _ => return None,
     })

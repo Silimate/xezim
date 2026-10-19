@@ -1848,7 +1848,8 @@ fn kinds_and_spellings() {
         let k = json[start..start + json[start..].find(']').unwrap()].to_string();
         (k, json, out)
     };
-    let all = "\"statement\", \"branch\", \"toggle\", \"fsm\"";
+    let all =
+        "\"statement\", \"branch\", \"toggle\", \"condition\", \"expression\", \"fsm\"";
     for args in [
         &["--code-coverage"][..],
         &["--code-coverage=all"],

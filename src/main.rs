@@ -233,9 +233,10 @@ fn print_usage() {
                    enabled by XEZIM_COMPAT=1."
     );
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
-    eprintln!("                   stmt, branch, toggle, fsm (or all, the default). Counts go to");
-    eprintln!("                   xezim_cov.json (XEZIM_COV_DB) with the functional coverage;");
-    eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
+    eprintln!("                   stmt, branch, cond, expr, toggle, fsm (or all, the default).");
+    eprintln!("                   Counts go to xezim_cov.json (XEZIM_COV_DB) with the");
+    eprintln!("                   functional coverage; --verbose prints a summary.");
+    eprintln!("                   XEZIM_CODE_COVERAGE=<kinds> too.");
     eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
     eprintln!("                   subtrees (tb.dut) and packages. Repeatable.");
     eprintln!("  --no-toggle-input-ports  Leave input and inout ports out of toggle coverage:");
@@ -421,11 +422,11 @@ fn print_usage() {
     );
     eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
     eprintln!("  -define <N>[=<v>], -incdir <dir>, -top <module>  Same as -D, -I, -s");
-    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, t,");
-    eprintln!("                   f = stmt, branch, toggle, fsm; bare = all four. Other letters");
-    eprintln!("                   are ignored with a warning");
-    eprintln!("  -coverage <types>  all, or B:E:F:T:U letters: B = stmt + branch, T = toggle,");
-    eprintln!("                   F = fsm; E is ignored with a warning, U adds nothing");
+    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, c,");
+    eprintln!("                   e, t, f = stmt, branch, cond, expr, toggle, fsm; bare = all.");
+    eprintln!("                   Other letters are ignored with a warning");
+    eprintln!("  -coverage <types>  all, or B:E:F:T:U letters: B = stmt + branch, E = cond +");
+    eprintln!("                   expr, T = toggle, F = fsm; U adds nothing");
     eprintln!("  -covworkdir <dir>, -covscope <name>, -covtest <name>  Write the results to");
     eprintln!("                   <dir>/<scope>/<test>/xezim_cov.json (cov_work/scope/test)");
     eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -access <spec>,");
@@ -3066,8 +3067,6 @@ fn run_main() -> i32 {
             let names: Vec<String> = unsupported
                 .chars()
                 .map(|c| match c {
-                    'c' => "condition (c)".to_string(),
-                    'e' => "expression (e)".to_string(),
                     'x' => "extended toggle (x)".to_string(),
                     _ => format!("'{}'", c),
                 })
@@ -3075,6 +3074,8 @@ fn run_main() -> i32 {
             let kept: Vec<&str> = [
                 (xezim::compiler::simulator::KIND_STATEMENT, "statement"),
                 (xezim::compiler::simulator::KIND_BRANCH, "branch"),
+                (xezim::compiler::simulator::KIND_CONDITION, "condition"),
+                (xezim::compiler::simulator::KIND_EXPRESSION, "expression"),
                 (xezim::compiler::simulator::KIND_TOGGLE, "toggle"),
                 (xezim::compiler::simulator::KIND_FSM, "FSM"),
             ]

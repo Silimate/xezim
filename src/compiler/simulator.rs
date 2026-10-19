@@ -2544,11 +2544,12 @@ mod vpi_cb;
 mod vpi_model;
 use assert_ctl::{AssertCtl, CtlIdent, CtlSite};
 pub(crate) use code_cov::{
-    COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
+    COND_FN as COV_COND_FN, EXPR_FN as COV_EXPR_FN, HIT_TASK as COV_HIT_TASK,
+    marker_id as cov_marker_id,
 };
 pub use code_cov::{
-    CodeCoverage, KIND_ALL, KIND_BRANCH, KIND_FSM, KIND_STATEMENT, KIND_TOGGLE,
-    parse_constant_mode as parse_code_coverage_constant_mode,
+    CodeCoverage, KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_FSM, KIND_STATEMENT,
+    KIND_TOGGLE, parse_constant_mode as parse_code_coverage_constant_mode,
     parse_kinds as parse_code_coverage_kinds, set_code_coverage,
 };
 use event_stamps::{EventId, EventStampStore, NamedEventPlan, NamedEventTarget};
@@ -19430,6 +19431,7 @@ impl Simulator {
         }
         mark_compile_phase("structural delay setup", &mut compile_phase_start);
         self.build_comb_entries();
+        self.cov_steps();
         self.dump_comb_graph();
         #[cfg(feature = "jit")]
         self.jit_compile_comb_entries();
@@ -37811,6 +37813,8 @@ impl Simulator {
             let cov_counter = if self.code_cov.is_some() {
                 Self::cov_contassign(
                     &self.module,
+                    &self.signal_name_to_id,
+                    &self.signal_widths,
                     &mut self.code_cov,
                     &mut self.code_cov_hits,
                     &mut ca,
@@ -38150,6 +38154,7 @@ impl Simulator {
                 // instantiation passes it; this one simply never did.
                 compiler.set_functions(&self.module.functions);
                 compiler.top_module_name = Some(self.module.name.clone());
+                compiler.set_cov_fallback(self.code_cov.is_some());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
                 }
@@ -38236,6 +38241,7 @@ impl Simulator {
                 // inline its calls and stayed on the AST interpreter.
                 compiler.set_functions(&self.module.functions);
                 compiler.top_module_name = Some(self.module.name.clone());
+                compiler.set_cov_fallback(self.code_cov.is_some());
                 if let Some(c) = cov_counter {
                     compiler.emit_cov_hit(c);
                 }
@@ -52109,6 +52115,9 @@ impl Simulator {
     }
 
     fn note_comb_ran_in_process(&mut self, eidx: usize, entry: &CombEntry) {
+        // Code coverage: the items this run skipped count nothing from
+        // earlier runs.
+        self.cov_block_ran(entry);
         if entry.cold.write_signal_ids.is_empty() {
             return;
         }
@@ -52167,6 +52176,8 @@ impl Simulator {
             return;
         }
         let mut pending = std::mem::take(&mut self.deferred_comb);
+        // `usize::MAX`: code coverage's mark (see `cov_expr`).
+        let cov = pending.iter().any(|p| p.0 == usize::MAX);
         for (eidx, snap) in pending.iter() {
             let eidx = *eidx;
             let clobbered = snap
@@ -52218,6 +52229,9 @@ impl Simulator {
         }
         self.deferred_comb_pool
             .extend(pending.into_iter().map(|(_, v)| v));
+        if cov {
+            self.cov_flush();
+        }
     }
 
     /// §4.5 boundary: run the process, then let the ACTIVE-region work its
@@ -66148,7 +66162,14 @@ impl Simulator {
                             // edge-block fix in exec_bytecode.
                             *self.name_resolve_hint.borrow_mut() =
                                 entries[eidx].cold.scope_hint.clone();
+                            // A blocking write the interpreter runs here
+                            // settles (`settle_after_proc_write`), which clears
+                            // the deferral of this settle: keep it, or the
+                            // continuous assignments after this entry see a
+                            // writing process's writes one at a time.
+                            let defer = self.proc_settle_defer;
                             self.eval_ast_comb_entry(&entries[eidx]);
+                            self.proc_settle_defer = defer;
                             if self.proc_depth > 0
                                 && matches!(entries[eidx].item, CombItem::AlwaysBlock { .. })
                             {
@@ -66215,18 +66236,21 @@ impl Simulator {
                                     // resolved the bare array name, found nothing, and
                                     // dropped every write. Pure-bytecode blocks pre-resolve
                                     // their ids, so this costs them one bool test.
+                                    // (A fallback's blocking write clears this
+                                    // settle's deferral, as in the AST arm.)
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
                                         if let Some(sc) = entries[eidx].cold.scope_hint.as_ref() {
                                             *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
                                         }
-                                        Some(prev)
+                                        Some((prev, self.proc_settle_defer))
                                     } else {
                                         None
                                     };
                                     self.exec_insns(insns);
-                                    if let Some(prev) = saved_hint {
+                                    if let Some((prev, defer)) = saved_hint {
                                         *self.name_resolve_hint.borrow_mut() = prev;
+                                        self.proc_settle_defer = defer;
                                     }
                                     self.timescale_scope_override = saved_ts;
                                     n_ab += 1;
@@ -74838,6 +74862,7 @@ impl Simulator {
     ) -> Value {
         match name.as_str() {
             COV_COND_FN => return self.cov_cond(args),
+            COV_EXPR_FN => return self.cov_expr(args),
             // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
             // (stashed by the suspend path; see make_intra_saved_expr).
             INTRA_SAVED_MARKER => {
@@ -98933,6 +98958,9 @@ impl Simulator {
             let span_key = self.sva_sites[i].stat_key;
             let attempts = std::mem::take(&mut self.sva_sites[i].attempts);
             if disabled {
+                // Cancelled by the guard, as `sva_cancel_disabled` counts them.
+                let inst = self.sva_sites[i].inst;
+                self.assert_insts[inst].disabled += attempts.len() as u64;
                 self.finished = was_finished;
                 continue;
             }
@@ -108755,6 +108783,7 @@ impl Simulator {
             self.fst_write_changes();
         }
         if self.code_cov.is_some() {
+            self.cov_flush();
             self.cov_toggle_sample();
             self.cov_fsm_sample();
         }

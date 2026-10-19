@@ -125232,19 +125232,42 @@ impl Simulator {
     /// example in a `for` loop bounded by `$clog2(...)`.
     ///
     /// §11.4.1 has a side-effecting lvalue index (`v[i++ +: 18] = @(e) ...`)
-    /// evaluated once, when the assignment captures its target.
-    /// `infer_lhs_width` doesn't evaluate an indexed select's start, but its
-    /// class-aggregate lookup may evaluate indices, so with class objects
-    /// live such a right-hand side stays self-determined.
+    /// evaluated once, when the assignment captures its target, so the
+    /// width lookup must not evaluate it (see `effect_free_target_width`).
     fn eval_target_rhs(&mut self, lvalue: &Expression, rvalue: &Expression) -> Value {
-        if !Self::rhs_takes_context(rvalue)
-            || (!self.no_class_objects() && Self::lvalue_has_incdec_index(lvalue))
-        {
+        if !Self::rhs_takes_context(rvalue) {
             return self.eval_expr(rvalue);
         }
-        match self.infer_lhs_width(lvalue) {
+        match self.effect_free_target_width(lvalue) {
             0 => self.eval_expr(rvalue),
             w => self.eval_assign_rhs(lvalue, rvalue, w),
+        }
+    }
+
+    /// The width of an assignment target, or 0 when finding it would
+    /// evaluate a side-effecting index. Only an indexed part-select of a
+    /// plain base (`v[i++ +: 18]`) has a width that doesn't depend on such an
+    /// index: `infer_lhs_width` reads only its constant width. An element or
+    /// member target (`arr[i++].f`) is sized by reading it, and the
+    /// class-aggregate lookup may evaluate indices, so those give 0 and keep
+    /// the old self-determined evaluation.
+    fn effect_free_target_width(&mut self, lvalue: &Expression) -> u32 {
+        if !Self::lvalue_has_incdec_index(lvalue) {
+            return self.infer_lhs_width(lvalue);
+        }
+        match &lvalue.kind {
+            ExprKind::RangeSelect {
+                expr,
+                right,
+                kind: RangeKind::IndexedUp | RangeKind::IndexedDown,
+                ..
+            } if self.no_class_objects()
+                && !Self::lvalue_has_incdec_index(expr)
+                && Self::cond_expr_is_effect_free(right, false) =>
+            {
+                self.infer_lhs_width(lvalue)
+            }
+            _ => 0,
         }
     }
 

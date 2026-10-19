@@ -696,6 +696,11 @@ testbench signals' counts: `clk` rose and fell four times, `rst` only fell and
   a waveform dump sees it: a signal that goes 0, 1, 0 within one time slot, even
   across delta cycles, does not toggle. The first comparison is with the value
   the signal starts with.
+- Values a VPI client writes are sampled the same way, at the end of the time
+  slot they are written in. One written at time 0 or before it (cocotb writes
+  its first values from `cbStartOfSimulation` and that slot's
+  `cbReadWriteSynch`) is the signal's time-0 value, the baseline its first
+  toggle is counted from.
 - Tracked: every net and variable of an integral type declared in a module or
   interface instance: `logic`, `bit` and `reg` vectors, nets, `int`, `integer`,
   `byte`, `shortint`, `longint`, enums and packed structs (both as plain bit

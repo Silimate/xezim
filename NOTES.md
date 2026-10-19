@@ -31,6 +31,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   functions is now sampled in the Preponed region like the others; it was
   read after the tick's NBAs, so `$rose(q)` of a flop fired one tick early
   and `$past(q)` returned the current tick's value (§16.5.1, §16.9.3).
+* A value a VPI client writes at time 0 is the toggle-coverage baseline.
+  Values written from the end-of-slot callbacks (`cbReadWriteSynch`,
+  `cbAtEndOfSimTime`) reach toggle coverage and the waveform dumps in their
+  own time slot, not the next one, and a value written from
+  `cbStartOfSimulation` is evaluated in the time-0 slot even when nothing
+  else runs there. cocotb writes its first values from both, so in a design
+  with nothing of its own at time 0 every signal those values reached lost
+  its first toggle. A toggle is counted once per time slot from the slot's
+  net change, so a value changed and changed back in later deltas of the
+  same slot no longer counts (§38.36.2, §38.36.3). (Silimate/xezim#35)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

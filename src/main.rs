@@ -242,6 +242,10 @@ fn print_usage() {
     eprintln!("                   the signal that drives one carries its toggles. By default");
     eprintln!("                   each instance counts its own ports (--toggle-input-ports).");
     eprintln!("                   XEZIM_TOGGLE_INPUT_PORTS=0 too.");
+    eprintln!("  --no-toggle-integers  Leave variables of an integer type (int, integer,");
+    eprintln!("                   shortint, longint, byte) out of toggle coverage, as some");
+    eprintln!("                   simulators do by default. --toggle-integers keeps them (the");
+    eprintln!("                   default). XEZIM_TOGGLE_INTEGERS=0 too.");
     eprintln!("  --code-coverage-constant=<exclude|keep>  Statements and branch arms a");
     eprintln!("                   constant condition (a parameter's value) rules out are left");
     eprintln!("                   out of the totals (exclude, the default) or counted (keep).");
@@ -1892,6 +1896,8 @@ fn run_main() -> i32 {
     let mut code_cov_kinds: Option<u8> = None;
     let mut code_cov_scopes: Vec<String> = Vec::new();
     let mut toggle_input_ports: Option<bool> = None;
+    // `--[no-]toggle-integers`.
+    let mut code_cov_integers: Option<bool> = None;
     let mut code_cov_keep: Option<bool> = None;
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
@@ -2511,6 +2517,12 @@ fn run_main() -> i32 {
             "--no-toggle-input-ports" => {
                 toggle_input_ports = Some(false);
             }
+            "--toggle-integers" => {
+                code_cov_integers = Some(true);
+            }
+            "--no-toggle-integers" => {
+                code_cov_integers = Some(false);
+            }
             _ if arg == "--code-coverage-constant"
                 || arg.starts_with("--code-coverage-constant=") =>
             {
@@ -2908,6 +2920,27 @@ fn run_main() -> i32 {
     // flag wins) leaves them to the signal that drives them.
     let input_ports = toggle_input_ports
         .unwrap_or_else(|| env::var("XEZIM_TOGGLE_INPUT_PORTS").ok().as_deref() != Some("0"));
+    // Integer variables are toggle-tracked unless `--no-toggle-integers` or
+    // XEZIM_TOGGLE_INTEGERS=0 leaves them out; the flag wins.
+    let integers = match code_cov_integers {
+        Some(on) => on,
+        None => match env::var("XEZIM_TOGGLE_INTEGERS").as_deref() {
+            Err(_) | Ok("") | Ok("1") => true,
+            Ok("0") => false,
+            Ok(v) => {
+                eprintln!("Error: XEZIM_TOGGLE_INTEGERS={}: want 0 or 1", v);
+                std::process::exit(1);
+            }
+        },
+    };
+    if let Some(on) = code_cov_integers {
+        if code_cov & xezim::compiler::simulator::KIND_TOGGLE == 0 {
+            eprintln!(
+                "Warning: --{}toggle-integers has no effect without toggle coverage",
+                if on { "" } else { "no-" }
+            );
+        }
+    }
     // `--code-coverage-constant` wins over XEZIM_CODE_COVERAGE_CONSTANT.
     let keep_constant = match code_cov_keep {
         Some(k) => k,
@@ -2930,6 +2963,7 @@ fn run_main() -> i32 {
                 kinds: code_cov,
                 scopes: code_cov_scopes,
                 exclude_input_ports: !input_ports,
+                integers,
                 keep_constant,
             },
         ));

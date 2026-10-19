@@ -30,6 +30,7 @@ fn run(dir: &Path, src: &str, args: &[&str]) -> Output {
         .env("XEZIM_COV_DB", dir.join("cov.json"))
         .env_remove("XEZIM_CODE_COVERAGE")
         .env_remove("XEZIM_TOGGLE_INPUT_PORTS")
+        .env_remove("XEZIM_TOGGLE_INTEGERS")
         .env_remove("XEZIM_CODE_COVERAGE_CONSTANT")
         .env_remove("XEZIM_VERBOSE")
         .args(args)
@@ -304,15 +305,15 @@ endmodule
     );
     let json = results(&d);
     for row in [
-        "{\"signal\": \"x\", \"width\": 1, \"rise\": [1], \"fall\": [1]}",
-        "{\"signal\": \"g\", \"width\": 1, \"rise\": [0], \"fall\": [0]}",
-        "{\"signal\": \"v\", \"width\": 2, \"rise\": [1, 0], \"fall\": [0, 0]}",
-        "{\"signal\": \"o\", \"width\": 1, \"rise\": [1], \"fall\": [1]}",
+        "{\"signal\": \"x\", \"width\": 1, \"type\": \"logic\", \"rise\": [1], \"fall\": [1]}",
+        "{\"signal\": \"g\", \"width\": 1, \"type\": \"logic\", \"rise\": [0], \"fall\": [0]}",
+        "{\"signal\": \"v\", \"width\": 2, \"type\": \"logic\", \"rise\": [1, 0], \"fall\": [0, 0]}",
+        "{\"signal\": \"o\", \"width\": 1, \"type\": \"logic\", \"rise\": [1], \"fall\": [1]}",
     ] {
         assert!(json.contains(row), "{row}: {json}");
     }
     assert!(
-        json.contains("{\"signal\": \"n\", \"width\": 32, \"rise\": [1, 1, 0,"),
+        json.contains("{\"signal\": \"n\", \"width\": 32, \"type\": \"int\", \"rise\": [1, 1, 0,"),
         "{json}"
     );
     for name in ["mem", "r", "a", "u"] {
@@ -344,7 +345,7 @@ fn scope<'a>(json: &'a str, name: &str) -> &'a str {
 
 fn toggle(signal: &str, rise: &[u32], fall: &[u32]) -> String {
     format!(
-        "{{\"signal\": \"{}\", \"width\": {}, \"rise\": {:?}, \"fall\": {:?}}}",
+        "{{\"signal\": \"{}\", \"width\": {}, \"type\": \"logic\", \"rise\": {:?}, \"fall\": {:?}}}",
         signal,
         rise.len(),
         rise,
@@ -532,7 +533,8 @@ endmodule
             "tb.up",
             &[
                 toggle("p2", &[1, 0, 0, 1], &[1, 0, 0, 1]),
-                toggle("s", &[1, 0, 1], &[1, 0, 1]),
+                // A packed struct port: its entry names the struct type.
+                toggle("s", &[1, 0, 1], &[1, 0, 1]).replace("\"logic\"", "\"struct\""),
                 toggle("t", &[0, 1], &[0, 1]),
                 toggle("wn", &[1, 1], &[0, 0]),
             ],
@@ -561,7 +563,8 @@ fn input_ports_opt_out() {
         cmd.current_dir(&d)
             .env("XEZIM_COV_DB", d.join("cov.json"))
             .env_remove("XEZIM_CODE_COVERAGE")
-            .env_remove("XEZIM_TOGGLE_INPUT_PORTS");
+            .env_remove("XEZIM_TOGGLE_INPUT_PORTS")
+            .env_remove("XEZIM_TOGGLE_INTEGERS");
         if let Some(v) = var {
             cmd.env("XEZIM_TOGGLE_INPUT_PORTS", v);
         }
@@ -591,6 +594,228 @@ fn input_ports_opt_out() {
     let on = toggle_total(34, 70, "48.57");
     assert!(child(&[], Some("1")).contains(&on));
     assert!(child(&["--toggle-input-ports"], Some("0")).contains(&on));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const INTEGERS: &str = "\
+typedef int count_t;
+module leaf(output int n, m, output logic [1:0] q);
+  integer i;
+  byte b;
+  if (1) begin : blk
+    shortint s;
+    initial begin s = 0; #1 s = 3; end
+  end
+  initial begin
+    n = 0; m = 0; q = 0; b = 0;
+    #1 for (i = 0; i < 2; i = i + 1) q = q + 1;
+    n = 3; m = 3; b = 3;
+  end
+endmodule
+module holder;
+  struct { int m; logic [1:0] k; } us;
+  initial begin us.m = 0; us.k = 0; #1 us.m = 3; us.k = 3; end
+endmodule
+module tb;
+  int a;
+  integer b;
+  longint c;
+  int unsigned d;
+  count_t e;
+  logic [31:0] f;
+  bit [7:0] g;
+  enum logic [1:0] {S0, S1, S2} st;
+  struct packed { logic [3:0] x; byte y; } ps;
+  int n;
+  logic [1:0] q;
+  leaf u(.n, .m(), .q);
+  holder v();
+  initial begin
+    a = 0; b = 0; c = 0; d = 0; e = 0; f = 0; g = 0; st = S0; ps = 0;
+    #1 a = 3; b = 3; c = 3; d = 3; e = 3; f = 3; g = 3; st = S2; ps = 12'h303;
+    #1 $finish;
+  end
+endmodule
+";
+
+/// The toggle totals of `scope` in a results file.
+fn scope_toggle(json: &str, scope: &str) -> String {
+    let at = json
+        .find(&format!("\"scope\": \"{scope}\","))
+        .unwrap_or_else(|| panic!("no scope {scope}: {json}"));
+    let rest = &json[at..];
+    let t = rest.find("\"toggle\": ").unwrap() + "\"toggle\": ".len();
+    rest[t..t + rest[t..].find('}').unwrap() + 1].to_string()
+}
+
+/// §6.11: the toggle entry of each signal names its declared data type,
+/// and `--no-toggle-integers` (or XEZIM_TOGGLE_INTEGERS=0) leaves out the
+/// variables of an integer atom type: `int`, `integer`, `shortint`,
+/// `longint` and `byte`, signed or unsigned, through a typedef, in a
+/// generate block or as an output port (ANSI ports inheriting the type
+/// too). Vectors, enums, packed structs and the members of unpacked
+/// structs stay. The reference simulator, with its integer toggles turned
+/// off, lists the same signals with the same counts, and the same totals
+/// for `tb.u` (4 bins, 1 hit); for `tb` it reports 111 bins and 11 hits,
+/// as it counts the enum by value. With them on, it reports 244 bins and 9
+/// hits for `tb.u`, as here.
+#[test]
+fn toggle_integers_left_out() {
+    let d = scratch("integers");
+    let out = run(&d, INTEGERS, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let all = results(&d);
+    let ints = [
+        ("a", 32, "int"),
+        ("b", 32, "integer"),
+        ("c", 64, "longint"),
+        ("d", 32, "int"),
+        ("e", 32, "int"),
+        ("n", 32, "int"),
+        ("m", 32, "int"),
+        ("i", 32, "integer"),
+        ("b", 8, "byte"),
+        ("blk.s", 16, "shortint"),
+    ];
+    let kept = [
+        ("f", 32, "logic"),
+        ("g", 8, "bit"),
+        ("st", 2, "enum"),
+        ("ps", 12, "struct"),
+        ("q", 2, "logic"),
+        ("us.m", 32, "struct"),
+        ("us.k", 2, "struct"),
+    ];
+    let row = |(name, width, ty): &(&str, u32, &str)| {
+        format!("{{\"signal\": \"{name}\", \"width\": {width}, \"type\": \"{ty}\", ")
+    };
+    for r in ints.iter().chain(&kept) {
+        assert!(all.contains(&row(r)), "{}: {all}", row(r));
+    }
+    assert_eq!(
+        scope_toggle(&all, "tb.u"),
+        "{\"covered\": 9, \"total\": 244, \"percent\": 3.69}"
+    );
+
+    let out = run(&d, INTEGERS, &["--code-coverage=toggle", "--no-toggle-integers"]);
+    assert!(out.status.success());
+    let some = results(&d);
+    for r in &ints {
+        assert!(!some.contains(&row(r)), "{}: {some}", row(r));
+    }
+    for r in &kept {
+        assert!(some.contains(&row(r)), "{}: {some}", row(r));
+    }
+    assert_eq!(
+        scope_toggle(&some, "tb"),
+        "{\"covered\": 10, \"total\": 112, \"percent\": 8.93}"
+    );
+    assert_eq!(
+        scope_toggle(&some, "tb.u"),
+        "{\"covered\": 1, \"total\": 4, \"percent\": 25.00}"
+    );
+    let code = |json: &str| json[json.find("\"code_coverage\"").unwrap()..].to_string();
+
+    // The variable does what the flag does; the flag wins.
+    let env = |val: &str, args: &[&str]| {
+        std::fs::write(d.join("t.sv"), INTEGERS).unwrap();
+        Command::new(xezim())
+            .current_dir(&d)
+            .env("XEZIM_COV_DB", d.join("cov.json"))
+            .env("XEZIM_TOGGLE_INTEGERS", val)
+            .args(args)
+            .arg("t.sv")
+            .output()
+            .expect("run xezim")
+    };
+    assert!(env("0", &["--code-coverage=toggle"]).status.success());
+    assert_eq!(code(&results(&d)), code(&some));
+    let on = &["--code-coverage=toggle", "--toggle-integers"];
+    assert!(env("0", on).status.success());
+    assert_eq!(code(&results(&d)), code(&all));
+    let bad = env("no", &["--code-coverage=toggle"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("XEZIM_TOGGLE_INTEGERS=no: want 0 or 1")
+    );
+    let stmt = run(&d, INTEGERS, &["--code-coverage=stmt", "--no-toggle-integers"]);
+    assert!(
+        String::from_utf8_lossy(&stmt.stderr)
+            .contains("Warning: --no-toggle-integers has no effect without toggle coverage")
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// An input port of an integer type is typed by its declaration like any
+/// other signal, so `--no-toggle-integers` leaves it out of its instance
+/// too, while a vector input stays (§6.11, §23.2.2.3).
+#[test]
+fn toggle_integers_left_out_of_input_ports() {
+    let d = scratch("integer-inputs");
+    let src = "\
+module child(input int k, input logic [1:0] l);
+endmodule
+module tb;
+  int a = 0;
+  logic [1:0] b = 0;
+  child c(.k(a), .l(b));
+  initial begin #1 a = 3; b = 3; #1 $finish; end
+endmodule
+";
+    let k = "{\"signal\": \"k\", \"width\": 32, \"type\": \"int\", ";
+    let l = "{\"signal\": \"l\", \"width\": 2, \"type\": \"logic\", ";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let all = results(&d);
+    let c = scope(&all, "tb.c");
+    assert!(c.contains(k) && c.contains(l), "{c}");
+    assert!(c.contains(&toggle_total(4, 68, "5.88")), "{c}");
+
+    let out = run(&d, src, &["--code-coverage=toggle", "--no-toggle-integers"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let some = results(&d);
+    let c = scope(&some, "tb.c");
+    assert!(!c.contains(k) && c.contains(l), "{c}");
+    assert!(c.contains(&toggle_total(2, 4, "50.00")), "{c}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// An instance that a path-specific `bind` targets runs a specialized copy of
+/// its module; its ports are still typed by the source declaration, so
+/// `--no-toggle-integers` leaves its `int` port out too (§23.11, §6.11).
+#[test]
+fn toggle_integers_left_out_of_bound_instance_ports() {
+    let d = scratch("integer-bound");
+    let src = "\
+module target(input int k, input logic [1:0] l);
+endmodule
+module mon(input int m);
+endmodule
+module tb;
+  int a = 0;
+  logic [1:0] b = 0;
+  target u(.k(a), .l(b));
+  bind target: tb.u mon m0(.m(k));
+  initial begin #1 a = 3; b = 3; #1 $finish; end
+endmodule
+";
+    let k = "{\"signal\": \"k\", \"width\": 32, \"type\": \"int\", ";
+    let l = "{\"signal\": \"l\", \"width\": 2, \"type\": \"logic\", ";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let all = results(&d);
+    let u = scope(&all, "tb.u");
+    assert!(u.contains(k) && u.contains(l), "{u}");
+
+    let out = run(&d, src, &["--code-coverage=toggle", "--no-toggle-integers"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let some = results(&d);
+    let u = scope(&some, "tb.u");
+    assert!(!u.contains(k) && u.contains(l), "{u}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

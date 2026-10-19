@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use xezim_core::SourceDefinition;
 use xezim_core::ast::Span;
-use xezim_core::ast::decl::ModuleItem;
+use xezim_core::ast::decl::{DPIProto, ModuleItem};
 use xezim_core::ast::expr::{AssignmentPatternItem, ExprKind, Expression};
 use xezim_core::ast::stmt::{
     EventControl, ForInit, ProceduralContinuous, Statement, StatementKind, TimingControl,
@@ -88,9 +88,14 @@ struct Names<'a> {
     insts: HashMap<&'a str, &'a str>,
     /// Labels of every generate block in the design.
     gens: HashSet<String>,
-    /// Names this check does not judge: packages, classes, interface and
-    /// typedef names, modports, and instances added by `bind`.
+    /// Names that are a scope of their own when they start a dotted name
+    /// (`pkg::x` and `C::m` parse as dotted names too): packages, classes,
+    /// interface and typedef names.
     opaque: HashSet<String>,
+    /// Definition name -> members it declares that the tables keep under
+    /// another key: its modports, and the DPI imports it declares (§35.5.1;
+    /// registered under their bare names).
+    members: HashMap<String, HashSet<String>>,
     /// Named blocks of processes (`u.blk`): their locals are not all in the
     /// tables, so a name through one is not checked.
     blocks: HashSet<String>,
@@ -149,14 +154,27 @@ impl<'a> Names<'a> {
         sorted.sort_unstable();
         sorted.dedup();
         let mut gens = HashSet::new();
+        let mut members: HashMap<String, HashSet<String>> = HashMap::new();
         let mut opaque: HashSet<String> = elab.packages.iter().cloned().collect();
         opaque.extend(elab.classes.keys().cloned());
         opaque.extend(elab.interfaces.iter().cloned());
         for def in defs {
             match def {
-                SourceDefinition::Module(m) => labels(&m.items, &mut gens, &mut opaque),
-                SourceDefinition::Interface(m) => labels(&m.items, &mut gens, &mut opaque),
-                SourceDefinition::Program(m) => labels(&m.items, &mut gens, &mut opaque),
+                SourceDefinition::Module(m) => labels(
+                    &m.items,
+                    &mut gens,
+                    members.entry(m.name.name.clone()).or_default(),
+                ),
+                SourceDefinition::Interface(m) => labels(
+                    &m.items,
+                    &mut gens,
+                    members.entry(m.name.name.clone()).or_default(),
+                ),
+                SourceDefinition::Program(m) => labels(
+                    &m.items,
+                    &mut gens,
+                    members.entry(m.name.name.clone()).or_default(),
+                ),
                 SourceDefinition::Class(c) => {
                     opaque.insert(c.name.name.clone());
                 }
@@ -176,6 +194,7 @@ impl<'a> Names<'a> {
             insts,
             gens,
             opaque,
+            members,
             blocks: HashSet::new(),
         }
     }
@@ -286,12 +305,11 @@ impl<'a> Names<'a> {
                 // declarations are flattened into the enclosing scope.
                 Step::Missing if implicit(&seg.name) => {}
                 Step::Missing => {
-                    // A DPI import declared in a module is a member of each
-                    // instance (§35.5.1), registered under its bare name.
-                    if self.opaque.contains(&seg.name)
-                        || self.elab.dpi_imports.contains_key(&seg.name)
-                        || !self.closed(&cur)
-                    {
+                    let declared = self
+                        .members
+                        .get(self.owner(&cur))
+                        .is_some_and(|m| m.contains(&seg.name));
+                    if declared || !self.closed(&cur) {
                         return Ok(());
                     }
                     return Err(Miss {
@@ -373,39 +391,36 @@ struct Miss {
     name: String,
 }
 
-/// Generate-block labels and modport names of a definition's items.
-fn labels(items: &[ModuleItem], gens: &mut HashSet<String>, opaque: &mut HashSet<String>) {
+/// Generate-block labels of a definition's items, and the members it
+/// declares that the tables keep under another key (see `Names::members`).
+fn labels(items: &[ModuleItem], gens: &mut HashSet<String>, members: &mut HashSet<String>) {
     for it in items {
         match it {
-            ModuleItem::GenerateRegion(g) => labels(&g.items, gens, opaque),
+            ModuleItem::GenerateRegion(g) => labels(&g.items, gens, members),
             ModuleItem::GenerateIf(g) => {
                 gens.extend(g.branch_labels.iter().flatten().cloned());
                 for (_, b) in &g.branches {
-                    labels(b, gens, opaque);
+                    labels(b, gens, members);
                 }
             }
             ModuleItem::GenerateFor(g) => {
                 gens.extend(g.name.iter().cloned());
-                labels(&g.items, gens, opaque);
+                labels(&g.items, gens, members);
             }
             ModuleItem::GenerateCase(g) => {
                 for arm in &g.arms {
                     gens.extend(arm.label.iter().cloned());
-                    labels(&arm.items, gens, opaque);
+                    labels(&arm.items, gens, members);
                 }
             }
             ModuleItem::ModportDeclaration(m) => {
-                opaque.extend(m.items.iter().map(|i| i.name.name.clone()));
+                members.extend(m.items.iter().map(|i| i.name.name.clone()));
             }
-            // An instance a `bind` adds: whether it lands where the user
-            // expects is the bind support's business, not this check's.
-            ModuleItem::Bind(b) => {
-                opaque.extend(
-                    b.instantiation
-                        .instances
-                        .iter()
-                        .map(|i| i.name.name.clone()),
-                );
+            ModuleItem::DPIImport(d) => {
+                members.insert(match &d.proto {
+                    DPIProto::Function(f) => f.name.name.name.clone(),
+                    DPIProto::Task(t) => t.name.name.name.clone(),
+                });
             }
             _ => {}
         }
@@ -656,158 +671,197 @@ fn expr_refs(e: &Expression, out: &mut Vec<Ref>) {
     }
 }
 
-fn control_refs(c: &TimingControl, out: &mut Vec<Ref>) {
-    match c {
-        TimingControl::Delay(d) => expr_refs(d, out),
-        TimingControl::Event(EventControl::HierIdentifier(e)) => expr_refs(e, out),
-        TimingControl::Event(EventControl::EventExpr(evs)) => {
-            for ev in evs {
-                expr_refs(&ev.expr, out);
-                ev.iff.iter().for_each(|x| expr_refs(x, out));
-            }
-        }
-        TimingControl::Event(_) => {}
-    }
+/// Collects a body's hierarchical references, leaving out those whose first
+/// component is a local declaration visible where they are written.
+struct Walker {
+    out: Vec<Ref>,
+    /// The declarations of each enclosing block, innermost last.
+    locals: Vec<HashSet<String>>,
 }
 
-/// Collect the hierarchical references of a statement, and the names it
-/// declares (`locals`), which shadow any scope of the same name.
-fn stmt_refs(s: &Statement, out: &mut Vec<Ref>, locals: &mut HashSet<String>) {
-    match &s.kind {
-        StatementKind::Expr(e) | StatementKind::Return(Some(e)) => expr_refs(e, out),
-        StatementKind::BlockingAssign { lvalue, rvalue } => {
-            expr_refs(lvalue, out);
-            expr_refs(rvalue, out);
-        }
-        StatementKind::NonblockingAssign {
-            lvalue,
-            delay,
-            rvalue,
-        } => {
-            expr_refs(lvalue, out);
-            delay.iter().for_each(|x| expr_refs(x, out));
-            expr_refs(rvalue, out);
-        }
-        StatementKind::If {
-            condition,
-            then_stmt,
-            else_stmt,
-            ..
-        } => {
-            expr_refs(condition, out);
-            stmt_refs(then_stmt, out, locals);
-            else_stmt.iter().for_each(|x| stmt_refs(x, out, locals));
-        }
-        StatementKind::Case { expr, items, .. } => {
-            expr_refs(expr, out);
-            for it in items {
-                it.patterns.iter().for_each(|x| expr_refs(x, out));
-                it.guard.iter().for_each(|x| expr_refs(x, out));
-                stmt_refs(&it.stmt, out, locals);
+impl Walker {
+    fn expr(&mut self, e: &Expression) {
+        let n = self.out.len();
+        expr_refs(e, &mut self.out);
+        let locals = &self.locals;
+        let mut i = n;
+        while i < self.out.len() {
+            if locals.iter().any(|l| l.contains(&self.out[i].segs[0].name)) {
+                self.out.remove(i);
+            } else {
+                i += 1;
             }
         }
-        StatementKind::For {
-            init,
-            condition,
-            step,
-            body,
-        } => {
-            for i in init {
-                match i {
-                    ForInit::VarDecl { name, init, .. } => {
-                        locals.insert(name.name.clone());
-                        expr_refs(init, out);
+    }
+
+    /// Run `f` in a block of its own, with `names` declared in it.
+    fn block(&mut self, names: HashSet<String>, f: impl FnOnce(&mut Self)) {
+        self.locals.push(names);
+        f(self);
+        self.locals.pop();
+    }
+
+    fn control(&mut self, c: &TimingControl) {
+        match c {
+            TimingControl::Delay(d) => self.expr(d),
+            TimingControl::Event(EventControl::HierIdentifier(e)) => self.expr(e),
+            TimingControl::Event(EventControl::EventExpr(evs)) => {
+                for ev in evs {
+                    self.expr(&ev.expr);
+                    ev.iff.iter().for_each(|x| self.expr(x));
+                }
+            }
+            TimingControl::Event(_) => {}
+        }
+    }
+
+    fn stmt(&mut self, s: &Statement) {
+        match &s.kind {
+            StatementKind::Expr(e) | StatementKind::Return(Some(e)) => self.expr(e),
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                self.expr(lvalue);
+                self.expr(rvalue);
+            }
+            StatementKind::NonblockingAssign {
+                lvalue,
+                delay,
+                rvalue,
+            } => {
+                self.expr(lvalue);
+                delay.iter().for_each(|x| self.expr(x));
+                self.expr(rvalue);
+            }
+            StatementKind::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.expr(condition);
+                self.stmt(then_stmt);
+                else_stmt.iter().for_each(|x| self.stmt(x));
+            }
+            StatementKind::Case { expr, items, .. } => {
+                self.expr(expr);
+                for it in items {
+                    it.patterns.iter().for_each(|x| self.expr(x));
+                    it.guard.iter().for_each(|x| self.expr(x));
+                    self.stmt(&it.stmt);
+                }
+            }
+            StatementKind::For {
+                init,
+                condition,
+                step,
+                body,
+            } => {
+                // §12.7.1: a variable the header declares is local to the loop.
+                let names = init
+                    .iter()
+                    .filter_map(|i| match i {
+                        ForInit::VarDecl { name, .. } => Some(name.name.clone()),
+                        ForInit::Assign { .. } => None,
+                    })
+                    .collect();
+                self.block(names, |w| {
+                    for i in init {
+                        match i {
+                            ForInit::VarDecl { init, .. } => w.expr(init),
+                            ForInit::Assign { lvalue, rvalue } => {
+                                w.expr(lvalue);
+                                w.expr(rvalue);
+                            }
+                        }
                     }
-                    ForInit::Assign { lvalue, rvalue } => {
-                        expr_refs(lvalue, out);
-                        expr_refs(rvalue, out);
+                    condition.iter().for_each(|x| w.expr(x));
+                    step.iter().for_each(|x| w.expr(x));
+                    w.stmt(body);
+                });
+            }
+            StatementKind::Foreach { array, vars, body } => {
+                self.expr(array);
+                let names = vars.iter().flatten().map(|v| v.name.clone()).collect();
+                self.block(names, |w| w.stmt(body));
+            }
+            StatementKind::While { condition, body }
+            | StatementKind::DoWhile { body, condition } => {
+                self.expr(condition);
+                self.stmt(body);
+            }
+            StatementKind::Repeat { count, body } => {
+                self.expr(count);
+                self.stmt(body);
+            }
+            StatementKind::Forever { body }
+            | StatementKind::ForeverTail { body }
+            | StatementKind::RsAction { body }
+            | StatementKind::ForeachTail { body, .. } => self.stmt(body),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                self.block(HashSet::new(), |w| stmts.iter().for_each(|x| w.stmt(x)));
+            }
+            StatementKind::TimingControl { control, stmt } => {
+                self.control(control);
+                self.stmt(stmt);
+            }
+            StatementKind::EventTrigger {
+                target: Some(t), ..
+            } => self.expr(t),
+            StatementKind::Wait { condition, stmt } => {
+                self.expr(condition);
+                self.stmt(stmt);
+            }
+            StatementKind::Assertion(a) => {
+                self.expr(&a.expr);
+                a.inferred_clock.iter().for_each(|c| self.expr(&c.expr));
+                for x in a.action.iter().chain(a.else_action.iter()) {
+                    self.stmt(x);
+                }
+            }
+            StatementKind::ProceduralContinuous(p) => match p {
+                ProceduralContinuous::Assign { lvalue, rvalue }
+                | ProceduralContinuous::Force { lvalue, rvalue } => {
+                    self.expr(lvalue);
+                    self.expr(rvalue);
+                }
+                ProceduralContinuous::Deassign(x) | ProceduralContinuous::Release(x) => {
+                    self.expr(x)
+                }
+            },
+            StatementKind::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    d.init.iter().for_each(|x| self.expr(x));
+                    if let Some(l) = self.locals.last_mut() {
+                        l.insert(d.name.name.clone());
                     }
                 }
             }
-            condition.iter().for_each(|x| expr_refs(x, out));
-            step.iter().for_each(|x| expr_refs(x, out));
-            stmt_refs(body, out, locals);
-        }
-        StatementKind::Foreach { array, vars, body } => {
-            expr_refs(array, out);
-            locals.extend(vars.iter().flatten().map(|v| v.name.clone()));
-            stmt_refs(body, out, locals);
-        }
-        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
-            expr_refs(condition, out);
-            stmt_refs(body, out, locals);
-        }
-        StatementKind::Repeat { count, body } => {
-            expr_refs(count, out);
-            stmt_refs(body, out, locals);
-        }
-        StatementKind::Forever { body }
-        | StatementKind::ForeverTail { body }
-        | StatementKind::RsAction { body }
-        | StatementKind::ForeachTail { body, .. } => stmt_refs(body, out, locals),
-        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
-            stmts.iter().for_each(|x| stmt_refs(x, out, locals));
-        }
-        StatementKind::TimingControl { control, stmt } => {
-            control_refs(control, out);
-            stmt_refs(stmt, out, locals);
-        }
-        StatementKind::EventTrigger {
-            target: Some(t), ..
-        } => expr_refs(t, out),
-        StatementKind::Wait { condition, stmt } => {
-            expr_refs(condition, out);
-            stmt_refs(stmt, out, locals);
-        }
-        StatementKind::Assertion(a) => {
-            expr_refs(&a.expr, out);
-            a.inferred_clock
-                .iter()
-                .for_each(|c| expr_refs(&c.expr, out));
-            for x in a.action.iter().chain(a.else_action.iter()) {
-                stmt_refs(x, out, locals);
+            StatementKind::RandCase { items } => {
+                for (w, x) in items {
+                    self.expr(w);
+                    self.stmt(x);
+                }
             }
+            StatementKind::WaitOrder { pass, fail, .. } => {
+                for x in pass.iter().chain(fail.iter()) {
+                    self.stmt(x);
+                }
+            }
+            _ => {}
         }
-        StatementKind::ProceduralContinuous(p) => match p {
-            ProceduralContinuous::Assign { lvalue, rvalue }
-            | ProceduralContinuous::Force { lvalue, rvalue } => {
-                expr_refs(lvalue, out);
-                expr_refs(rvalue, out);
-            }
-            ProceduralContinuous::Deassign(x) | ProceduralContinuous::Release(x) => {
-                expr_refs(x, out)
-            }
-        },
-        StatementKind::VarDecl { declarators, .. } => {
-            for d in declarators {
-                locals.insert(d.name.name.clone());
-                d.init.iter().for_each(|x| expr_refs(x, out));
-            }
-        }
-        StatementKind::RandCase { items } => {
-            for (w, x) in items {
-                expr_refs(w, out);
-                stmt_refs(x, out, locals);
-            }
-        }
-        StatementKind::WaitOrder { pass, fail, .. } => {
-            for x in pass.iter().chain(fail.iter()) {
-                stmt_refs(x, out, locals);
-            }
-        }
-        _ => {}
     }
 }
 
-/// The references of a body, without those whose first component is one of
-/// the body's own declarations.
-fn body_refs(stmts: &[&Statement], mut locals: HashSet<String>) -> Rc<Vec<Ref>> {
-    let mut refs = Vec::new();
+/// The references of a body whose own scope declares `formals` (a task's or
+/// function's arguments), without those a local declaration shadows.
+fn body_refs(stmts: &[&Statement], formals: HashSet<String>) -> Rc<Vec<Ref>> {
+    let mut w = Walker {
+        out: Vec::new(),
+        locals: vec![formals],
+    };
     for s in stmts {
-        stmt_refs(s, &mut refs, &mut locals);
+        w.stmt(s);
     }
-    refs.retain(|r| !locals.contains(&r.segs[0].name));
-    Rc::new(refs)
+    Rc::new(w.out)
 }
 
 /// Flat names of the named blocks in a statement.

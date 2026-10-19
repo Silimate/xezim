@@ -163,6 +163,11 @@ fn every_unresolved_reference_is_an_error() {
             "  initial x = $root.tb.dut.missing;",
             "'missing' is not declared in 'tb.dut'",
         ),
+        (
+            "inner_block_local",
+            "  initial begin\n    begin int dut; dut = 1; end\n    dut.missing = 1;\n  end",
+            "'missing' is not declared in 'tb.dut'",
+        ),
     ];
     for (name, body, want) in cases {
         let (ok, text) = run(name, &SHELL.replace("$BODY", body), &[]);
@@ -175,7 +180,8 @@ fn every_unresolved_reference_is_an_error() {
 }
 
 /// Names written in an instance resolve from that instance: downward into
-/// its children, and upward by an enclosing module's or instance's name.
+/// its children, and upward by an enclosing module's or instance's name. A
+/// package or modport declared elsewhere is not a member of an instance.
 #[test]
 fn unresolved_references_in_instances_are_errors() {
     let cases: &[(&str, &str, &str)] = &[
@@ -232,6 +238,30 @@ endmodule
 "#,
             "'nope' is not declared in 'tb.m.u' (searched from 'tb.m'",
         ),
+        (
+            "declared_elsewhere",
+            r#"
+package helper;
+  int x;
+endpackage
+interface bus_if;
+  logic d;
+  modport mp(input d);
+endinterface
+module leaf;
+  logic q;
+endmodule
+module tb;
+  leaf dut();
+  bus_if bus();
+  initial begin
+    dut.helper = 1;
+    dut.mp = 1;
+  end
+endmodule
+"#,
+            "'helper' is not declared in 'tb.dut'",
+        ),
     ];
     for (name, src, want) in cases {
         let (ok, text) = run(name, src, &[]);
@@ -253,7 +283,8 @@ fn no_strict_accepts_an_unresolved_reference() {
 }
 
 /// Every legal kind of dotted name still elaborates: class handles, struct
-/// members, interface and modport members, instance arrays, generate blocks
+/// members (one of a block-local variable that hides an instance), interface
+/// and modport members, instance arrays, generate blocks
 /// (named, implicit and a branch a constant rules out), `$root`, absolute
 /// and upward names, subroutines, events, parameters, `defparam`, `bind`,
 /// named blocks, package and class scopes, and scope arguments.
@@ -332,6 +363,11 @@ module tb;
   wire [3:0] w1 = dut.u_leaf.r;
   assign dut.g[0].gv = 4'h3;
   a: assert property (@(posedge clk) dut.u_leaf.r !== 4'hf);
+  initial begin : shadow
+    us_t dut;  // hides the instance `dut` in this block: `dut.a` is a member
+    dut.a = 5;
+    if (dut.a != 5) $display("FAIL block-local shadow");
+  end
   initial begin
     $dumpvars(0, tb.dut);
     obj = new; obj.inner = new;

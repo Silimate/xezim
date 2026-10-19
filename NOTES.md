@@ -10,6 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An assertion attempt at time 0 reads default sampled values (§16.5.1): a
+  variable's declaration initializer, else its type's default, and x for a
+  net. It read the values the time-0 continuous assignments and
+  `always_comb` blocks had already driven, so under a clock that rises at
+  time 0, as cocotb's `Clock` does, an attempt passed where the reference
+  simulator's fails. `$past` at the next tick reads the same samples. A
+  value a VPI client writes from cbStartOfSimulation (cocotb's `Immediate`)
+  is in place before the time-0 slot and counts as a default sampled value,
+  as on the reference simulator.
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the

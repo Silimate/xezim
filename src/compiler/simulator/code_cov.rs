@@ -11,7 +11,8 @@
 //! without code coverage compiles exactly the design it did before.
 //! Continuous assignments count in their comb entry (`ca_counter`). Toggles
 //! compare each tracked signal with its value at the end of the previous
-//! time slot, off the dirty set the waveform writers share.
+//! time slot, off the dirty set the waveform writers share; a slot sampled
+//! more than once (once per tick and at its end) counts only its net change.
 use super::*;
 use crate::ast::Span;
 use crate::compiler::elaborate::InitialBlock;
@@ -164,18 +165,31 @@ struct BranchSite {
     arms: Vec<Arm>,
 }
 
+/// One 64-bit word of a tracked signal, as toggle coverage last saw it.
+#[derive(Clone, Copy)]
+struct Word {
+    /// Value at the last sample.
+    v: u64,
+    x: u64,
+    /// Time of the last change, `u64::MAX` before the first.
+    at: u64,
+    /// Value at the end of the slot before that change: the slot's toggles
+    /// count from it.
+    bv: u64,
+    bx: u64,
+}
+
 /// Per-bit rise/fall counts of the tracked signals.
 pub(crate) struct Toggle {
     /// Signal id -> tracked index, `u32::MAX` when not tracked.
     slot: Vec<u32>,
     ids: Vec<u32>,
     width: Vec<u32>,
-    /// First word of each tracked signal in `prev_v` / `prev_x`.
+    /// First word of each tracked signal in `words`.
     word0: Vec<u32>,
     /// First bit of each tracked signal in `rise` / `fall`.
     bit0: Vec<u32>,
-    prev_v: Vec<u64>,
-    prev_x: Vec<u64>,
+    words: Vec<Word>,
     rise: Vec<u32>,
     fall: Vec<u32>,
     /// (scope, name within the scope, tracked index); aliases of one signal
@@ -184,15 +198,33 @@ pub(crate) struct Toggle {
 }
 
 impl Toggle {
-    fn sample(&mut self, k: usize, v: u64, x: u64, word: usize) {
+    /// Sample word `word` of tracked signal `k` at time `now`. A slot can be
+    /// sampled more than once (every tick flushes, and so does the end of
+    /// the slot); the counts hold the change from the end of the previous
+    /// slot to the latest sample, so a value changed and changed back within
+    /// one slot does not toggle.
+    fn sample(&mut self, k: usize, v: u64, x: u64, word: usize, now: u64) {
         let w = self.word0[k] as usize + word;
-        let (pv, px) = (self.prev_v[w], self.prev_x[w]);
-        self.prev_v[w] = v;
-        self.prev_x[w] = x;
+        let s = &mut self.words[w];
+        let (pv, px) = (s.v, s.x);
+        if v == pv && x == px {
+            return;
+        }
+        s.v = v;
+        s.x = x;
+        let base = self.bit0[k] as usize + word * 64;
+        if s.at == now {
+            self.resample(w, base, pv, px);
+            return;
+        }
+        // The slot's first change: the previous sample is the value at the
+        // end of the previous slot.
+        s.at = now;
+        s.bv = pv;
+        s.bx = px;
         let known = !(x | px);
         let mut rise = v & !pv & known;
         let mut fall = pv & !v & known;
-        let base = self.bit0[k] as usize + word * 64;
         while rise != 0 {
             let b = rise.trailing_zeros() as usize;
             self.rise[base + b] = self.rise[base + b].saturating_add(1);
@@ -202,6 +234,36 @@ impl Toggle {
             let b = fall.trailing_zeros() as usize;
             self.fall[base + b] = self.fall[base + b].saturating_add(1);
             fall &= fall - 1;
+        }
+    }
+
+    /// Word `w` changed again in the slot it last changed in: move its
+    /// counts from the transition counted so far (baseline to `pv`/`px`)
+    /// to the one from the baseline to its new value.
+    #[cold]
+    fn resample(&mut self, w: usize, base: usize, pv: u64, px: u64) {
+        let s = self.words[w];
+        let (v, x, bv, bx) = (s.v, s.x, s.bv, s.bx);
+        let was = !(bx | px);
+        let known = !(bx | x);
+        Self::recount(&mut self.rise, base, pv & !bv & was, v & !bv & known);
+        Self::recount(&mut self.fall, base, bv & !pv & was, bv & !v & known);
+    }
+
+    /// Move the counts of bits `bit..bit + 64` from the transitions in `old`
+    /// to those in `new`.
+    fn recount(n: &mut [u32], bit: usize, old: u64, new: u64) {
+        let mut add = new & !old;
+        while add != 0 {
+            let b = bit + add.trailing_zeros() as usize;
+            n[b] = n[b].saturating_add(1);
+            add &= add - 1;
+        }
+        let mut sub = old & !new;
+        while sub != 0 {
+            let b = bit + sub.trailing_zeros() as usize;
+            n[b] = n[b].saturating_sub(1);
+            sub &= sub - 1;
         }
     }
 }
@@ -1657,8 +1719,7 @@ impl Simulator {
             width: Vec::new(),
             word0: Vec::new(),
             bit0: Vec::new(),
-            prev_v: Vec::new(),
-            prev_x: Vec::new(),
+            words: Vec::new(),
             rise: Vec::new(),
             fall: Vec::new(),
             names: Vec::new(),
@@ -1698,15 +1759,20 @@ impl Simulator {
                 t.slot[id] = k;
                 t.ids.push(id as u32);
                 t.width.push(width);
-                t.word0.push(t.prev_v.len() as u32);
+                t.word0.push(t.words.len() as u32);
                 t.bit0.push(t.rise.len() as u32);
                 let words = width.div_ceil(64) as usize;
                 let v = &self.signal_table[id];
                 for w in 0..words {
                     let n = (width as usize - w * 64).min(64);
                     let (pv, px) = v.slice_bits_swar(w * 64, n);
-                    t.prev_v.push(pv);
-                    t.prev_x.push(px);
+                    t.words.push(Word {
+                        v: pv,
+                        x: px,
+                        at: u64::MAX,
+                        bv: pv,
+                        bx: px,
+                    });
                 }
                 t.rise.resize(t.rise.len() + width as usize, 0);
                 t.fall.resize(t.fall.len() + width as usize, 0);
@@ -1717,12 +1783,13 @@ impl Simulator {
         t
     }
 
-    /// End of a time slot: compare every tracked signal written since the
-    /// last one with its previous value.
+    /// End of a tick or of a time slot: compare every tracked signal written
+    /// since the last sample with its value at the end of the previous slot.
     pub(super) fn cov_toggle_sample(&mut self) {
         let Some(t) = self.code_cov.as_mut().and_then(|c| c.toggle.as_mut()) else {
             return;
         };
+        let now = self.time;
         let full = !self.dump_dirty_active;
         let n = if full {
             t.ids.len()
@@ -1750,12 +1817,12 @@ impl Simulator {
                 } else {
                     (1u64 << width) - 1
                 };
-                t.sample(k, v & mask, x & mask, 0);
+                t.sample(k, v & mask, x & mask, 0, now);
             } else {
                 for w in 0..width.div_ceil(64) {
                     let n = (width - w * 64).min(64);
                     let (v, x) = self.signal_table[id].slice_bits_swar(w * 64, n);
-                    t.sample(k, v, x, w);
+                    t.sample(k, v, x, w, now);
                 }
             }
         }

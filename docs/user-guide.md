@@ -48,7 +48,8 @@ Example — run the picorv32 testbench against a gate-level netlist:
 xezim testbench.v synth.v +firmware=firmware/firmware.hex --max-time 50000000
 ```
 
-The exit status is 1 for parse and elaboration errors, `$fatal`, a
+The exit status is 1 for parse and elaboration errors (among them a
+hierarchical name that does not resolve, §23.8), `$fatal`, a
 `--dpi-lib` library that cannot be loaded, and an `-s` that names no module
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.

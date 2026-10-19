@@ -474,6 +474,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Build metadata: nearest release tag baked into -V (build-time)",
     ),
     (
+        "XEZIM_HIER_REF_DEBUG",
+        "Debug: trace how each hierarchical reference resolves in the §23.8 elaboration check",
+    ),
+    (
         "XEZIM_HOT_STATS",
         "Print hottest comb entries / edge blocks at end of sim",
     ),

@@ -41,7 +41,7 @@ module t23i;
   u6_t uv = 6'h3f;
   initial begin
     #31;
-    $display("T|23.11b|%0d %0d %0d %0d", u1.c_all.cnt, u2.c_in.cnt, u2.c_path.cnt, u3.c_list.cnt);
+    $display("T|23.11b|%0d %0d %0d", u1.c_all.cnt, u2.c_in.cnt, u3.c_list.cnt);
     $display("T|23.11c|%h %h", u1.b_if.copy, u3.b_if.copy);
     $display("T|23.5|eo=%h", eo);
     $display("T|26.unit2|%0d %0d %0d", uvar, $bits(uv), $unit::ufn(2));

@@ -4,8 +4,8 @@ xezim collects **functional coverage** (covergroups, IEEE 1800 clause 19) and
 **assertion coverage** (`cover` statements, plus pass/fail counts of assertions,
 clause 16) in every simulation, and writes the results to a JSON file when the run
 ends. When asked (`--code-coverage`), it also collects **code coverage**:
-statement, branch, toggle and FSM (state machine) counts, in the same file.
-There is no condition or expression coverage.
+statement, branch, condition, expression, toggle and FSM (state machine)
+counts, in the same file.
 
 This guide covers what is supported, how to write coverage that xezim collects, and
 how to read the results. Code coverage has [its own section](#code-coverage).
@@ -24,7 +24,7 @@ how to read the results. Code coverage has [its own section](#code-coverage).
 | Options | `option.at_least`, `option.weight`, `option.auto_bin_max`, `type_option.merge_instances`, `type_option.weight` |
 | Queries | `get_inst_coverage()` and `get_coverage()` on a covergroup, a coverpoint or a cross, with or without `(covered, total)`; `cg_type::get_coverage()`; `$get_coverage()`; `start()` and `stop()` |
 | Assertion coverage | Counts for `cover property`, `cover sequence`, `assert property`, `assume property` and the immediate `cover`, `assert` and `assume` |
-| Code coverage | Statement, branch, toggle and FSM coverage with `--code-coverage` (or `+cover`). See [Code coverage](#code-coverage) |
+| Code coverage | Statement, branch, condition, expression, toggle and FSM coverage with `--code-coverage` (or `+cover`). See [Code coverage](#code-coverage) |
 | Results | The `xezim_cov.json` file, and `[COV]` summary lines with `--verbose` |
 
 ---
@@ -542,21 +542,22 @@ hit, so a combined percentage can't be worked out from them alone.
 ## Code coverage
 
 With `--code-coverage`, xezim also counts which statements ran, which way each
-branch went, which bits of each signal toggled, and which states and
-transitions of each state machine the run visited, and writes the counts to
+branch went, which terms of each condition and logic expression decided its
+value, which bits of each signal toggled, and which states and transitions
+of each state machine the run visited, and writes the counts to
 `xezim_cov.json` next to the functional coverage.
 
 ### Enabling code coverage
 
 | Spelling | Collects |
 |---|---|
-| `--code-coverage` | Statement, branch, toggle and FSM coverage |
-| `--code-coverage=<kinds>` | The kinds listed, separated by commas: `stmt` (or `statement`), `branch`, `toggle`, `fsm`, `all` |
+| `--code-coverage` | Statement, branch, condition, expression, toggle and FSM coverage |
+| `--code-coverage=<kinds>` | The kinds listed, separated by commas: `stmt` (or `statement`), `branch`, `cond` (or `condition`), `expr` (or `expression`), `toggle`, `fsm`, `all` |
 | `XEZIM_CODE_COVERAGE=<kinds>` | The same, for scripts that cannot add a flag. `--code-coverage` wins |
-| `+cover` | All four |
-| `+cover=<letters>` | `s` statement, `b` branch, `t` toggle, `f` FSM. Other simulators' other letters (`c` condition, `e` expression, `x` extended toggle) are ignored with one warning, for example `Warning: +cover=sbcf: xezim has no condition (c) coverage; collecting statement, branch, FSM coverage` |
-| `-coverage` | All four, unless a `+cover=<letters>` names fewer |
-| `-coverage <types>` | `all` (or `A`): all four. Otherwise types joined by `:`, in either case: `B` block (statement and branch), `T` toggle, `F` FSM, `U` functional (always collected). `E` expression is ignored with one warning, for example `Warning: -coverage B:E: xezim has no expression (e) coverage; collecting statement, branch coverage`. A `+cover=<letters>` wins |
+| `+cover` | All six |
+| `+cover=<letters>` | `s` statement, `b` branch, `c` condition, `e` expression, `t` toggle, `f` FSM. Other simulators' other letter (`x` extended toggle) is ignored with one warning, for example `Warning: +cover=sbx: xezim has no extended toggle (x) coverage; collecting statement, branch coverage` |
+| `-coverage` | All six, unless a `+cover=<letters>` names fewer |
+| `-coverage <types>` | `all` (or `A`): all six. Otherwise types joined by `:`, in either case: `B` block (statement and branch), `E` expression (condition and expression), `T` toggle, `F` FSM, `U` functional (always collected). A `+cover=<letters>` wins |
 
 `--code-coverage-scope=<path>[,<path>...]` (repeatable) limits every kind to the
 instances at or below the given paths (`tb.dut`, or `dut` for the instance of that
@@ -577,11 +578,12 @@ it like any other code; `--code-coverage-constant=exclude` is the default, and
 the flag wins over the variable.
 
 Code coverage is off by default, and then costs nothing: the design compiles and
-runs exactly as it does without the feature. When it is on, statements and
-branches are instrumented as the design is compiled, before xezim lowers it to
-bytecode, so every execution path (compiled blocks, the two-state executors and
-the interpreter) counts the same way, and the simulation's results do not
-change. The instrumented run is slower, most of all for RTL:
+runs exactly as it does without the feature. When it is on, statements,
+branches, conditions and expressions are instrumented as the design is
+compiled, before xezim lowers it to bytecode, so every execution path (compiled
+blocks, the two-state executors and the interpreter) counts the same way, and
+the simulation's results do not change. The instrumented run is slower, most of
+all for RTL:
 
 | Run | Without | `=stmt,branch,toggle` | `=stmt,branch` | `=toggle` |
 |---|---|---|---|---|
@@ -590,6 +592,13 @@ change. The instrumented run is slower, most of all for RTL:
 
 The C906 run's results file is 23 MB: 47,632 statements, 23,603 branch arms and
 979,190 toggle bins in 1,773 scopes.
+
+Condition and expression coverage cost more per item: the interpreter evaluates
+each covered condition and expression, term by term, where the rest of the
+design runs compiled. A UART with its testbench (135 condition and expression
+terms) runs 1.55x the instructions of a run without coverage with
+`=cond,expr`, against 1.22x with `=stmt,branch,toggle` and 1.73x with all
+five.
 
 FSM coverage instruments only the always blocks that hold a state register. On
 CVDP designs with state machines, `--code-coverage=fsm` took 2 to 3% more CPU
@@ -604,7 +613,7 @@ module counter (input logic clk, rst, en, output logic [2:0] q);
   always_ff @(posedge clk)
     if (rst)
       q <= 0;
-    else if (en)
+    else if (en && q != 3'd7)
       q <= q + 1;
 endmodule
 
@@ -628,9 +637,9 @@ $ xezim --code-coverage cnt_cov.sv
 q = 3
 Simulation finished at time 40 ($finish called)
 $ xezim --code-coverage --verbose cnt_cov.sv 2>&1 | grep '^\[COV\] code\|^\[COV\]  '
-[COV] code coverage: statement 12/12 (100.00%), branch 2/3 (66.67%), toggle 14/24 (58.33%), fsm 0/0
-[COV]   tb (tb): statement 9/9 (100.00%), branch 0/0, toggle 7/12 (58.33%), fsm 0/0
-[COV]   tb.u_cnt (counter): statement 3/3 (100.00%), branch 2/3 (66.67%), toggle 7/12 (58.33%), fsm 0/0
+[COV] code coverage: statement 12/12 (100.00%), branch 2/3 (66.67%), toggle 14/24 (58.33%), condition 0/2 (0.00%), expression 0/0, fsm 0/0
+[COV]   tb (tb): statement 9/9 (100.00%), branch 0/0, toggle 7/12 (58.33%), condition 0/0, expression 0/0, fsm 0/0
+[COV]   tb.u_cnt (counter): statement 3/3 (100.00%), branch 2/3 (66.67%), toggle 7/12 (58.33%), condition 0/2 (0.00%), expression 0/0, fsm 0/0
 ```
 
 The first line is the design's totals, then one line per scope with its design
@@ -646,10 +655,14 @@ The counter's entry in `xezim_cov.json`:
         "statement": {"covered": 3, "total": 3, "percent": 100.00},
         "branch": {"covered": 2, "total": 3, "percent": 66.67},
         "toggle": {"covered": 7, "total": 12, "percent": 58.33},
+        "condition": {"covered": 0, "total": 2, "percent": 0.00},
+        "expression": {"covered": 0, "total": 0, "percent": null},
         "fsm": {"covered": 0, "total": 0, "percent": null, "states": {"covered": 0, "total": 0, "percent": null}, "transitions": {"covered": 0, "total": 0, "percent": null}},
         "statements": [{"file": "cnt_cov.sv", "line": 2, "kind": "always_ff", "count": 4}, {"file": "cnt_cov.sv", "line": 4, "kind": "statement", "count": 1}, {"file": "cnt_cov.sv", "line": 6, "kind": "statement", "count": 3}],
         "branches": [{"file": "cnt_cov.sv", "line": 3, "kind": "if", "arms": [{"line": 4, "arm": "if", "count": 1}, {"line": 6, "arm": "else if", "count": 3}, {"line": 3, "arm": "else (implicit)", "count": 0}]}],
         "toggles": [{"signal": "clk", "width": 1, "type": "logic", "rise": [4], "fall": [4]}, {"signal": "en", "width": 1, "type": "logic", "rise": [1], "fall": [0]}, {"signal": "q", "width": 3, "type": "logic", "rise": [2, 1, 0], "fall": [1, 0, 0]}, {"signal": "rst", "width": 1, "type": "logic", "rise": [0], "fall": [1]}],
+        "conditions": [{"file": "cnt_cov.sv", "line": 5, "kind": "if", "text": "en && q != 3'd7", "terms": [{"term": "en", "hits": [0, 3]}, {"term": "q != 3'd7", "hits": [0, 3]}]}],
+        "expressions": [],
         "fsms": []
       }
 ```
@@ -659,6 +672,10 @@ came with both `rst` and `en` low, so the implicit `else` of the `if` chain was
 never taken. `q` went 0, 1, 2, 3: bit 2 never toggled and bit 1 never fell, so
 3 of its 6 bins are covered. The inputs count in the counter too, with the
 testbench signals' counts: `clk` rose and fell four times, `rst` only fell and
+`en` only rose, so 7 of the counter's 12 toggle bins are covered. The `else if`
+condition was evaluated on the three counting edges, each time with `en` at 1
+and `q != 3'd7` true: both terms decided it at 1 (their row 1), but neither
+was ever seen deciding it at 0, so neither term is covered.
 `en` only rose, so 7 of the counter's 12 toggle bins are covered. `q` is no
 state machine: nothing tests it (see [FSMs](#fsms)).
 
@@ -733,6 +750,10 @@ is left out of the instance's totals (*excluded*):
 - The statements of an excluded arm are excluded, and so are the branches
   inside it, and the `?:`s in the conditions of the `else if`s after a
   constantly true one.
+- The [condition and expression](#conditions-and-expressions) items of that
+  code (an excluded arm, an operand that is never evaluated, the condition of
+  an `else if` after a constantly true one) are excluded too. They are left
+  out of the results altogether.
 
 Constants are literals (strings included), parameters and `localparam`s, enum
 constants, package parameters (`pkg::P`), the genvar of a generate loop, and an
@@ -825,6 +846,97 @@ branch 1/3, and no `excluded` members.
   says which entries the option leaves out (see
   [the results](#the-code-coverage-results)).
 - Counts are exact: they do not stop at 1.
+
+#### Conditions and expressions
+
+Condition and expression coverage are *focused expression coverage*: a logic
+expression is split into its input terms, and each term has two rows, the term
+at 0 and the term at 1. A row counts when, in an evaluation, the term has that
+value and decides the result: no other term masks it. A term is covered once
+both of its rows are; coverage is the covered terms over all terms.
+
+- **Items.** A *condition* is the condition of an `if` (each one of an
+  `else if` chain), a `while` or `do ... while`, or a `?:` (wherever `?:`
+  is a [branch](#branches), and in the arguments of `$display`, `$write`,
+  `$error` and the other message tasks). An *expression* is the value of a
+  procedural assignment (blocking or nonblocking), of a continuous
+  assignment, or of an input port connected to an expression (`.en(a & b)`,
+  an expression of the parent instance), when that value is 1 bit wide.
+- **Operators and terms.** The logic operators are `&&`, `||`, `!`, and `~`,
+  `&`, `|`, `^`, `~^` on 1-bit operands; in an expression also `?:` with
+  1-bit arms, whose condition is one of its terms. Every other operand is a
+  term: a signal, a select, a function call, a relation (`a == b`, `x < 3`), a
+  reduction (`^v`, and `~^v` its own term), a vector operand of `&&`, a
+  bitwise operator on vectors. A 1-bit signal compared with 0 or 1
+  (`s == 1'b0`) is the term `s`. The same text twice is one term.
+- **Which expressions count.** One with a logic operator on two operands that
+  are not constant, or one that is a relation (`if (state == IDLE)`: one
+  term). Not: a lone signal or select, possibly negated (`if (!rst_n)`), a
+  1-bit signal compared with a constant, a negated relation
+  (`!(a == b)`), a `for` loop's condition, a 1-bit `?:` whose arms take more
+  bits where assigned, and an expression with a system function as a term
+  (`!$isunknown(x) && y`). Constants fold first: `x & 1'b0` is 0, so in
+  `(a & b) | (b & 1'b0)` only `a` and `b` are terms. An expression with more
+  than 32 terms is not covered. A `?:` that is part of an expression is a
+  multiplexer of it, not a condition of its own.
+- **Masking.** `&&` and `||` are short-circuit (§11.3.5): the left operand of
+  `&&` decides alone when it is 0, as the right operand is not evaluated, and
+  decides at 1 when the right is 1; the right operand decides when the left
+  is 1. `||` is the same with 0 and 1 swapped. The bitwise operators evaluate
+  both operands: one decides when the other is 1 for `&`, 0 for `|`, and
+  known for `^` and `~^`. A multiplexer's condition decides unless its other
+  arm is a constant equal to the taken arm, and each arm decides when the
+  condition selects it. A decision passes up through the operators above it.
+  An x or z term gives no row. A negated `&&` or `||` (`!(a && b)`, `~(a ||
+  b)`) is the reference simulator's `~&` or `~|`: both operands decide as
+  for `&` and `|` (the right one is read even when the left decides, if
+  that has no side effects).
+- **Bimodal items.** An item with `^`, `~^` or (in an expression) `?:`
+  counts each row by the item's value too, as the reference simulator does:
+  there a term's two rows can both decide the same value (`a ^ b` at (0, 0)
+  and (1, 1) is always 0; `s ? x : y` with `x` and `y` equal), so a term is
+  covered when its rows were hit at different values of the item. A design
+  unit adds up only the copies of an item that count alike.
+- **Transient states.** The reference simulator evaluates an item each time
+  one of its inputs changes, so it also sees the delta cycle in which one
+  input has its new value and another not yet: in `assign y = d | ~v`, where
+  `d` follows `v` through another block, `v` at 1 with `d` still 0. xezim
+  settles combinational logic in dependency order and evaluates the item once
+  all of its inputs have changed, so for an item of a continuous assignment,
+  or at the top level of a combinational `always` block (not under an `if`
+  or `case`, nor in a loop), it replays the inputs' changes in the order the
+  reference simulator makes them, and counts the rows of each state between.
+  A block's output changes one delta cycle after the block's inputs. A net
+  driven by continuous assignments (a port connection, a gate) changes half
+  a cycle after the variables it reads, but together with the nets it reads;
+  an inverter of an `always` block's output (`assign q_n = ~q`) with that
+  output. A combinational block runs after the continuous assignments of its
+  inputs' cycle, and sees the outputs of the blocks above it in its module
+  that ran in that cycle too. Inputs one process writes change together.
+  A variable an `assign` drives from the top's inputs only changes with
+  them or after them (the testbench writes those through the simulator's
+  interface; cocotb's writes change it with them).
+  How late a signal changes depends on which signals upstream changed, so
+  each input has an earliest and a latest step (the shortest and the longest
+  path to it), and a state between two inputs' changes counts only when one
+  input's latest step is before the other's earliest: otherwise they count
+  as changing together.
+- **Counts** are the evaluations in which the row was hit, one per
+  evaluation (or replayed state) however many times the term appears.
+- **Evaluation.** The interpreter evaluates each item, operator by operator
+  as the design would (the right of `&&` is evaluated only when needed, so a
+  function call's side effects happen as often as without coverage), so the
+  simulation's results do not change. xezim runs combinational blocks after
+  each blocking write of a process; the reference simulator once the
+  process waits. An item they evaluate meanwhile counts its last such
+  evaluation when the process waits (a `#0` too), so the process's writes
+  one at a time are not seen. Reading what the design skipped (the other
+  operand of a negated `&&`), coverage counts nothing inside it, so the
+  rows don't depend on which kinds are collected.
+
+For example, `if (en && q != 3'd7)` evaluated with `en` at 0 hits `en`'s row 0
+(the right side is not evaluated); with `en` at 1 it hits `en`'s row 1 when
+`q != 3'd7` is 1, and the row of `q != 3'd7` for its value.
 
 #### FSMs
 
@@ -1045,6 +1157,31 @@ differences:
   into that net, and then lists it under the parent only; with full signal
   visibility it lists the port in the instance, as xezim does.
 - Toggle counts are not capped at 1.
+- Condition and expression items match the reference simulator's focused
+  expression coverage report item for item, term for term and row for row on
+  most designs. The differences:
+  - Another simulator folds what it can prove constant: a variable assigned
+    only once, an input port tied to a constant (here only a constant written
+    directly in the port connection folds), or a `for` loop's index. Here the
+    items of such code still count. The items of code that
+    [constant conditions](#constant-conditions) rule out are excluded here
+    too.
+  - Transient states (see [Conditions and expressions](#conditions-and-expressions))
+    follow a model of the reference simulator's delta cycles, measured on
+    small designs, not its scheduler. Not replayed: an item under an `if` or
+    `case` or in a loop of a combinational block (the reference simulator
+    counts those states too when the item runs in them), in a function or
+    task, with a function call in a term, or with a term that reads what its
+    own block writes; nor a state between two inputs whose order depends on
+    which signals upstream changed: with `assign n = p & en`, `p` a block
+    output and `en` a register, `n` changes after `p` when `p` changes and
+    on its own when `en` does, so the state between `p`'s change and `n`'s,
+    which the reference simulator counts, is not counted.
+  - Each iteration of a generate loop has its own items, as there. Those of
+    procedural code name their generate block (`block`); those of continuous
+    assignments share `file`, `line` and `text`.
+  - Counts are evaluations, like the other kinds; the other simulator may
+    only record whether a row was hit.
 - A state process's input check compares values at its runs and at the end of
   each time slot, and follows the next-state variable through each run of its
   block (`next = go ? A : B; if (state == A) next = state;` changes `next` and
@@ -1065,18 +1202,19 @@ The results file gains a `code_coverage` member:
 
 | Field | Meaning |
 |---|---|
-| `code_coverage.kinds` | The kinds collected: `statement`, `branch`, `toggle`, `fsm` |
-| `code_coverage.statement`, `.branch`, `.toggle`, `.fsm` | Totals over the design: `covered`, `total` and `percent` (two decimals; `null` when `total` is 0). Toggle totals count bins, two per bit. FSM totals count states and transitions, and `fsm` also has `states` and `transitions`, each with its own `covered`, `total` and `percent`. `excluded`, present when it is not 0, counts the statements or arms left out of `covered` and `total` (see [Constant conditions](#constant-conditions)) |
+| `code_coverage.kinds` | The kinds collected: `statement`, `branch`, `toggle`, `condition`, `expression`, `fsm` |
+| `code_coverage.statement`, `.branch`, `.toggle`, `.condition`, `.expression`, `.fsm` | Totals over the design: `covered`, `total` and `percent` (two decimals; `null` when `total` is 0). Toggle totals count bins, two per bit; condition and expression totals count terms. FSM totals count states and transitions, and `fsm` also has `states` and `transitions`, each with its own `covered`, `total` and `percent`. `excluded`, present when it is not 0, counts the statements or arms left out of `covered` and `total` (see [Constant conditions](#constant-conditions)) |
 | `code_coverage.scopes[]` | One entry per scope that has code: the instances by path, then the packages, `$unit` and the modules that declare classes |
 | `scopes[].scope` | The instance path from the top (`tb.u_cnt`), or the package, `$unit` or module name |
 | `scopes[].design_unit` | The module or interface of the instance; the scope's own name otherwise |
 | `scopes[].kind` | `instance`, `package`, `unit` or `module` (see [Scopes](#scopes)) |
-| `scopes[].statement`, `.branch`, `.toggle`, `.fsm` | The scope's totals, like the design totals |
+| `scopes[].statement`, `.branch`, `.toggle`, `.condition`, `.expression`, `.fsm` | The scope's totals, like the design totals |
 | `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait`. An excluded statement has `"excluded": "constant"` and is not in the totals |
 | `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count`. `"excluded": "constant"` after `kind` marks a branch whose decision is a constant or that is in an excluded arm: none of its arms is in the totals. On an arm, it marks one that can never run |
 | `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, `type`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first. `type` is the data type the signal was declared with, after any typedef: `logic` (also a net declared without a data type), `bit`, `reg`, `byte`, `shortint`, `int`, `longint`, `integer`, `enum`, `struct` or `union`. A member of an unpacked struct or union has the type of the variable it belongs to, `struct` or `union`. `--no-toggle-integers` leaves out the entries of type `byte`, `shortint`, `int`, `longint` and `integer` |
+| `scopes[].conditions[]`, `.expressions[]` | Every condition and expression item, never-evaluated ones included: `file`, `line`, `kind` (a condition's `if`, `while`, `do` or `ternary`; an expression's `statement`, `assign` or `port`), `block` (the generate block within the scope, when there is one), `text` (the source text) and `terms[]`, each with `term` (its source text), `hits` (the counts of its rows 0 and 1) and, in a bimodal item (one with `^`, `~^` or `?:`), `outputs` (`[[row 0 at 0, row 0 at 1], [row 1 at 0, row 1 at 1]]`, by the item's value). An item in code that [constant conditions](#constant-conditions) rule out is neither listed nor in the totals |
 | `scopes[].fsms[]` | Every FSM (see [FSMs](#fsms)): `variable` (the state variable's name within the scope, `gen[0].state` in a generate block), `next` (the next-state variable, or `null` for a one-process FSM), `file` and `line` of the state process, `reset` (the states it is reset to), `states[]` (`name`, `value`, `line`, `count`) in value order, `transitions[]` (`from`, `to`, `line`, `count`) by source state and then target, `unreachable` (state names) and `illegal` |
-| `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches`, `toggles` and `fsms` with the counts of all its instances added up (FSMs of different parameterizations stay apart). A statement, arm, bin, state or transition is covered when any instance covered it. A statement or arm is excluded only when every instance excludes it; otherwise its count adds up only the instances that count it (the arm a constant decision takes runs, but it is no arm in an instance where the decision is made at run time) |
+| `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches`, `toggles`, `conditions`, `expressions` and `fsms` with the counts of all its instances added up (FSMs of different parameterizations stay apart). A statement, arm, bin, row, state or transition is covered when any instance covered it. A statement or arm is excluded only when every instance excludes it; otherwise its count adds up only the instances that count it (the arm a constant decision takes runs, but it is no arm in an instance where the decision is made at run time) |
 
 Only the kinds collected appear. Several statements on one line are separate
 entries with the same `line`.
@@ -1156,9 +1294,9 @@ every run of a design. Toggles add up per bit in the same way, from
 
 ### Code coverage limits
 
-- No condition or expression coverage, and no exclusions besides code that
-  [constant conditions](#constant-conditions) rule out: every other statement,
-  arm, tracked bit, state and transition counts.
+- No exclusions besides code that [constant conditions](#constant-conditions)
+  rule out: every other statement, arm, term, tracked bit, state and
+  transition counts.
 - FSMs that are not recognized: one-hot machines written as `case (1'b1)` over
   the state bits, `casez`/`casex` items with wildcards, a state variable wider
   than 64 bits or of one bit, an element of an array or a member of a struct, a
@@ -1173,7 +1311,15 @@ every run of a design. Toggles add up per bit in the same way, from
   generators, gate fusion for instrumented continuous assignments, table
   lookups for `case` statements, skipping a flop's clock edge when its inputs
   are unchanged, clock generators such as `always #5 clk = ~clk;`, and parallel
-  evaluation. The results do not change; the run is slower.
+  evaluation. The interpreter evaluates condition and expression items. The
+  results do not change; the run is slower.
+- Condition and expression coverage leave out: vector operands of bitwise
+  operators (`a[3:0] & b[3:0]` is one term, and as a value no item),
+  operands of relations (`a == b` is one term, not compared bit by bit),
+  `case` items, `for` loop conditions, `wait` conditions, expressions wider
+  than 1 bit, `return` values and the arguments of calls (a `?:` condition in
+  them is a condition, though). An operand whose width xezim cannot tell
+  without evaluating it (a class property, a method's result) is a term.
 - A function evaluated during elaboration (for a parameter value) counts only its
   calls during the run.
 - Assertion action blocks, `randsequence` productions and covergroups are not
@@ -1194,8 +1340,8 @@ every run of a design. Toggles add up per bit in the same way, from
 
 **Not supported at all:**
 
-- Condition and expression coverage. Code coverage is statement, branch, toggle
-  and FSM only; see [Code coverage limits](#code-coverage-limits).
+- Code coverage is statement, branch, condition, expression, toggle and FSM;
+  see [Code coverage limits](#code-coverage-limits).
 - Coverage databases in other formats (such as UCIS), text or HTML coverage
   reports, and merging results across runs (the files can be added up with
   `jq`: see [Several runs](#several-runs) and
@@ -1242,11 +1388,11 @@ it.
 | `--verbose`, `XEZIM_VERBOSE=1` | Print the `[COV]` summary lines on stderr, along with the other engine lines |
 | `+seed=<n>` | Seed the random generator, for reproducible random stimulus and coverage |
 | `--error-exit` | Exit nonzero after any `$error`, including one from an assertion's action block, and after an `illegal_bins` hit |
-| `--code-coverage[=<kinds>]`, `XEZIM_CODE_COVERAGE=<kinds>` | Collect code coverage: `stmt`, `branch`, `toggle`, `fsm` or `all` (the default). See [Code coverage](#code-coverage) |
+| `--code-coverage[=<kinds>]`, `XEZIM_CODE_COVERAGE=<kinds>` | Collect code coverage: `stmt`, `branch`, `cond`, `expr`, `toggle`, `fsm` or `all` (the default). See [Code coverage](#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees and packages |
 | `--no-toggle-input-ports`, `XEZIM_TOGGLE_INPUT_PORTS=0` | Leave input and inout ports out of toggle coverage; by default each instance counts its own (`--toggle-input-ports`). See [Toggles](#toggles) |
 | `--code-coverage-constant=<exclude\|keep>`, `XEZIM_CODE_COVERAGE_CONSTANT` | Leave out (`exclude`, the default) or count (`keep`) the code that [constant conditions](#constant-conditions) rule out |
-| `+cover`, `+cover=<letters>`, `-coverage [<types>]` | Other simulators' spellings of `--code-coverage`: `s`, `b`, `t` and `f` (or `B`, `T` and `F`) select the kinds; other letters are ignored with a warning |
+| `+cover`, `+cover=<letters>`, `-coverage [<types>]` | Other simulators' spellings of `--code-coverage`: `s`, `b`, `c`, `e`, `t` and `f` (or `B`, `E`, `T` and `F`) select the kinds; other letters are ignored with a warning |
 | `-covworkdir <dir>`, `-covscope <name>`, `-covtest <name>` | Write the results file to `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`, `scope`, `test`) |
 | `-covoverwrite` | Accepted for compatibility with other simulators; no effect (the file is always replaced) |
 | `--no-toggle-integers`, `XEZIM_TOGGLE_INTEGERS=0` | Leave variables of an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of toggle coverage. `--toggle-integers` keeps them (the default) |

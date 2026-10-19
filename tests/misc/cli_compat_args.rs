@@ -160,13 +160,15 @@ fn bare_names_and_dash_c() {
 }
 
 /// `-coverage <types>`: `all`/`A` or a `:` list of B, E, F, T, U in either
-/// case. Blocks are statements and branch arms, `F` is FSM coverage; xezim
-/// has no expression coverage; functional coverage is always on. Anything
-/// else is not a list, and `-coverage` then takes no value.
+/// case. Blocks are statements and branch arms, expressions are condition
+/// and expression coverage, `F` is FSM coverage; functional coverage is
+/// always on. Anything else is not a list, and `-coverage` then takes no
+/// value.
 #[test]
 fn coverage_type_lists() {
     use xezim::compiler::simulator::{
-        KIND_ALL, KIND_BRANCH, KIND_FSM, KIND_STATEMENT, KIND_TOGGLE,
+        KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_FSM, KIND_STATEMENT,
+        KIND_TOGGLE,
     };
     let all = KIND_ALL;
     let none = String::new();
@@ -184,7 +186,10 @@ fn coverage_type_lists() {
     assert_eq!(coverage_types("T"), Some((KIND_TOGGLE, none.clone())));
     assert_eq!(
         coverage_types("B:E:F:U:e"),
-        Some((KIND_STATEMENT | KIND_BRANCH | KIND_FSM, "e".to_string()))
+        Some((
+            KIND_STATEMENT | KIND_BRANCH | KIND_CONDITION | KIND_EXPRESSION | KIND_FSM,
+            String::new()
+        ))
     );
     assert_eq!(coverage_types("U"), Some((0, none)));
     for bad in ["", "tb", "B:", ":T", "B,T", "x", "t.sv", "+cover=s"] {

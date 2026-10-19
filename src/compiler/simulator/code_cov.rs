@@ -3769,6 +3769,7 @@ impl Simulator {
         }
         if kinds & KIND_TOGGLE != 0 {
             let names = std::mem::take(&mut self.code_cov_toggle_names);
+            let names = self.cov_drop_fixed(names);
             cov.toggle = Some(self.cov_build_toggle(&mut cov, &inst_paths, names));
             self.enable_dump_dirty_tracking();
         }
@@ -4949,7 +4950,16 @@ impl Simulator {
     /// drives them. When the run leaves integers out, the signals declared
     /// with an integer atom type are left out too. Each comes with its data
     /// type (`ToggleTypes::of`).
-    pub(super) fn cov_toggle_candidates(module: &ElaboratedModule) -> Vec<(String, &'static str)> {
+    ///
+    /// Each name also carries what `cov_drop_fixed` needs: `None` for a port,
+    /// a net and a variable of a struct, enum or named type, which always
+    /// stay tracked; for any other variable, whether a constant declaration
+    /// initializer gave it its elaborated value (a bit that is not x, or is
+    /// set in a 2-state variable). One declared in a generate block counts
+    /// as not initialized: the reference simulator keeps those.
+    pub(super) fn cov_toggle_candidates(
+        module: &ElaboratedModule,
+    ) -> Vec<(String, &'static str, Option<bool>)> {
         let Some(cfg) = code_coverage().filter(|c| c.kinds & KIND_TOGGLE != 0) else {
             return Vec::new();
         };
@@ -4971,6 +4981,17 @@ impl Simulator {
             .chain(module.tasks.keys())
             .map(|k| format!("{}.", k))
             .collect();
+        // Declared in a generate block (or a named block) of its instance.
+        let nested = |n: &str| {
+            let mut cut = n.len();
+            while let Some(p) = n[..cut].rfind('.') {
+                if inst_paths.contains(&n[..p]) {
+                    return n[p + 1..].contains('.');
+                }
+                cut = p;
+            }
+            n.contains('.')
+        };
         let types = ToggleTypes {
             module,
             // A path-specific bind runs a specialized copy of its target
@@ -4982,7 +5003,7 @@ impl Simulator {
                 .collect(),
             ports: std::cell::OnceCell::new(),
         };
-        let mut out: Vec<(String, &'static str)> = module
+        let mut out: Vec<(String, &'static str, Option<bool>)> = module
             .signals
             .iter()
             .filter(|(name, sig)| {
@@ -5053,11 +5074,131 @@ impl Simulator {
                 }
                 !subr_prefixes.iter().any(|p| n.starts_with(p.as_str()))
             })
-            .map(|(name, sig)| (name.clone(), types.of(name, sig.type_name.as_deref())))
-            .filter(|(_, ty)| cfg.integers || !TOGGLE_INTEGER_TYPES.contains(ty))
+            .map(|(name, sig)| {
+                let n = name.as_str();
+                let var = sig.direction.is_none()
+                    && sig.type_name.is_none()
+                    && !module.nets.contains(n)
+                    && !module.packed_struct_fields.contains_key(n)
+                    && !module.packed_signal_elem_widths.contains_key(n)
+                    && !matches!(
+                        module.var_decl_types.get(n),
+                        Some(DataType::Struct(_)) | Some(DataType::Enum(_))
+                    );
+                let two = module.two_state_signals.contains(n);
+                let width = sig.width as usize;
+                let init = (0..width).step_by(64).any(|lo| {
+                    let w = (width - lo).min(64);
+                    let mask = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+                    let (v, x) = sig.value.slice_bits_swar(lo, w);
+                    (if two { v } else { v | !x }) & mask != 0
+                });
+                (
+                    name.clone(),
+                    types.of(name, sig.type_name.as_deref()),
+                    var.then(|| init && !nested(n)),
+                )
+            })
+            .filter(|(_, ty, _)| cfg.integers || !TOGGLE_INTEGER_TYPES.contains(ty))
             .collect();
         out.sort();
         out
+    }
+
+    /// The toggle candidates without the variables whose value is fixed
+    /// before the run starts, which the reference simulator leaves out of
+    /// toggle coverage: one that only a constant declaration initializer
+    /// sets (§6.8: it takes effect before any process starts), and one that
+    /// only a single blocking assignment of a constant sets, in an `initial`
+    /// block with no timing control. Any other write in the design keeps a
+    /// variable: a procedural or continuous assignment (even one that never
+    /// runs), a port connection, a `force`, or an argument a subroutine or
+    /// system task may write. A write the census can't place keeps every
+    /// variable of its name. Values a VPI client writes don't count, as on
+    /// the reference simulator; a variable nothing writes that has no
+    /// initializer (one a VPI client drives) stays tracked.
+    fn cov_drop_fixed(
+        &self,
+        names: Vec<(String, &'static str, Option<bool>)>,
+    ) -> Vec<(String, &'static str)> {
+        let index: HashMap<String, usize> = names
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, f))| f.is_some())
+            .map(|(i, (n, _, _))| (n.clone(), i))
+            .collect();
+        if index.is_empty() {
+            return names.into_iter().map(|(n, t, _)| (n, t)).collect();
+        }
+        let mut leaves: HashMap<String, Vec<usize>> = HashMap::default();
+        for (n, &i) in &index {
+            let leaf = n.rsplit('.').next().unwrap_or(n);
+            leaves.entry(leaf.to_string()).or_default().push(i);
+        }
+        let m = &self.module;
+        let mut c = Census {
+            sim: self,
+            index,
+            top: format!("{}.", m.name),
+            scope: String::new(),
+            leaves,
+            once: vec![0; names.len()],
+            more: vec![false; names.len()],
+        };
+        for b in &m.always_blocks {
+            c.process(&b.stmt, &b.scope, false);
+        }
+        for p in &m.pending_always {
+            let b = p.clone().materialize();
+            c.process(&b.stmt, &b.scope, false);
+        }
+        for b in &m.initial_blocks {
+            c.process(&b.stmt, &b.scope, true);
+        }
+        for p in &m.pending_initial {
+            let b = p.clone().materialize();
+            c.scope = b.scope.clone();
+            c.stmt(&b.stmt, &p.source, !timed(&b.stmt));
+        }
+        for b in m
+            .final_blocks
+            .iter()
+            .chain(&m.program_initial_blocks)
+            .chain(&m.static_init_blocks)
+        {
+            c.process(&b.stmt, &b.scope, false);
+        }
+        for (k, f) in m.functions.iter() {
+            c.subroutine(k, &f.items);
+        }
+        for (k, t) in m.tasks.iter() {
+            c.subroutine(k, &t.items);
+        }
+        for cls in m.classes.values() {
+            for meth in cls.methods.values() {
+                use crate::ast::decl::ClassMethodKind as K;
+                match &meth.kind {
+                    K::Function(f) | K::Extern(f) | K::PureVirtual(f) => c.subroutine("", &f.items),
+                    K::Task(t) => c.subroutine("", &t.items),
+                }
+            }
+        }
+        c.scope.clear();
+        for ca in &m.continuous_assigns {
+            c.mark(&ca.lhs, false);
+        }
+        for p in &m.pending_cont_assign {
+            c.mark(&p.clone().materialize(&m.parameters).lhs, false);
+        }
+        names
+            .into_iter()
+            .enumerate()
+            .filter(|(i, (_, _, f))| match f {
+                Some(init) => c.more[*i] || c.once[*i] != u32::from(!*init),
+                None => true,
+            })
+            .map(|(_, (n, t, _))| (n, t))
+            .collect()
     }
 
     fn cov_build_toggle(
@@ -5393,4 +5534,490 @@ impl Simulator {
         json.push_str("    ]\n  }");
         Some(json)
     }
+}
+
+/// The writes to toggle candidates `cov_drop_fixed` counts, by candidate:
+/// `once` the blocking assignments of a constant in an `initial` block
+/// without a timing control, `more` any other write.
+struct Census<'a> {
+    sim: &'a Simulator,
+    index: HashMap<String, usize>,
+    /// The top module's name and a dot, which a full path starts with.
+    top: String,
+    /// Instance or subroutine scope of the code being read: a subroutine
+    /// body may still name a variable of its instance without it.
+    scope: String,
+    /// Candidates by the last part of their name, for writes the census
+    /// can't place (`mark_path`).
+    leaves: HashMap<String, Vec<usize>>,
+    once: Vec<u32>,
+    more: Vec<bool>,
+}
+
+impl<'a> Census<'a> {
+    fn process(&mut self, s: &Statement, scope: &str, initial: bool) {
+        self.scope = scope.to_string();
+        self.stmt(s, s, initial && !timed(s));
+    }
+
+    fn subroutine(&mut self, key: &str, items: &[Statement]) {
+        self.scope = key
+            .rsplit_once('.')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        for s in items {
+            self.stmt(s, s, false);
+        }
+    }
+
+    /// Count a write to each candidate the lvalue `e` names.
+    fn mark(&mut self, e: &Expression, once: bool) {
+        let mut found = Vec::new();
+        paths(e, &mut found);
+        for p in found {
+            self.mark_path(&p, once);
+        }
+    }
+
+    /// Count a write to the candidate path `p` names, whole or by a prefix
+    /// (a select or member writes its variable), with and without the scope
+    /// in front. A clocking block output writes the signal it is bound to
+    /// (§14.3). A write the census can't place, such as one through a
+    /// virtual interface or to a name it doesn't know, counts for every
+    /// candidate with the same last name: when unsure, keep the variable.
+    fn mark_path(&mut self, p: &str, once: bool) {
+        let sim = self.sim;
+        let p = p.strip_prefix(self.top.as_str()).unwrap_or(p);
+        let scoped = (!self.scope.is_empty()).then(|| format!("{}.{}", self.scope, p));
+        let mut placed = false;
+        for full in std::iter::once(p.to_string()).chain(scoped) {
+            placed |= sim.signal_name_to_id.get(&full).is_some();
+            let mut end = full.len();
+            loop {
+                let head = &full[..end];
+                if let Some(&i) = self.index.get(head) {
+                    placed = true;
+                    if once {
+                        self.once[i] += 1;
+                    } else {
+                        self.more[i] = true;
+                    }
+                }
+                if let Some(cb) = sim
+                    .module
+                    .clocking_blocks
+                    .get(head)
+                    .filter(|_| end < full.len())
+                {
+                    placed = true;
+                    let var = full[end + 1..].split('.').next().unwrap_or_default();
+                    let mut bound = Vec::new();
+                    match cb
+                        .signals
+                        .iter()
+                        .find(|s| s.name.name == var)
+                        .and_then(|s| s.bound_to.as_ref())
+                    {
+                        Some(e) => paths(e, &mut bound),
+                        None => bound.push(var.to_string()),
+                    }
+                    let up = head.rsplit_once('.').map(|(u, _)| u);
+                    for b in bound {
+                        if let Some(u) = up {
+                            self.mark_path(&format!("{}.{}", u, b), false);
+                        }
+                        self.mark_path(&b, false);
+                    }
+                }
+                match head.rfind('.') {
+                    Some(d) => end = d,
+                    None => break,
+                }
+            }
+        }
+        if !placed {
+            let leaf = p.rsplit('.').next().unwrap_or(p);
+            for i in self.leaves.get(leaf).cloned().unwrap_or_default() {
+                self.more[i] = true;
+            }
+        }
+    }
+
+    /// `once`: the statement runs exactly once, at time 0 (straight-line
+    /// code of an `initial` block without timing controls). `src` is the
+    /// statement as an instance's module declares it, before its ports are
+    /// replaced by their connections: a port tied to a constant is not a
+    /// constant in the module.
+    fn stmt(&mut self, s: &Statement, src: &Statement, once: bool) {
+        use crate::ast::stmt::ProceduralContinuous as PC;
+        match &s.kind {
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                let whole = matches!(&lvalue.kind,
+                    ExprKind::Ident(h) if h.path.iter().all(|p| p.selects.is_empty()));
+                let fixed = once
+                    && whole
+                    && self.constant(rvalue)
+                    && matches!(&src.kind,
+                        StatementKind::BlockingAssign { rvalue: r, .. } if self.constant(r));
+                self.mark(lvalue, fixed);
+                self.expr(lvalue);
+                self.expr(rvalue);
+            }
+            StatementKind::NonblockingAssign { lvalue, rvalue, .. }
+            | StatementKind::ProceduralContinuous(PC::Assign { lvalue, rvalue })
+            | StatementKind::ProceduralContinuous(PC::Force { lvalue, rvalue }) => {
+                self.mark(lvalue, false);
+                self.expr(lvalue);
+                self.expr(rvalue);
+            }
+            StatementKind::Expr(e) | StatementKind::Return(Some(e)) => self.expr(e),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                let srcs = match &src.kind {
+                    StatementKind::SeqBlock { stmts: v, .. }
+                    | StatementKind::ParBlock { stmts: v, .. }
+                        if v.len() == stmts.len() =>
+                    {
+                        Some(v)
+                    }
+                    _ => None,
+                };
+                for (i, x) in stmts.iter().enumerate() {
+                    self.stmt(x, srcs.map_or(x, |v| &v[i]), once);
+                }
+            }
+            StatementKind::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.expr(condition);
+                self.stmt(then_stmt, then_stmt, false);
+                if let Some(x) = else_stmt {
+                    self.stmt(x, x, false);
+                }
+            }
+            StatementKind::Case { expr, items, .. } => {
+                self.expr(expr);
+                for it in items {
+                    self.stmt(&it.stmt, &it.stmt, false);
+                }
+            }
+            StatementKind::For {
+                init,
+                condition,
+                step,
+                body,
+            } => {
+                for i in init {
+                    match i {
+                        ForInit::Assign { lvalue, rvalue } => {
+                            self.mark(lvalue, false);
+                            self.expr(lvalue);
+                            self.expr(rvalue);
+                        }
+                        ForInit::VarDecl { init, .. } => self.expr(init),
+                    }
+                }
+                for e in condition.iter().chain(step) {
+                    self.expr(e);
+                }
+                self.stmt(body, body, false);
+            }
+            StatementKind::While { condition, body }
+            | StatementKind::DoWhile { body, condition }
+            | StatementKind::Repeat {
+                count: condition,
+                body,
+            }
+            | StatementKind::Wait {
+                condition,
+                stmt: body,
+            } => {
+                self.expr(condition);
+                self.stmt(body, body, false);
+            }
+            StatementKind::Foreach { body, .. }
+            | StatementKind::ForeachTail { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::ForeverTail { body }
+            | StatementKind::RsAction { body }
+            | StatementKind::TimingControl { stmt: body, .. } => self.stmt(body, body, false),
+            StatementKind::Assertion(a) => {
+                for x in [&a.action, &a.else_action].into_iter().flatten() {
+                    self.stmt(x, x, false);
+                }
+            }
+            StatementKind::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    if let Some(e) = &d.init {
+                        self.expr(e);
+                    }
+                }
+            }
+            StatementKind::RandCase { items } => {
+                for (w, x) in items {
+                    self.expr(w);
+                    self.stmt(x, x, false);
+                }
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => {
+                for x in [pass, fail].into_iter().flatten() {
+                    self.stmt(x, x, false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The writes inside an expression: assignment operators, `++`/`--`,
+    /// and arguments of a call that may write them.
+    fn expr(&mut self, e: &Expression) {
+        match &e.kind {
+            ExprKind::AssignExpr {
+                lvalue: l,
+                rvalue: r,
+            }
+            | ExprKind::Binary {
+                op: BinaryOp::Assign,
+                left: l,
+                right: r,
+            } => {
+                self.mark(l, false);
+                self.expr(l);
+                self.expr(r);
+            }
+            ExprKind::Unary { op, operand } => {
+                if matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+                ) {
+                    self.mark(operand, false);
+                }
+                self.expr(operand);
+            }
+            ExprKind::Call { func, args } => {
+                // An argument to an input port only reads; to any other
+                // port, or of a call with no known declaration, it may write.
+                let ports = self.ports(func);
+                for (i, a) in args.iter().enumerate() {
+                    let (port, a) = match &a.kind {
+                        ExprKind::NamedArg {
+                            name,
+                            expr: Some(x),
+                        } => (
+                            ports.and_then(|p| p.iter().find(|q| q.name.name == name.name)),
+                            &**x,
+                        ),
+                        _ => (ports.and_then(|p| p.get(i)), a),
+                    };
+                    if !port.is_some_and(|q| q.direction == PortDirection::Input) {
+                        self.mark(a, false);
+                    }
+                    self.expr(a);
+                }
+            }
+            ExprKind::SystemCall { name, args } => {
+                let read = reads_only(name);
+                for a in args {
+                    if !read {
+                        self.mark(a, false);
+                    }
+                    self.expr(a);
+                }
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Index {
+                expr: left,
+                index: right,
+            }
+            | ExprKind::Range(left, right) => {
+                self.expr(left);
+                self.expr(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr(condition);
+                self.expr(then_expr);
+                self.expr(else_expr);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.expr(expr);
+                self.expr(left);
+                self.expr(right);
+            }
+            ExprKind::Concatenation(v) | ExprKind::StreamOp { exprs: v, .. } => {
+                for x in v {
+                    self.expr(x);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.expr(count);
+                for x in exprs {
+                    self.expr(x);
+                }
+            }
+            ExprKind::AssignmentPattern(v) => {
+                for x in v {
+                    self.expr(x.expr());
+                }
+            }
+            ExprKind::Inside { expr, ranges } => {
+                self.expr(expr);
+                for x in ranges {
+                    self.expr(x);
+                }
+            }
+            ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::WithClause { expr: x, .. }
+            | ExprKind::RandomizeWith { call: x, .. }
+            | ExprKind::Specialization { base: x, .. }
+            | ExprKind::ShallowCopy { source: x }
+            | ExprKind::Matches { expr: x, .. }
+            | ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::Tagged { inner: Some(x), .. } => self.expr(x),
+            _ => {}
+        }
+    }
+
+    /// The ports of the function or task a call names, when the design
+    /// declares it.
+    fn ports(&self, func: &Expression) -> Option<&'a [crate::ast::decl::FunctionPort]> {
+        let ExprKind::Ident(h) = &func.kind else {
+            return None;
+        };
+        let m: &'a ElaboratedModule = &self.sim.module;
+        let n = dotted(h);
+        [format!("{}.{}", self.scope, n), n].iter().find_map(|k| {
+            m.functions
+                .get(k)
+                .map(|f| f.ports.as_slice())
+                .or_else(|| m.tasks.get(k).map(|t| t.ports.as_slice()))
+        })
+    }
+
+    /// An expression of literals and parameters only.
+    fn constant(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::TypeLiteral(_) => true,
+            ExprKind::Ident(h) => {
+                let n = dotted(h);
+                let scoped = format!("{}.{}", self.scope, n);
+                let leaf = n.rsplit('.').next().unwrap_or(&n);
+                let params = &self.sim.module.parameters;
+                let names = &self.sim.signal_name_to_id;
+                params.contains_key(&n)
+                    || params.contains_key(&scoped)
+                    || (params.contains_key(leaf)
+                        && names.get(&n).is_none()
+                        && names.get(&scoped).is_none())
+            }
+            ExprKind::Unary { operand: x, .. } | ExprKind::Paren(x) => self.constant(x),
+            ExprKind::Binary { op, left, right } => {
+                !matches!(op, BinaryOp::Assign) && self.constant(left) && self.constant(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => self.constant(condition) && self.constant(then_expr) && self.constant(else_expr),
+            ExprKind::Concatenation(v) => v.iter().all(|x| self.constant(x)),
+            ExprKind::Replication { count, exprs } => {
+                self.constant(count) && exprs.iter().all(|x| self.constant(x))
+            }
+            // Casts keep their operand last.
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$signed" | "$unsigned" | "$clog2" => args.iter().all(|x| self.constant(x)),
+                "$bits" => true,
+                n if n.starts_with("$__xz_") && n.ends_with("_cast") => {
+                    args.last().is_some_and(|x| self.constant(x))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+fn dotted(h: &HierarchicalIdentifier) -> String {
+    h.path
+        .iter()
+        .map(|s| s.name.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The variables an lvalue names, as dotted paths.
+fn paths(e: &Expression, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Ident(h) => out.push(dotted(h)),
+        ExprKind::MemberAccess { expr, member } => {
+            let n = out.len();
+            paths(expr, out);
+            for p in &mut out[n..] {
+                p.push('.');
+                p.push_str(&member.name);
+            }
+        }
+        ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::Paren(expr) => paths(expr, out),
+        ExprKind::Concatenation(v) | ExprKind::StreamOp { exprs: v, .. } => {
+            for x in v {
+                paths(x, out);
+            }
+        }
+        ExprKind::AssignmentPattern(v) => {
+            for x in v {
+                paths(x.expr(), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A statement that can suspend its process: a delay, event control, wait
+/// (an intra-assignment one included) or task call.
+fn timed(s: &Statement) -> bool {
+    match &s.kind {
+        StatementKind::TimingControl { .. }
+        | StatementKind::Wait { .. }
+        | StatementKind::WaitFork
+        | StatementKind::WaitOrder { .. } => true,
+        StatementKind::Expr(e) => matches!(e.kind, ExprKind::Call { .. }),
+        // `a = #5 b;` and `a = @e b;` (§9.4.5) suspend too.
+        StatementKind::BlockingAssign { rvalue, .. } => Simulator::intra_timing_suspends(rvalue),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().any(timed)
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => timed(then_stmt) || else_stmt.as_deref().is_some_and(timed),
+        StatementKind::Case { items, .. } => items.iter().any(|i| timed(&i.stmt)),
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body } => timed(body),
+        _ => false,
+    }
+}
+
+/// System tasks and functions that only read their arguments (by prefix:
+/// `$display` covers `$displayh`).
+fn reads_only(name: &str) -> bool {
+    const READ: &str = "$display $write $strobe $monitor $fdisplay $fwrite $fstrobe $fmonitor \
+        $error $warning $info $fatal $sformatf $psprintf $signed $unsigned $clog2 $bits $size \
+        $countones $countbits $onehot $isunknown $past $rose $fell $stable $changed $sampled \
+        $finish $stop $time $__xz_cov $__xz_size_cast $__xz_type_cast $__xz_named_cast";
+    READ.split_whitespace().any(|r| name.starts_with(r))
 }

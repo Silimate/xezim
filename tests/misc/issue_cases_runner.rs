@@ -354,3 +354,85 @@ fn issue_312_survey_single_module() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
+
+/// Issue #390: a queue-of-structs element pushed as a function's struct
+/// return (`q.push_back(make(...))`) keeps its string members when the queue
+/// is passed to a function, copied to another queue, or iterated with
+/// foreach (§7.10.2.2, §13.4.1). One integrated MWE: the issue's shape plus
+/// the foreach-formal, queue-copy, multi-element and mixed-sourcing cousins,
+/// with working shapes (ref formal, struct var from a call) as controls.
+#[test]
+fn issue_390_queue_struct_call_elems() {
+    let msgs = outputs(
+        include_str!("../issue_cases/issue390_queue_struct_call_elems.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+
+/// A call is evaluated once even when a deeply nested struct has no leaf
+/// layout available (§13.5.1, §7.10.2.2). Expected counts and queue sizes
+/// were checked with the reference simulator.
+#[test]
+fn queue_struct_value_arguments_run_once() {
+    let msgs = outputs(
+        include_str!("../issue_cases/queue_struct_value_once.sv"),
+        100_000,
+    );
+    let mut rows: Vec<_> = msgs
+        .iter()
+        .filter(|m| m.starts_with("T|"))
+        .cloned()
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            "T|back|1 1",
+            "T|conditional|2 2",
+            "T|front|1 1",
+            "T|insert|1 1",
+            "T|method|1 2",
+            "T|parenthesized|2 2",
+        ],
+        "{msgs:#?}",
+    );
+}
+
+/// A full-word first concatenation part is copied without a shift by 64
+/// (§11.4.12). Adjacent widths, nesting and multi-part forms preserve both
+/// value and X/Z planes. Expected rows match the reference simulator.
+#[test]
+fn full_word_concatenation_preserves_value_and_xz_planes() {
+    let out = outputs(
+        include_str!("../issue_cases/narrow_concat_boundaries.sv"),
+        1000,
+    );
+    let mut rows: Vec<_> = out.into_iter().filter(|m| m.starts_with("T|")).collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            "T|boundaries|x123456789abcdef 10123456789abcdez x123456789abcdezx123456789abcdez",
+            "T|known_boundaries|7123456789abcdef 10123456789abcdef fedcba9876543210fedcba9876543210",
+            "T|known|fedcba9876543210 fedcba9876543210 fedcba9876543210 fedcba9876543210 fedcba9876543210",
+            "T|unknown|x123456789abcdez x123456789abcdez x123456789abcdez x123456789abcdez x123456789abcdez",
+        ]
+    );
+}
+
+/// Issue #391: appending one-character string casts — out = {out, string'(c)}
+/// — padded every character with 127 NUL bytes once the function tiered up
+/// to bytecode ("HELLO" came back with len 513 = 1 + 4*128). The cast now
+/// converts to a string value (§6.16) and the concat takes the §11.4.12
+/// string path; bare and prepended casts are covered as cousins.
+#[test]
+fn issue_391_string_cast_concat_padding() {
+    let msgs = outputs(
+        include_str!("../issue_cases/issue391_string_cast_concat.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}

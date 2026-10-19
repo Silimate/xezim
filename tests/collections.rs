@@ -195,3 +195,6 @@ mod next_twelve_declaration_patterns_365;
 
 #[path = "collections/whole_array_nba_381.rs"]
 mod next_rest_whole_array_nba_381;
+
+#[path = "collections/collection_returns_387.rs"]
+mod collection_returns_387;

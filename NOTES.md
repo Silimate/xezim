@@ -10,6 +10,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Concurrent assertions size their expressions as the rest of the language
+  does. A context-determined operand (of `+ - * / % **`, of a bitwise or
+  conditional operator, or a shift's left operand) is extended to the width
+  of the whole expression before the operation: over 16-bit `a` and `b`,
+  `a * b == 32'sh0001_0000` multiplies at 32 bits, where it multiplied at 16
+  and failed. This holds in properties, sequences, `disable iff`, clocking
+  event guards and cover properties, for the results of `$past`, and for
+  property local variables, whose match item assignments (`x = a + b`) are
+  now sized with `x`. A size cast to a parameter width (`W'(r)`) keeps its
+  width in an assertion; its parameter was read like a signal and the cast
+  lost its width. The evaluator now also sizes a size cast, a select, an array
+  element, a struct member and a concatenation in a comparison, which
+  corrects them in procedural code it runs, such as an `initial` block
+  (§6.24.1, §11.6.1, §11.8.2, §16.10). (Silimate/xezim#55)
 * A value a VPI client writes to an element of an instance's unpacked-array
   input port reaches the instance, through any number of port levels, and
   the actual's name reads it too; a value written to the actual reaches the

@@ -539,6 +539,25 @@ fn g_overrides_parameter_defaults() {
     assert!(err.contains("'NOPE'; ignored"), "{}", err);
 }
 
+const EXPRS: &str = "\
+module tb #(parameter [5:0] P = 0, parameter logic [3:0][2:0] R = 0, parameter int N = 0);
+  initial $display(\"P=%0d R=%h N=%0d\", P, R, N);
+endmodule
+";
+
+/// A `-g` value is a constant expression (§6.20.2): a concatenation or
+/// replication of sized literals (§11.4.12) sets a packed parameter. The
+/// cocotb runner (contrib/cocotb) passes `parameters` values to `-g` as given,
+/// and cocotb testbenches pass such values for packed parameters.
+#[test]
+fn g_takes_constant_expressions() {
+    let d = scratch("gexpr");
+    std::fs::write(d.join("t.sv"), EXPRS).unwrap();
+    let args = ["t.sv", "-gP={3'd7,3'd5}", "-gR={4{3'd5}}", "-gN=8'hff - 1"];
+    let out = ok_stdout(&d, &args);
+    assert!(out.contains("P=61 R=b6d N=254"), "{}", out);
+}
+
 const LOCALS: &str = "\
 module tb #(parameter int TOPP = 1) ();
   parameter int BODYP = 2;

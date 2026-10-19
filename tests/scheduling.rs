@@ -307,6 +307,8 @@ mod phase_jump_static_latch;
 mod release_from_level_sensitive_block;
 #[path = "scheduling/static_recursion_shared_cell.rs"]
 mod static_recursion_shared_cell;
+#[path = "scheduling/sva_array_sampling.rs"]
+mod sva_array_sampling;
 #[path = "scheduling/sva_context_width.rs"]
 mod sva_context_width;
 #[path = "scheduling/sva_instances_and_sequences.rs"]

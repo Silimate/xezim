@@ -24,6 +24,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   element, a struct member and a concatenation in a comparison, which
   corrects them in procedural code it runs, such as an `initial` block
   (§6.24.1, §11.6.1, §11.8.2, §16.10). (Silimate/xezim#55)
+* A value a VPI client writes to an element of an instance's unpacked-array
+  input port reaches the instance, through any number of port levels, and
+  the actual's name reads it too; a value written to the actual reaches the
+  port's name in the same delta. The port and a whole-array actual are one
+  object (§23.3.3.7), as a scalar port and its actual already were. They had
+  storage of their own, connected element by element, while the instance
+  read the actual, so a cocotb test driving `dut.inst.port[i]` left the
+  instance reading z. (#66)
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
@@ -59,6 +67,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   of a static task or function, whole or select, commit in the NBA region;
   select writes were dropped and whole writes to a local the task wrote
   first took effect at once (§10.4.2). (#4)
+* Concurrent assertions sample the elements of unpacked arrays in the
+  Preponed region like other variables. They read the value an element took
+  in the NBA region of the edge being evaluated, so `a[0] == $past(s)` with
+  `a[0] <= s` failed at every edge. This covers multidimensional arrays,
+  unpacked arrays of packed vectors, arrays of structs, arrays in interfaces,
+  array ports, and dynamic arrays and queues up to index 63. A select with
+  constant indices samples its element. One whose indices read variables
+  samples the element their sampled values name, found again in each time
+  slot, so a large memory is never copied. An index read from a sequence
+  local variable, a procedure's loop variable, a sampled-value function or a
+  call samples the whole array (§16.5.1). (#27)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -97,6 +116,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   toggle scores and design totals change accordingly;
   `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
   previous counting, where only the driving signal counts.
+* Toggle coverage leaves out a variable whose value is fixed before the run
+  starts, as the reference simulator does: one only its declaration
+  initializer sets (`reg [4:0] poly = 5'b10011;`), and one only a single
+  constant assignment sets in an `initial` block without timing controls.
+  Such a variable never changes, so its bins could never be covered and
+  held instance scores down (§6.8). Any other write keeps a variable, even
+  one that never runs; writes through VPI don't count. (Silimate/xezim#46)
 * Named blocking `case` branches retain their `%m` scope and `disable`
   targets across suspension (§9.3, §9.6.2).
 
@@ -136,6 +162,28 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   parameters included, in `xezim_build.json` instead of `xezim_sources.f`, so
   `test()` on another runner uses them too. The runner's tests are in
   `contrib/cocotb/tests`.
+
+**Usability**
+
+* `--compat` (or `XEZIM_COMPAT=1`) runs a flow written for commercial
+  simulators with one flag: no time cap, `--relax-implicit-static`,
+  `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
+  or `-do` run time still sets the run length.
+* `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
+  `$finish` or no events remain, as with `-do "run -all"`. The default is
+  unchanged: a design that never finishes still stops.
+* `--version` and `-version` print the version and git revision, as `-V`
+  does, and exit 0.
+* More of other simulators' options run as-is: `-define`, `-incdir` and
+  `-top` (same as `-D`, `-I`, `-s`), `-coverage <types>` (`all`, or `B`,
+  `T`, `U`, `E`, `F` joined by `:`), `-covworkdir`/`-covscope`/`-covtest`
+  (the results file goes in `<dir>/<scope>/<test>/`), and, with no effect,
+  `-covoverwrite`, `-licqueue`, `-R`, `-access`, `+access+`, `-nowarn`,
+  `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
+  to be read as source files or top names, and `-licqueue` as `-l icqueue`,
+  which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
+  (same as `+seed=`) now work on the command line too, where they were read
+  as `-s vseed` and `-s eed`.
 
 **Maintenance**
 

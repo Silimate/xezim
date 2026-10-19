@@ -3600,16 +3600,9 @@ impl<'a> Builder<'a> {
         let mut elems = Vec::new();
         for v in values {
             let ename = format!("{}[{}]", name, v);
-            let (flat_prefix, flat_suffix) = match &gf.name {
-                Some(_) => (
-                    format!("{}{}.", ctx.flat_prefix, ename),
-                    ctx.flat_suffix.clone(),
-                ),
-                None => (
-                    ctx.flat_prefix.clone(),
-                    format!("__gf_{}_{}_{}", gf.var, v, ctx.flat_suffix),
-                ),
-            };
+            // §27.6: all for-generate data now uses the public block scope.
+            let flat_prefix = format!("{}{}.", ctx.flat_prefix, ename);
+            let flat_suffix = ctx.flat_suffix.clone();
             let inst_prefix = format!("{}{}.", ctx.inst_prefix, ename);
             let params = self.merge_params(ctx, &flat_prefix, Some((&gf.var, v)));
             let sub = self.gen_scope(

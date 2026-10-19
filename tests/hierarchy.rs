@@ -247,3 +247,12 @@ mod unobserved_port_elision;
 mod vif_packed_array_elem_nba;
 #[path = "hierarchy/named_block_hier_names.rs"]
 mod named_block_hier_names;
+
+#[path = "hierarchy/instance_array_342.rs"]
+mod instance_array_342;
+
+#[path = "hierarchy/positional_ports_358.rs"]
+mod next_twelve_positional_ports_358;
+
+#[path = "hierarchy/generate_names_380.rs"]
+mod next_rest_generate_names_380;

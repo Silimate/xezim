@@ -37,6 +37,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--cache-dir <dir>` | Select the automatic elaborated-design cache directory |
 | `--no-cache` | Disable the automatic elaborated-design cache |
 | `-l`, `--log <file>` | Redirect all stdout/stderr — including DPI/VPI C output — to a log file |
+| `--tee <file>` | Copy stdout/stderr, including DPI/VPI C output, to a log file while retaining each stream on the console |
 | `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations |
 | `-y <dir>` | Library directory: `<module>.<ext>` loaded on demand |
 | `+libext+<ext>+…` | Extension list for `-y` search (replaces the default `.v`/`.sv`/`.V`) |
@@ -44,6 +45,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `+notimingcheck` | Disable the specify-block timing checks (`$setup`, `$hold`, `$width`, …; also `+notimingchecks`/`-notimingchecks`). A violation otherwise prints one `** Error:` line (counted by `--error-exit`) and toggles the check's notifier |
 | `+no_notifier` / `+no_tchk_msg` | Report timing violations without toggling notifiers / toggle notifiers without reporting |
 | `+delay_mode_zero` / `+delay_mode_unit`, `+mindelays` / `+typdelays` / `+maxdelays` | Gate-level delay modes and min/typ/max selection |
+| `-vcd [dumpon]` | Enable source-driven VCD dumping, like `--wave`; the optional compatibility token `dumpon` is consumed |
 | `--wave` | Compile the model with waveform support, enabling `$dumpfile`/`$dumpvars` (off by default; `--fst`/`--xtrace` imply it) |
 | `--fst <file>` | Emit an FST (GTKWave binary) waveform dump |
 | `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable). `LEVEL:<hier>` limits the depth: `1:top.u1` dumps only `top.u1`'s own signals, `2:top.u1` one level of children too, and `0:` or no prefix every level (§21.7.1.4) |

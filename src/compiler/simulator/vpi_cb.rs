@@ -677,6 +677,8 @@ impl Simulator {
             || !self.inactive_queue.is_empty()
             || !self.pending_reactive.is_empty()
             || !self.nba_region_waiters.is_empty()
+            || !self.deferred_clocking_conts.is_empty()
+            || !self.deferred_clocking_guarded.is_empty()
     }
 
     /// After callbacks that may have written: a fresh delta, so a deposited
@@ -689,6 +691,24 @@ impl Simulator {
         }
         self.check_edges();
         let _ = self.drain_edge_cascade(self.cascade_limit);
+        // §14.13: a clock deposited by a synchronization callback opens a
+        // new delta at this time. Complete its sampling and clocking-event
+        // delivery after the resulting NBAs, before absorbing the edge into
+        // the next snapshot. Otherwise @(cb) remains deferred until another
+        // clock toggle, and #0 inputs still expose the preceding edge.
+        self.drain_observed_region();
+        self.tick_clocking_blocks();
+        if self.clocking_mirror_dirty {
+            self.clocking_mirror_dirty = false;
+            let saved = self.edge_dispatch_phase;
+            self.edge_dispatch_phase = "clocking-mirror";
+            self.check_edges();
+            self.edge_dispatch_phase = saved;
+            let _ = self.drain_edge_cascade(self.cascade_limit);
+        }
+        self.drain_deferred_clocking_conts();
+        self.drain_reactive_region();
+        self.drain_nba_region_waiters();
         self.snapshot_edge_signals();
         self.vpi_same_time_work()
     }

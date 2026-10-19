@@ -292,8 +292,8 @@ fn method_boost_enabled() -> bool {
 /// lowering, register allocation, block layout. Stale entries with an old
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
-// CmpBranchConst changes the serialized instruction stream.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3037;
+// Typed local bindings change the compiled instruction stream.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3042;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1578,7 +1578,7 @@ struct CombEntryCold {
     cov: Option<u32>,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB011";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB016";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -1635,6 +1635,9 @@ struct NbaEntry {
     /// all while the other advanced at double rate, so its `forever` divider
     /// never reached its threshold and the clock it drove never toggled.
     static_key: Option<String>,
+    /// §10.4.2: frozen destination/source bit offsets and length for a
+    /// selected persistent local. Merge at commit to preserve source order.
+    static_slice: Option<(u32, u32, u32)>,
     /// §8.3 + §4.9.4: the `this` handle in scope when the NBA was SCHEDULED.
     ///
     /// The slow path commits through `assign_value` in the NBA region, AFTER
@@ -3261,6 +3264,8 @@ type PropOwners = HashMap<String, (String, Arc<super::elaborate::ElaboratedClass
 /// none of them skips the per-class checks for that kind.
 struct ClassMemberNames {
     statics: HashSet<String>,
+    /// Cheap prefilter for selected static-property accesses.
+    static_first: [bool; 256],
     vif_props: HashSet<String>,
     /// First bytes of the `vif_props` names: a cheap prefilter for the
     /// member-chain checks that ask whether a name can be a vif property.
@@ -3313,6 +3318,7 @@ type LoopVarSnapshot = (
     Option<String>,
     bool,
     Option<Vec<(String, u32, u32)>>,
+    (Option<u32>, bool),
 );
 
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a
@@ -3493,8 +3499,8 @@ struct SvaClockedSite {
 enum SvaSeq {
     /// A boolean: holds at one cycle.
     Bool(Expression),
-    /// `##[min:max]` (`max == u32::MAX` unbounded).
-    Delay(u32, u32),
+    /// `##[min:max]` (`max == u64::MAX` unbounded).
+    Delay(u64, u64),
     Concat(Vec<SvaSeq>),
     Or(Box<SvaSeq>, Box<SvaSeq>),
     And(Box<SvaSeq>, Box<SvaSeq>),
@@ -3505,20 +3511,20 @@ enum SvaSeq {
     /// `s[*min:max]`.
     Rep {
         seq: Box<SvaSeq>,
-        min: u32,
-        max: u32,
+        min: u64,
+        max: u64,
     },
     /// `b[->min:max]`.
     Goto {
         cond: Expression,
-        min: u32,
-        max: u32,
+        min: u64,
+        max: u64,
     },
     /// `b[=min:max]`.
     NonCon {
         cond: Expression,
-        min: u32,
-        max: u32,
+        min: u64,
+        max: u64,
     },
     /// §16.10 / §16.11 match items, run within the cycle: local variable
     /// assignments and subroutine calls (no cycle of its own).
@@ -3572,6 +3578,10 @@ enum SvaCompound {
     Throughout(Expression, SvaNfa),
     /// Only the earliest match (§16.9.7).
     FirstMatch(SvaNfa),
+    /// §16.7: a counted cycle delay, with no state unrolling or clipping.
+    Delay(u64, u64),
+    /// §16.9.2: counted copies of the unit, one cycle apart.
+    Repeat(SvaNfa, u64, u64),
 }
 
 /// A sequence in flight: `pcs` are the states waiting for the next cycle,
@@ -3608,6 +3618,8 @@ struct SvaSubRun {
     /// operand's latest match (§16.10: an operand's assignments flow out).
     env: SvaEnv,
     ever_env: [SvaEnv; 2],
+    ticks: u64,
+    repeated: Vec<(u64, SvaRun)>,
 }
 
 /// A property body compiled for evaluation (§16.12).
@@ -3621,6 +3633,12 @@ enum SvaNode {
     /// `ante |-> cons` (overlap) / `ante |=> cons`: every match of the
     /// antecedent starts one evaluation of the consequent.
     Impl {
+        ante: SvaNfa,
+        overlap: bool,
+        cons: Box<SvaNode>,
+    },
+    /// §16.12.9: at least one antecedent match has a successful consequent.
+    Followed {
         ante: SvaNfa,
         overlap: bool,
         cons: Box<SvaNode>,
@@ -3653,6 +3671,12 @@ enum SvaState {
         matched_any: bool,
         /// Consequent evaluations `(ticks until they start, state)`.
         cons: Vec<(u32, SvaState)>,
+    },
+    Followed {
+        ante: SvaRun,
+        ante_alive: bool,
+        cons: Vec<(u32, SvaState)>,
+        vacuous: bool,
     },
     And {
         a: Box<SvaState>,
@@ -3741,9 +3765,20 @@ impl SvaNfaBuilder {
     }
 
     /// `unit[*min:max]`: consecutive copies one cycle apart.
-    fn rep(&mut self, u: &SvaRepUnit<'_>, min: u32, max: u32) -> (usize, usize) {
-        const UNROLL_CAP: u32 = 256;
-        let min = min.min(UNROLL_CAP);
+    fn rep(&mut self, u: &SvaRepUnit<'_>, min: u64, max: u64) -> (usize, usize) {
+        // §16.9.2: large counts use run-time counters, preserving the
+        // complete unit (including multi-cycle matches and local variables).
+        if min > 256 || (max != u64::MAX && max > 256) {
+            let unit = match u {
+                SvaRepUnit::Seq(seq) => Self::build(seq),
+                SvaRepUnit::Goto(cond) => Self::build(&SvaSeq::Goto {
+                    cond: (*cond).clone(),
+                    min: 1,
+                    max: 1,
+                }),
+            };
+            return self.sub(SvaCompound::Repeat(unit, min, max));
+        }
         let s = self.state();
         let t = self.state();
         if min == 0 {
@@ -3761,7 +3796,7 @@ impl SvaNfaBuilder {
         if let Some(pe) = prev_end {
             self.add(pe, SvaEdge::Eps(t));
         }
-        if max == u32::MAX {
+        if max == u64::MAX {
             let (cs, ce) = self.unit(u);
             match prev_end {
                 None => self.add(s, SvaEdge::Eps(cs)),
@@ -3770,7 +3805,7 @@ impl SvaNfaBuilder {
             self.add(ce, SvaEdge::Eps(t));
             self.add(ce, SvaEdge::Tick(cs));
         } else {
-            let max = max.min(UNROLL_CAP).max(min);
+            let max = max.max(min);
             for _ in min..max {
                 let (cs, ce) = self.unit(u);
                 match prev_end {
@@ -3793,20 +3828,23 @@ impl SvaNfaBuilder {
                 (s, t)
             }
             SvaSeq::Delay(min, max) => {
+                if *min > 4096 || (*max != u64::MAX && *max > 4096) {
+                    return self.sub(SvaCompound::Delay(*min, *max));
+                }
                 let s = self.state();
                 let mut cur = s;
-                for _ in 0..(*min).min(4096) {
+                for _ in 0..*min {
                     let n = self.state();
                     self.add(cur, SvaEdge::Tick(n));
                     cur = n;
                 }
-                if *max == u32::MAX {
+                if *max == u64::MAX {
                     self.add(cur, SvaEdge::Tick(cur));
                     (s, cur)
                 } else {
                     let t = self.state();
                     self.add(cur, SvaEdge::Eps(t));
-                    for _ in *min..(*max).min(4096).max(*min) {
+                    for _ in *min..(*max).max(*min) {
                         let n = self.state();
                         self.add(cur, SvaEdge::Tick(n));
                         self.add(n, SvaEdge::Eps(t));
@@ -3850,9 +3888,9 @@ impl SvaNfaBuilder {
                 // §16.9.10: `(1[*0:$] ##1 a ##1 1[*0:$]) intersect b`.
                 let span = crate::ast::Span::dummy();
                 let padded = SvaSeq::Concat(vec![
-                    SvaSeq::Delay(0, u32::MAX),
+                    SvaSeq::Delay(0, u64::MAX),
                     (**a).clone(),
-                    SvaSeq::Delay(0, u32::MAX),
+                    SvaSeq::Delay(0, u64::MAX),
                     SvaSeq::Bool(Self::true_lit(span)),
                 ]);
                 self.sub(SvaCompound::Intersect(Self::build(&padded), Self::build(b)))
@@ -4139,8 +4177,8 @@ struct ProcessContext {
     task_string_formals: Vec<TaskFrameStrings>,
 }
 
-/// The formals of one task frame whose string-ness differs from the global
-/// `string_signals` set (see `Simulator::task_string_formals`).
+/// Frame-local string classifications for task formals and scalar locals.
+/// They remain authoritative while other processes change global metadata.
 #[derive(Debug, Clone)]
 struct TaskFrameStrings {
     /// `local_gen_stack` generation of the task's frame.
@@ -4289,6 +4327,8 @@ struct PortPlan {
     fixed_width: Option<u32>,
     /// `is_type_signed` of the declared type (declaration only).
     signed: bool,
+    /// A direct scalar two-state declaration; independent of specialization.
+    two_state: bool,
     /// `is_virtual_iface_type` is false whatever the specialization: neither
     /// an interface nor a type reference, or a plain class (type tables).
     never_vif: bool,
@@ -4339,6 +4379,24 @@ struct DeclShadow {
     meta: FormalMetadataSnapshot,
 }
 
+/// One selected region of a declared packed value (§7.4.1 / §11.5.1).
+struct DeclaredPackedAccess {
+    storage: String,
+    is_signed: bool,
+    static_target: Option<(String, Option<(String, String)>, String)>,
+    offset: u32,
+    width: u32,
+    dimensions: Vec<(i64, i64)>,
+    element_type: DataType,
+    unpacked: usize,
+}
+
+/// A known static root either supports packed access or retains its own path.
+enum DeclaredStaticAccess {
+    Packed(DeclaredPackedAccess),
+    Other,
+}
+
 /// One subroutine activation's displaced declarations, restored when it
 /// returns. `frame_gen` is the activation's local-frame generation; `epoch` the
 /// `nested_run_epoch` at entry.
@@ -4365,6 +4423,13 @@ struct BlockScopeSave {
     /// Enclosing frame entries (bare names and unpacked-struct leaves) the
     /// block's declarations shadow.
     shadowed: Vec<(String, Value)>,
+    /// §6.21: declared layouts and scalar types displaced by this block.
+    declarations: Vec<DeclShadow>,
+    /// The enclosing frame's string-kind overlay, not the global name table.
+    string_kinds: Vec<(String, Option<bool>)>,
+    /// A suspend-aware for loop closes its variable scope at the same sentinel.
+    loop_vars: Vec<LoopVarSnapshot>,
+    owns_loop_frame: bool,
     /// Enclosing collection renames (`local_dyn`) the block's collection
     /// declarations shadow, moved aside so the inner declaration cannot
     /// clean the outer storage up.
@@ -4708,7 +4773,8 @@ fn vector_fragment_width(frag: &str) -> Option<u32> {
         .or_else(|| frag.strip_prefix("reg"))?;
     let rest = rest
         .trim_start()
-        .strip_prefix("signed")
+        .strip_prefix("unsigned")
+        .or_else(|| rest.trim_start().strip_prefix("signed"))
         .unwrap_or(rest)
         .trim();
     if !rest.starts_with('[') {
@@ -4732,6 +4798,12 @@ fn vector_fragment_width(frag: &str) -> Option<u32> {
 /// where the type parses as a bare identifier (§6.11, §20.6.2). Returns None
 /// for non-type names so a same-named signal/typedef path is used instead.
 fn atom_type_keyword_width(name: &str) -> Option<u32> {
+    let name = name
+        .trim()
+        .strip_suffix(" unsigned")
+        .or_else(|| name.trim().strip_suffix(" signed"))
+        .unwrap_or(name.trim())
+        .trim_end();
     Some(match name {
         "integer" | "int" => 32,
         "shortint" => 16,
@@ -5621,6 +5693,17 @@ enum PendingSel<'a> {
     },
 }
 
+/// How one select of a chain addresses the packed value it is applied to
+/// (see [`Simulator::packed_hops`]), before any index is evaluated.
+#[derive(Debug, Clone, Copy)]
+enum PackedHop {
+    /// A packed dimension declared `[l:r]` of elements `ew` bits wide.
+    /// §7.4.1: the left bound labels the most significant element.
+    Dim { l: i64, r: i64, ew: u32 },
+    /// A member of a packed struct or union, `off` bits above its LSB.
+    Field(u32),
+}
+
 /// The §7.8 collection kind of an unpacked-struct member whose declarator
 /// carries an unsized `[]`, queue `[$]` or associative `[k]` dimension.
 /// (Distinct from the rand-collection [`CollKind`]: this one separates the
@@ -6360,12 +6443,14 @@ pub struct Simulator {
     default_clocking_cb: Option<String>,
     /// LRM §14.4 `#1step` input skew — Preponed (slot-entry) value of every
     /// clocking-block INPUT signal, keyed by signal name. Captured at the top
-    /// of each time slot BEFORE the active/NBA regions run (same point as
-    /// `sva_preponed`), so when a clock posedge fires later in the slot the
+    /// of each time slot BEFORE callback writes and active/NBA regions run,
+    /// so when a clock posedge fires later in the slot the
     /// input snapshot is the value from *before* the edge, not the same-edge
     /// NBA update. Without this, `cb.<in>` reads the post-edge value (off by
     /// one clock relative to a reference simulator).
     clocking_preponed: HashMap<String, Value>,
+    /// Slot whose Preponed clocking-input values have already been captured.
+    clocking_preponed_slot: Option<u64>,
     /// §14.4 `input #N` history per sampled net (see `ClockingHist`). Empty
     /// unless some clocking input has an explicit positive skew.
     clocking_hist: HashMap<String, ClockingHist>,
@@ -6492,6 +6577,8 @@ pub struct Simulator {
     /// maturity): these commit in the target slot's NBA region, after that
     /// slot's Active reads.
     delayed_nba: Vec<(u64, usize, Value)>,
+    /// Future NBA writes whose targets require captured declaration context.
+    delayed_nba_queue: Vec<(u64, NbaEntry)>,
     /// NBA writes into PACKED-ARENA cells (issue #147). A packed cell has no
     /// `signal_table` slot, so it cannot ride `nba_fast` (apply indexes the
     /// per-signal tables) — and committing immediately gave NBAs into big
@@ -7121,6 +7208,9 @@ pub struct Simulator {
     /// still read/written route to each cell's shared value only when the
     /// SUBROUTINE-PRECISE key below also matches.)
     static_local_names: HashSet<String>,
+    /// Module/package subroutine statics allocated before procedural code.
+    hoisted_sub_static_names: HashSet<String>,
+    hoisted_static_subroutines: HashSet<String>,
     /// First-byte membership filter over `static_local_names`. The eval
     /// preamble tests EVERY bare identifier against that set, so a designs
     /// with any static subroutine local paid a string hash per expression
@@ -7155,8 +7245,8 @@ pub struct Simulator {
     /// Snapshot at frame entry, restore at frame exit, so a
     /// frame can never leak an add OR a remove to its caller.
     string_signals_removed: Vec<Vec<String>>,
-    /// §13.5 / §6.16: the `string` formals of each active TASK frame of the
-    /// running process, keyed by the frame's generation (`local_gen_stack`).
+    /// §6.21/§13.5/§6.16: string classifications of task formals and scalar
+    /// locals, keyed by their frame generation (`local_gen_stack`).
     /// A task can suspend, so its formals must not enter the global
     /// `string_signals` set: while it waits, or after `disable fork` kills
     /// it, another subroutine's same-named packed formal would read as a
@@ -7334,11 +7424,6 @@ pub struct Simulator {
     /// an invocation of each named task. Filled by bind_task_frame, cleared
     /// by unwind_task_frame; a cross-process disable kills the listed pids.
     active_task_pids: HashMap<String, HashSet<usize>>,
-    /// A `$finish` raised by a waiters-first `@(edge)` continuation is held
-    /// until the current time slot's edge blocks AND postponed-side passes
-    /// (SVA actions, $monitor/$strobe) have run — reference simulators still
-    /// fire a final-cycle assertion action or display racing the finish.
-    finish_deferred: bool,
     /// §15.5.5 event variables are HANDLES to synchronization objects:
     /// `ev_alias = ev_b` makes both names one object. Maps an event variable
     /// (or element key `arr[i]`) to the event it currently aliases;
@@ -7816,8 +7901,10 @@ pub struct Simulator {
     /// so a cached block is always byte-identical to a fresh compile of the
     /// same instance. String keys are never cached (HashMaps intern to u32).
     compiled_class_method_ids: HashMap<String, u32>,
-    compiled_method_block_cache:
-        HashMap<(u32, u32, std::rc::Rc<Vec<u32>>, u32), super::bytecode::CompiledMethodOutcome>,
+    compiled_method_block_cache: HashMap<
+        (u32, u32, u32, std::rc::Rc<Vec<u32>>, u32),
+        super::bytecode::CompiledMethodOutcome,
+    >,
     compiled_method_admission: Option<std::rc::Rc<super::bytecode::MethodAdmission>>,
     persisted_method_context_hash: Option<u64>,
     /// class-perf Step 7b: prebound compiled-method gates, keyed (cid, mid).
@@ -9108,9 +9195,16 @@ struct SampledWatch {
     edge: EdgeKind,
     /// Simple-signal operand: sampled PREPONED via the prev-value snapshot.
     sig_id: Option<usize>,
-    /// General operand fallback: evaluated at edge time (post-slot values).
+    /// General operand, evaluated using the slot-entry snapshot.
     expr: Expression,
     hist: std::collections::VecDeque<Value>,
+    /// §16.9.3: only qualifying sampled clock ticks enter this history.
+    gate: Option<Expression>,
+    /// An action's gating expression is evaluated in its Reactive context.
+    action_gate: bool,
+    pending_sample: Option<(u64, Value)>,
+    sample_ids: Vec<usize>,
+    slot_values: Vec<(usize, Value)>,
     depth: usize,
     /// Time of the most recent sample. A PROCEDURAL `$past` runs before this
     /// slot's sampler (an SVA site after it), so the reader checks whether the
@@ -11010,20 +11104,9 @@ impl Simulator {
             // avoid perturbing auto-loop-var / signal-name bookkeeping.
             fn frameless_locals(stmt: &Statement) -> std::collections::HashSet<String> {
                 let mut out = std::collections::HashSet::new();
-                // Named and unnamed process-block bodies are handled
-                // identically (the flattening executor / later auto-naming make
-                // the distinction immaterial), so collect the body's top-level
-                // locals regardless of whether the outer SeqBlock carries a
-                // label.
-                if let StatementKind::SeqBlock { stmts, .. } = &stmt.kind {
-                    for s in stmts.iter() {
-                        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
-                            for d in declarators.iter() {
-                                out.insert(d.name.name.clone());
-                            }
-                        }
-                    }
-                }
+                Simulator::for_each_decl_name(stmt, &mut |name, _| {
+                    out.insert(name.to_string());
+                });
                 out
             }
             // §26.3: module and package subroutine bodies spell `P::m` the
@@ -11234,6 +11317,31 @@ impl Simulator {
                 if c >= 2 || module_claims(&nm) {
                     taken.insert(nm);
                 }
+            }
+            // §6.21: collisions also include a local inside another
+            // process's nested block. Rename those declarations innermost first.
+            let mut nested_number = 0;
+            for b in module
+                .initial_blocks
+                .iter_mut()
+                .map(|b| &mut b.stmt)
+                .chain(module.always_blocks.iter_mut().map(|b| &mut b.stmt))
+                .chain(deferred_always.iter_mut().filter_map(|d| match d {
+                    DeferredAlways::Eager(ab) => Some(&mut ab.stmt),
+                    DeferredAlways::Lazy { .. } => None,
+                }))
+                .chain(module.final_blocks.iter_mut().map(|b| &mut b.stmt))
+            {
+                Self::rename_nested_shadowed(
+                    b,
+                    &|n| taken.contains(n),
+                    &mut Vec::new(),
+                    &mut nested_number,
+                    "pc",
+                    0,
+                    "",
+                    &mut Vec::new(),
+                );
             }
             for (i, ib) in module.initial_blocks.iter_mut().enumerate() {
                 if let Some(new_stmt) = super::elaborate::rename_process_shadowed_locals(
@@ -12862,13 +12970,21 @@ impl Simulator {
                     Some(&module.typedefs),
                 )
                 .max(1);
-                m.insert(name.clone(), (w, super::elaborate::is_type_signed(dt)));
+                m.insert(
+                    name.clone(),
+                    (
+                        w,
+                        super::elaborate::is_type_signed_resolved(dt, &module.typedef_types),
+                    ),
+                );
             }
             for (name, &w) in module.typedefs.iter() {
                 m.entry(name.clone()).or_insert((w.max(1), false));
             }
             m
         };
+        let (hoisted_sub_static_names, hoisted_static_subroutines) =
+            Self::hoist_subroutine_statics(&mut module);
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -12995,6 +13111,7 @@ impl Simulator {
             clocking_last_edge: HashMap::default(),
             default_clocking_cb: None,
             clocking_preponed: HashMap::default(),
+            clocking_preponed_slot: None,
             clocking_hist: HashMap::default(),
             clocking_hist_slot: None,
             clocking_inouts: HashMap::default(),
@@ -13042,6 +13159,7 @@ impl Simulator {
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
             delayed_nba: Vec::new(),
+            delayed_nba_queue: Vec::new(),
             packed_nba: Vec::new(),
             udp_runtime: Vec::new(),
             has_udp: false,
@@ -13225,6 +13343,8 @@ impl Simulator {
             m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
             static_local_names: HashSet::default(),
+            hoisted_sub_static_names,
+            hoisted_static_subroutines,
             static_local_first: [false; 256],
             static_local_keys: HashSet::default(),
             static_local_syncs: Vec::new(),
@@ -13274,7 +13394,6 @@ impl Simulator {
             pending_nba_triggers: Vec::new(),
             pending_nba_instance_triggers: Vec::new(),
             active_task_pids: HashMap::default(),
-            finish_deferred: false,
             event_aliases: HashMap::default(),
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
@@ -16489,12 +16608,15 @@ impl Simulator {
         if !is_resolved_int {
             return None;
         }
-        // §7.4.1: packed dimensions on the reference itself (`M [1:0]` with
-        // `typedef bit [31:0] M`) multiply the typedef's width; the chain
-        // above resolves to the element type alone.
-        let own_dims = matches!(dt, DT::TypeReference { dimensions, .. } if !dimensions.is_empty());
+        // §7.4.1/§6.18: the named typedef width includes packed dimensions
+        // on every alias in the chain, not just its terminal element type.
+        let named_width = matches!(dt, DT::TypeReference { name, dimensions, .. }
+            if !dimensions.is_empty()
+                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs)
+                    .is_some_and(|width| *width > 0));
+        let width_type = if named_width { dt } else { resolved };
         let pw = super::elaborate::resolve_type_width(
-            if own_dims { dt } else { resolved },
+            width_type,
             Some(&self.module.parameters),
             Some(&self.module.typedefs),
         );
@@ -16504,6 +16626,59 @@ impl Simulator {
         let signed =
             super::elaborate::is_type_signed_resolved(&resolved, &self.module.typedef_types);
         Some((pw, signed))
+    }
+
+    /// §13.5/§10.8: scalar formals own their declared width and signing
+    /// before the first frame-local store. Ref/aggregate binding stays with
+    /// its identity/member binders; unresolved class types keep their policy.
+    fn fit_scalar_formal_seed(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+        mut value: Value,
+    ) -> Value {
+        if !port.dimensions.is_empty() {
+            return value;
+        }
+        let dt = &port.data_type;
+        let integral = match dt {
+            DataType::IntegerAtom { .. } | DataType::IntegerVector { .. } => {
+                self.scalar_formal_integral(dt)
+            }
+            DataType::Implicit { dimensions, .. } if !dimensions.is_empty() => {
+                self.scalar_formal_integral(dt)
+            }
+            DataType::TypeReference {
+                name, type_args, ..
+            } if type_args.is_empty()
+                && !name.has_specialized_scope()
+                && !self.typeref_names_class(dt)
+                && self.local_type_param_concrete(dt).is_none()
+                && !super::elaborate::lookup_scoped_type(
+                    name,
+                    &self.module.typedef_unpacked_dims,
+                )
+                .is_some_and(|dims| !dims.is_empty()) =>
+            {
+                self.scalar_formal_integral(dt)
+            }
+            _ => None,
+        };
+        if let Some((width, signed)) = integral {
+            if value.is_real {
+                value = Self::real_to_int(value.to_f64(), width.max(1));
+            } else if width > 0 && width != value.width {
+                value = value.resize_for_assign(width);
+            }
+            value.is_signed = signed;
+            if super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+                && value.has_xz()
+            {
+                value = value.to_two_state();
+            }
+        } else if super::elaborate::is_type_real(dt) && !value.is_real {
+            value = Value::from_f64(value.to_f64());
+        }
+        value
     }
 
     /// Given a resolved struct DataType, return a list of (field_name, bit_offset, width)
@@ -20789,12 +20964,6 @@ impl Simulator {
         {
             self.time = self.max_time;
         }
-        // cbEndOfSimulation, once, after the event loop terminates and before
-        // `final` blocks execute; preceded by cbEnterInteractive when `$stop`
-        // ended the run.
-        if self.vpi_cb_mask != 0 {
-            self.vpi_end_of_simulation();
-        }
         // LRM §9.2.3 — `final` procedures run after the event loop terminates
         // but BEFORE any trace flush. May not contain time-consuming
         // statements (no `#`, `@`, `wait`). We honor that by running each
@@ -20828,6 +20997,11 @@ impl Simulator {
                 self.finished = false;
             }
             self.finished = was_finished;
+        }
+        // §9.2.3: end-of-simulation callbacks observe all final procedures.
+        // cbEnterInteractive has already been delivered if $stop ended the run.
+        if self.vpi_cb_mask != 0 {
+            self.vpi_end_of_simulation();
         }
         if self.code_cov.is_some() {
             self.emit_coverage_summary();
@@ -21102,6 +21276,9 @@ impl Simulator {
     /// FIFO rank (`ClockGen::ahead`) has been reached. Returns whether a due
     /// generator was left for later in this slot.
     fn fire_due_clocks(&mut self, ready_only: bool) -> bool {
+        if self.finished {
+            return false;
+        }
         let mut held = false;
         let trace = self.sched_trace_on();
         // Collected inside the &mut borrow of `clock_generators`, printed
@@ -22154,6 +22331,20 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
         }
         let extracted = self.extract_sensitivity(&ab.stmt);
+        // §14.13: a clocking event is delivered after sampling/NBA, rather
+        // than as the raw clock edge returned by extract_sensitivity.
+        fn leading_event(stmt: &Statement) -> Option<&EventControl> {
+            match &stmt.kind {
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(event),
+                    ..
+                } => Some(event),
+                StatementKind::SeqBlock { stmts, .. } => stmts.first().and_then(leading_event),
+                _ => None,
+            }
+        }
+        let clocking_head =
+            leading_event(&ab.stmt).is_some_and(|event| self.is_clocking_event(event));
         *self.name_resolve_hint.borrow_mut() = saved_hint;
         if let Some((sens, body)) = extracted {
             if !sens.is_empty() {
@@ -22219,6 +22410,7 @@ impl Simulator {
                 // edge the comb path could wake on; such a block runs as a
                 // process below.
                 if all_level
+                    && !clocking_head
                     && !has_named_event
                     && !self_ref
                     && !self.stmt_is_blocking(&body)
@@ -22342,7 +22534,7 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
-                if self.event_needs_value_waiter(&sens, &ab.scope) {
+                if clocking_head || self.event_needs_value_waiter(&sens, &ab.scope) {
                     if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
                         return None;
                     }
@@ -22751,6 +22943,7 @@ impl Simulator {
         compiler.set_cast_widths(&self.cast_widths);
         compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
         compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+        compiler.set_typedef_types(&self.module.typedef_types);
         compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
         compiler.set_assoc_arrays(&self.module.associative_arrays);
         compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -27278,6 +27471,9 @@ impl Simulator {
                     let saved = self.ts_fallback_enter();
                     self.exec_statement(&st);
                     self.ts_fallback_exit(saved);
+                    if self.finished {
+                        return true;
+                    }
                 }
                 TsInsn::SaveSig { sig } => {
                     let (v, x) = self.signal_table[*sig as usize].raw_bits();
@@ -28232,6 +28428,9 @@ impl Simulator {
                         let saved = self.ts_fallback_enter();
                         self.exec_statement(&st);
                         self.ts_fallback_exit(saved);
+                        if self.finished {
+                            return true;
+                        }
                     }
                     TsInsn::SaveSig { sig } => {
                         let (v, x) = self.signal_table[*sig as usize].raw_bits();
@@ -29683,6 +29882,9 @@ impl Simulator {
                         let saved = self.ts_fallback_enter();
                         self.exec_statement(&st);
                         self.ts_fallback_exit(saved);
+                        if self.finished {
+                            return true;
+                        }
                     }
                     TsInsn::SaveSig { sig } => {
                         let (v, x) = self.signal_table[*sig as usize].raw_bits();
@@ -30619,6 +30821,7 @@ impl Simulator {
             );
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
             compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+            compiler.set_typedef_types(&self.module.typedef_types);
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -31020,6 +31223,7 @@ impl Simulator {
                 );
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+                compiler.set_typedef_types(&self.module.typedef_types);
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -31059,6 +31263,7 @@ impl Simulator {
                 delay_compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 delay_compiler
                     .set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+                delay_compiler.set_typedef_types(&self.module.typedef_types);
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -31997,7 +32202,7 @@ impl Simulator {
                 Insn::Negate(d, s) => {
                     let w = vm_regs[*s as usize].width;
                     let mut r = Value::zero(w).sub(&vm_regs[*s as usize]).resize(w);
-                    r.is_signed = true;
+                    r.is_signed = vm_regs[*s as usize].is_signed;
                     vm_regs[*d as usize] = r;
                 }
                 Insn::ReduceAnd(d, s) => {
@@ -32812,7 +33017,7 @@ impl Simulator {
                 Insn::Negate(d, s) => {
                     let w = vm_regs[*s as usize].width;
                     let mut r = Value::zero(w).sub(&vm_regs[*s as usize]).resize(w);
-                    r.is_signed = true;
+                    r.is_signed = vm_regs[*s as usize].is_signed;
                     vm_regs[*d as usize] = r;
                 }
                 Insn::ReduceAnd(d, s) => {
@@ -35090,6 +35295,9 @@ impl Simulator {
                 | Insn::RetCollection(..)
                 | Insn::AssignPendingColl(..) => {
                     local_count += self.exec_class_opcode(&insns[pc]);
+                    if self.finished {
+                        break;
+                    }
                 }
                 // Advance a compiled foreach: pop the slot's next key into
                 // the var register; `ok` = 0 at exhaustion (loop exit).
@@ -35348,7 +35556,7 @@ impl Simulator {
                 Insn::Negate(d, s) => {
                     let w = self.vm_regs[*s as usize].width;
                     let mut r = Value::zero(w).sub(&self.vm_regs[*s as usize]).resize(w);
-                    r.is_signed = true;
+                    r.is_signed = self.vm_regs[*s as usize].is_signed;
                     self.vm_regs[*d as usize] = r;
                 }
                 Insn::ReduceAnd(d, s) => {
@@ -36066,6 +36274,9 @@ impl Simulator {
                         .entry(reason)
                         .or_insert((0u64, 0u64));
                     ent.0 += 1;
+                    if self.finished {
+                        break;
+                    }
                 }
                 Insn::StmtFallback(payload) => {
                     let s = payload.0.clone();
@@ -36084,6 +36295,10 @@ impl Simulator {
                         .or_insert((0u64, 0u64));
                     e.0 += 1;
                     e.1 += elapsed;
+                    // §20.2: an AST system task can terminate this stream.
+                    if self.finished {
+                        break;
+                    }
                 }
                 Insn::InitLocalColl(payload) => {
                     // class-perf: a function-local QUEUE/unsized-dynarray decl
@@ -37440,6 +37655,7 @@ impl Simulator {
                 );
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+                compiler.set_typedef_types(&self.module.typedef_types);
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -37522,6 +37738,7 @@ impl Simulator {
                 );
                 compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                 compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+                compiler.set_typedef_types(&self.module.typedef_types);
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -38279,6 +38496,7 @@ impl Simulator {
                     );
                     compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+                    compiler.set_typedef_types(&self.module.typedef_types);
                     compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                     compiler.set_assoc_arrays(&self.module.associative_arrays);
                     compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -46420,7 +46638,7 @@ impl Simulator {
     fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
         let mut cascade_iter = 0u32;
-        while cascade_iter < cascade_limit {
+        while cascade_iter < cascade_limit && !self.finished {
             // Inactive region precedes the NBA region (§4.5): `#0`
             // continuations parked by this round's active-region work run
             // before its NBAs commit.
@@ -47477,6 +47695,9 @@ impl Simulator {
         if let Some(t) = _t {
             accum.t_snap += t.elapsed().as_nanos() as u64;
         }
+        // §14.4: #1step samples precede every callback/active-region write
+        // at this time, and remain fixed across this slot's later deltas.
+        self.refresh_clocking_preponed();
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot
@@ -47497,26 +47718,12 @@ impl Simulator {
         if self.fire_due_after_delay_cbs() {
             self.dirty_any = true;
         }
-        // §38.14: `vpi_control(vpiFinish)` from one of these callbacks is
-        // `$finish` once the routine returns, so nothing the callback woke may
-        // run: no always block, NBA, assertion or monitor of this slot. cocotb
-        // ends every test this way, from the `Timer` or clock-edge callback
-        // that resumed it. Only a VPI routine can have ended the run this
-        // early in the slot. The values it wrote are still dumped.
-        if self.finished {
-            self.dump_write_changes();
-            return;
-        }
         self.fire_timing_timers();
         // LRM §16.5.1: capture Preponed (slot-entry) samples of every
         // SVA-referenced signal BEFORE the active/NBA regions run, so a
         // clocked assertion firing later this slot (tick_sva_sites) samples
         // pre-edge values rather than same-edge NBA updates.
         self.refresh_sva_preponed();
-        // LRM §14.4 `#1step` clocking-input skew: capture the same Preponed
-        // (slot-entry) samples for clocking-block inputs, so `cb.<in>` read
-        // after a posedge later this slot sees the pre-edge value.
-        self.refresh_clocking_preponed();
 
         if self.sched_trace_on() {
             eprintln!("[sched] t={} +--- tick ---", self.time);
@@ -47652,6 +47859,9 @@ impl Simulator {
             accum.t_process += t.elapsed().as_nanos() as u64;
         }
 
+        if self.finished {
+            return;
+        }
         // IEEE 1800-2017 §9.2.2.2: an always_comb with an empty inferred
         // sensitivity list triggers exactly once at time zero, AFTER all
         // initial/always procedures have started (run to their first delay).
@@ -47680,9 +47890,15 @@ impl Simulator {
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
         self.drain_inactive_pre_nba();
+        if self.finished {
+            return;
+        }
         // §38.36.2 cbNBASynch: the Pre-NBA region.
         if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_NBA_SYNCH) != 0 {
             self.vpi_nba_synch();
+            if self.finished {
+                return;
+            }
         }
         if !self.nba_fast.is_empty()
             || !self.nba_queue.is_empty()
@@ -47721,19 +47937,31 @@ impl Simulator {
         if let Some(t) = _t {
             accum.t_edges += t.elapsed().as_nanos() as u64;
         }
+        if self.finished {
+            return;
+        }
         let (ds, dn, dse, de) = self.drain_edge_cascade(cascade_limit);
         accum.t_snap += ds;
         accum.t_nba += dn;
         accum.t_settle += dse;
         accum.t_edges += de;
+        if self.finished {
+            return;
+        }
 
         // LRM §4.4 region ordering — observed runs after the NBA region
         // has settled but BEFORE the postponed region (which is where
         // $strobe and $monitor live). No-op when no probes are registered.
         self.drain_observed_region();
+        if self.finished {
+            return;
+        }
         // LRM §16.5 SVA clocked property evaluation. Detects edges on
         // each registered clock signal and ticks pending consequents.
         self.tick_sva_sites();
+        if self.finished {
+            return;
+        }
         // LRM §14.3 clocking-block input snapshot — refresh per-cycle
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).
@@ -47753,17 +47981,23 @@ impl Simulator {
         // region — so they observe post-edge state and this cycle's samples.
         let tick_late_epoch_start = self.late_resume_epoch;
         self.drain_deferred_clocking_conts();
+        if self.finished {
+            return;
+        }
         self.drain_reactive_region();
+        if self.finished {
+            return;
+        }
         self.drain_nba_region_waiters();
+        if self.finished {
+            return;
+        }
         self.fire_vpi_synch_cbs();
+        if self.finished {
+            return;
+        }
         self.check_monitor();
         self.drain_pending_strobes();
-        // Deferred `$finish` from a waiters-first continuation: this time
-        // slot's edge blocks, SVA actions and monitors have all run — stop.
-        if self.finish_deferred {
-            self.finish_deferred = false;
-            self.finished = true;
-        }
         self.dump_write_changes();
 
         // Condition-waiter fixpoint (level-sensitive `wait(expr)` resume).
@@ -47798,8 +48032,17 @@ impl Simulator {
                 self.check_edges();
                 let _ = self.drain_edge_cascade(cascade_limit);
                 self.drain_deferred_clocking_conts();
+                if self.finished {
+                    return;
+                }
                 self.drain_reactive_region();
+                if self.finished {
+                    return;
+                }
                 self.drain_nba_region_waiters();
+                if self.finished {
+                    return;
+                }
                 self.drain_condition_waiters(false, true);
                 late_passes += 1;
                 if self.finished || late_passes > 10_000 || self.late_resume_epoch == epoch_before {
@@ -48252,6 +48495,7 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
+                && self.delayed_nba_queue.is_empty()
                 && !has_reactive
                 // A pending VPI timer (cbAfterDelay, a future cbReadWriteSynch,
                 // ...) is real future work even when the HDL side is idle — a
@@ -48275,6 +48519,7 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
+                && self.delayed_nba_queue.is_empty()
                 && !self.vpi_timed_future()
             {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
@@ -50763,14 +51008,8 @@ impl Simulator {
             if self.dpi_export_depth > 0 && !self.condition_waiters.is_empty() {
                 self.nested_drain_condition_waiters();
             }
-            // §20.2: a `$finish` the edge delivery above deferred to the end
-            // of this slot (`finish_deferred`, as `run_one_tick` honours it)
-            // stops the run here too. This loop never took it: the slot
-            // ended, the flag stayed set, and a nested scheduler kept
-            // advancing time to `--max-time` (#290).
-            if self.finish_deferred {
-                self.finish_deferred = false;
-                self.finished = true;
+            if self.finished {
+                break;
             }
             // §4.4.2.3: a process resumed above may have parked a `#0`
             // continuation in the Inactive queue. apply_nba for this pass
@@ -50783,7 +51022,7 @@ impl Simulator {
         // Final slot inside the window: its NBA/settle/edge work has already
         // run above, so service it here rather than letting the caller's tick
         // attribute it to the delay's target time.
-        if slot_pending {
+        if slot_pending && !self.finished {
             self.run_postponed_region();
         }
         self.current_pid = saved_pid;
@@ -52327,6 +52566,7 @@ impl Simulator {
             );
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
             compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+            compiler.set_typedef_types(&self.module.typedef_types);
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -52559,6 +52799,7 @@ impl Simulator {
             );
             compiler.set_packed_elem_widths(&self.module.packed_signal_elem_widths);
             compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+            compiler.set_typedef_types(&self.module.typedef_types);
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
@@ -53352,6 +53593,7 @@ impl Simulator {
                                             i += 1;
                                             continue;
                                         }
+                                        self.refresh_bound_task_string_kinds(&td.ports);
                                         let frame = self.class_task_body_frame(&tm, stmt.span);
                                         // Chain the caller's tail instead of copying it onto the end of
                                         // the spliced body (ProcCont::pushed_frame).
@@ -53552,6 +53794,7 @@ impl Simulator {
                                     self.ensure_spec_statics(&sb, &ss);
                                     self.current_spec = Some((sb, ss));
                                 }
+                                self.refresh_bound_task_string_kinds(&td.ports);
                                 self.task_cleanup.push(cleanup);
                                 let frame = self.class_task_body_frame(&tm, stmt.span);
                                 // Chain the caller's tail instead of copying it onto the end of
@@ -54620,6 +54863,20 @@ impl Simulator {
                 if condition.is_some()
                     && (self.stmt_has_event_wait(body) || self.stmt_is_blocking(body))
                 {
+                    // §12.7.1: retain the enclosing declaration, and close the
+                    // automatic loop scope after the final resumed iteration.
+                    let names: Vec<String> = init
+                        .iter()
+                        .filter_map(|fi| match fi {
+                            ForInit::VarDecl { name, .. } => Some(name.name.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let saved = self.snapshot_loop_vars(&names);
+                    let owns_loop_frame = self.local_stack.is_empty() && !names.is_empty();
+                    if owns_loop_frame {
+                        self.push_loop_frame();
+                    }
                     for fi in init {
                         match fi {
                             ForInit::VarDecl {
@@ -54627,7 +54884,20 @@ impl Simulator {
                                 name,
                                 init: e,
                             } => {
-                                let rv = self.declare_for_init_var(data_type, &name.name, e);
+                                let v = self.eval_expr(e);
+                                let w = super::elaborate::resolve_type_width(
+                                    data_type,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                );
+                                self.widths.insert(name.name.clone(), w);
+                                let mut rv = v.resize(w);
+                                rv.is_signed = self.type_is_signed_concrete(data_type);
+                                if rv.is_signed {
+                                    self.signed_signals.insert(name.name.clone());
+                                } else {
+                                    self.signed_signals.remove(&name.name);
+                                }
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
                                 } else {
@@ -54686,11 +54956,23 @@ impl Simulator {
                             },
                             stmt.span,
                         );
-                        let f: Arc<[Statement]> = Arc::from(vec![while_stmt]);
+                        let f: Arc<[Statement]> = Arc::from(vec![
+                            while_stmt,
+                            Statement::new(StatementKind::Null, stmt.span),
+                        ]);
                         self.blocking_cont_cache
                             .insert(for_key, (Arc::clone(&pc.stmts), f.clone()));
                         f
                     };
+                    if !saved.is_empty() {
+                        self.block_scope_saves.push(BlockScopeSave {
+                            frame_key: Self::frame_key(&frame),
+                            frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
+                            loop_vars: saved,
+                            owns_loop_frame,
+                            ..Default::default()
+                        });
+                    }
                     // Chain the caller's tail rather than copying it (ProcCont::pushed_frame).
                     let cont = pc.pushed_frame(frame, pc.start + i + 1);
                     self.continue_stmts_or_trampoline(pid, cont);
@@ -55680,7 +55962,65 @@ impl Simulator {
     /// `static`, which gives it the subroutine's persistent store; the
     /// others behave the same either way and stay as they are, so their
     /// subroutine still compiles and inlines.
+    fn collect_nba_roots(stmt: &Statement, names: &mut HashSet<String>) {
+        fn root(e: &Expression, names: &mut HashSet<String>) {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Paren(expr) => root(expr, names),
+                ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
+                    names.insert(h.path[0].name.name.clone());
+                }
+                ExprKind::Concatenation(parts) => {
+                    for e in parts {
+                        root(e, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+        match &stmt.kind {
+            StatementKind::NonblockingAssign { lvalue, .. } => root(lvalue, names),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    Self::collect_nba_roots(s, names);
+                }
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::collect_nba_roots(then_stmt, names);
+                if let Some(s) = else_stmt {
+                    Self::collect_nba_roots(s, names);
+                }
+            }
+            StatementKind::Case { items, .. } => {
+                for i in items {
+                    Self::collect_nba_roots(&i.stmt, names);
+                }
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => {
+                Self::collect_nba_roots(body, names);
+            }
+            _ => {}
+        }
+    }
+
     fn mark_static_locals(items: &mut [Statement]) {
+        let mut nba_names = HashSet::default();
+        for stmt in items.iter() {
+            Self::collect_nba_roots(stmt, &mut nba_names);
+        }
         for i in 0..items.len() {
             let (head, rest) = items.split_at_mut(i + 1);
             let s = &mut head[i];
@@ -55690,22 +56030,24 @@ impl Simulator {
                     declarators,
                     data_type,
                 } => {
-                    // Integral and real scalars: what the static-local store
-                    // keeps exactly (an aggregate keeps its per-call storage).
                     if lifetime.is_none()
-                        && matches!(
-                            data_type,
-                            DataType::IntegerAtom { .. }
-                                | DataType::IntegerVector { .. }
-                                | DataType::Real { .. }
-                        )
+                        // Keep the chosen policy for initialized declarations
+                        // without an explicit lifetime, including mixed lists.
+                        && declarators.iter().all(|d| d.init.is_none())
                         && declarators.iter().any(|d| {
-                            d.dimensions.is_empty()
-                                && d.init.is_none()
-                                && super::bytecode::BytecodeCompiler::static_local_carries(
-                                    &d.name.name,
-                                    rest,
-                                )
+                            d.init.is_none()
+                                && (!d.dimensions.is_empty()
+                                    || nba_names.contains(&d.name.name)
+                                    || (matches!(
+                                        data_type,
+                                        DataType::IntegerAtom { .. }
+                                            | DataType::IntegerVector { .. }
+                                            | DataType::Real { .. }
+                                    )
+                                        && super::bytecode::BytecodeCompiler::static_local_carries(
+                                            &d.name.name,
+                                            rest,
+                                        )))
                         })
                     {
                         *lifetime = Some(crate::ast::types::Lifetime::Static);
@@ -55742,6 +56084,323 @@ impl Simulator {
                 _ => {}
             }
         }
+    }
+
+    /// §6.21 / §13.3 / §13.4: module subroutine statics have one
+    /// declaration-owned store, shared by recursion and allocated before
+    /// time zero. Allocate all cells first, then evaluate their initializers.
+    fn hoist_subroutine_statics(
+        module: &mut ElaboratedModule,
+    ) -> (HashSet<String>, HashSet<String>) {
+        fn selected(s: &Statement, nba_names: &HashSet<String>) -> bool {
+            match &s.kind {
+                StatementKind::VarDecl {
+                    lifetime: Some(crate::ast::types::Lifetime::Static),
+                    declarators,
+                    ..
+                } => declarators.iter().any(|d| {
+                    d.init.is_some() || !d.dimensions.is_empty() || nba_names.contains(&d.name.name)
+                }),
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    stmts.iter().any(|s| selected(s, nba_names))
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => {
+                    selected(then_stmt, nba_names)
+                        || else_stmt.as_deref().is_some_and(|s| selected(s, nba_names))
+                }
+                StatementKind::Case { items, .. } => {
+                    items.iter().any(|i| selected(&i.stmt, nba_names))
+                }
+                StatementKind::For { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::TimingControl { stmt: body, .. }
+                | StatementKind::Wait { stmt: body, .. } => selected(body, nba_names),
+                _ => false,
+            }
+        }
+        fn collect(
+            s: &Statement,
+            module: &ElaboratedModule,
+            formals: &HashMap<String, Expression>,
+            allocate: &mut Vec<Statement>,
+            initialize: &mut Vec<Statement>,
+            names: &mut HashSet<String>,
+            nba_names: &HashSet<String>,
+        ) {
+            match &s.kind {
+                StatementKind::VarDecl {
+                    data_type,
+                    lifetime: Some(crate::ast::types::Lifetime::Static),
+                    declarators,
+                } => {
+                    for d in declarators {
+                        if d.init.is_none()
+                            && d.dimensions.is_empty()
+                            && !nba_names.contains(&d.name.name)
+                        {
+                            continue;
+                        }
+                        names.insert(d.name.name.clone());
+                        let mut storage = d.clone();
+                        storage.init = None;
+                        allocate.push(Statement::new(
+                            StatementKind::VarDecl {
+                                data_type: data_type.clone(),
+                                lifetime: Some(crate::ast::types::Lifetime::Static),
+                                declarators: vec![storage],
+                            },
+                            s.span,
+                        ));
+                        if let Some(init) = &d.init {
+                            let empty = std::collections::HashSet::new();
+                            let rhs = super::elaborate::rewrite_expr(
+                                init,
+                                "",
+                                formals,
+                                &empty,
+                                &HashMap::default(),
+                            );
+                            let lhs = Expression::new(
+                                ExprKind::Ident(HierarchicalIdentifier {
+                                    root: None,
+                                    path: vec![crate::ast::expr::HierPathSegment {
+                                        name: d.name.clone(),
+                                        selects: vec![],
+                                    }],
+                                    span: d.span,
+                                    cached_signal_id: std::cell::Cell::new(None),
+                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                }),
+                                d.span,
+                            );
+                            initialize.push(Statement::new(
+                                StatementKind::BlockingAssign {
+                                    lvalue: lhs,
+                                    rvalue: rhs,
+                                },
+                                s.span,
+                            ));
+                        }
+                    }
+                }
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    for st in stmts {
+                        collect(st, module, formals, allocate, initialize, names, nba_names);
+                    }
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => {
+                    collect(
+                        then_stmt, module, formals, allocate, initialize, names, nba_names,
+                    );
+                    if let Some(st) = else_stmt {
+                        collect(st, module, formals, allocate, initialize, names, nba_names);
+                    }
+                }
+                StatementKind::Case { items, .. } => {
+                    for i in items {
+                        collect(
+                            &i.stmt, module, formals, allocate, initialize, names, nba_names,
+                        );
+                    }
+                }
+                StatementKind::For { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::TimingControl { stmt: body, .. }
+                | StatementKind::Wait { stmt: body, .. } => collect(
+                    body, module, formals, allocate, initialize, names, nba_names,
+                ),
+                _ => {}
+            }
+        }
+        fn prepare(
+            module: &ElaboratedModule,
+            items: &mut Vec<Statement>,
+            ports: &[crate::ast::decl::FunctionPort],
+            routine: &str,
+            ordinal: usize,
+            allocate: &mut Vec<Statement>,
+            initialize: &mut Vec<Statement>,
+            names: &mut HashSet<String>,
+        ) -> bool {
+            let mut nba_names = HashSet::default();
+            for stmt in items.iter() {
+                Simulator::collect_nba_roots(stmt, &mut nba_names);
+            }
+            if !items.iter().any(|s| selected(s, &nba_names)) {
+                return false;
+            }
+            let span = items
+                .first()
+                .map(|s| s.span)
+                .unwrap_or_else(crate::ast::Span::dummy);
+            let mut body = Statement::new(
+                StatementKind::SeqBlock {
+                    name: Some(crate::ast::Identifier {
+                        name: routine.to_string(),
+                        span,
+                    }),
+                    stmts: std::mem::take(items),
+                },
+                span,
+            );
+            // Rename inner declarations before their enclosing ones so every
+            // static owns a unique cell even when sibling blocks reuse a name.
+            Simulator::rename_nested_shadowed(
+                &mut body,
+                &|_| true,
+                &mut Vec::new(),
+                &mut 0,
+                &format!("psub{ordinal}_"),
+                1,
+                "",
+                &mut Vec::new(),
+            );
+            let mut formals = HashMap::default();
+            for port in ports {
+                let w = super::elaborate::resolve_type_width(
+                    &port.data_type,
+                    Some(&module.parameters),
+                    Some(&module.typedefs),
+                )
+                .max(1);
+                let two = super::elaborate::is_type_two_state_resolved(
+                    &port.data_type,
+                    &module.typedef_types,
+                );
+                let expression = if matches!(
+                    &port.data_type,
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                ) {
+                    Expression::new(ExprKind::StringLiteral(String::new()), port.span)
+                } else if super::elaborate::is_type_real(&port.data_type) {
+                    Expression::new(
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::Real(0.0)),
+                        port.span,
+                    )
+                } else {
+                    Expression::new(
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                            size: Some(w),
+                            signed: super::elaborate::is_type_signed_resolved(
+                                &port.data_type,
+                                &module.typedef_types,
+                            ),
+                            base: crate::ast::expr::NumberBase::Binary,
+                            value: if two {
+                                "0".repeat(w as usize)
+                            } else {
+                                "x".repeat(w as usize)
+                            },
+                            cached_val: std::cell::Cell::new(None),
+                        }),
+                        port.span,
+                    )
+                };
+                formals.insert(port.name.name.clone(), expression);
+            }
+            nba_names.clear();
+            Simulator::collect_nba_roots(&body, &mut nba_names);
+            collect(
+                &body, module, &formals, allocate, initialize, names, &nba_names,
+            );
+            if let StatementKind::SeqBlock { stmts, .. } = body.kind {
+                *items = stmts;
+            }
+            true
+        }
+        let mut names = HashSet::default();
+        let mut routines = HashSet::default();
+        let mut allocate = Vec::new();
+        let mut initialize = Vec::new();
+        let mut ordinal = 0usize;
+        let mut functions: Vec<_> = module.functions.keys().cloned().collect();
+        functions.sort();
+        let mut rewritten: HashMap<String, Vec<Statement>> = HashMap::default();
+        for key in functions {
+            let Some(original) = module.functions.get(&key) else {
+                continue;
+            };
+            if !original.name.scopes.is_empty() {
+                continue;
+            }
+            let mut fd = original.clone();
+            if let Some(items) = rewritten.get(&fd.name.name.name) {
+                fd.items = items.clone();
+            } else {
+                ordinal += 1;
+                if !prepare(
+                    module,
+                    &mut fd.items,
+                    &fd.ports,
+                    &fd.name.name.name,
+                    ordinal,
+                    &mut allocate,
+                    &mut initialize,
+                    &mut names,
+                ) {
+                    continue;
+                }
+                routines.insert(fd.name.name.name.clone());
+                rewritten.insert(fd.name.name.name.clone(), fd.items.clone());
+            }
+            module.functions.insert(key, fd);
+        }
+        let mut tasks: Vec<_> = module.tasks.keys().cloned().collect();
+        tasks.sort();
+        for key in tasks {
+            let Some(mut td) = module.tasks.remove(&key) else {
+                continue;
+            };
+            if td.name.scopes.is_empty() {
+                ordinal += 1;
+                if prepare(
+                    module,
+                    &mut td.items,
+                    &td.ports,
+                    &td.name.name.name,
+                    ordinal,
+                    &mut allocate,
+                    &mut initialize,
+                    &mut names,
+                ) {
+                    routines.insert(td.name.name.name.clone());
+                }
+            }
+            module.tasks.insert(key, td);
+        }
+        if !allocate.is_empty() {
+            let block = |stmts: Vec<Statement>| super::elaborate::InitialBlock {
+                stmt: Statement::new(
+                    StatementKind::SeqBlock { name: None, stmts },
+                    crate::ast::Span::dummy(),
+                ),
+                scope: String::new(),
+            };
+            module.static_init_blocks.insert(0, block(allocate));
+            if !initialize.is_empty() {
+                module.static_init_blocks.push(block(initialize));
+            }
+        }
+        (names, routines)
     }
 
     /// Would `mark_static_locals` mark anything in `items` (read-only, so a
@@ -56193,10 +56852,25 @@ impl Simulator {
             let plain = Self::type_is_plain_scalar(data_type);
             for d in declarators {
                 let nm = d.name.name.as_str();
+                let type_changes = match self.module.var_decl_types.get(nm) {
+                    Some(old) => !Self::dt_trivially_equal(old, data_type),
+                    None => self.widths.contains_key(nm),
+                };
+                if type_changes {
+                    sv.declarations.push(DeclShadow {
+                        width: self.widths.get(nm).copied(),
+                        signed: self.signed_signals.contains(nm),
+                        real: self.real_signals.contains(nm),
+                        string: self.string_signals.contains(nm),
+                        meta: self.snapshot_formal_metadata(nm),
+                    });
+                }
                 let frame = self.local_stack.last()?;
                 if let Some(v) = frame.get(nm) {
                     if !sv.shadowed.iter().any(|(n, _)| n == nm) {
                         sv.shadowed.push((nm.to_string(), v.clone()));
+                        sv.string_kinds
+                            .push((nm.to_string(), self.task_frame_string_flag(nm)));
                     }
                 }
                 if plain && d.dimensions.is_empty() {
@@ -56226,7 +56900,7 @@ impl Simulator {
     /// variables go out of scope and the enclosing ones they shadowed are
     /// visible again. A `static` block variable keeps its persistent value;
     /// only the frame's view of it ends here.
-    fn block_scope_exit(&mut self, stmts: &[Statement], sv: BlockScopeSave) {
+    fn block_scope_exit(&mut self, stmts: &[Statement], mut sv: BlockScopeSave) {
         if self.local_gen_stack.last().copied().unwrap_or(0) != sv.frame_gen
             || self.local_stack.is_empty()
         {
@@ -56289,7 +56963,7 @@ impl Simulator {
             }
         }
         if let Some(frame) = self.local_stack.last_mut() {
-            for (k, v) in sv.shadowed {
+            for (k, v) in sv.shadowed.drain(..) {
                 frame.insert(k, v);
             }
         }
@@ -56298,6 +56972,21 @@ impl Simulator {
                 ld.extend(sv.dyn_shadowed);
             }
         }
+        self.restore_decl_shadows(sv.declarations);
+        for (name, kind) in sv.string_kinds {
+            if let Some(kind) = kind {
+                self.record_frame_string_kind(&name, kind);
+            } else if let Some(&g) = self.local_gen_stack.last() {
+                if let Some(e) = self.task_string_formals.iter_mut().find(|e| e.fgen == g) {
+                    e.strings.retain(|n| n != &name);
+                    e.others.retain(|n| n != &name);
+                }
+            }
+        }
+        if sv.owns_loop_frame {
+            self.pop_loop_frame();
+        }
+        self.restore_loop_vars(&sv.loop_vars);
     }
 
     /// §6.21 for a synchronous loop: open the body block's scope once for
@@ -57616,9 +58305,32 @@ impl Simulator {
         Some(format!("{}.{}", bound_name, member.name))
     }
 
+    /// §23.9: a local or instance property wins over a same-named module
+    /// signal for selected writes, just as it does for whole-variable writes.
+    fn bare_selected_storage_shadows_signal(&self, h: &HierarchicalIdentifier) -> bool {
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return false;
+        }
+        let name = &h.path[0].name.name;
+        self.local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name))
+            || self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h))
+                .and_then(|o| o.as_ref())
+                .is_some_and(|o| o.properties.contains_key(name))
+    }
+
     fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
+                if self.bare_selected_storage_shadows_signal(hier) {
+                    return None;
+                }
                 let is_ambiguous_leaf =
                     hier.path.len() == 1 && !hier.path[0].name.name.contains('.');
                 // Use cached signal ID if available
@@ -57635,6 +58347,25 @@ impl Simulator {
                 None
             }
             ExprKind::Index { expr, index } => {
+                // §7.6 / §10.4.2: a fixed multidimensional leaf is a
+                // stable signal too, including for intra-assignment delays.
+                if matches!(expr.kind, ExprKind::Index { .. })
+                    && Self::cond_expr_is_effect_free(lhs, false)
+                {
+                    let mut root = expr.as_ref();
+                    while let ExprKind::Index { expr, .. } = &root.kind {
+                        root = expr;
+                    }
+                    if let ExprKind::Ident(h) = &root.kind {
+                        let name = self.resolve_hier_name(h);
+                        if self.module.arrays_2d.contains_key(name.as_ref())
+                            || self.module.arrays_nd.contains_key(name.as_ref())
+                        {
+                            let leaf = self.flat_member_name(lhs)?;
+                            return self.signal_name_to_id.get(leaf.as_str()).copied();
+                        }
+                    }
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
                     // A DYNAMIC array / QUEUE element carries a signal TWIN in
@@ -57671,10 +58402,11 @@ impl Simulator {
                         if let Some(b) = db {
                             self.dollar_bound.push(b);
                         }
-                        let idx = self.eval_expr(index).to_u64().unwrap_or(0);
+                        let idx = self.eval_expr(index).to_i64();
                         if db.is_some() {
                             self.dollar_bound.pop();
                         }
+                        let idx = idx?;
                         // Use a small buffer to avoid allocation for common array names
                         let elem = format!("{}[{}]", name, idx);
                         return self.signal_name_to_id.get(elem.as_str()).copied();
@@ -57756,6 +58488,68 @@ impl Simulator {
     /// lvalue for the commit phase. The selected index is sampled now, while
     /// the process locals are live, and subsequent writes to the same signal
     /// merge into the existing pending value in source order.
+    fn enqueue_context_nba(&mut self, entry: NbaEntry, delay: u64) {
+        if delay == 0 {
+            self.nba_queue.push(entry);
+        } else {
+            self.delayed_nba_queue
+                .push((self.time.saturating_add(delay), entry));
+        }
+    }
+
+    fn try_schedule_static_packed_nba(
+        &mut self,
+        lhs: &Expression,
+        val: &Value,
+        delay: u64,
+    ) -> bool {
+        let Some(name) = Self::lvalue_bare_root(lhs) else {
+            return false;
+        };
+        if self
+            .ref_alias_stack
+            .last()
+            .is_some_and(|m| m.contains_key(name))
+            || self
+                .ref_binding_stack
+                .last()
+                .is_some_and(|m| m.contains_key(name))
+        {
+            return false;
+        }
+        let key = self.packed_local_static_key(name);
+        if key.is_none() && !self.hoisted_sub_static_names.contains(name) {
+            return false;
+        }
+        let Some((root, _, steps, hops, two)) = self.frame_packed_target(lhs) else {
+            return false;
+        };
+        let (width, slice) = self.packed_hops_eval(&hops, &steps);
+        let Some((dst, src, len)) = slice else {
+            return true;
+        };
+        let mut value = if val.is_real {
+            Self::real_to_int(val.to_f64(), width)
+        } else {
+            val.resize_for_assign(width)
+        };
+        if two {
+            value = value.to_two_state();
+        }
+        self.enqueue_context_nba(
+            NbaEntry {
+                lhs: key.is_none().then(|| root.into_owned()),
+                value,
+                resolved_id: None,
+                static_key: key,
+                static_slice: Some((dst as u32, src as u32, len as u32)),
+                this_handle: None,
+            },
+            delay,
+        );
+        true
+    }
+
     fn try_schedule_packed_index_nba(&mut self, lhs: &Expression, val: &Value) -> bool {
         let ExprKind::Index { expr: base, index } = &lhs.kind else {
             return false;
@@ -57853,6 +58647,9 @@ impl Simulator {
     }
 
     fn apply_nba(&mut self) {
+        if self.finished {
+            return;
+        }
         // Value-trace attribution: NBA commits run outside the scheduling
         // process, so current_pid is stale here -- stamp the phase so the
         // drain prints "nba" instead of a misleading process origin.
@@ -57913,13 +58710,36 @@ impl Simulator {
         // pattern existed because we needed to release the borrow on
         // `self.nba_queue` before calling `self.assign_value(&self, &mut self)`;
         // mem::take achieves the same release without the clones.
+        if !self.delayed_nba_queue.is_empty() {
+            let immediate = std::mem::take(&mut self.nba_queue);
+            let pending = std::mem::take(&mut self.delayed_nba_queue);
+            for (time, entry) in pending {
+                if time <= self.time {
+                    self.nba_queue.push(entry);
+                } else {
+                    self.delayed_nba_queue.push((time, entry));
+                }
+            }
+            self.nba_queue.extend(immediate);
+        }
         let queue = std::mem::take(&mut self.nba_queue);
         for entry in queue {
             // A `static` subroutine local commits to the key captured when the
             // NBA was SCHEDULED; re-resolving here would consult whichever call
             // frame is current in the NBA region (see NbaEntry::static_key).
             if let Some(key) = entry.static_key {
-                self.static_local_vars.insert(key, entry.value);
+                if let Some((dst, src, len)) = entry.static_slice {
+                    if let Some(stored) = self.static_local_vars.get_mut(&key) {
+                        stored.copy_bits_from(
+                            dst as usize,
+                            &entry.value,
+                            src as usize,
+                            len as usize,
+                        );
+                    }
+                } else {
+                    self.static_local_vars.insert(key, entry.value);
+                }
                 continue;
             }
             if let Some(lhs) = entry.lhs {
@@ -57927,10 +58747,17 @@ impl Simulator {
                 // target resolves (see NbaEntry::this_handle).
                 if let Some(h) = entry.this_handle {
                     self.this_stack.push(Some(h));
-                    self.assign_value(&lhs, &entry.value);
-                    self.this_stack.pop();
+                }
+                let value = if let Some((dst, src, len)) = entry.static_slice {
+                    let mut stored = self.eval_expr(&lhs);
+                    stored.copy_bits_from(dst as usize, &entry.value, src as usize, len as usize);
+                    stored
                 } else {
-                    self.assign_value(&lhs, &entry.value);
+                    entry.value
+                };
+                self.assign_value(&lhs, &value);
+                if entry.this_handle.is_some() {
+                    self.this_stack.pop();
                 }
             }
         }
@@ -58121,7 +58948,12 @@ impl Simulator {
     /// Get the next time a delayed update is due (for time advancement).
     fn next_delayed_time(&self) -> Option<u64> {
         let a = self.delayed_updates.iter().map(|(t, _, _)| *t).min();
-        let b = self.delayed_nba.iter().map(|(t, _, _)| *t).min();
+        let b = self
+            .delayed_nba
+            .iter()
+            .map(|(t, _, _)| *t)
+            .chain(self.delayed_nba_queue.iter().map(|(t, _)| *t))
+            .min();
         match (a, b) {
             (Some(x), Some(y)) => Some(x.min(y)),
             (x, None) => x,
@@ -58153,6 +58985,7 @@ impl Simulator {
     /// Any future-time NBA matured at (or before) the current time?
     fn delayed_nba_due(&self) -> bool {
         self.delayed_nba.iter().any(|(t, _, _)| *t <= self.time)
+            || self.delayed_nba_queue.iter().any(|(t, _)| *t <= self.time)
     }
 
     /// Schedule a delayed signal update (inertial delay model).
@@ -59458,11 +60291,22 @@ impl Simulator {
                 break;
             }
         }
+        if edge_code.is_none()
+            && let Some(si) = self.active_sva_site
+        {
+            let site = &self.sva_sites[si];
+            edge_code = Some(match site.edge {
+                1 => 2,
+                2 => 0,
+                _ => 1,
+            });
+            clk_id = self
+                .signal_name_to_id
+                .get(site.clock_signal.as_str())
+                .copied();
+        }
         if edge_code.is_none() {
             // Procedural context + default clocking: infer from it.
-            if self.active_sva_site.is_some() {
-                return None;
-            }
             // No default clocking: fall back to the clock inferred from the
             // enclosing always block. Without this, procedural `$rose(a)`
             // inside `always @(posedge clk)` had no history at all — `prev`
@@ -59475,23 +60319,38 @@ impl Simulator {
                     self.activation_scope.borrow().as_deref().unwrap_or(""),
                     !self.sampled_registering,
                 )?;
-                let operand = args.first()?.clone();
-                let site = expr.span.start;
-                let widx = self.sampled_watch_for(site, &operand, ec, cid, n)?;
-                return Some(self.sampled_cur_and_past(widx, &operand, n));
+                edge_code = Some(ec);
+                clk_id = Some(cid);
             }
-            let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
-            // clocking_meta stores the bare clock SIGNAL name (the parser
-            // drops the event's edge); default clocking events are
-            // overwhelmingly posedge — same assumption the `##N` cycle-delay
-            // machinery makes.
-            edge_code = Some(1);
-            clk_id = self.signal_name_to_id.get(clk_str.trim()).copied();
+            if edge_code.is_none() {
+                let (clk_str, _) = self.clocking_meta.get("__xz_default_clocking")?.clone();
+                // clocking_meta stores the bare clock SIGNAL name (the parser
+                // drops the event's edge); default clocking events are
+                // overwhelmingly posedge — same assumption the `##N` cycle-delay
+                // machinery makes.
+                edge_code = Some(1);
+                clk_id = self.signal_name_to_id.get(clk_str.trim()).copied();
+            }
         }
         let clk_id = clk_id?;
         let operand = args.first()?.clone();
         let site = expr.span.start;
         let widx = self.sampled_watch_for(site, &operand, edge_code.unwrap_or(0), clk_id, n)?;
+        if let ExprKind::SystemCall { name, .. } = &expr.kind {
+            if name == "$past" {
+                self.sampled_watches[widx].gate = args
+                    .get(2)
+                    .filter(|a| !matches!(a.kind, ExprKind::Null | ExprKind::Empty))
+                    .cloned();
+                if self.sampled_registering
+                    && let Some(g) = args.get(2)
+                {
+                    let mut ids = Vec::new();
+                    self.collect_sva_signal_ids(g, &mut ids);
+                    self.add_sampled_watch_ids(widx, &ids);
+                }
+            }
+        }
         Some(self.sampled_cur_and_past(widx, &operand, n))
     }
 
@@ -59918,7 +60777,15 @@ impl Simulator {
                 // failures (no clock resolvable) — eval falls back.
                 let ex = e.clone();
                 let ar = args.clone();
-                let _ = self.sampled_fn_via_watch(&ex, &ar, 1);
+                let depth = if name == "$past" {
+                    ar.get(1)
+                        .filter(|a| !matches!(a.kind, ExprKind::Null | ExprKind::Empty))
+                        .map(|a| self.eval_expr(a).to_u64().unwrap_or(1) as usize)
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+                let _ = self.sampled_fn_via_watch(&ex, &ar, depth);
             }
             ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
                 for a in args {
@@ -59929,7 +60796,17 @@ impl Simulator {
                 self.scan_sampled_expr(left);
                 self.scan_sampled_expr(right);
             }
-            ExprKind::Unary { operand, .. } => self.scan_sampled_expr(operand),
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.scan_sampled_expr(operand)
+            }
+            ExprKind::SvaClocked { body, .. } => self.scan_sampled_expr(body),
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.scan_sampled_expr(expr);
+                self.scan_sampled_expr(left);
+                self.scan_sampled_expr(right);
+            }
             ExprKind::Conditional {
                 condition,
                 then_expr,
@@ -59988,7 +60865,24 @@ impl Simulator {
             return w.clone();
         }
         let width = self.signal_widths.get(id).copied().unwrap_or(1).min(64);
-        Value::from_inline(self.prev_val[id], self.prev_xz[id], width)
+        let mut v = Value::from_inline(self.prev_val[id], self.prev_xz[id], width);
+        v.is_signed = self.signal_signed.get(id).copied().unwrap_or(false);
+        v
+    }
+
+    fn add_sampled_watch_ids(&mut self, idx: usize, ids: &[usize]) {
+        for &sid in ids {
+            if !self.sampled_watches[idx].sample_ids.contains(&sid) {
+                self.sampled_watches[idx].sample_ids.push(sid);
+            }
+            if !self.preponed_ids.contains(&sid) {
+                self.preponed_ids.push(sid);
+            }
+            if !self.edge_signal_ids.contains(&sid) {
+                self.edge_signal_ids.push(sid);
+                self.seed_prev_from_current(sid);
+            }
+        }
     }
 
     /// Get-or-create the sampled watch for a call site. Registers the clock
@@ -60018,7 +60912,12 @@ impl Simulator {
             2 => EdgeKind::Negedge,
             _ => EdgeKind::AnyEdge,
         };
-        let sig_id = self.get_lhs_signal_id(operand);
+        let sig_id = match &operand.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|p| p.selects.is_empty()) => {
+                self.get_lhs_signal_id(operand)
+            }
+            _ => None,
+        };
         // A signal registered here at run time has no preponed snapshot yet,
         // and the snapshot pass only runs for a slot that wrote something —
         // a declaration-initialised operand (`logic [7:0] v = 8'hA5;`) is
@@ -60055,12 +60954,20 @@ impl Simulator {
             sig_id,
             expr: operand.clone(),
             hist: std::collections::VecDeque::new(),
+            gate: None,
+            action_gate: false,
+            pending_sample: None,
+            sample_ids: Vec::new(),
+            slot_values: Vec::new(),
             depth: depth + 1,
             last_sample_time: None,
             slot_val: None,
             slot_time: None,
             default,
         });
+        let mut sample_ids = Vec::new();
+        self.collect_sva_signal_ids(operand, &mut sample_ids);
+        self.add_sampled_watch_ids(i, &sample_ids);
         let scope = self.sampled_scope();
         self.sampled_watch_site
             .entry(site)
@@ -60074,12 +60981,18 @@ impl Simulator {
     fn tick_sampled_watches(&mut self) {
         for i in 0..self.sampled_watches.len() {
             if self.sampled_watches[i].slot_time != Some(self.time) {
-                if let Some(sid) = self.sampled_watches[i].sig_id {
-                    let v = self.preponed_value_of(sid);
-                    let w = &mut self.sampled_watches[i];
-                    w.slot_val = Some(v);
-                    w.slot_time = Some(self.time);
-                }
+                let ids = self.sampled_watches[i].sample_ids.clone();
+                let vals = ids
+                    .into_iter()
+                    .map(|sid| (sid, self.preponed_value_of(sid)))
+                    .collect();
+                let slot_val = self.sampled_watches[i]
+                    .sig_id
+                    .map(|sid| self.preponed_value_of(sid));
+                let w = &mut self.sampled_watches[i];
+                w.slot_values = vals;
+                w.slot_val = slot_val;
+                w.slot_time = Some(self.time);
             }
             let (clk_id, edge) = {
                 let w = &self.sampled_watches[i];
@@ -60088,28 +61001,61 @@ impl Simulator {
             if !self.check_edge_id(clk_id, edge) {
                 continue;
             }
-            self.sampled_watches[i].last_sample_time = Some(self.time);
-            let w = &self.sampled_watches[i];
-            let sample = match w.sig_id {
-                Some(_) if w.slot_time == Some(self.time) && w.slot_val.is_some() => {
-                    w.slot_val.clone().unwrap()
-                }
-                Some(sid) => self.preponed_value_of(sid),
-                None => {
-                    let e = self.sampled_watches[i].expr.clone();
-                    self.eval_expr(&e)
-                }
+            let mut saved = self.sampled_watches[i].slot_values.clone();
+            for (sid, v) in &mut saved {
+                std::mem::swap(&mut self.signal_table[*sid], v);
+            }
+            let gate = self.sampled_watches[i].gate.clone();
+            let deferred_gate = self.sampled_watches[i].action_gate && gate.is_some();
+            let qualifies =
+                deferred_gate || gate.as_ref().is_none_or(|g| self.eval_expr(g).is_true());
+            let sample = if qualifies {
+                let e = self.sampled_watches[i].expr.clone();
+                Some(self.eval_expr(&e))
+            } else {
+                None
             };
-            let w = &mut self.sampled_watches[i];
-            w.hist.push_front(sample);
-            let cap = w.depth + 1;
-            while w.hist.len() > cap {
-                w.hist.pop_back();
+            for (sid, v) in saved.into_iter().rev() {
+                self.signal_table[sid] = v;
+            }
+            if let Some(sample) = sample {
+                let w = &mut self.sampled_watches[i];
+                if deferred_gate {
+                    w.pending_sample = Some((self.time, sample));
+                    continue;
+                }
+                w.last_sample_time = Some(self.time);
+                w.hist.push_front(sample);
+                while w.hist.len() > w.depth + 1 {
+                    w.hist.pop_back();
+                }
+            }
+        }
+    }
+
+    /// §16.9.3 / §16.14.1: the operand is sampled in Preponed, but an
+    /// action block's unsampled gate is evaluated after NBA, before actions.
+    fn finish_action_sampled_watches(&mut self) {
+        for i in 0..self.sampled_watches.len() {
+            let Some((time, sample)) = self.sampled_watches[i].pending_sample.take() else {
+                continue;
+            };
+            let gate = self.sampled_watches[i].gate.clone();
+            if gate.as_ref().is_none_or(|g| self.eval_expr(g).is_true()) {
+                let w = &mut self.sampled_watches[i];
+                w.last_sample_time = Some(time);
+                w.hist.push_front(sample);
+                while w.hist.len() > w.depth + 1 {
+                    w.hist.pop_back();
+                }
             }
         }
     }
 
     fn check_edges_inner(&mut self, detect_subset: Option<&[usize]>, validate_coverage: bool) {
+        if self.finished {
+            return;
+        }
         // A `#delay` in an edge block's body re-enters here through the
         // synchronous `TimingControl::Delay` arm. That is legitimate — the
         // delay's own region flush must deliver edges made before it — but a
@@ -60155,8 +61101,6 @@ impl Simulator {
             self.sample_edge_covergroups();
         }
         if waiters_first && !self.event_waiters.is_empty() {
-            // Only a finish these continuations raise is deferred below.
-            let finished_before = self.finished;
             let _t_w = self.profile_timing.then(std::time::Instant::now);
             // Drain and run triggered waiters, then RE-DRAIN: a resumed
             // continuation may `-> ev` or write a signal that triggers ANOTHER
@@ -60196,14 +61140,6 @@ impl Simulator {
             }
             if let Some(t) = _t_w {
                 self.prof_edge_waiters += t.elapsed().as_nanos() as u64;
-            }
-            // A `$finish` from one of these continuations ends the run AFTER
-            // this edge delivery completes: the same edge's always blocks
-            // still fire once (reference-simulator behavior — a final-cycle
-            // `$display` monitor racing the testbench's `$finish` prints).
-            if self.finished && !finished_before {
-                self.finish_deferred = true;
-                self.finished = false;
             }
         }
         // Cheap handle; `self.edge_blocks` stays populated so nested passes and
@@ -60960,14 +61896,7 @@ impl Simulator {
             }
         }
 
-        // §20.2: after `$finish` (or `vpi_control(vpiFinish)`, §38.14) no
-        // process runs again. The interpreter already refuses every statement
-        // once `finished` is set, but compiled block code does not check it:
-        // an always block dispatched after the finish ran its compiled
-        // statements while its interpreted ones (`$display`, ...) were
-        // skipped, so `final` blocks and coverage saw updates the log never
-        // showed.
-        if !triggered.is_empty() && !self.finished {
+        if !triggered.is_empty() {
             if let Some(pat) = self.edge_fire_trace.clone() {
                 // One-time: precompute which blocks match, and resolve the
                 // watch list. Per-dispatch cost is then a bitmap index per
@@ -61455,9 +62384,6 @@ impl Simulator {
             // no StmtFallback insns (common case: 99%+ of edges don't fall
             // back to AST exec, since bytecode pre-resolves signal IDs).
             for &bi in &sequential_blocks {
-                // A block before this one may have ended the run: `$finish`,
-                // or a write a VPI value-change callback answered with
-                // `vpi_control(vpiFinish)`.
                 if self.finished {
                     break;
                 }
@@ -61475,6 +62401,13 @@ impl Simulator {
                     );
                 }
                 if needs_hint {
+                    // §6.21: an AST fallback belongs to this always process,
+                    // not to a suspended task that caused edge dispatch.
+                    let saved_context = if self.process_context_is_default() {
+                        None
+                    } else {
+                        Some(self.take_process_context())
+                    };
                     let saved_hint = self.name_resolve_hint.borrow().clone();
                     // Same activation-scope install as run_process_stmts:
                     // the fallback stmts execute as THIS block's activation
@@ -61501,6 +62434,9 @@ impl Simulator {
                     self.timescale_scope_override = None;
                     *self.name_resolve_hint.borrow_mut() = saved_hint;
                     *self.activation_scope.borrow_mut() = saved_activation_scope;
+                    if let Some(ctx) = saved_context {
+                        self.restore_process_context(ctx);
+                    }
                 } else {
                     self.exec_bytecode(bi);
                 }
@@ -61605,10 +62541,6 @@ impl Simulator {
         // post-#0 write executed — losing exactly the event this exists for.
         let __prev_edge_cont = self.in_edge_cont;
         self.in_edge_cont = true;
-        // A finish raised before the continuations below (by an always block
-        // of this pass, an earlier process, or a VPI routine) stays a finish:
-        // only one the continuations raise is deferred to the end of the slot.
-        let finished_before_conts = self.finished;
         let mut triggered_conts = triggered_conts;
         for (pid, stmts) in triggered_conts.drain(..) {
             if self.finished {
@@ -61695,18 +62627,12 @@ impl Simulator {
             }
         }
         self.in_edge_cont = __prev_edge_cont;
-        if !waiters_first && active_region && self.finished && !finished_before_conts {
-            // A `$finish` from a continuation resumed AFTER this edge's
-            // blocks stops the run once the slot completes: its SVA ticks
-            // (tick_sva_sites runs after this pass returns) and postponed
-            // monitors still fire — reference behavior, mirroring the
-            // waiters-first pre-block deferral above.
-            self.finish_deferred = true;
-            self.finished = false;
-        }
     }
 
     fn settle_combinatorial(&mut self) {
+        if self.finished {
+            return;
+        }
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
         }
@@ -65859,6 +66785,12 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        // §20.2: a function can terminate simulation while its caller is
+        // evaluating an assignment's RHS. Do not commit that caller's write.
+        // Final procedures run with `finished` cleared (§9.2.3).
+        if self.finished {
+            return false;
+        }
         if matches!(&lhs.kind, ExprKind::MemberAccess { expr, .. }
                 if !matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1))
             || matches!(&lhs.kind, ExprKind::Ident(h) if h.path.len() >= 3)
@@ -68046,6 +68978,13 @@ impl Simulator {
             lhs
         };
 
+        // Packed geometry applies after reference, interface and $ rewrites.
+        if (self.needs_declared_packed_access(lhs) || self.needs_static_packed_access(lhs))
+            && let Some(changed) = self.write_declared_packed_access(lhs, val)
+        {
+            return changed;
+        }
+
         // §7.4.6 / §11.5.1: an ELEMENT index containing x or z selects nothing,
         // so the write is discarded — `a['hx] = v` must leave every element
         // alone. The index folded to 0 through `to_u64`, so it silently
@@ -68396,6 +69335,13 @@ impl Simulator {
                 }
                 return changed;
             }
+            // §7.4.1/§11.5.1: a nested select of a packed variable the frame
+            // owns (`p[1][3:0] = v`, `a[i].f[3] = b`).
+            if Self::select_of_select(lhs)
+                && let Some(r) = self.frame_packed_select_write(lhs, val)
+            {
+                return r;
+            }
         }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -68442,25 +69388,10 @@ impl Simulator {
                             .join(".");
                         let last_idx = self.local_stack.len() - 1;
                         if self.local_stack[last_idx].contains_key(joined.as_str()) {
-                            // §10.7: on assignment to a sized local, resize
-                            // the RHS to the local's DECLARED width so a
-                            // narrow signed literal sign-extends (e.g.
-                            // `logic [63:0] mask = -1` must yield all-ones).
-                            // The declared width is read from the `widths`
-                            // table (populated at VarDecl time), NOT from the
-                            // currently-stored value — the stored width drifts
-                            // as differently-sized RHS values flow through and
-                            // would corrupt string/handle locals. If no
-                            // declared width is recorded (method formals,
-                            // pattern bindings), leave the value untouched.
-                            //
-                            // WIDTH: a value WIDER than the declared width is
-                            // TRUNCATED to it (LRM assignment semantics, e.g.
-                            // `byte b; b = $urandom` keeps only the low 8
-                            // bits). STRING locals are exempt: xezim models a
-                            // `string` as a 1024-bit packed value and must not
-                            // truncate its text; the same `is_str` guard as
-                            // the signal-store path is used.
+                            // §6.21/§10.7: a frame-local integral value keeps its
+                            // declared width and signing on every store. Bare-name
+                            // metadata may currently describe a different process's
+                            // same-named declaration, so it cannot type this store.
                             let is_str = hier.path.last().is_some_and(|s| {
                                 self.string_signals.contains(&s.name.name)
                                     || self.p_local_is_string(&s.name.name)
@@ -68488,8 +69419,10 @@ impl Simulator {
                     // Check local stack
                     if !self.local_stack.is_empty() {
                         let last_idx = self.local_stack.len() - 1;
-                        if let Some(prev_is_real) =
-                            self.local_stack[last_idx].get(name).map(|p| p.is_real)
+                        if let Some((prev_is_real, local_width, local_signed)) = self.local_stack
+                            [last_idx]
+                            .get(name)
+                            .map(|p| (p.is_real, p.width, p.is_signed))
                         {
                             // §10.7: on assignment to a sized local, resize
                             // the RHS to the local's DECLARED width so a
@@ -68508,15 +69441,15 @@ impl Simulator {
                             // $urandom` keeps only the low 8 bits). STRING
                             // locals are exempt (1024-bit internal packed
                             // text).
-                            let is_str = self.string_signals.contains(name.as_str())
-                                || self.p_local_is_string(name);
+                            let is_str = self.p_local_is_string(name);
                             let fitted = if prev_is_real && !val.is_real && !is_str {
                                 // §6.12.2: an integral value assigned to a REAL
                                 // local converts; stored as integral bits, a
                                 // `real t; t = k; h = t / 2;` divided as integers.
                                 Value::from_f64(val.to_f64())
                             } else if !val.is_real && !is_str {
-                                if let Some(&target_w) = self.widths.get(name) {
+                                if local_width > 0 {
+                                    let target_w = local_width;
                                     let mut f = if val.width != target_w {
                                         val.resize_for_assign(target_w)
                                     } else {
@@ -68529,7 +69462,7 @@ impl Simulator {
                                     // otherwise stored the unsized literal's
                                     // SIGNED stamp, and the counter wrapped
                                     // negative at 8 (ivtest sv_foreach3 hang).
-                                    f.is_signed = self.signed_signals.contains(name.as_str());
+                                    f.is_signed = local_signed;
                                     f
                                 } else {
                                     val.clone()
@@ -68542,16 +69475,7 @@ impl Simulator {
                                 // 32.55 forever (uart AVIP baud clock never toggled).
                                 let (w, signed) = self.local_stack[last_idx]
                                     .get(name)
-                                    .map(|p| {
-                                        (
-                                            self.widths
-                                                .get(name)
-                                                .copied()
-                                                .unwrap_or(p.width)
-                                                .max(1),
-                                            p.is_signed,
-                                        )
-                                    })
+                                    .map(|p| (p.width.max(1), p.is_signed))
                                     .unwrap_or((32, true));
                                 let mut f = Self::real_to_int(val.to_f64(), w);
                                 f.is_signed = signed;
@@ -69308,7 +70232,9 @@ impl Simulator {
                 // + HashMap lookup on every call for tight memory-init loops).
                 let target_id: Option<usize> = match &expr.kind {
                     ExprKind::Ident(hier) => {
-                        if let Some(id) = hier.cached_signal_id.get() {
+                        if self.bare_selected_storage_shadows_signal(hier) {
+                            None
+                        } else if let Some(id) = hier.cached_signal_id.get() {
                             Some(id)
                         } else {
                             let name = self.resolve_hier_name(hier);
@@ -69700,8 +70626,12 @@ impl Simulator {
                             }
                         }
                     }
-                    // (b) packed struct field.
-                    if let ExprKind::Ident(bh) = &base.kind {
+                    // (b) packed struct field. A struct of the running frame
+                    // takes (c): it hides a module variable of the same name
+                    // (§23.9), which this would write.
+                    if let ExprKind::Ident(bh) = &base.kind
+                        && self.frame_bound_bare_name(bh).is_none()
+                    {
                         let base_name = self.resolve_hier_name(bh);
                         if let Some(fields) =
                             self.module.packed_struct_fields.get(&*base_name).cloned()
@@ -71092,6 +72022,490 @@ impl Simulator {
         Some(base_v.range_select((lsb + out_w as u64 - 1) as usize, lsb as usize))
     }
 
+    /// Is `e` an index or part-select whose base is itself an index or a
+    /// member access (`p[1][3:0]`, `s.f[2]`)? The cheap shape test that
+    /// gates `frame_packed_chain` on the assignment and read paths.
+    #[inline(always)]
+    fn select_of_select(e: &Expression) -> bool {
+        let (ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }) = &e.kind else {
+            return false;
+        };
+        matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::Paren(_)
+        )
+    }
+
+    /// A select of a select of a variable the innermost call frame owns (a
+    /// task or function local, formal or return value): `p[1][3:0]`,
+    /// `p[0][7]`, `p[i][j][k +: 2]`, `a[i].f[3]`, `s.m[1][7:4]`. Returns the
+    /// variable's identifier and name and the selects, root first. `None`
+    /// for a non-frame root. A single select is also accepted when capturing
+    /// a persistent local's NBA; ordinary reads/writes use `select_of_select`.
+    fn frame_packed_chain<'e>(
+        &self,
+        e: &'e Expression,
+    ) -> Option<(
+        std::borrow::Cow<'e, Expression>,
+        &'e str,
+        Vec<PendingSel<'e>>,
+    )> {
+        let mut steps = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    steps.push(PendingSel::Index(index));
+                    cur = expr;
+                }
+                // §11.5.1: only the last select may be a part-select.
+                ExprKind::RangeSelect {
+                    expr,
+                    kind,
+                    left,
+                    right,
+                } if steps.is_empty() => {
+                    steps.push(PendingSel::Range {
+                        kind: *kind,
+                        left,
+                        right,
+                    });
+                    cur = expr;
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    steps.push(PendingSel::Member(member.name.as_str()));
+                    cur = expr;
+                }
+                ExprKind::Paren(x) => cur = x,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.is_empty() {
+            return None;
+        }
+        let name = h.path[0].name.name.as_str();
+        if !self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name))
+            && !self.hoisted_sub_static_names.contains(name)
+        {
+            return None;
+        }
+        steps.reverse();
+        let root = if h.path.len() == 1 && h.path[0].selects.is_empty() {
+            std::borrow::Cow::Borrowed(cur)
+        } else {
+            // Elaboration flattens module-task members into an identifier
+            // path; class methods retain MemberAccess nodes. Both denote
+            // the same declared packed geometry (§7.4.1 / §23.9).
+            let mut prefix = Vec::new();
+            for (i, segment) in h.path.iter().enumerate() {
+                if i != 0 {
+                    prefix.push(PendingSel::Member(segment.name.name.as_str()));
+                }
+                prefix.extend(segment.selects.iter().map(PendingSel::Index));
+            }
+            prefix.extend(steps);
+            steps = prefix;
+            let mut identifier = h.clone();
+            identifier.path.truncate(1);
+            identifier.path[0].selects.clear();
+            identifier.cached_signal_id = Cell::new(None);
+            identifier.cached_resolved_name = std::cell::OnceCell::new();
+            std::borrow::Cow::Owned(Expression::new(ExprKind::Ident(identifier), cur.span))
+        };
+        if steps.is_empty() {
+            return None;
+        }
+        Some((root, name, steps))
+    }
+
+    /// `frame_packed_chain` placed on the variable's declared type: the
+    /// identifier, name, selects and their `packed_hops`, and whether the
+    /// type is 2-state. `None` for a collection (its elements have their own
+    /// storage), a type with no packed layout, or a frame value whose width
+    /// is not the declared one.
+    #[allow(clippy::type_complexity)]
+    fn frame_packed_target<'e>(
+        &self,
+        e: &'e Expression,
+    ) -> Option<(
+        std::borrow::Cow<'e, Expression>,
+        &'e str,
+        Vec<PendingSel<'e>>,
+        Vec<PackedHop>,
+        bool,
+    )> {
+        let (root, name, steps) = self.frame_packed_chain(e)?;
+        if self.module.arrays.contains_key(name)
+            || self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.module.queue_vars.contains(name)
+        {
+            return None;
+        }
+        let dt = self.module.var_decl_types.get(name)?;
+        let (hops, total, two) = self.packed_hops(dt, &steps)?;
+        let valid = if let Some(cur) = self.local_stack.last().and_then(|f| f.get(name)) {
+            !cur.is_real && cur.width == total
+        } else if self.hoisted_sub_static_names.contains(name) {
+            self.get_signal_value_by_name(name)
+                .is_some_and(|cur| !cur.is_real && cur.width == total)
+        } else {
+            false
+        };
+        if !valid {
+            return None;
+        }
+        Some((root, name, steps, hops, two))
+    }
+
+    /// The packed layout of `dt`: its packed dimensions, outermost first and
+    /// through typedefs, then the element below them — a packed struct or
+    /// union, or `None` for a single bit — and that element's width. An
+    /// integer atom is a vector `[w-1:0]`; an enum has its base type's layout
+    /// (`int` by default). `None` for a type with
+    /// no packed layout (class, string, real, unpacked or tagged aggregate)
+    /// or a bound that is not constant.
+    fn packed_shape<'a>(
+        &'a self,
+        dt: &'a DataType,
+    ) -> Option<(
+        Vec<(i64, i64)>,
+        Option<&'a crate::ast::types::StructUnionType>,
+        u32,
+    )> {
+        use crate::ast::types::PackedDimension;
+        fn bounds(
+            ds: &[PackedDimension],
+            params: &HashMap<String, Value>,
+            out: &mut Vec<(i64, i64)>,
+        ) -> Option<()> {
+            for d in ds {
+                let PackedDimension::Range { left, right, .. } = d else {
+                    return None;
+                };
+                out.push((
+                    super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                    super::elaborate::const_eval_i64_with_params(right, Some(params))?,
+                ));
+            }
+            Some(())
+        }
+        let params = &self.module.parameters;
+        let typedefs: Option<&HashMap<String, u32>> = Some(&self.module.typedefs);
+        let mut dims = Vec::new();
+        let mut cur = dt;
+        for _ in 0..32 {
+            match cur {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    bounds(dimensions, params, &mut dims)?;
+                    cur = super::elaborate::lookup_scoped_type(name, &self.module.typedef_types)?;
+                }
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. } => {
+                    bounds(dimensions, params, &mut dims)?;
+                    return Some((dims, None, 1));
+                }
+                DataType::IntegerAtom { .. } => {
+                    let w = resolve_type_width(cur, Some(params), typedefs);
+                    dims.push((w as i64 - 1, 0));
+                    return Some((dims, None, 1));
+                }
+                // §6.19: the base type lays out an enum's bits, so its range
+                // labels them (`enum logic [8:1]`); the default base is int.
+                DataType::Enum(e) => {
+                    bounds(&e.dimensions, params, &mut dims)?;
+                    let Some(b) = e.base_type.as_deref() else {
+                        dims.push((31, 0));
+                        return Some((dims, None, 1));
+                    };
+                    cur = b;
+                }
+                DataType::Struct(su) if su.packed && !su.tagged => {
+                    bounds(&su.dimensions, params, &mut dims)?;
+                    let ws = su.members.iter().flat_map(|m| {
+                        let w = resolve_type_width(&m.data_type, Some(params), typedefs);
+                        m.declarators.iter().map(move |_| w)
+                    });
+                    let w = if matches!(su.kind, crate::ast::types::StructUnionKind::Union) {
+                        ws.max()?
+                    } else {
+                        ws.sum::<u32>()
+                    };
+                    return Some((dims, Some(su), w));
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// §7.2.1/§7.3.1: the bit offset of member `name` within one `su` and
+    /// its declared type. The first member of a packed struct is the most
+    /// significant; every member of a packed union starts at bit 0.
+    fn packed_member_at<'a>(
+        &self,
+        su: &'a crate::ast::types::StructUnionType,
+        name: &str,
+    ) -> Option<(u32, &'a DataType)> {
+        let union = matches!(su.kind, crate::ast::types::StructUnionKind::Union);
+        let mut off = 0u32;
+        for m in su.members.iter().rev() {
+            let w = resolve_type_width(
+                &m.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            for d in m.declarators.iter().rev() {
+                if d.name.name == name {
+                    return Some((if union { 0 } else { off }, &m.data_type));
+                }
+                off += w;
+            }
+        }
+        None
+    }
+
+    /// Walk the selects `steps` (root first) down the declared type `dt` and
+    /// record how each addresses the value it applies to, without
+    /// evaluating anything: an index or part-select takes the next packed
+    /// dimension (a packed struct with none left is a vector of its bits), a
+    /// member moves to its field. Also returns the width of `dt`. `None`
+    /// when the type has no packed layout or a step does not fit it.
+    fn packed_hops(
+        &self,
+        dt: &DataType,
+        steps: &[PendingSel],
+    ) -> Option<(Vec<PackedHop>, u32, bool)> {
+        fn width(dims: &[(i64, i64)], bw: u32) -> Option<u32> {
+            dims.iter().try_fold(bw, |w, &(l, r)| {
+                w.checked_mul(u32::try_from((l - r).unsigned_abs() + 1).ok()?)
+            })
+        }
+        let (mut dims, mut agg, mut bw) = self.packed_shape(dt)?;
+        let total = width(&dims, bw)?;
+        let mut two = super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types);
+        let mut hops = Vec::with_capacity(steps.len());
+        let mut d = 0usize;
+        for step in steps {
+            match step {
+                PendingSel::Index(_) | PendingSel::Range { .. } => {
+                    if let Some(&(l, r)) = dims.get(d) {
+                        d += 1;
+                        hops.push(PackedHop::Dim {
+                            l,
+                            r,
+                            ew: width(&dims[d..], bw)?,
+                        });
+                    } else if agg.take().is_some() {
+                        hops.push(PackedHop::Dim {
+                            l: bw as i64 - 1,
+                            r: 0,
+                            ew: 1,
+                        });
+                        bw = 1;
+                    } else {
+                        return None;
+                    }
+                }
+                PendingSel::Member(m) => {
+                    let su = agg.filter(|_| d == dims.len())?;
+                    let (off, mdt) = self.packed_member_at(su, m)?;
+                    let (md, ma, mb) = self.packed_shape(mdt)?;
+                    let mw = resolve_type_width(
+                        mdt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    );
+                    if width(&md, mb)? != mw {
+                        return None;
+                    }
+                    hops.push(PackedHop::Field(off));
+                    two = super::elaborate::is_type_two_state_resolved(
+                        mdt,
+                        &self.module.typedef_types,
+                    );
+                    (dims, agg, bw, d) = (md, ma, mb, 0);
+                }
+            }
+        }
+        Some((hops, total, two))
+    }
+
+    /// Evaluate the selects `steps` placed by `packed_hops`, in order. Returns
+    /// the width of the select and, unless an index is x/z or out of range
+    /// (§11.5.1: the select then names no bits), `(lsb, src, len)`: the `len`
+    /// bits it names that exist, from bit `lsb` of the variable and bit `src`
+    /// of the select's value. A part-select partly out of range keeps the
+    /// bits in range only.
+    fn packed_hops_eval(
+        &mut self,
+        hops: &[PackedHop],
+        steps: &[PendingSel],
+    ) -> (u32, Option<(u64, u64, u64)>) {
+        fn int(sim: &mut Simulator, e: &Expression) -> Option<i64> {
+            let v = sim.eval_expr(e);
+            v.to_i64().filter(|_| !v.has_xz() && !v.is_real)
+        }
+        let mut lsb = 0u64;
+        // Every index is evaluated, in order, even past an invalid one.
+        let mut ok = true;
+        for (k, (hop, step)) in hops.iter().zip(steps).enumerate() {
+            let (l, r, ew) = match *hop {
+                PackedHop::Field(off) => {
+                    lsb += off as u64;
+                    continue;
+                }
+                PackedHop::Dim { l, r, ew } => (l, r, ew),
+            };
+            // Labels of the first and last element selected, and the element
+            // count when they are unknown.
+            let (ends, elems) = match step {
+                PendingSel::Index(ix) => (int(self, ix).map(|i| (i, i)), 1),
+                PendingSel::Range { kind, left, right } => {
+                    let (a, n) = (int(self, left), int(self, right));
+                    let up = matches!(kind, RangeKind::IndexedUp);
+                    match kind {
+                        RangeKind::Constant => (a.zip(n), 1),
+                        _ => (
+                            a.zip(n.filter(|&n| n > 0)).map(|(a, n)| {
+                                let b = if up {
+                                    a.saturating_add(n - 1)
+                                } else {
+                                    a.saturating_sub(n - 1)
+                                };
+                                (a, b)
+                            }),
+                            n.unwrap_or(1),
+                        ),
+                    }
+                }
+                PendingSel::Member(_) => (None, 1),
+            };
+            let Some((a, b)) = ends else {
+                ok = false;
+                if k + 1 == hops.len() {
+                    let w = elems.max(1).saturating_mul(ew as i64);
+                    return (u32::try_from(w).unwrap_or(0), None);
+                }
+                continue;
+            };
+            // Slot of a label counted from the least significant element;
+            // linear, so a label outside `[l:r]` lands outside `0..count`.
+            let slot = |i: i64| {
+                if l >= r {
+                    i.saturating_sub(r)
+                } else {
+                    r.saturating_sub(i)
+                }
+            };
+            let count = (l - r).abs() + 1;
+            let n = i64::try_from(a.abs_diff(b))
+                .unwrap_or(i64::MAX)
+                .saturating_add(1);
+            let lo = slot(a).min(slot(b));
+            if k + 1 < hops.len() {
+                ok &= lo >= 0 && lo < count;
+                if ok {
+                    lsb += lo as u64 * ew as u64;
+                }
+                continue;
+            }
+            let w = u32::try_from(n.saturating_mul(ew as i64)).unwrap_or(0);
+            let (first, last) = (lo.max(0), lo.saturating_add(n - 1).min(count - 1));
+            if !ok || w == 0 || first > last {
+                return (w, None);
+            }
+            let ew = ew as u64;
+            return (
+                w,
+                Some((
+                    lsb + first as u64 * ew,
+                    (first - lo) as u64 * ew,
+                    (last - first + 1) as u64 * ew,
+                )),
+            );
+        }
+        (0, None)
+    }
+
+    /// §7.4.1/§7.2.1/§11.5.1: store `val` through a select of a select of a
+    /// packed variable the innermost call frame owns (`frame_packed_chain`).
+    /// The select arms resolve a nested select of a multidimensional packed
+    /// array or of a packed array of structs against the module signal table
+    /// only, so the same write to a task or function local was dropped:
+    /// `p[1][3:0] = v` and `p[0][7] = b` left `p` unchanged. Walk the
+    /// local's declared type instead and splice the bits into its frame
+    /// value. `None` when `lhs` is not such a select (the arms below take
+    /// it); `Some(false)` when it names no bits.
+    fn frame_packed_select_write(&mut self, lhs: &Expression, val: &Value) -> Option<bool> {
+        let (root, _, steps, hops, two) = self.frame_packed_target(lhs)?;
+        let (w, sel) = self.packed_hops_eval(&hops, &steps);
+        let Some((lsb, src, len)) = sel else {
+            return Some(false);
+        };
+        let mut v = if val.is_real {
+            Self::real_to_int(val.to_f64(), w)
+        } else {
+            val.resize_for_assign(w)
+        };
+        // §6.11.2: a 2-state variable stores x/z bits as 0.
+        if two && v.has_xz() {
+            v = v.to_two_state();
+        }
+        // §6.21: selected stores use the same live cell as whole stores.
+        // A frame snapshot can be stale after a recursive static-local write.
+        let mut stored = self.eval_expr(root.as_ref());
+        let changed = stored.copy_bits_from(lsb as usize, &v, src as usize, len as usize);
+        if changed {
+            self.assign_value(root.as_ref(), &stored);
+        }
+        Some(changed)
+    }
+
+    /// The read of `frame_packed_select_write`'s selects, through the same
+    /// walk, so a read returns the bits a write stores. The generic arms
+    /// place a select below a struct member at the member's raw bit
+    /// positions, so `s.f[4:1]` of a member declared `[8:1]` read the wrong
+    /// bits (§7.4.1). Bits outside the variable read x, or 0 in a 2-state
+    /// variable (§11.5.1).
+    fn frame_packed_select_read(&mut self, e: &Expression) -> Option<Value> {
+        let (root, _, steps, hops, two) = self.frame_packed_target(e)?;
+        let base = self.eval_expr(root.as_ref());
+        let (w, sel) = self.packed_hops_eval(&hops, &steps);
+        let w = w.max(1);
+        let mut out = if two { Value::zero(w) } else { Value::new(w) };
+        if let Some((lsb, src, len)) = sel {
+            for b in 0..len as usize {
+                out.set_bit(src as usize + b, base.get_bit(lsb as usize + b));
+            }
+        }
+        Some(out)
+    }
+
+    /// §7.4.2: the packed dimensions of a packed array of a packed struct
+    /// typedef (`e_t [0:1] b`), the struct counted as one trailing `[w-1:0]`
+    /// dimension, as elaboration records them for a module variable. The
+    /// other shape helpers stop at the struct and record nothing, so on a
+    /// local or formal an element select took every dimension as `[n-1:0]`
+    /// and `b[1]` of an ascending `[0:1]` read and wrote the wrong element.
+    fn struct_array_full_dims(&self, dt: &DataType) -> Option<Vec<(i64, i64)>> {
+        if !matches!(dt, DataType::TypeReference { dimensions, .. } if !dimensions.is_empty()) {
+            return None;
+        }
+        let (mut dims, agg, bw) = self.packed_shape(dt)?;
+        agg?;
+        dims.push((bw as i64 - 1, 0));
+        Some(dims)
+    }
+
     /// Bit slice (lsb, width) addressed by an index chain into a packed
     /// value of `total` bits with dimensions `dims` (outermost first), using
     /// the same slot arithmetic as the signal path: descending dimensions
@@ -71137,6 +72551,509 @@ impl Simulator {
             }
         }
         w.max(1)
+    }
+
+    /// Cold nested-select path: walk the declaration instead of guessing
+    /// bit offsets from the current value. An unpacked index changes storage;
+    /// a packed index changes the region within that storage.
+    fn declared_packed_type(&self, dt: &DataType) -> Option<(DataType, Vec<(i64, i64)>, u32)> {
+        let width = super::elaborate::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        if width == 0 {
+            return None;
+        }
+        let query = super::elaborate::type_query_dims_of(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+            Some(&self.module.typedef_types),
+        );
+        let mut dimensions = query.dims;
+        let mut element =
+            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types).clone();
+        match &mut element {
+            DataType::Struct(su) if su.packed => {
+                for d in &su.dimensions {
+                    let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
+                        return None;
+                    };
+                    dimensions.push((
+                        super::elaborate::const_eval_i64_with_params(
+                            left,
+                            Some(&self.module.parameters),
+                        )?,
+                        super::elaborate::const_eval_i64_with_params(
+                            right,
+                            Some(&self.module.parameters),
+                        )?,
+                    ));
+                }
+                su.dimensions.clear();
+            }
+            DataType::IntegerVector { .. }
+            | DataType::IntegerAtom { .. }
+            | DataType::Implicit { .. } => {}
+            DataType::Enum(_) => {
+                // §6.19: an enum's base declaration supplies its bit labels,
+                // including a typedef base and an implicit int base.
+                dimensions = self.packed_shape(dt)?.0;
+            }
+            _ => return None,
+        }
+        Some((element, dimensions, width))
+    }
+
+    /// §8.9: selected static properties share the same class cell as a
+    /// whole-property write, including a member reached through an object.
+    fn declared_static_packed_root(&mut self, expr: &Expression) -> Option<DeclaredStaticAccess> {
+        let (class, spec, member) = match &expr.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                if self.frame_bound_bare_name(h).is_some()
+                    || (h.path.len() == 1 && self.dyn_name_lookup(&h.path[0].name.name).is_some())
+                {
+                    return None;
+                }
+                if h.path.len() == 1 {
+                    let member = h.path[0].name.name.clone();
+                    if let Some(class) = self.class_context_stack.last().cloned().flatten() {
+                        (class, None, member)
+                    } else {
+                        let handle = self.this_stack.last().copied().flatten()?;
+                        let (class, spec) =
+                            self.static_member_target(handle, None, None, &member)?;
+                        (class, spec, member)
+                    }
+                } else if h.path.len() == 2 {
+                    let first = &h.path[0].name.name;
+                    let member = &h.path[1].name.name;
+                    if self.module.classes.contains_key(first) {
+                        (first.clone(), None, member.clone())
+                    } else {
+                        let handle = self.eval_ident_handle(first)?;
+                        let (class, spec) =
+                            self.static_member_target(handle, Some(first), None, member)?;
+                        (class, spec, member.clone())
+                    }
+                } else {
+                    return None;
+                }
+            }
+            ExprKind::MemberAccess { expr: recv, member } => {
+                if let ExprKind::Ident(h) = &recv.kind
+                    && h.path.len() == 1
+                    && self.module.classes.contains_key(&h.path[0].name.name)
+                {
+                    (h.path[0].name.name.clone(), None, member.name.clone())
+                } else {
+                    let handle = match &recv.kind {
+                        ExprKind::This => self.this_stack.last().copied().flatten()?,
+                        ExprKind::Ident(h) if h.path.len() == 1 => {
+                            self.eval_ident_handle(&h.path[0].name.name)?
+                        }
+                        _ => return None,
+                    };
+                    let (class, spec) =
+                        self.static_member_target(handle, None, None, &member.name)?;
+                    (class, spec, member.name.clone())
+                }
+            }
+            _ => return None,
+        };
+        if !self.member_is_static_prop(&class, &member) {
+            return None;
+        }
+        let access = (|| {
+            // §8.9 / §7.4: static collections retain their collection
+            // backing store; their element type is not the property's shape.
+            if self.member_is_static_coll(&class, &member)
+                || self.static_fixed_key_in(&class, &member).is_some()
+            {
+                return None;
+            }
+            self.static_prop_key_spec(&class, &member, spec.as_ref())?;
+            let (dt, unpacked) = self.class_property_decl_type(&class, &member)?;
+            if !unpacked.is_empty() {
+                return None;
+            }
+            let (element_type, dimensions, width) = self.declared_packed_type(&dt)?;
+            // Static structs have an aliased member holder; retain its existing
+            // read/write paths instead of creating a second backing value.
+            if matches!(element_type, DataType::Struct(_)) {
+                return None;
+            }
+            Some(DeclaredPackedAccess {
+                storage: String::new(),
+                is_signed: super::elaborate::is_type_signed_resolved(
+                    &dt,
+                    &self.module.typedef_types,
+                ),
+                static_target: Some((class, spec, member)),
+                offset: 0,
+                width,
+                dimensions,
+                element_type,
+                unpacked: 0,
+            })
+        })();
+        Some(match access {
+            Some(value) => DeclaredStaticAccess::Packed(value),
+            None => DeclaredStaticAccess::Other,
+        })
+    }
+
+    fn declared_packed_access(&mut self, expr: &Expression) -> Option<DeclaredPackedAccess> {
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                if !self.class_member_names().statics.is_empty()
+                    && let Some(access) = self.declared_static_packed_root(expr)
+                {
+                    return match access {
+                        DeclaredStaticAccess::Packed(value) => Some(value),
+                        DeclaredStaticAccess::Other => None,
+                    };
+                }
+                let name = self
+                    .frame_bound_bare_name(h)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
+                // Associative keys retain their key-type conversion path.
+                if self.is_associative_array(&name) {
+                    return None;
+                }
+                let dt = self.module.var_decl_types.get(&name)?;
+                let (element_type, dimensions, width) = self.declared_packed_type(dt)?;
+                let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(&name) {
+                    dims.len()
+                } else if self.module.arrays_2d.contains_key(&name) {
+                    2
+                } else if self.module.arrays.contains_key(&name)
+                    || self.module.dynamic_arrays.contains(&name)
+                {
+                    1
+                } else {
+                    0
+                };
+                Some(DeclaredPackedAccess {
+                    storage: name,
+                    is_signed: super::elaborate::is_type_signed_resolved(
+                        dt,
+                        &self.module.typedef_types,
+                    ),
+                    static_target: None,
+                    offset: 0,
+                    width,
+                    dimensions,
+                    element_type,
+                    unpacked,
+                })
+            }
+            ExprKind::Paren(inner) => self.declared_packed_access(inner),
+            ExprKind::Index { expr: base, index } => {
+                if !Self::cond_expr_is_effect_free(index, false) {
+                    return None;
+                }
+                let mut access = self.declared_packed_access(base)?;
+                let index = self.eval_expr(index).to_index()?;
+                if access.unpacked > 0
+                    || self.module.dynamic_arrays.contains(&access.storage)
+                    || self.module.queue_vars.contains(&access.storage)
+                {
+                    access.storage.push('[');
+                    Self::push_i64(&mut access.storage, index);
+                    access.storage.push(']');
+                    access.unpacked = access.unpacked.saturating_sub(1);
+                    return Some(access);
+                }
+                let (left, right) = access
+                    .dimensions
+                    .first()
+                    .copied()
+                    .unwrap_or((access.width as i64 - 1, 0));
+                if index < left.min(right) || index > left.max(right) {
+                    return None;
+                }
+                let count = u32::try_from(left.abs_diff(right) + 1).ok()?;
+                if access.width % count != 0 {
+                    return None;
+                }
+                access.width /= count;
+                access.is_signed = false;
+                let slot = if left >= right {
+                    index - right
+                } else {
+                    right - index
+                };
+                access.offset = access
+                    .offset
+                    .checked_add((slot as u32).checked_mul(access.width)?)?;
+                if !access.dimensions.is_empty() {
+                    access.dimensions.remove(0);
+                }
+                Some(access)
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                left,
+                right,
+                kind,
+            } => {
+                if !Self::cond_expr_is_effect_free(left, false)
+                    || !Self::cond_expr_is_effect_free(right, false)
+                {
+                    return None;
+                }
+                let mut access = self.declared_packed_access(base)?;
+                if access.unpacked != 0 {
+                    return None;
+                }
+                let (dl, dr) = access
+                    .dimensions
+                    .first()
+                    .copied()
+                    .unwrap_or((access.width as i64 - 1, 0));
+                let a = self.eval_expr(left).to_index()?;
+                let b = self.eval_expr(right).to_index()?;
+                let (l, r) = match kind {
+                    RangeKind::Constant => (a, b),
+                    RangeKind::IndexedUp if b > 0 => {
+                        if dl >= dr {
+                            (a.checked_add(b - 1)?, a)
+                        } else {
+                            (a, a.checked_add(b - 1)?)
+                        }
+                    }
+                    RangeKind::IndexedDown if b > 0 => {
+                        if dl >= dr {
+                            (a, a.checked_sub(b - 1)?)
+                        } else {
+                            (a.checked_sub(b - 1)?, a)
+                        }
+                    }
+                    _ => return None,
+                };
+                if l < dl.min(dr)
+                    || l > dl.max(dr)
+                    || r < dl.min(dr)
+                    || r > dl.max(dr)
+                    || (l != r && (l > r) != (dl > dr))
+                {
+                    return None;
+                }
+                let count = u32::try_from(dl.abs_diff(dr) + 1).ok()?;
+                if access.width % count != 0 {
+                    return None;
+                }
+                let stride = access.width / count;
+                access.is_signed = false;
+                let slot = if dl >= dr { r - dr } else { dr - r };
+                access.offset = access
+                    .offset
+                    .checked_add((slot as u32).checked_mul(stride)?)?;
+                access.width = u32::try_from(l.abs_diff(r) + 1).ok()?.checked_mul(stride)?;
+                if access.dimensions.is_empty() {
+                    access.dimensions.push((l, r));
+                } else {
+                    access.dimensions[0] = (l, r);
+                }
+                Some(access)
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                if !self.class_member_names().statics.is_empty()
+                    && let Some(access) = self.declared_static_packed_root(expr)
+                {
+                    return match access {
+                        DeclaredStaticAccess::Packed(value) => Some(value),
+                        DeclaredStaticAccess::Other => None,
+                    };
+                }
+                let mut access = self.declared_packed_access(base)?;
+                if access.unpacked != 0 || !access.dimensions.is_empty() {
+                    return None;
+                }
+                let DataType::Struct(su) = &access.element_type else {
+                    return None;
+                };
+                let mut remaining = access.width;
+                for m in &su.members {
+                    let (element, dimensions, width) = self.declared_packed_type(&m.data_type)?;
+                    for d in &m.declarators {
+                        if !d.dimensions.is_empty() {
+                            return None;
+                        }
+                        let offset = if su.kind == crate::ast::types::StructUnionKind::Union {
+                            0
+                        } else {
+                            remaining = remaining.checked_sub(width)?;
+                            remaining
+                        };
+                        if d.name.name == member.name {
+                            access.offset = access.offset.checked_add(offset)?;
+                            access.width = width;
+                            access.is_signed = super::elaborate::is_type_signed_resolved(
+                                &m.data_type,
+                                &self.module.typedef_types,
+                            );
+                            access.dimensions = dimensions;
+                            access.element_type = element;
+                            return Some(access);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn needs_declared_packed_access(&self, expr: &Expression) -> bool {
+        match &expr.kind {
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                match &base.kind {
+                    ExprKind::MemberAccess { .. } => true,
+                    ExprKind::Index { .. } => {
+                        let mut root = base.as_ref();
+                        while let ExprKind::Index { expr, .. } = &root.kind {
+                            root = expr;
+                        }
+                        let ExprKind::Ident(h) = &root.kind else {
+                            return false;
+                        };
+                        let name = self
+                            .frame_bound_bare_name(h)
+                            .map(std::borrow::Cow::Borrowed)
+                            .unwrap_or_else(|| self.resolve_hier_name(h));
+                        // Ordinary vectors in unpacked memories already use the
+                        // existing fast element path. Only packed geometry needs
+                        // the declaration walk below the unpacked boundary.
+                        self.module
+                            .packed_full_dims
+                            .get(name.as_ref())
+                            .is_some_and(|d| d.len() > 1)
+                            || self.module.packed_struct_fields.contains_key(name.as_ref())
+                    }
+                    _ => false,
+                }
+            }
+            ExprKind::MemberAccess { expr: base, .. } => {
+                matches!(base.kind, ExprKind::Index { .. })
+            }
+            _ => false,
+        }
+    }
+
+    fn needs_static_packed_access(&self, expr: &Expression) -> bool {
+        let mut base = match &expr.kind {
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => expr.as_ref(),
+            _ => return false,
+        };
+        // Values are seeded lazily: an empty value map must not discard the
+        // first selected write. Eligibility comes from the declarations.
+        let names = self.class_member_names();
+        if names.statics.is_empty() {
+            return false;
+        }
+        let candidate = |name: &str| {
+            name.as_bytes()
+                .first()
+                .is_some_and(|&b| names.static_first[b as usize])
+                && names.statics.contains(name)
+        };
+        loop {
+            match &base.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::Paren(expr) => base = expr,
+                _ => break,
+            }
+        }
+        match &base.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                (self.class_context_stack.last().is_some_and(Option::is_some)
+                    || self.this_stack.last().copied().flatten().is_some())
+                    && candidate(&h.path[0].name.name)
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 => candidate(&h.path[1].name.name),
+            ExprKind::MemberAccess { member, .. } => candidate(&member.name),
+            _ => false,
+        }
+    }
+
+    fn packed_local_static_key(&self, name: &str) -> Option<String> {
+        if self.in_const_param_eval || !self.static_local_names.contains(name) {
+            return None;
+        }
+        let key = self.static_local_key_for(name)?;
+        self.static_local_keys.contains(&key).then_some(key)
+    }
+
+    fn packed_local_value(&self, name: &str) -> Option<Value> {
+        if let Some(key) = self.packed_local_static_key(name) {
+            return self.static_local_vars.get(&key).cloned();
+        }
+        self.get_local_or_signal(name)
+    }
+
+    fn read_declared_packed_access(&mut self, expr: &Expression) -> Option<Value> {
+        let access = self.declared_packed_access(expr)?;
+        if access.unpacked != 0 || access.width == 0 {
+            return None;
+        }
+        let value = if let Some((class, spec, member)) = &access.static_target {
+            self.static_read_in(class, spec.clone(), member)?
+        } else {
+            self.packed_local_value(&access.storage)?
+        };
+        let end = access.offset.checked_add(access.width)?;
+        if end > value.width {
+            return None;
+        }
+        let mut selected = value.range_select((end - 1) as usize, access.offset as usize);
+        selected.is_signed = access.is_signed;
+        Some(selected)
+    }
+
+    fn write_declared_packed_access(&mut self, expr: &Expression, value: &Value) -> Option<bool> {
+        let access = self.declared_packed_access(expr)?;
+        if access.unpacked != 0 || access.width == 0 {
+            return None;
+        }
+        let mut stored = if let Some((class, spec, member)) = &access.static_target {
+            self.static_read_in(class, spec.clone(), member)?
+        } else {
+            self.packed_local_value(&access.storage)?
+        };
+        if access.offset.checked_add(access.width)? > stored.width {
+            return None;
+        }
+        let before = stored.clone();
+        if access.static_target.is_none() && self.forced_names.contains(&access.storage) {
+            return Some(false);
+        }
+        let fitted = if value.has_xz()
+            && super::elaborate::is_type_two_state_resolved(
+                &access.element_type,
+                &self.module.typedef_types,
+            ) {
+            value.to_two_state().resize_for_assign(access.width)
+        } else {
+            value.resize_for_assign(access.width)
+        };
+        for bit in 0..access.width {
+            stored.set_bit((access.offset + bit) as usize, fitted.get_bit(bit as usize));
+        }
+        let changed = stored != before;
+        if let Some((class, spec, member)) = access.static_target {
+            self.static_write_in(&class, spec, &member, stored);
+        } else {
+            if let Some(key) = self.packed_local_static_key(&access.storage) {
+                self.static_local_vars.insert(key, stored.clone());
+            }
+            self.set_local_or_signal(&access.storage, stored);
+        }
+        Some(changed)
     }
 
     fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
@@ -71688,6 +73605,21 @@ impl Simulator {
             // inside an SVA clocked body; falls back to current
             // value when no active site (compile-time use).
             "$past" => {
+                let n = args
+                    .get(1)
+                    .filter(|a| !matches!(a.kind, ExprKind::Null | ExprKind::Empty))
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1) as usize)
+                    .unwrap_or(1);
+                if let Some((_, past)) = self.sampled_fn_via_watch(expr, args, n) {
+                    return past.unwrap_or_else(|| {
+                        Value::new(
+                            args.first()
+                                .map(|a| self.infer_width(a))
+                                .unwrap_or(1)
+                                .max(1),
+                        )
+                    });
+                }
                 // Inside a concurrent assertion the site's per-cycle ring is the
                 // history (index N = N clock ticks ago, sampled values).
                 if let Some(site_idx) = self.active_sva_site {
@@ -73220,7 +75152,10 @@ impl Simulator {
                             } else {
                                 inner_v
                             };
-                            out.is_signed = super::elaborate::is_type_signed(&dt);
+                            out.is_signed = super::elaborate::is_type_signed_resolved(
+                                &dt,
+                                &self.module.typedef_types,
+                            );
                             return out;
                         }
                         let w = super::elaborate::resolve_type_width(
@@ -73241,7 +75176,10 @@ impl Simulator {
                         ) {
                             out = out.to_two_state();
                         }
-                        out.is_signed = super::elaborate::is_type_signed(&dt);
+                        out.is_signed = super::elaborate::is_type_signed_resolved(
+                            &dt,
+                            &self.module.typedef_types,
+                        );
                         return out;
                     }
                     // (b) A typedef/enum known only by width (e.g. an enum
@@ -75618,6 +77556,17 @@ impl Simulator {
     /// named sides must be plain scalar names (`cmp_name_scalar`). The rest
     /// is the arm's own sizing, evaluation order, real promotion and
     /// integral compare.
+    /// §5.9 / §6.16: a literal is integral until a string-typed operand
+    /// supplies a string context. Parentheses do not supply that context.
+    fn operand_has_string_type(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::StringLiteral(_) => false,
+            ExprKind::Paren(inner) => self.operand_has_string_type(inner),
+            ExprKind::Concatenation(parts) => parts.iter().any(|e| self.operand_has_string_type(e)),
+            _ => self.operand_is_string(e),
+        }
+    }
+
     fn plain_compare(
         &mut self,
         op: BinaryOp,
@@ -75823,6 +77772,11 @@ impl Simulator {
                 {
                     return v;
                 }
+                if matches!(base.kind, ExprKind::Index { .. })
+                    && let Some(v) = self.read_declared_packed_access(expr)
+                {
+                    return v;
+                }
                 if matches!(
                     base.kind,
                     ExprKind::Call { .. } | ExprKind::MemberAccess { .. }
@@ -75852,13 +77806,18 @@ impl Simulator {
                     return v;
                 }
             }
-            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. }
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
                 if matches!(
                     base.kind,
                     ExprKind::Call { .. } | ExprKind::MemberAccess { .. }
-                ) =>
-            {
-                if let Some(v) = self.recv_call_once_eval(expr, ctx_width) {
+                ) && let Some(v) = self.recv_call_once_eval(expr, ctx_width)
+                {
+                    return v;
+                }
+                if (self.needs_declared_packed_access(expr)
+                    || self.needs_static_packed_access(expr))
+                    && let Some(v) = self.read_declared_packed_access(expr)
+                {
                     return v;
                 }
             }
@@ -75911,6 +77870,13 @@ impl Simulator {
                 if let Some(v) = self.frame_get(&key) {
                     return v.clone();
                 }
+            }
+            // §7.4.1/§11.5.1: a nested select of a packed variable the frame
+            // owns, placed as its write is (`frame_packed_select_write`).
+            if Self::select_of_select(expr)
+                && let Some(v) = self.frame_packed_select_read(expr)
+            {
+                return v;
             }
         }
         // §6.21: a `static` subroutine local is a LIVE cell shared across ALL
@@ -77292,7 +79258,8 @@ impl Simulator {
                     UnaryOp::Plus => v,
                     UnaryOp::Minus => {
                         let mut r = Value::zero(v.width).sub(&v).resize(v.width);
-                        r.is_signed = true;
+                        // §11.8.1: unary minus preserves its operand type.
+                        r.is_signed = v.is_signed;
                         r
                     }
                     UnaryOp::LogNot => v.logic_not(),
@@ -77904,8 +79871,7 @@ impl Simulator {
                         | BinaryOp::Geq
                         | BinaryOp::Eq
                         | BinaryOp::Neq
-                ) && (left_is_str.unwrap_or_else(|| self.operand_is_string(left))
-                    || right_is_str.unwrap_or_else(|| self.operand_is_string(right)))
+                ) && (self.operand_has_string_type(left) || self.operand_has_string_type(right))
                 {
                     // §6.16: string comparison is by TEXT. Equality also goes
                     // through here because an out-of-bounds string-collection
@@ -78124,49 +80090,51 @@ impl Simulator {
                     // `[2:0]` array starts at index 2, a 2-D array goes row
                     // by row. A queue / dynamic-array SLICE `q[a:b]` streams
                     // elements a..b.
-                    let elem_list: Option<(Vec<String>, u32)> = match &p.kind {
-                        ExprKind::Ident(h) => {
-                            let n = self.resolve_hier_name(h);
-                            // One probe for the common scalar operand;
-                            // the 2-D / N-D tables are usually empty.
-                            if self.module.arrays.contains_key(&*n)
-                                || (!self.module.arrays_2d.is_empty()
-                                    && self.module.arrays_2d.contains_key(&*n))
-                                || (!self.module.arrays_nd.is_empty()
-                                    && self.module.arrays_nd.contains_key(&*n))
-                            {
-                                self.stream_elem_order(&n)
-                            } else {
-                                None
+                    // §11.4.14: resolve the collection's backing storage,
+                    // including class members, before reading its elements.
+                    let elem_list = if let Some(name) = self.array_operand_name(p) {
+                        self.stream_elem_order(&name)
+                    } else {
+                        match &p.kind {
+                            ExprKind::Ident(h) => {
+                                let name = self.resolve_hier_name(h);
+                                self.stream_elem_order(&name)
                             }
-                        }
-                        ExprKind::RangeSelect {
-                            expr: base,
-                            left,
-                            right,
-                            ..
-                        } => match &base.kind {
-                            ExprKind::Ident(h)
-                                if self
-                                    .module
-                                    .dynamic_arrays
-                                    .contains(&*self.resolve_hier_name(h)) =>
-                            {
-                                let n = self.resolve_hier_name(h).to_string();
-                                let l = self.eval_expr(left).to_i64();
-                                let r = self.eval_expr(right).to_i64();
-                                match (l, r) {
-                                    (Some(l), Some(r)) if l <= r && r - l < 1 << 20 => {
-                                        self.stream_elem_order(&n).map(|(_, ew)| {
-                                            ((l..=r).map(|i| format!("{}[{}]", n, i)).collect(), ew)
-                                        })
+                            ExprKind::RangeSelect {
+                                expr: base,
+                                left,
+                                right,
+                                ..
+                            } => {
+                                if let Some(name) = self.array_operand_name(base)
+                                    && self.module.dynamic_arrays.contains(&name)
+                                {
+                                    let left = self.eval_expr(left).to_i64();
+                                    let right = self.eval_expr(right).to_i64();
+                                    match (left, right) {
+                                        (Some(left), Some(right))
+                                            if left <= right && right - left < 1 << 20 =>
+                                        {
+                                            self.stream_elem_order(&name).map(|(_, width)| {
+                                                (
+                                                    (left..=right)
+                                                        .map(|i| format!("{name}[{i}]"))
+                                                        .collect(),
+                                                    width,
+                                                )
+                                            })
+                                        }
+                                        _ => None,
                                     }
-                                    _ => None,
+                                } else {
+                                    None
                                 }
                             }
+                            ExprKind::Paren(inner) => self
+                                .array_operand_name(inner)
+                                .and_then(|name| self.stream_elem_order(&name)),
                             _ => None,
-                        },
-                        _ => None,
+                        }
                     };
                     let piece = if let Some((names, ew)) = elem_list {
                         let mut acc = Value::zero(0);
@@ -84710,10 +86678,10 @@ impl Simulator {
                                 break 'rows;
                             }
                             if let Some(n) = &iv {
-                                self.set_loop_var(n, Value::from_u64(i, 32));
+                                self.set_loop_var(n, Self::signed_loop_val(i as i64));
                             }
                             if let Some(n) = &jv {
-                                self.set_loop_var(n, Value::from_u64(j, 32));
+                                self.set_loop_var(n, Self::signed_loop_val(j as i64));
                             }
                             self.continue_flag = false;
                             *iterations = iterations.saturating_add(1);
@@ -84810,7 +86778,7 @@ impl Simulator {
                                     self.set_loop_var(n, kv);
                                 }
                                 if let Some(n) = &iv {
-                                    self.set_loop_var(n, Value::from_u64(j, 32));
+                                    self.set_loop_var(n, Self::signed_loop_val(j as i64));
                                 }
                                 self.continue_flag = false;
                                 *iterations = iterations.saturating_add(1);
@@ -85364,7 +87332,7 @@ impl Simulator {
                                     self.set_loop_var_aliased(
                                         var_scope.as_deref(),
                                         n,
-                                        Value::from_u64(j, 32),
+                                        Self::signed_loop_val(j as i64),
                                     );
                                 }
                                 self.continue_flag = false;
@@ -85428,7 +87396,7 @@ impl Simulator {
                         self.set_loop_var_aliased(
                             var_scope.as_deref(),
                             &var.name,
-                            Value::from_u64(i, 32),
+                            Self::signed_loop_val(i as i64),
                         );
                         self.continue_flag = false;
                         *iterations = iterations.saturating_add(1);
@@ -85519,7 +87487,7 @@ impl Simulator {
                         self.set_loop_var_aliased(
                             var_scope.as_deref(),
                             &var.name,
-                            Value::from_u64(i, 32),
+                            Self::signed_loop_val(i as i64),
                         );
                         self.continue_flag = false;
                         *iterations = iterations.saturating_add(1);
@@ -85572,7 +87540,7 @@ impl Simulator {
                         self.set_loop_var_aliased(
                             var_scope.as_deref(),
                             &var.name,
-                            Value::from_u64(i, 32),
+                            Self::signed_loop_val(i as i64),
                         );
                         self.continue_flag = false;
                         *iterations = iterations.saturating_add(1);
@@ -85624,7 +87592,7 @@ impl Simulator {
                         self.set_loop_var_aliased(
                             var_scope.as_deref(),
                             &var.name,
-                            Value::from_u64(i, 32),
+                            Self::signed_loop_val(i as i64),
                         );
                         self.continue_flag = false;
                         *iterations = iterations.saturating_add(1);
@@ -85815,7 +87783,7 @@ impl Simulator {
         let is_vif_handle = !is_class_handle
             && matches!(data_type, crate::ast::types::DataType::TypeReference { .. })
             && Self::dt_is_virtual_iface(data_type, &self.module);
-        let default_v = if is_real_type {
+        let mut default_v = if is_real_type {
             Value::from_f64(0.0)
         } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle || is_vif_handle
         {
@@ -85823,6 +87791,9 @@ impl Simulator {
         } else {
             Value::new(w)
         };
+        // §6.11.3: the initial cell carries its declared signing before its
+        // first assignment. Frame-local stores use this stable type stamp.
+        default_v.is_signed = decl_signed;
         // §6.21: a local of an `initial`/`always`/`final` block is static
         // unless declared `automatic` — one variable, initialized once (its
         // initializer is not re-run when the block is entered again). Such a
@@ -85838,6 +87809,12 @@ impl Simulator {
         // running each time, as an automatic one would.
         let explicit_static = matches!(lifetime, Some(crate::ast::types::Lifetime::Static));
         for d in declarators {
+            if explicit_static
+                && !self.static_local_syncs.is_empty()
+                && self.hoisted_sub_static_names.contains(&d.name.name)
+            {
+                continue;
+            }
             if static_block && (explicit_static || d.init.is_none()) {
                 // Done already? (Allocation-free once it is: the activation
                 // after the first.)
@@ -85992,6 +87969,7 @@ impl Simulator {
                                 &self.module.typedef_types,
                             )
                         })
+                        .or_else(|| self.struct_array_full_dims(data_type))
                 {
                     self.module
                         .packed_full_dims
@@ -86128,13 +88106,22 @@ impl Simulator {
                 // makes `pk[i][j][k]` a lane select and the full dims answer
                 // `$size(pk, 3)` / `$dimensions(pk)`. Only the flat element
                 // width was kept, so the packed dims read as one 32-bit one.
-                match super::elaborate::packed_full_dims_of(data_type, &self.module.parameters) {
+                match super::elaborate::packed_full_dims_of(data_type, &self.module.parameters)
+                    .or_else(|| {
+                        super::elaborate::packed_full_dims_chained(
+                            data_type,
+                            &self.module.parameters,
+                            &self.module.typedef_types,
+                        )
+                    }) {
                     Some(fdims) if fdims.len() >= 2 => {
                         if let Some(ew) = super::elaborate::packed_inner_elem_width(
                             data_type,
                             &self.module.parameters,
                             &self.module.typedefs,
-                        ) {
+                        )
+                        .or_else(|| self.ast_decl_elem_width(data_type))
+                        {
                             self.module
                                 .packed_signal_elem_widths
                                 .insert(d.name.name.clone(), ew);
@@ -86803,7 +88790,9 @@ impl Simulator {
                     self.exec_statement(&assign);
                 }
             } else {
-                if let Some(task_name) = self.current_static_task.clone() {
+                if !matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic))
+                    && let Some(task_name) = self.current_static_task.clone()
+                {
                     let key = format!("{}.{}", task_name, d.name.name);
                     if !self.static_task_init.insert(key) {
                         continue;
@@ -87250,6 +89239,11 @@ impl Simulator {
                 } else {
                     self.forget_string_flag(&d.name.name);
                 }
+                // §6.21: another process may declare a same-named string
+                // while this frame is parked. Keep this declaration's kind
+                // with the frame, independently of the global name tables.
+                let is_string = self.declared_name_is_string(&d.name.name);
+                self.record_frame_string_kind(&d.name.name, is_string);
                 // Record a class-typed local's type so a later
                 // separate `name = new();` knows what to construct.
                 // Covergroup-typed locals (§19.8) are recorded too:
@@ -87422,6 +89416,11 @@ impl Simulator {
                 .unwrap_or_default();
             for d in declarators {
                 let nm = &d.name.name;
+                // Hoisted declarations already use their shared global cell;
+                // never create a second frame-backed scalar mirror.
+                if self.hoisted_sub_static_names.contains(nm) {
+                    continue;
+                }
                 // Skip aggregates: arrays/queues/assoc are not persisted.
                 if !d.dimensions.is_empty()
                     || self.module.arrays.contains_key(nm)
@@ -87540,6 +89539,9 @@ impl Simulator {
                 // below expects — the chain shape skipped the check and the
                 // drive landed on a phantom name instead of the clocking
                 // output net.
+                // Keep the member tree for declaration-based packed geometry;
+                // the flat spelling below is only needed by clocking drives.
+                let packed_lvalue = lvalue;
                 let lvalue_norm;
                 let lvalue: &Expression = match Self::member_chain_as_flat_ident(lvalue) {
                     Some(flat) => {
@@ -87660,7 +89662,10 @@ impl Simulator {
                 // §10.4.2: a whole UNPACKED struct has no storage of its own —
                 // its member leaves are the storage — so it is updated as one
                 // nonblocking assignment per leaf, every source leaf read now.
-                if let Some(leaf_nbas) = self.unpacked_struct_nba_leaves(lvalue, rvalue) {
+                if let Some(leaf_nbas) = self
+                    .unpacked_array_nba_leaves(lvalue, rvalue)
+                    .or_else(|| self.unpacked_struct_nba_leaves(lvalue, rvalue))
+                {
                     let d = match intra_d {
                         Some(d) => d,
                         None => delay
@@ -87776,6 +89781,7 @@ impl Simulator {
                 }
                 // SV-2023: NBA to a ref formal redirects to the caller's
                 // actual lvalue (IEEE 1800-2023 §13.5.2).
+                let written = lvalue;
                 let lvalue_owned;
                 let lvalue: &Expression = if let ExprKind::Ident(hier) = &lvalue.kind {
                     if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
@@ -87797,6 +89803,9 @@ impl Simulator {
                 } else {
                     lvalue
                 };
+                // The caller's actual of a `ref` formal names the caller's
+                // variables, not this frame's.
+                let rebound = !std::ptr::eq(lvalue, written);
                 let w = self.infer_lhs_width(lvalue);
                 let d = match intra_d {
                     Some(d) => d,
@@ -87805,26 +89814,26 @@ impl Simulator {
                         .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
                         .unwrap_or(0),
                 };
-                if d == 0 {
-                    // A `static` subroutine local is checked BEFORE the signal
-                    // resolution below: it is backed by a persistent store keyed
-                    // per declaring subroutine, but `resolve_nba_target` finds a
-                    // bare same-named SIGNAL, which every instance of an
-                    // interface shares. Two instances each running
-                    // `task Gen; static int count; … count <= count + 1;` then
-                    // wrote one cell — one instance's counter never advanced and
-                    // the divider it fed never reached its threshold.
-                    if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
-                        self.nba_queue.push(NbaEntry {
+                // §10.4.2 / §6.21: capture persistent storage before the
+                // call frame is restored. Every write still commits in NBA.
+                if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
+                    self.enqueue_context_nba(
+                        NbaEntry {
                             lhs: None,
                             value: val.resize_for_assign(w),
                             resolved_id: None,
                             static_key: Some(key),
-                            // No `lhs` to re-resolve, so no context needed.
+                            static_slice: None,
                             this_handle: None,
-                        });
-                        return;
-                    }
+                        },
+                        d,
+                    );
+                    return;
+                }
+                if !rebound && self.try_schedule_static_packed_nba(packed_lvalue, &val, d) {
+                    return;
+                }
+                if d == 0 {
                     let id_opt = self.resolve_nba_target(lvalue);
                     if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
@@ -87846,14 +89855,8 @@ impl Simulator {
                         if h.path.len() == 1
                             && self.local_stack.last().is_some_and(|m| m.contains_key(&h.path[0].name.name)))
                     {
-                        // NBA to a bare task-FRAME local: the deferred queue
-                        // commits in `apply_nba`, OUTSIDE the (possibly
-                        // suspended) process's local frame, so the local would
-                        // never update. Apply immediately — delta-vs-blocking
-                        // timing is unobservable for a process-local. (Body-
-                        // declared locals in the signal map are left deferred:
-                        // routines doing `nba <= next_nba; @(nba)`
-                        // need the NBA region to fire the edge.)
+                        // Preserve the existing whole-frame fallback.
+                        // Persistent local declarations were captured above.
                         self.assign_value(lvalue, &val.resize_for_assign(w));
                     } else {
                         let frozen = self.freeze_lvalue_indices(lvalue);
@@ -87869,6 +89872,7 @@ impl Simulator {
                             value: qval,
                             resolved_id: None,
                             static_key,
+                            static_slice: None,
                             this_handle,
                         });
                     }
@@ -87905,13 +89909,17 @@ impl Simulator {
                     };
                     let static_key = self.nba_static_key_for_lvalue(lvalue);
                     let this_handle = self.this_stack.last().copied().flatten();
-                    self.nba_queue.push(NbaEntry {
-                        lhs: Some(frozen),
-                        value: qval,
-                        resolved_id: None,
-                        static_key,
-                        this_handle,
-                    });
+                    self.enqueue_context_nba(
+                        NbaEntry {
+                            lhs: Some(frozen),
+                            value: qval,
+                            resolved_id: None,
+                            static_key,
+                            static_slice: None,
+                            this_handle,
+                        },
+                        d,
+                    );
                 }
             }
             StatementKind::If {
@@ -88113,7 +90121,29 @@ impl Simulator {
                             name,
                             init: e,
                         } => {
-                            let rv = self.declare_for_init_var(data_type, &name.name, e);
+                            let v = self.eval_expr(e);
+                            let w = super::elaborate::resolve_type_width(
+                                data_type,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            );
+                            self.widths.insert(name.name.clone(), w);
+                            let mut rv = v.resize(w);
+                            // Preserve declared signedness: `resize` yields an
+                            // unsigned Value, so a `for (int i = ...; i >= 0;
+                            // --i)` loop var would read as unsigned and `i >= 0`
+                            // would be always-true -> infinite descending loop
+                            // in any count-down loop.
+                            if super::elaborate::is_type_signed(data_type) {
+                                rv.is_signed = true;
+                            }
+                            // Keep `signed_signals` authoritative for the
+                            // fitted frame-write stamp (§6.11.1).
+                            if super::elaborate::is_type_signed(data_type) {
+                                self.signed_signals.insert(name.name.clone());
+                            } else {
+                                self.signed_signals.remove(&name.name);
+                            }
                             // Declare the loop variable in the current call
                             // frame's local scope (highest read/write
                             // precedence) so its init, the step, and condition
@@ -88144,7 +90174,7 @@ impl Simulator {
                     .filter_map(|fi| match fi {
                         ForInit::VarDecl {
                             data_type, name, ..
-                        } if self.type_is_signed_concrete(data_type) => Some(name.name.clone()),
+                        } if super::elaborate::is_type_signed(data_type) => Some(name.name.clone()),
                         _ => None,
                     })
                     .collect();
@@ -94773,31 +96803,24 @@ impl Simulator {
     }
 
     /// §16.9.2 delay bounds of a `##` count: `N`, `[m:n]`, `[m:$]`.
-    fn sva_delay_bounds(&mut self, d: &Expression) -> (u32, u32) {
+    fn sva_delay_bounds(&mut self, d: &Expression) -> (u64, u64) {
         match &d.kind {
             ExprKind::Range(lo, hi) => self.sva_bounds_pair(lo, hi),
-            ExprKind::Dollar => (0, u32::MAX),
+            ExprKind::Dollar => (0, u64::MAX),
             ExprKind::Paren(inner) => self.sva_delay_bounds(inner),
             _ => {
-                let n = self.eval_expr(d).to_u64().unwrap_or(1).min(u32::MAX as u64) as u32;
+                let n = self.eval_expr(d).to_u64().unwrap_or(1);
                 (n, n)
             }
         }
     }
 
-    fn sva_bounds_pair(&mut self, lo: &Expression, hi: &Expression) -> (u32, u32) {
-        let l = self
-            .eval_expr(lo)
-            .to_u64()
-            .unwrap_or(0)
-            .min(u32::MAX as u64) as u32;
+    fn sva_bounds_pair(&mut self, lo: &Expression, hi: &Expression) -> (u64, u64) {
+        let l = self.eval_expr(lo).to_u64().unwrap_or(0);
         let h = if matches!(hi.kind, ExprKind::Dollar) {
-            u32::MAX
+            u64::MAX
         } else {
-            self.eval_expr(hi)
-                .to_u64()
-                .unwrap_or(l as u64)
-                .min(u32::MAX as u64) as u32
+            self.eval_expr(hi).to_u64().unwrap_or(l)
         };
         (l, h.max(l))
     }
@@ -94862,7 +96885,7 @@ impl Simulator {
                 )
             }
             ExprKind::SystemCall { name, args } if name.starts_with("$sva_") => {
-                let bounds = |this: &mut Self| -> (u32, u32) {
+                let bounds = |this: &mut Self| -> (u64, u64) {
                     match (args.get(1), args.get(2)) {
                         (Some(lo), Some(hi)) => this.sva_bounds_pair(lo, hi),
                         _ => (1, 1),
@@ -95038,7 +97061,7 @@ impl Simulator {
         };
         match node {
             SvaNode::Seq(nfa, _) => inject(nfa),
-            SvaNode::Impl { ante, .. } => inject(ante),
+            SvaNode::Impl { ante, .. } | SvaNode::Followed { ante, .. } => inject(ante),
             SvaNode::Not(inner) => Self::sva_inject_init(inner, init),
             SvaNode::And(a, b) | SvaNode::Or(a, b) => {
                 Self::sva_inject_init(a, init);
@@ -95066,6 +97089,18 @@ impl Simulator {
                     Self::sva_inject_init(&mut node, &items);
                 }
                 node
+            }
+            ExprKind::SystemCall { name, args }
+                if matches!(
+                    name.as_str(),
+                    "$sva_follow_overlap" | "$sva_follow_nonoverlap"
+                ) && args.len() == 2 =>
+            {
+                SvaNode::Followed {
+                    ante: self.sva_build_seq(&args[0]),
+                    overlap: name == "$sva_follow_overlap",
+                    cons: Box::new(self.sva_compile_node(&args[1])),
+                }
             }
             ExprKind::Binary { op, left, right }
                 if matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow) =>
@@ -95123,7 +97158,8 @@ impl Simulator {
         match (node, st) {
             (SvaNode::Seq(_, strong), SvaState::Seq(_)) => *strong,
             (SvaNode::Eventually(_), SvaState::Leaf(_)) => true,
-            (SvaNode::Impl { cons: cn, .. }, SvaState::Impl { cons, .. }) => {
+            (SvaNode::Impl { cons: cn, .. }, SvaState::Impl { cons, .. })
+            | (SvaNode::Followed { cons: cn, .. }, SvaState::Followed { cons, .. }) => {
                 cons.iter().any(|(_, cs)| Self::sva_strong_pending(cn, cs))
             }
             (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb })
@@ -95169,6 +97205,14 @@ impl Simulator {
             ExprKind::SystemCall { name, args } if name == "$sva_locals" => {
                 args.last().is_some_and(Self::sva_has_property_op)
             }
+            ExprKind::SystemCall { name, .. }
+                if matches!(
+                    name.as_str(),
+                    "$sva_follow_overlap" | "$sva_follow_nonoverlap"
+                ) =>
+            {
+                true
+            }
             ExprKind::Binary { op, left, right } => {
                 matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow)
                     || (matches!(op, BinaryOp::SvaAnd | BinaryOp::SeqOr)
@@ -95206,6 +97250,12 @@ impl Simulator {
                 ante_alive: true,
                 matched_any: false,
                 cons: Vec::new(),
+            },
+            SvaNode::Followed { .. } => SvaState::Followed {
+                ante: SvaRun::with_env(env.clone()),
+                ante_alive: true,
+                cons: Vec::new(),
+                vacuous: false,
             },
             SvaNode::And(a, b) => SvaState::And {
                 a: Box::new(Self::sva_new_state(a, env)),
@@ -95364,6 +97414,8 @@ impl Simulator {
                             ever: [false, false],
                             env: env.clone(),
                             ever_env: [Vec::new(), Vec::new()],
+                            ticks: 0,
+                            repeated: Vec::new(),
                         };
                         let (m, alive) = self.sva_sub_advance(nfa, &mut sub);
                         for menv in m {
@@ -95394,6 +97446,51 @@ impl Simulator {
             return (Vec::new(), false);
         };
         match &**comp {
+            SvaCompound::Delay(min, max) => {
+                let out = if sub.ticks >= *min {
+                    vec![sub.env.clone()]
+                } else {
+                    Vec::new()
+                };
+                let alive = *max == u64::MAX || sub.ticks < *max;
+                sub.ticks = sub.ticks.saturating_add(1);
+                (out, alive)
+            }
+            SvaCompound::Repeat(unit, min, max) => {
+                let mut out = Vec::new();
+                if sub.ticks == 0 {
+                    sub.ticks = 1;
+                    if *min == 0 {
+                        out.push(sub.env.clone());
+                    }
+                    if *max > 0 {
+                        sub.repeated.push((0, SvaRun::with_env(sub.env.clone())));
+                    }
+                }
+                let mut keep = Vec::new();
+                for (count, mut run) in std::mem::take(&mut sub.repeated) {
+                    let (matches, alive) = self.sva_run_advance(unit, &mut run, false);
+                    if alive {
+                        keep.push((count, run));
+                    }
+                    for env in matches {
+                        let next = count.saturating_add(1);
+                        if next >= *min {
+                            out.push(env.clone());
+                        }
+                        if *max == u64::MAX || next < *max {
+                            let next = if *max == u64::MAX {
+                                next.min((*min).max(1))
+                            } else {
+                                next
+                            };
+                            keep.push((next, SvaRun::with_env(env)));
+                        }
+                    }
+                }
+                sub.repeated = keep;
+                (out, !sub.repeated.is_empty())
+            }
             SvaCompound::FirstMatch(inner) => {
                 let (m, alive) = self.sva_run_advance(inner, &mut sub.runs[0], true);
                 if !m.is_empty() {
@@ -95528,6 +97625,66 @@ impl Simulator {
                         SvaOutcome::Pass
                     } else {
                         SvaOutcome::Vacuous
+                    })
+                } else {
+                    None
+                }
+            }
+            (
+                SvaNode::Followed {
+                    ante,
+                    overlap,
+                    cons: cons_node,
+                },
+                SvaState::Followed {
+                    ante: arun,
+                    ante_alive,
+                    cons,
+                    vacuous,
+                },
+            ) => {
+                // Unlike implication, one successful match suffices. Failure of
+                // one consequent must not discard other possible match points.
+                let mut fresh = Vec::new();
+                if *ante_alive {
+                    let (matches, alive) = self.sva_run_advance(ante, arun, false);
+                    *ante_alive = alive;
+                    for env in matches {
+                        fresh.push(Self::sva_new_state(cons_node, &env));
+                    }
+                }
+                let mut keep = Vec::new();
+                for (mut delay, mut cst) in cons.drain(..) {
+                    delay = delay.saturating_sub(1);
+                    if delay > 0 {
+                        keep.push((delay, cst));
+                        continue;
+                    }
+                    match self.sva_advance(cons_node, &mut cst) {
+                        Some(SvaOutcome::Pass) => return Some(SvaOutcome::Pass),
+                        Some(SvaOutcome::Vacuous) => *vacuous = true,
+                        Some(SvaOutcome::Fail) => {}
+                        None => keep.push((0, cst)),
+                    }
+                }
+                for mut cst in fresh {
+                    if *overlap {
+                        match self.sva_advance(cons_node, &mut cst) {
+                            Some(SvaOutcome::Pass) => return Some(SvaOutcome::Pass),
+                            Some(SvaOutcome::Vacuous) => *vacuous = true,
+                            Some(SvaOutcome::Fail) => {}
+                            None => keep.push((0, cst)),
+                        }
+                    } else {
+                        keep.push((1, cst));
+                    }
+                }
+                *cons = keep;
+                if !*ante_alive && cons.is_empty() {
+                    Some(if *vacuous {
+                        SvaOutcome::Vacuous
+                    } else {
+                        SvaOutcome::Fail
                     })
                 } else {
                     None
@@ -95723,6 +97880,41 @@ impl Simulator {
             disable_scope,
             ctl,
         });
+        // §16.9.3: the assertion's leading clock also clocks sampled calls
+        // used only in its action blocks; history starts before the first tick.
+        if let Some(&cid) = self
+            .signal_name_to_id
+            .get(self.sva_sites.last().unwrap().clock_signal.as_str())
+        {
+            let ec = match edge {
+                1 => 2,
+                2 => 0,
+                _ => 1,
+            };
+            let saved_scope = self.activation_scope.borrow().clone();
+            *self.activation_scope.borrow_mut() =
+                Some(self.sva_sites.last().unwrap().scope.clone());
+            let old_registering = self.sampled_registering;
+            let old_site = self.active_sva_site.replace(self.sva_sites.len() - 1);
+            self.sampled_registering = true;
+            let body_stmt = Statement::new(
+                StatementKind::Expr(body_expanded.clone()),
+                body_expanded.span,
+            );
+            self.record_sampled_sites(&body_stmt, ec, cid);
+            self.scan_sampled_expr(&body_expanded);
+            for action in [&a.action, &a.else_action].into_iter().flatten() {
+                let first = self.sampled_watches.len();
+                self.record_sampled_sites(action, ec, cid);
+                self.scan_sampled_stmt(action);
+                for watch in &mut self.sampled_watches[first..] {
+                    watch.action_gate = true;
+                }
+            }
+            self.sampled_registering = old_registering;
+            self.active_sva_site = old_site;
+            *self.activation_scope.borrow_mut() = saved_scope;
+        }
     }
 
     /// Tally one finished attempt on a site: cover sites count matches only.
@@ -95809,10 +98001,30 @@ impl Simulator {
     /// changes on the clock edge has an identical preponed and live value.
     fn collect_sva_signal_ids(&self, expr: &Expression, out: &mut Vec<usize>) {
         match &expr.kind {
-            ExprKind::Ident(_) => {
-                if let Some(id) = self.get_lhs_signal_id(expr) {
-                    out.push(id);
+            ExprKind::Ident(h) => {
+                // A field may be parsed as a hierarchical identifier instead
+                // of MemberAccess. Sample its nearest owning aggregate too.
+                let name = self.resolve_hier_name(h);
+                let mut prefix = name.as_ref();
+                loop {
+                    if let Some(&id) = self.signal_name_to_id.get(prefix) {
+                        out.push(id);
+                    }
+                    match prefix.rsplit_once('.') {
+                        Some((p, _)) => prefix = p,
+                        None => break,
+                    }
                 }
+            }
+            ExprKind::MemberAccess { expr: base, .. } => {
+                // Packed fields may have mirrored leaf signals. Sample them
+                // together with the aggregate that owns the selected bits.
+                if let Some(parts) = Self::flatten_member_path(expr) {
+                    if let Some(&id) = self.signal_name_to_id.get(parts.join(".").as_str()) {
+                        out.push(id);
+                    }
+                }
+                self.collect_sva_signal_ids(base, out);
             }
             ExprKind::Unary { operand, .. } => self.collect_sva_signal_ids(operand, out),
             ExprKind::Binary { left, right, .. } => {
@@ -95892,9 +98104,10 @@ impl Simulator {
     /// `#1step` input skew samples pre-edge values. No-op with no clocking
     /// blocks.
     fn refresh_clocking_preponed(&mut self) {
-        if self.clocking_meta.is_empty() {
+        if self.clocking_meta.is_empty() || self.clocking_preponed_slot == Some(self.time) {
             return;
         }
+        self.clocking_preponed_slot = Some(self.time);
         let names: Vec<String> = self
             .clocking_meta
             .values()
@@ -96000,6 +98213,9 @@ impl Simulator {
     }
 
     fn tick_sva_sites(&mut self) {
+        if self.finished {
+            return;
+        }
         if self.sva_sites.is_empty() {
             return;
         }
@@ -96009,6 +98225,7 @@ impl Simulator {
         // property probe the object's members first.
         let saved_this = std::mem::take(&mut self.this_stack);
         let saved_cls = std::mem::take(&mut self.class_context_stack);
+        self.finish_action_sampled_watches();
         self.tick_sva_sites_inner();
         self.this_stack = saved_this;
         self.class_context_stack = saved_cls;
@@ -96028,6 +98245,9 @@ impl Simulator {
         // Use indices so we can call &mut self methods inside the loop
         // without holding a borrow on self.sva_sites.
         for i in 0..self.sva_sites.len() {
+            if self.finished {
+                break;
+            }
             let clk_name = &self.sva_sites[i].clock_signal;
             if clk_name.is_empty() {
                 continue;
@@ -96066,6 +98286,8 @@ impl Simulator {
             // this fire's predicates must read through the sampled-value overlay.
             let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
             let prev_active = self.active_sva_site.replace(i);
+            let prev_activation_scope = self.activation_scope.borrow().clone();
+            *self.activation_scope.borrow_mut() = Some(self.sva_sites[i].scope.clone());
             // LRM §16.9.3: refresh the past-value snapshots BEFORE anything
             // evaluates, so `$past(<sig>)` in a consequent that comes due
             // this tick reads the previous cycle's sample too.
@@ -96081,6 +98303,7 @@ impl Simulator {
                 self.sva_sites[i].matured.clear();
                 self.sva_sites[i].sampled_ids = sampled_ids;
                 self.active_sva_site = prev_active;
+                *self.activation_scope.borrow_mut() = prev_activation_scope;
                 continue;
             }
             let saved = self.install_preponed(&sampled_ids);
@@ -96123,12 +98346,8 @@ impl Simulator {
                     None => live.push(st),
                 }
             }
-            // An attempt that can never finish (`s_eventually` of a signal
-            // that never rises, `##[1:$]`) must not grow without bound.
-            const SVA_MAX_ATTEMPTS: usize = 1024;
-            if live.len() > SVA_MAX_ATTEMPTS {
-                live.drain(..live.len() - SVA_MAX_ATTEMPTS);
-            }
+            // §16.7: an attempt with a long legal delay remains live;
+            // dropping it at a fixed queue depth changes assertion results.
             self.sva_sites[i].attempts = live;
             self.restore_preponed(saved);
             self.sva_sites[i].sampled_ids = sampled_ids;
@@ -96159,6 +98378,7 @@ impl Simulator {
                 }
             }
             self.active_sva_site = prev_active;
+            *self.activation_scope.borrow_mut() = prev_activation_scope;
         }
     }
 
@@ -101546,7 +103766,7 @@ impl Simulator {
         &mut self,
         stmt: &crate::ast::stmt::Statement,
         hint: Option<&str>,
-    ) {
+    ) -> bool {
         let saved_ts = self.timescale_scope_override.take();
         self.timescale_scope_override = hint.map(|h| h.to_string());
         // `%m` wants the instance-relative scope the interpreter's edge path
@@ -101563,6 +103783,7 @@ impl Simulator {
         self.exec_statement(stmt);
         *self.name_resolve_hint.borrow_mut() = saved_hint;
         self.timescale_scope_override = saved_ts;
+        self.finished
     }
 
     /// JIT bridge: both planes in one call (see `xezim_jit_load_signal2`).
@@ -102895,6 +105116,11 @@ impl Simulator {
                 total
             }
             ExprKind::Ident(h) => {
+                if let Some(name) = self.frame_bound_bare_name(h) {
+                    if let Some(v) = self.local_stack.last().and_then(|f| f.get(name)) {
+                        return v.width.max(1);
+                    }
+                }
                 let is_ambiguous_leaf = h.path.len() == 1 && !h.path[0].name.name.contains('.');
                 if let Some(id) = h.cached_signal_id.get() {
                     if !is_ambiguous_leaf {
@@ -103113,7 +105339,10 @@ impl Simulator {
                         d.len()
                     } else if self.module.arrays_2d.contains_key(&*n) {
                         2
-                    } else if self.module.arrays.contains_key(&*n) {
+                    } else if self.module.arrays.contains_key(&*n)
+                        || self.module.dynamic_arrays.contains(&*n)
+                        || self.is_associative_array(&n)
+                    {
                         1
                     } else {
                         0
@@ -106412,13 +108641,29 @@ impl Simulator {
     /// declared signedness and, for a 2-state type, x/z bits as 0. Stored at
     /// the RHS's own size, `logic [1:0] s[4] = '{0,1,2,3}` held 32-bit signed
     /// ints, so `s[2]` read -2 and `s[2] == 2` was false. Anything else (an
-    /// associative or dynamic collection, a string or real element) is
-    /// returned unchanged.
+    /// associative collection, a string or real element) is returned
+    /// unchanged. A formal or dynamic element can take its width from the
+    /// array registration when no per-element width was installed.
     fn fit_block_local_array_elem(&self, name: &str, elem_name: &str, val: Value) -> Value {
         if val.is_real || self.is_associative_array(name) || self.is_string_collection(name) {
             return val;
         }
-        let Some(&w) = self.widths.get(elem_name).filter(|&&w| w > 0) else {
+        let width = self
+            .widths
+            .get(elem_name)
+            .copied()
+            .filter(|w| *w > 0)
+            .or_else(|| {
+                self.module
+                    .dynamic_arrays
+                    .contains(name)
+                    .then(|| self.widths.get(name).copied().filter(|w| *w > 0))
+                    .flatten()
+            })
+            .or_else(|| self.module.arrays.get(name).map(|shape| shape.2))
+            .or_else(|| self.module.arrays_2d.get(name).map(|shape| shape.2))
+            .or_else(|| self.module.arrays_nd.get(name).map(|shape| shape.1));
+        let Some(w) = width else {
             return val;
         };
         let Some(dt) = self.module.var_decl_types.get(name) else {
@@ -108981,6 +111226,22 @@ impl Simulator {
             .then_some(n)
     }
 
+    /// The bare variable a whole or select lvalue writes: `a` in `a`,
+    /// `a[3:0]`, `a[i +: 4]` or `a[i][j]`. None for anything else, a member
+    /// hierarchy roots are excluded; member writes keep their local root.
+    fn lvalue_bare_root(e: &Expression) -> Option<&str> {
+        match &e.kind {
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::MemberAccess { expr, .. }
+            | ExprKind::Paren(expr) => Self::lvalue_bare_root(expr),
+            ExprKind::Ident(h) if !h.path.is_empty() && h.root.is_none() => {
+                Some(h.path[0].name.name.as_str())
+            }
+            _ => None,
+        }
+    }
+
     fn get_local_or_signal(&self, name: &str) -> Option<Value> {
         if let Some(m) = self.local_stack.last() {
             if let Some(v) = m.get(name) {
@@ -109225,13 +111486,14 @@ impl Simulator {
                     self.var_typedef_types.get(n).cloned(),
                     self.fe_trusted_types.contains(n),
                     self.module.packed_struct_fields.get(n).cloned(),
+                    (self.widths.get(n).copied(), self.signed_signals.contains(n)),
                 )
             })
             .collect()
     }
 
     fn restore_loop_vars(&mut self, saved: &[LoopVarSnapshot]) {
-        for (n, _cur, _had_frame, prior_td, was_trusted, prior_ps) in saved {
+        for (n, _cur, _had_frame, prior_td, was_trusted, prior_ps, _) in saved {
             self.meta_note(n);
             match prior_td {
                 Some(t) => {
@@ -109259,7 +111521,22 @@ impl Simulator {
                 }
             }
         }
-        for (n, cur, had_frame, _, _, _) in saved {
+        for (n, _, _, _, _, _, (width, signed)) in saved {
+            match width {
+                Some(w) => {
+                    self.widths.insert(n.clone(), *w);
+                }
+                None => {
+                    self.widths.remove(n);
+                }
+            }
+            if *signed {
+                self.signed_signals.insert(n.clone());
+            } else {
+                self.signed_signals.remove(n);
+            }
+        }
+        for (n, cur, had_frame, _, _, _, _) in saved {
             if *had_frame {
                 if let Some(m) = self.local_stack.last_mut() {
                     match cur {
@@ -109647,6 +111924,26 @@ impl Simulator {
                 None => self.module.packed_struct_fields.remove(&name),
             };
         }
+        // §7.4.1: a private array keeps its element's packed geometry.
+        // The declaration registered it under the lexical name before the
+        // storage rename; subsequent selected accesses use the private key.
+        if let Some(dimensions) = self
+            .module
+            .packed_full_dims
+            .get(bare)
+            .filter(|d| d.len() > 1)
+            .cloned()
+        {
+            self.module.packed_full_dims.insert(key.clone(), dimensions);
+            if let Some(width) = self.module.packed_signal_elem_widths.get(bare).copied() {
+                self.module
+                    .packed_signal_elem_widths
+                    .insert(key.clone(), width);
+            }
+            if let Some(dt) = self.module.var_decl_types.get(bare).cloned() {
+                self.module.var_decl_types.insert(key.clone(), dt);
+            }
+        }
         key
     }
 
@@ -109691,6 +111988,8 @@ impl Simulator {
         self.module.queue_max_sizes.remove(key);
         self.module.descending_arrays.remove(key);
         self.module.var_decl_types.remove(key);
+        self.module.packed_full_dims.remove(key);
+        self.module.packed_signal_elem_widths.remove(key);
         self.module.packed_struct_fields.remove(key);
         self.module.array_elem_class.remove(key);
         if !self.local_coll_elems.is_empty()
@@ -115747,36 +118046,6 @@ impl Simulator {
         self.push_local_frame_typed(f, types);
     }
 
-    /// §12.7.1: a variable declared in a `for` header has the header's data
-    /// type. Returns its initial value, fitted to the declared width and
-    /// carrying the declared signedness rather than the initializer's
-    /// (§6.11.1), so `for (bit [3:0] i = 2; i > -1; i--)` compares unsigned
-    /// (§11.8.1). Registers the width and signedness by name, as a block
-    /// declaration does: the frame-write path fits every later write to the
-    /// variable, the step included, from them. Both the synchronous `for`
-    /// and the lowering for a body that blocks declare through here; the
-    /// lowering used to register no signedness, so after a delay `i--`
-    /// stored an unsigned value and `for (int i = 2; i >= 0; i--)` never
-    /// ended.
-    fn declare_for_init_var(&mut self, data_type: &DataType, name: &str, e: &Expression) -> Value {
-        let v = self.eval_expr(e);
-        let w = super::elaborate::resolve_type_width(
-            data_type,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        );
-        self.widths.insert(name.to_string(), w);
-        let signed = self.type_is_signed_concrete(data_type);
-        if signed {
-            self.signed_signals.insert(name.to_string());
-        } else {
-            self.signed_signals.remove(name);
-        }
-        let mut v = v.resize(w);
-        v.is_signed = signed;
-        v
-    }
-
     /// The frame a loop pushes for its loop variables in a process that has
     /// no call frame (see `loop_frame_gens`).
     fn push_loop_frame(&mut self) {
@@ -115788,7 +118057,17 @@ impl Simulator {
 
     fn pop_loop_frame(&mut self) {
         if let Some(g) = self.local_gen_stack.last() {
-            self.loop_frame_gens.remove(g);
+            // §9.3.2: a surviving fork child still owns its capture frame.
+            // Keep that generation classified as a process frame after the
+            // parent leaves the loop; task/call-frame lifetime rules differ.
+            let inherited = self.fork_baselines.keys().any(|pid| {
+                self.process_contexts
+                    .get(pid)
+                    .is_some_and(|ctx| ctx.local_gen_stack.contains(g))
+            });
+            if !inherited {
+                self.loop_frame_gens.remove(g);
+            }
         }
         self.pop_local_frame();
     }
@@ -115881,7 +118160,11 @@ impl Simulator {
     fn pop_local_frame(&mut self) {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
-        self.local_gen_stack.pop();
+        if let Some(g) = self.local_gen_stack.pop() {
+            if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
+                self.task_string_formals.pop();
+            }
+        }
         if let Some(mut f) = self.local_stack.pop() {
             if self.frame_pool.len() < 64 {
                 f.clear();
@@ -115894,7 +118177,11 @@ impl Simulator {
     fn pop_local_frame_take(&mut self) -> Option<HashMap<String, Value>> {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
-        self.local_gen_stack.pop();
+        if let Some(g) = self.local_gen_stack.pop() {
+            if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
+                self.task_string_formals.pop();
+            }
+        }
         self.local_stack.pop()
     }
 
@@ -117897,7 +120184,14 @@ impl Simulator {
     fn bound_type_dt(&self, b: &str) -> Option<DataType> {
         use crate::ast::types::{IntegerAtomType as A, IntegerVectorType as V, Signing};
         let span = crate::ast::Span::dummy();
-        let atom = match b {
+        let (base, signing) = if let Some(base) = b.strip_suffix(" unsigned") {
+            (base.trim_end(), Some(Signing::Unsigned))
+        } else if let Some(base) = b.strip_suffix(" signed") {
+            (base.trim_end(), Some(Signing::Signed))
+        } else {
+            (b, None)
+        };
+        let atom = match base {
             "byte" => Some(A::Byte),
             "shortint" => Some(A::ShortInt),
             "int" => Some(A::Int),
@@ -117909,7 +120203,7 @@ impl Simulator {
         if let Some(kind) = atom {
             return Some(DataType::IntegerAtom {
                 kind,
-                signing: None,
+                signing,
                 span,
             });
         }
@@ -122608,6 +124902,37 @@ impl Simulator {
     /// its own, so the single update the generic path queues against the
     /// struct's name landed nowhere and every member — scalar ones included —
     /// read back garbage. `None` when the target is anything else.
+    /// §7.6 / §10.4.2: whole fixed arrays assign by declared position.
+    /// Snapshot every source before posting any leaf update, including aliases.
+    fn unpacked_array_nba_leaves(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> Option<Vec<(Expression, Value)>> {
+        let dst = self.foreach_check_operand_name(lvalue)?;
+        let src = self.foreach_check_operand_name(rvalue)?;
+        if self.module.dynamic_arrays.contains(&dst)
+            || self.module.dynamic_arrays.contains(&src)
+            || self.is_associative_array(&dst)
+            || self.is_associative_array(&src)
+        {
+            return None;
+        }
+        let (targets, _) = self.stream_elem_order(&dst)?;
+        let (sources, _) = self.stream_elem_order(&src)?;
+        if targets.len() != sources.len() {
+            return None;
+        }
+        let mut leaves = Vec::with_capacity(targets.len());
+        for (target, source) in targets.into_iter().zip(sources) {
+            let lhs = Self::append_leaf_path(lvalue, &target[dst.len()..]);
+            let rhs = Self::append_leaf_path(rvalue, &source[src.len()..]);
+            let value = self.eval_expr(&rhs);
+            leaves.push((lhs, value));
+        }
+        Some(leaves)
+    }
+
     fn unpacked_struct_nba_leaves(
         &mut self,
         lvalue: &Expression,
@@ -124974,6 +127299,11 @@ impl Simulator {
     /// `T _t;` where `T`→`string`) through the active specialization so the
     /// `%p` argument quoting matches the concrete bound type.
     fn p_local_is_string(&self, name: &str) -> bool {
+        self.task_frame_string_flag(name)
+            .unwrap_or_else(|| self.declared_name_is_string(name))
+    }
+
+    fn declared_name_is_string(&self, name: &str) -> bool {
         use crate::ast::types::{DataType, SimpleType};
         let Some(mut dt) = self.module.var_decl_types.get(name) else {
             return self.string_signals.contains(name);
@@ -125033,6 +127363,15 @@ impl Simulator {
     /// needs) and judges the base kind like `is_type_signed`.
     fn type_is_signed_concrete(&self, dt: &crate::ast::types::DataType) -> bool {
         use crate::ast::types::DataType;
+        // §8.25: the receiver's type argument shadows a same-named global
+        // typedef, including an explicitly unsigned argument.
+        if let DataType::TypeReference { name, .. } = dt
+            && !name.has_scope()
+            && let Some(bound) = self.resolve_type_param_binding(&name.name.name)
+            && let Some(signed) = self.concrete_type_signed(&bound)
+        {
+            return signed;
+        }
         // Fast path: resolvable without a type parameter (typedefs only).
         if super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types) {
             return true;
@@ -135771,6 +138110,132 @@ impl Simulator {
         }
     }
 
+    fn record_frame_string_kind(&mut self, name: &str, is_string: bool) {
+        let Some(&fgen) = self.local_gen_stack.last() else {
+            return;
+        };
+        let pos = match self
+            .task_string_formals
+            .iter()
+            .rposition(|e| e.fgen == fgen)
+        {
+            Some(pos) => pos,
+            None => {
+                self.task_string_formals.push(TaskFrameStrings {
+                    fgen,
+                    strings: Vec::new(),
+                    others: Vec::new(),
+                });
+                self.task_string_formals.len() - 1
+            }
+        };
+        let e = &mut self.task_string_formals[pos];
+        let (keep, remove) = if is_string {
+            (&mut e.strings, &mut e.others)
+        } else {
+            (&mut e.others, &mut e.strings)
+        };
+        remove.retain(|n| n != name);
+        if !keep.iter().any(|n| n == name) {
+            keep.push(name.to_string());
+        }
+    }
+
+    /// Resolve this formal's string kind without discarding an explicit
+    /// typedef scope or a declaring alias's lexical scope.
+    fn frame_formal_is_string(&self, dt: &DataType) -> bool {
+        if self.plain_class_ref(dt).is_some() {
+            return false;
+        }
+        let mut current = dt;
+        let mut prefix = String::new();
+        let mut seen = Vec::<String>::new();
+        for _ in 0..16 {
+            if Self::is_string_data_type(current) {
+                return true;
+            }
+            let DataType::TypeReference { name, .. } = current else {
+                return false;
+            };
+            let leaf = name.name.name.as_str();
+            let scoped = name.has_scope();
+            let lexical = (!scoped && !prefix.is_empty()).then(|| format!("{prefix}::{leaf}"));
+            let lexical = lexical.filter(|key| self.module.typedef_types.contains_key(key));
+            let key = if scoped {
+                name.qualified()
+            } else if let Some(key) = lexical {
+                key
+            } else {
+                // A bare runtime type parameter wins over a same-named
+                // global alias. A target reached through a package alias
+                // instead keeps the package's lexical type lookup.
+                let parameter_site = prefix.is_empty()
+                    || self
+                        .module
+                        .classes
+                        .get(&prefix)
+                        .is_some_and(|cd| cd.type_param_names.iter().any(|n| n == leaf));
+                if parameter_site {
+                    let bound = self.resolve_type_param_binding(leaf).or_else(|| {
+                        let h = self.this_stack.last().copied().flatten()?;
+                        self.heap.get(h)?.as_ref()?.type_bindings.get(leaf).cloned()
+                    });
+                    if let Some(bound) = bound {
+                        if bound == "string" {
+                            return true;
+                        }
+                        if seen.contains(&bound) {
+                            return false;
+                        }
+                        seen.push(bound.clone());
+                        let Some(next) = self.module.typedef_types.get(&bound) else {
+                            return false;
+                        };
+                        prefix = bound
+                            .rsplit_once("::")
+                            .map_or(String::new(), |(p, _)| p.to_string());
+                        current = next;
+                        continue;
+                    }
+                }
+                leaf.to_string()
+            };
+            if seen.contains(&key) {
+                return false;
+            }
+            seen.push(key.clone());
+            // lookup_scoped_type permits a leaf fallback. An explicitly
+            // qualified declaration must not bind an unrelated leaf alias.
+            let Some(next) = self.module.typedef_types.get(&key) else {
+                return false;
+            };
+            prefix = key
+                .rsplit_once("::")
+                .map_or(String::new(), |(p, _)| p.to_string());
+            current = next;
+        }
+        false
+    }
+
+    /// Reclassify a bound blocking method task after its callee context is
+    /// active. Replace the entry already owned by TaskCleanup; do not push
+    /// another entry or change its teardown ownership.
+    fn refresh_bound_task_string_kinds(&mut self, ports: &[crate::ast::decl::FunctionPort]) {
+        let Some(&fgen) = self.local_gen_stack.last() else {
+            return;
+        };
+        let Some(pos) = self
+            .task_string_formals
+            .iter()
+            .rposition(|e| e.fgen == fgen)
+        else {
+            return;
+        };
+        if let Some(entry) = self.task_frame_strings(fgen, ports) {
+            self.task_string_formals[pos] = entry;
+        }
+    }
+
     /// The `task_string_formals` entry for a task frame of generation `fgen`
     /// with formals `ports`, or `None` when no formal needs one.
     fn task_frame_strings(
@@ -135782,9 +138247,10 @@ impl Simulator {
         let mut others = Vec::new();
         for port in ports {
             let n = &port.name.name;
-            if Self::is_string_data_type(&port.data_type) {
+            if self.frame_formal_is_string(&port.data_type) {
                 strings.push(n.clone());
-            } else if self.string_signals.contains(n.as_str()) {
+            } else {
+                // A different process may declare a string of this name later.
                 others.push(n.clone());
             }
         }
@@ -144624,10 +147090,18 @@ impl Simulator {
                 expr: Box::new(base.clone()),
                 index: Box::new(Expression::new(
                     ExprKind::Number(NumberLiteral::Integer {
-                        size: None,
+                        size: (i < 0).then_some(64),
                         signed: true,
-                        base: NumberBase::Decimal,
-                        value: i.to_string(),
+                        base: if i < 0 {
+                            NumberBase::Hex
+                        } else {
+                            NumberBase::Decimal
+                        },
+                        value: if i < 0 {
+                            format!("{:016x}", i as u64)
+                        } else {
+                            i.to_string()
+                        },
                         cached_val: std::cell::Cell::new(None),
                     }),
                     base.span,
@@ -145718,6 +148192,12 @@ impl Simulator {
 
     fn stmt_is_pure(&mut self, st: &Statement, locals: &HashSet<String>) -> bool {
         match &st.kind {
+            // A declaration-owned static can be written by this call;
+            // treating it as a per-call local hides observable side effects.
+            StatementKind::VarDecl {
+                lifetime: Some(crate::ast::types::Lifetime::Static),
+                ..
+            } => false,
             StatementKind::Null | StatementKind::VarDecl { .. } => true,
             StatementKind::Break | StatementKind::Continue => true,
             StatementKind::Return(e) => e.as_ref().is_none_or(|e| self.expr_is_pure(e, locals)),
@@ -146186,12 +148666,9 @@ impl Simulator {
                     || self.module.arrays_2d.contains_key(&port.name.name)
                     || self.module.arrays_nd.contains_key(&port.name.name);
                 if let Some(info) = self.bind_array_arg(port, actual) {
-                    // §21.2.1.7: a formal bound from its default pattern
-                    // records its declared type, as the task path does for
-                    // every formal, or `%p` of the formal printed x.
-                    if info.1.is_empty() {
-                        self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
-                    }
+                    // §7.4.1 / §13.5 / §21.2.1.7: every unpacked formal
+                    // retains its element type, including packed geometry.
+                    self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
                     if is_out {
                         if !info.1.is_empty() {
                             array_writebacks.push(info);
@@ -146227,54 +148704,7 @@ impl Simulator {
             } else {
                 Value::zero(32)
             };
-            // §13.5.2 / §6.10 / §10.7: a scalar integral formal adopts its
-            // declared port's width and signedness, so `input signed [5:0] v`
-            // sign-extends `v` in later arithmetic and a `real` actual bound to
-            // an integral formal rounds to an integer. Only plain integral port
-            // types qualify — real / string / chandle / struct / class formals
-            // keep the caller value untouched (resizing a string to its
-            // 1024-bit storage width would corrupt it).
-            // A bare `Implicit` with no dimensions is a shared-type second
-            // declarator (`input int a, b;` — `b` inherits `a`'s type) whose
-            // width can't be resolved standalone; skip it so the caller value
-            // isn't truncated. Implicit WITH dims (`input signed [5:0] v`) still
-            // qualifies.
-            if matches!(
-                &port.data_type,
-                crate::ast::types::DataType::IntegerVector { .. }
-                    | crate::ast::types::DataType::IntegerAtom { .. }
-            ) || matches!(
-                &port.data_type,
-                crate::ast::types::DataType::Implicit { dimensions, .. }
-                    if !dimensions.is_empty()
-            ) {
-                let pw = super::elaborate::resolve_type_width(
-                    &port.data_type,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
-                val = if val.is_real {
-                    Self::real_to_int(val.to_f64(), pw.max(1))
-                } else if pw > 0 && pw != val.width {
-                    // resize_for_assign (not resize) so a signed source with an
-                    // X/Z MSB widens with X/Z, matching assignment to the formal.
-                    // pw == 0 means the width couldn't be resolved (e.g. a
-                    // shared-type second declarator `input int a, b`) — keep the
-                    // caller value rather than truncating it to nothing.
-                    val.resize_for_assign(pw)
-                } else {
-                    val
-                };
-                val.is_signed = super::elaborate::is_type_signed_resolved(
-                    &port.data_type,
-                    &self.module.typedef_types,
-                );
-            } else if super::elaborate::is_type_real(&port.data_type) && !val.is_real {
-                // §6.12.2: an integral actual bound to a `real`/`shortreal`
-                // formal converts to floating point, so later real arithmetic
-                // in the body (e.g. `x /= 2`) is done in the real domain.
-                val = Value::from_f64(val.to_f64());
-            }
+            val = self.fit_scalar_formal_seed(port, val);
             if let DataType::TypeReference {
                 name: tn,
                 type_args,
@@ -146385,7 +148815,7 @@ impl Simulator {
         // initial value is the type default: x for a 4-state type, 0 for a
         // 2-state one. An empty `function integer y(); endfunction` returns
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
-        let ret_init = if super::elaborate::is_type_real(&fd.return_type) {
+        let mut ret_init = if super::elaborate::is_type_real(&fd.return_type) {
             Value::from_f64(0.0)
         } else if match &ret_tp {
             Some((_, c)) => self.concrete_type_two_state(c),
@@ -146395,6 +148825,7 @@ impl Simulator {
         } else {
             Value::new(ret_w)
         };
+        ret_init.is_signed = ret_signed;
         // §13.3.1/§13.4.1: a STATIC-lifetime function's implicit return
         // variable persists across calls — a path that exits without
         // assigning returns the PREVIOUS call's value, not a fresh default.
@@ -147436,7 +149867,11 @@ impl Simulator {
         if frame.epoch != self.nested_run_epoch {
             return;
         }
-        for d in frame.saves.into_iter().rev() {
+        self.restore_decl_shadows(frame.saves);
+    }
+
+    fn restore_decl_shadows(&mut self, saves: Vec<DeclShadow>) {
+        for d in saves.into_iter().rev() {
             let name = d.meta.name.clone();
             match d.width {
                 Some(w) => {
@@ -147550,6 +149985,22 @@ impl Simulator {
             }
         }
         if !no_unpacked_dims {
+            // §7.4.1 / §13.5: unpacked formals still have a packed element
+            // type. Keep that geometry below their unpacked indices.
+            if let Some(dims) = super::elaborate::packed_full_dims_chained(
+                dt,
+                &self.module.parameters,
+                &self.module.typedef_types,
+            )
+            .filter(|dims| dims.len() > 1)
+            {
+                self.module.packed_full_dims.insert(name.to_string(), dims);
+                if let Some(width) = self.ast_decl_elem_width(dt) {
+                    self.module
+                        .packed_signal_elem_widths
+                        .insert(name.to_string(), width);
+                }
+            }
             return;
         }
         // A built-in scalar or a plain class has no element width, struct
@@ -147588,6 +150039,7 @@ impl Simulator {
                     &self.module.typedef_types,
                 )
             })
+            .or_else(|| self.struct_array_full_dims(dt))
         {
             self.module.packed_full_dims.insert(name.to_string(), fdims);
         }
@@ -147857,6 +150309,7 @@ impl Simulator {
                         Some(a) => self.eval_expr(a),
                         None => Value::zero(32),
                     };
+                    let val = self.fit_scalar_formal_seed(port, val);
                     locals.insert(port.name.name.clone(), val);
                     if let Some(a) = actual.filter(|a| i < args.len() || Self::is_lvalue_expr(a)) {
                         output_bindings.push((port.name.name.clone(), a.clone()));
@@ -147918,45 +150371,12 @@ impl Simulator {
                     } else {
                         Value::zero(32)
                     };
-                    // §13.5.1/§10.7: a scalar integral formal adopts the port's
-                    // width and signedness. Widen with the ARG's own signedness
-                    // first (so an unsigned x-MSB actual zero-extends, not X-
-                    // extends), THEN stamp the formal's signedness — otherwise a
-                    // negative default/arg reads unsigned.
-                    if matches!(
-                        &port.data_type,
-                        crate::ast::types::DataType::IntegerVector { .. }
-                            | crate::ast::types::DataType::IntegerAtom { .. }
-                    ) || matches!(
-                        &port.data_type,
-                        crate::ast::types::DataType::Implicit { dimensions, .. }
-                            if !dimensions.is_empty()
-                    ) {
-                        let pw = super::elaborate::resolve_type_width(
-                            &port.data_type,
-                            Some(&self.module.parameters),
-                            Some(&self.module.typedefs),
-                        );
-                        val = if val.is_real {
-                            Self::real_to_int(val.to_f64(), pw.max(1))
-                        } else if pw > 0 && pw != val.width {
-                            val.resize_for_assign(pw)
-                        } else {
-                            val
-                        };
-                        val.is_signed = super::elaborate::is_type_signed_resolved(
-                            &port.data_type,
-                            &self.module.typedef_types,
-                        );
-                    } else if super::elaborate::is_type_real(&port.data_type) {
-                        // §13.3.1: an integral actual CONVERTS to a real
-                        // formal (the function path and the compiled inline
-                        // both do); bound as integral bits, `dt / 2` divided
-                        // as integers.
-                        if !val.is_real {
-                            val = Value::from_f64(val.to_f64());
-                        }
-                    } else if self.type_is_signed_concrete(&port.data_type) {
+                    val = self.fit_scalar_formal_seed(port, val);
+                    // Preserve runtime-bound type-parameter signing, without
+                    // resolving its width through a module default.
+                    if !Self::type_is_plain_scalar(&port.data_type)
+                        && self.type_is_signed_concrete(&port.data_type)
+                    {
                         val.is_signed = true;
                     }
                     locals.insert(port.name.name.clone(), val);
@@ -151652,7 +154072,6 @@ impl Simulator {
     /// `unpacked_typedef_type_key`: a type parameter follows its binding, a
     /// typedef its target; built-in types render with their signing.
     fn type_key_of_elem(&self, dt: &DataType, depth: u32) -> Option<String> {
-        use crate::ast::types::{IntegerAtomType, Signing};
         match dt {
             DataType::TypeReference {
                 name,
@@ -151675,16 +154094,6 @@ impl Simulator {
                     return self.type_key_of_elem(&t, depth + 1);
                 }
                 Some(n)
-            }
-            DataType::IntegerAtom { kind, signing, .. } => {
-                let base = crate::elaborate::data_type_to_spec_fragment(dt)?;
-                // `int signed` is `int`; `int unsigned` is another type.
-                let default_signed = !matches!(kind, IntegerAtomType::Time);
-                Some(match signing {
-                    Some(Signing::Unsigned) if default_signed => format!("{} unsigned", base),
-                    Some(Signing::Signed) if !default_signed => format!("{} signed", base),
-                    _ => base,
-                })
             }
             _ => crate::elaborate::data_type_to_spec_fragment(dt),
         }
@@ -151789,20 +154198,60 @@ impl Simulator {
         reps.get(&key).cloned()
     }
 
-    /// Remove whitespace outside of double-quoted string literals so that
+    /// Normalize layout whitespace outside of double-quoted string literals so that
     /// sig fragments that differ only in spacing (the parser's spaced
     /// reconstruction `special_comp # ( 1 )` vs a typedef-resolved
     /// `special_comp#(1)`) key to the same per-spec static cell.
     fn normalize_spec_ws(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let mut in_str = false;
-        for ch in s.chars() {
+        let mut chars = s.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
             if ch == '"' {
                 in_str = !in_str;
                 out.push(ch);
             } else if in_str {
                 out.push(ch);
-            } else if !ch.is_whitespace() {
+            } else if ch.is_whitespace() {
+                let mut next = index + ch.len_utf8();
+                while let Some(&(i, c)) = chars.peek() {
+                    if !c.is_whitespace() {
+                        break;
+                    }
+                    next = i + c.len_utf8();
+                    chars.next();
+                }
+                // §6.11 / §8.25: `byte unsigned` is a qualified builtin,
+                // while `byteunsigned` can name an unrelated typedef.
+                let word = out
+                    .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("");
+                let integral = matches!(
+                    word,
+                    "byte"
+                        | "shortint"
+                        | "int"
+                        | "longint"
+                        | "integer"
+                        | "time"
+                        | "bit"
+                        | "logic"
+                        | "reg"
+                );
+                let tail = &s[next..];
+                let signing = tail
+                    .strip_prefix("unsigned")
+                    .or_else(|| tail.strip_prefix("signed"))
+                    .is_some_and(|rest| {
+                        rest.chars()
+                            .next()
+                            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                    });
+                if integral && signing {
+                    out.push(' ');
+                }
+            } else {
                 out.push(ch);
             }
         }
@@ -160523,7 +162972,12 @@ impl Simulator {
 
     /// Whether the type named by a type-parameter binding is 2-state.
     fn concrete_type_two_state(&self, name: &str) -> bool {
-        match name {
+        let base = name
+            .strip_suffix(" unsigned")
+            .or_else(|| name.strip_suffix(" signed"))
+            .unwrap_or(name)
+            .trim_end();
+        match base {
             "byte" | "shortint" | "int" | "longint" | "bit" => return true,
             "logic" | "reg" | "integer" | "time" => return false,
             _ => {}
@@ -160617,13 +163071,25 @@ impl Simulator {
     /// Signedness of the integral type a type parameter is bound to, by
     /// name: a built-in atom or a typedef. `None` when it cannot be told.
     fn concrete_type_signed(&self, name: &str) -> Option<bool> {
+        if let Some(base) = name.strip_suffix(" unsigned") {
+            if atom_type_keyword_width(base.trim_end()).is_some()
+                || vector_fragment_width(name).is_some()
+            {
+                return Some(false);
+            }
+        }
+        if let Some(base) = name.strip_suffix(" signed") {
+            if atom_type_keyword_width(base.trim_end()).is_some() {
+                return Some(true);
+            }
+        }
         match name {
             "byte" | "shortint" | "int" | "longint" | "integer" => return Some(true),
             "bit" | "logic" | "reg" | "time" => return Some(false),
             _ => {}
         }
         if vector_fragment_width(name).is_some() {
-            return Some(name.contains("signed"));
+            return Some(name.contains("signed") && !name.contains("unsigned"));
         }
         let dt = self.module.typedef_types.get(name)?;
         let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
@@ -165272,6 +167738,10 @@ impl Simulator {
                     param_first[b as usize] = true;
                 }
             }
+            let mut static_first = [false; 256];
+            for n in &statics {
+                if let Some(&b) = n.as_bytes().first() { static_first[b as usize] = true; }
+            }
             let mut vif_first = [false; 256];
             for n in &vif_props {
                 if let Some(&b) = n.as_bytes().first() {
@@ -165281,6 +167751,7 @@ impl Simulator {
             ClassMemberNames {
                 ident_slow,
                 statics,
+                static_first,
                 vif_props,
                 vif_first,
                 methods,
@@ -165847,6 +168318,14 @@ impl Simulator {
                     class_ref,
                     fixed_width,
                     signed: super::elaborate::is_type_signed(dt),
+                    two_state: port.dimensions.is_empty()
+                        && matches!(
+                            dt,
+                            DataType::IntegerAtom { .. }
+                                | DataType::IntegerVector { .. }
+                                | DataType::Implicit { .. }
+                        )
+                        && super::elaborate::is_type_two_state(dt),
                     never_vif,
                 }
             })
@@ -166576,6 +169055,14 @@ impl Simulator {
                                 val
                             };
                             val.is_signed = signed;
+                            if val.has_xz()
+                                && super::elaborate::is_type_two_state_resolved(
+                                    &port.data_type,
+                                    &self.module.typedef_types,
+                                )
+                            {
+                                val = val.to_two_state();
+                            }
                         } else if self.type_is_signed_concrete(&port.data_type) {
                             // A TYPE-PARAMETER formal (`T t` with `T`->`int`)
                             // isn't a resolvable integral typedef, so
@@ -166612,6 +169099,9 @@ impl Simulator {
                         val.is_signed = pp.signed;
                     } else if plan.ports[i].signed {
                         val.is_signed = true;
+                    }
+                    if plan.ports[i].two_state && val.has_xz() {
+                        val = val.to_two_state();
                     }
                     if let DataType::TypeReference {
                         name: tn,
@@ -166741,7 +169231,7 @@ impl Simulator {
                     // string Value, not a 32-bit int — otherwise an implicit
                     // `funcname = {a, "b", ...}` string-concat assignment
                     // coerces to the int's 32-bit width and reads back empty.
-                    let init = if let (ClassMethodKind::Function(f), Some(rp)) =
+                    let mut init = if let (ClassMethodKind::Function(f), Some(rp)) =
                         (&method.kind, plan.ret.as_ref())
                     {
                         if rp.decl_string {
@@ -166790,6 +169280,13 @@ impl Simulator {
                     } else {
                         Value::zero(32)
                     };
+                    if let Some(rp) = plan.ret.as_ref()
+                        && rp.class.is_none()
+                        && !rp.decl_string
+                        && !rp.collection
+                    {
+                        init.is_signed = rp.signed;
+                    }
                     if !locals.contains_key(rn) {
                         locals.insert(rn.to_string(), init);
                     }
@@ -167047,6 +169544,14 @@ impl Simulator {
                 {
                     self.return_value = Some(cval);
                 } else {
+                    // §6.16/§13.5: classify the callee's formal types under
+                    // its active specialization, independently of global
+                    // string flags. Common frame teardown removes this entry.
+                    if let Some(&fgen) = self.local_gen_stack.last() {
+                        if let Some(entry) = self.task_frame_strings(fgen, ports) {
+                            self.task_string_formals.push(entry);
+                        }
+                    }
                     // Mark string-typed return variable, params, and class
                     // properties only when the AST interpreter actually runs
                     // this body (compiled bytecode never reads `string_signals`).
@@ -168324,6 +170829,7 @@ impl Simulator {
     /// while ordinary in-memory method caching never serializes the design.
     fn persisted_method_key(
         &mut self,
+        handle: usize,
         cname: &str,
         method_name: &str,
         formal_widths: &[u32],
@@ -168361,6 +170867,14 @@ impl Simulator {
             context
         };
         context.hash(&mut h);
+        // §8.25: identical formal widths can still have different local T types.
+        if let Some(inst) = self.heap.get(handle).and_then(|inst| inst.as_ref()) {
+            inst.spec.hash(&mut h);
+            let mut bindings: Vec<_> = inst.type_bindings.iter().collect();
+            bindings.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            bindings.hash(&mut h);
+        }
+        self.current_spec.hash(&mut h);
         cname.hash(&mut h);
         method_name.hash(&mut h);
         formal_widths.hash(&mut h);
@@ -168516,6 +171030,11 @@ impl Simulator {
         fd: &crate::ast::decl::FunctionDeclaration,
         pkg_scope: Option<&str>,
     ) -> Option<Value> {
+        if !self.hoisted_static_subroutines.is_empty()
+            && self.hoisted_static_subroutines.contains(&fd.name.name.name)
+        {
+            return None;
+        }
         let cname = self.free_fn_class_name(pkg_scope);
         let ret_is_string = Self::is_string_data_type(&fd.return_type);
         self.try_run_compiled_method(
@@ -168938,11 +171457,11 @@ impl Simulator {
         };
 
         // Intern the (class, method) identity and build the width signature —
-        // the cache key. All compile inputs for a method are (class id, method
-        // id, formal widths, result width); interned u32 ids + the plan's Rc'd
+        // the cache key. The specialization distinguishes local types even
+        // with identical formal/result widths; interned ids + the plan's Rc'd
         // width Vec (an Rc clone per call, no allocation) so repeated calls to
         // a hot method lower its body ONCE and reuse the block.
-        let key = (cid, mid, pre.formal_widths.clone(), result_width);
+        let key = (cid, mid, spec_id, pre.formal_widths.clone(), result_width);
         let entry = match self.compiled_method_block_cache.get(&key) {
             Some(super::bytecode::CompiledMethodOutcome::Block(e)) => e.clone(),
             // Negative-cached as non-compilable: skip straight to AST.
@@ -168957,7 +171476,13 @@ impl Simulator {
                 // key. A miss falls through to compile-and-store below; a
                 // garbage/corrupt payload is just a miss.
                 let disk_key = method_cache_dir().and_then(|_| {
-                    self.persisted_method_key(cname, method_name, &pre.formal_widths, result_width)
+                    self.persisted_method_key(
+                        handle,
+                        cname,
+                        method_name,
+                        &pre.formal_widths,
+                        result_width,
+                    )
                 });
                 if let Some(k) = disk_key {
                     match self.load_persisted_method(k) {
@@ -169477,6 +172002,62 @@ impl Simulator {
                 });
                 let dpi_fds = self.dpi_import_fd_table();
                 let compiled = {
+                    // §6.18 / §8.25: retain lexical aliases and resolve type
+                    // parameters against this receiver's specialization.
+                    let mut local_typedef_types = HashMap::default();
+                    let mut unresolved_type_names = HashSet::default();
+                    let mut cur = Some(cname.to_string());
+                    let mut seen = HashSet::default();
+                    while let Some(cn) = cur {
+                        if !seen.insert(cn.clone()) {
+                            break;
+                        }
+                        let Some(cd) = self.module.classes.get(&cn) else {
+                            break;
+                        };
+                        for name in &cd.type_param_names {
+                            let binding = self
+                                .obj_type_param(handle, &cn, name)
+                                .and_then(|binding| self.bound_type_dt(&binding));
+                            if let Some(dt) = binding {
+                                // §8.25: compile locals against this receiver's specialization.
+                                local_typedef_types
+                                    .entry(name.clone())
+                                    .or_insert_with(|| dt.clone());
+                                local_typedef_types.insert(format!("{cn}::{name}"), dt);
+                            } else {
+                                unresolved_type_names.insert(name.clone());
+                            }
+                        }
+                        for (name, dt) in &cd.typedef_targets {
+                            // Keep the declaring class when an inherited alias
+                            // is reached by a bare name from a derived method.
+                            local_typedef_types.entry(name.clone()).or_insert_with(|| {
+                                let span = crate::ast::Span::dummy();
+                                DataType::TypeReference {
+                                    name: crate::ast::types::TypeName {
+                                        scopes: vec![crate::ast::types::TypeScope {
+                                            name: crate::ast::Identifier {
+                                                name: cn.clone(),
+                                                span,
+                                            },
+                                            type_args: vec![],
+                                        }],
+                                        name: crate::ast::Identifier {
+                                            name: name.clone(),
+                                            span,
+                                        },
+                                        span,
+                                    },
+                                    dimensions: vec![],
+                                    type_args: vec![],
+                                    span,
+                                }
+                            });
+                            local_typedef_types.insert(format!("{cn}::{name}"), dt.clone());
+                        }
+                        cur = cd.extends.clone();
+                    }
                     let mut compiler = BytecodeCompiler::new(
                         &self.signal_name_to_id,
                         &self.signal_signed,
@@ -169484,6 +172065,14 @@ impl Simulator {
                         &self.module.arrays,
                         &self.widths,
                     );
+                    compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
+                    compiler.set_typedef_types(&self.module.typedef_types);
+                    compiler.set_method_formal_types(ports);
+                    if let CompiledBodyKind::Function(function) = kind {
+                        compiler.set_method_return_type(&function.return_type);
+                    }
+                    compiler.set_local_typedef_types(local_typedef_types);
+                    compiler.set_unresolved_type_names(unresolved_type_names);
                     compiler.method_admission = Some(admission);
                     // issue-301 plan fact: multi-dim packed coll elements.
                     compiler.coll_elem_packed_dims = (*pre.coll_elem_packed_dims).clone();
@@ -169492,6 +172081,31 @@ impl Simulator {
                         body,
                         &mut compiler.typedef_coll_strings,
                     );
+                    // Formal aliases need the same unpacked-shape exclusion
+                    // as body-local aliases before adding scalar register facts.
+                    for port in ports {
+                        if let DataType::TypeReference { name, .. } = &port.data_type {
+                            let dims = super::elaborate::lookup_scoped_type(
+                                name,
+                                &self.module.typedef_unpacked_dims,
+                            )
+                            .filter(|dims| !dims.is_empty())
+                            .cloned()
+                            .or_else(|| {
+                                let owner = name
+                                    .scopes
+                                    .last()
+                                    .map_or(cname, |scope| scope.name.name.as_str());
+                                Self::typedef_dims_via_tables(&self.module, owner, &name.name.name)
+                                    .filter(|dims| !dims.is_empty())
+                            });
+                            if let Some(dims) = dims {
+                                compiler
+                                    .typedef_coll_dims
+                                    .insert(super::bytecode::type_name_key(name), dims);
+                            }
+                        }
+                    }
                     compiler.set_dpi_import_fds(dpi_fds);
                     if method_trace_enabled() {
                         compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
@@ -169970,7 +172584,13 @@ impl Simulator {
         // caller's `AssignPendingColl`; we no longer blacklist it here. The
         // instruction guards below (static locals, fallback insns) and the
         // transport in `vm_try_direct_call` keep such a call correct.
-        let key = (cid, mid, pre.formal_widths.clone(), pre.static_result_width);
+        let key = (
+            cid,
+            mid,
+            spec_id,
+            pre.formal_widths.clone(),
+            pre.static_result_width,
+        );
         let Some(super::bytecode::CompiledMethodOutcome::Block(rc_entry)) =
             self.compiled_method_block_cache.get(&key).cloned()
         else {
@@ -170212,7 +172832,7 @@ impl Simulator {
         } else {
             pre.static_result_width
         };
-        let key = (cid, mid, pre.formal_widths.clone(), result_width);
+        let key = (cid, mid, 0, pre.formal_widths.clone(), result_width);
         let Some(super::bytecode::CompiledMethodOutcome::Block(rc_entry)) =
             self.compiled_method_block_cache.get(&key).cloned()
         else {
@@ -170486,7 +173106,13 @@ impl Simulator {
             never(self);
             return None;
         }
-        let key = (cid, mid, pre.formal_widths.clone(), pre.static_result_width);
+        let key = (
+            cid,
+            mid,
+            0,
+            pre.formal_widths.clone(),
+            pre.static_result_width,
+        );
         let Some(super::bytecode::CompiledMethodOutcome::Block(rc_entry)) =
             self.compiled_method_block_cache.get(&key).cloned()
         else {

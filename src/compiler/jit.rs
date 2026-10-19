@@ -116,7 +116,7 @@ pub unsafe extern "C" fn xezim_jit_stmt_fallback(
     stmt: *const crate::ast::stmt::Statement,
     hint_ptr: *const u8,
     hint_len: usize,
-) {
+) -> u32 {
     unsafe {
         let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
         let hint = if hint_ptr.is_null() || hint_len == 0 {
@@ -124,7 +124,7 @@ pub unsafe extern "C" fn xezim_jit_stmt_fallback(
         } else {
             std::str::from_utf8(std::slice::from_raw_parts(hint_ptr, hint_len)).ok()
         };
-        sim.jit_exec_fallback_stmt(&*stmt, hint);
+        sim.jit_exec_fallback_stmt(&*stmt, hint) as u32
     }
 }
 
@@ -739,6 +739,7 @@ mod enabled {
             fb_sig.params.push(AbiParam::new(pointer_type)); // stmt
             fb_sig.params.push(AbiParam::new(pointer_type)); // hint ptr
             fb_sig.params.push(AbiParam::new(types::I64)); // hint len
+            fb_sig.returns.push(AbiParam::new(types::I32)); // simulation finished
             let fb_id: FuncId = self
                 .module
                 .declare_function("xezim_jit_stmt_fallback", Linkage::Import, &fb_sig)
@@ -1489,7 +1490,13 @@ mod enabled {
                         let (hp, hl) = self.block_scope_hint.unwrap_or((0, 0));
                         let hpc = builder.ins().iconst(pointer_type, hp as i64);
                         let hlc = builder.ins().iconst(types::I64, hl as i64);
-                        builder.ins().call(fb_ref, &[sim_ptr, sp, hpc, hlc]);
+                        let call = builder.ins().call(fb_ref, &[sim_ptr, sp, hpc, hlc]);
+                        let finished = builder.inst_results(call)[0];
+                        let resume = builder.create_block();
+                        // §20.2: a terminating fallback completes the native
+                        // block; returning success avoids interpreter replay.
+                        builder.ins().brif(finished, exit_block, &[], resume, &[]);
+                        builder.switch_to_block(resume);
                     }
                     other => {
                         let emitted = emit_insn(

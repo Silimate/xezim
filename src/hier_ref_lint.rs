@@ -829,10 +829,11 @@ impl Walker {
             },
             StatementKind::VarDecl { declarators, .. } => {
                 for d in declarators {
-                    d.init.iter().for_each(|x| self.expr(x));
+                    // In scope from its declarator on, its initializer included.
                     if let Some(l) = self.locals.last_mut() {
                         l.insert(d.name.name.clone());
                     }
+                    d.init.iter().for_each(|x| self.expr(x));
                 }
             }
             StatementKind::RandCase { items } => {

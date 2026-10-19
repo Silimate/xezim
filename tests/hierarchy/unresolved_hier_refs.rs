@@ -283,7 +283,8 @@ fn no_strict_accepts_an_unresolved_reference() {
 }
 
 /// Every legal kind of dotted name still elaborates: class handles, struct
-/// members (one of a block-local variable that hides an instance), interface
+/// members (of a block-local variable that hides an instance, in its own
+/// initializer too), interface
 /// and modport members, instance arrays, generate blocks
 /// (named, implicit and a branch a constant rules out), `$root`, absolute
 /// and upward names, subroutines, events, parameters, `defparam`, `bind`,
@@ -367,6 +368,10 @@ module tb;
     us_t dut;  // hides the instance `dut` in this block: `dut.a` is a member
     dut.a = 5;
     if (dut.a != 5) $display("FAIL block-local shadow");
+  end
+  initial begin : self_init
+    automatic us_t dut = '{1, dut.a};  // its own initializer sees it
+    if (dut.a != 1) $display("FAIL self initializer");
   end
   initial begin
     $dumpvars(0, tb.dut);

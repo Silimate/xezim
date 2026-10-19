@@ -354,6 +354,8 @@ mod spec_canonical_keying;
 mod static_collection_per_spec;
 #[path = "misc/static_init_sysfuncs.rs"]
 mod static_init_sysfuncs;
+#[path = "misc/static_local_partial_write.rs"]
+mod static_local_partial_write;
 #[path = "misc/static_local_per_spec.rs"]
 mod static_local_per_spec;
 #[path = "misc/static_method_via_handle.rs"]
@@ -409,6 +411,8 @@ mod class_collection_storage;
 mod class_queue_locators;
 #[path = "misc/cli_compat_args.rs"]
 mod cli_compat_args;
+#[path = "misc/compat_defaults.rs"]
+mod compat_defaults;
 #[path = "misc/cross_checked_constructs.rs"]
 mod cross_checked_constructs;
 #[path = "misc/dead_giant_declaration_elision.rs"]

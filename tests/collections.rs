@@ -11,6 +11,9 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "collections/struct_copy_selector.rs"]
+mod struct_copy_selector;
+
 #[path = "collections/array_element_collection.rs"]
 mod array_element_collection;
 #[path = "collections/array_locator_and_reduction.rs"]

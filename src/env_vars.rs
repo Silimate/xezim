@@ -212,6 +212,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Signal commits: enable experimental per-destination sidecar specialization (1 enables)",
     ),
     (
+        "XEZIM_COMPAT",
+        "CLI: same as --compat (no time cap, relaxed implicit-static and driver checks, --error-exit)",
+    ),
+    (
         "XEZIM_COMPILE_FAIL_STATS",
         "Bytecode: print why statements failed to compile (bail census)",
     ),
@@ -588,7 +592,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_METHOD_TIER",
-        "class-perf: compile a class method only after N calls (0 = first call)",
+        "compile a class method after N calls (0 = first call); an explicit setting also attempts compilation on the next call after a wait-free method reaches N measured loop iterations",
     ),
     (
         "XEZIM_NAME_STATS",

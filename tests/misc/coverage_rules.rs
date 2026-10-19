@@ -174,7 +174,12 @@ module m(input logic clk, input logic a, b, c, input logic [1:0] v, output logic
     if ((a & b) || c) z <= 0;
     if (!a && v) z <= 1;
     if (!(a && b)) z <= 0;
+    if (b && a) z <= 1;
+    if (b && ok(a)) z <= 0;
   end
+  function automatic logic ok(input logic x);
+    return x;
+  endfunction
 endmodule
 module tb;
   logic clk = 0, a = 0, b = 0, c = 0; logic [1:0] v = 0; wire y, z;
@@ -192,7 +197,8 @@ endmodule
 /// (`assign y = a && b`) are no items. A term is covered once it has been
 /// 0 and 1, whether or not it decided the value: `a` of `a && b` is 1 only
 /// while `b` is 0, which the default rules (the term must decide) don't
-/// count.
+/// count. A term a short circuit skips is read all the same when reading it
+/// has no side effects (`a` of `b && a`), and not otherwise (`ok(a)`).
 #[test]
 fn logical_conditions_scored_by_term_values() {
     let d = scratch("logical");
@@ -206,6 +212,8 @@ fn logical_conditions_scored_by_term_values() {
             "(a & b) || c",
             "!a && v",
             "!(a && b)",
+            "b && a",
+            "b && ok(a)",
             "a && b"
         ]
     );
@@ -221,15 +229,42 @@ fn logical_conditions_scored_by_term_values() {
     let u = scope(&logical, "tb.u");
     assert_eq!(
         strings(u, "text"),
-        ["a && b", "(a & b) || c", "!a && v", "!(a && b)"]
+        [
+            "a && b",
+            "(a & b) || c",
+            "!a && v",
+            "!(a && b)",
+            "b && a",
+            "b && ok(a)"
+        ]
     );
     assert_eq!(
         strings(u, "term"),
-        ["a", "b", "a & b", "c", "!a", "v", "a", "b"]
+        [
+            "a", "b", "a & b", "c", "!a", "v", "a", "b", "b", "a", "b", "ok(a)"
+        ]
     );
-    assert!(u.contains("{\"term\": \"a\", \"hits\": [2, 2]}"), "{u}");
+    // The item's text and its terms.
+    let item = |text: &str| {
+        let at = u.find(&format!("\"text\": \"{text}\"")).unwrap();
+        &u[at..at + u[at..].find("]}]}").unwrap() + 4]
+    };
     assert!(
-        u.contains("\"condition\": {\"covered\": 4, \"total\": 8, \"percent\": 50.00}"),
+        item("a && b").contains("{\"term\": \"a\", \"hits\": [2, 2]}"),
+        "{u}"
+    );
+    // A short circuit doesn't hide a side-effect-free term (`a`, read while
+    // `b` is 0), but a function call is not read again.
+    assert!(
+        item("b && a").contains("{\"term\": \"a\", \"hits\": [2, 2]}"),
+        "{u}"
+    );
+    assert!(
+        item("b && ok(a)").contains("{\"term\": \"ok(a)\", \"hits\": [0, 0]}"),
+        "{u}"
+    );
+    assert!(
+        u.contains("\"condition\": {\"covered\": 6, \"total\": 12, \"percent\": 50.00}"),
         "{u}"
     );
     assert!(

@@ -1042,8 +1042,9 @@ fn sensitize(nodes: &[Node], i: u32, vals: &[u8], rows: &mut [u8]) {
 
 /// Mark in `rows` every term an evaluation of a logical-mode item read, at
 /// the value it had: sum-of-products scoring, where a term is covered once
-/// it has been 0 and 1, whether or not it decided the item's value. A term
-/// short-circuiting skipped is not read.
+/// it has been 0 and 1, whether or not it decided the item's value. A term a
+/// short circuit skips is read quietly when it has no side effects (see
+/// `cov_node`); one with side effects is not read.
 fn sop(nodes: &[Node], vals: &[u8], rows: &mut [u8]) {
     for (i, n) in nodes.iter().enumerate() {
         if let Op::Term(t, inv) = n.op {
@@ -1188,8 +1189,9 @@ fn order(steps: &[(u32, u32)], mut terms: Vec<usize>) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Reading `e` has no side effects (no function call), so coverage may read
-/// it again (quietly: the coverage markers in it count nothing then).
+/// Reading `e` has no side effects (no function call, increment or
+/// assignment), so coverage may read it again (quietly: the coverage markers
+/// in it count nothing then).
 fn pure(e: &Expression) -> bool {
     match &e.kind {
         ExprKind::Number(_) | ExprKind::TypeLiteral(_) => true,
@@ -1203,7 +1205,9 @@ fn pure(e: &Expression) -> bool {
                 UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
             ) && pure(operand)
         }
-        ExprKind::Binary { left, right, .. } => pure(left) && pure(right),
+        ExprKind::Binary { op, left, right } => {
+            *op != BinaryOp::Assign && pure(left) && pure(right)
+        }
         ExprKind::Conditional {
             condition,
             then_expr,
@@ -4913,6 +4917,11 @@ impl Simulator {
         }
     }
 
+    /// `--code-coverage-expressions=logical`.
+    fn cov_logical(&self) -> bool {
+        self.code_cov.as_ref().is_some_and(|c| c.logical)
+    }
+
     /// Inside a read that only coverage makes.
     fn cov_quiet(&self) -> bool {
         self.code_cov.as_ref().is_some_and(|c| c.quiet > 0)
@@ -4954,7 +4963,7 @@ impl Simulator {
             return;
         }
         let mut rows = [0u8; MAX_TERMS];
-        if self.code_cov.as_ref().is_some_and(|c| c.logical) {
+        if self.cov_logical() {
             sop(nodes, vals, &mut rows);
         } else {
             sensitize(nodes, 0, vals, &mut rows);
@@ -5320,10 +5329,11 @@ impl Simulator {
             (Op::And | Op::AndFull, ExprKind::Binary { left, right, .. }) => {
                 let l = self.cov_node(nodes, k0, left, vals);
                 // §11.3.5: only a known 0 on the left skips the right. Under
-                // a negation the right decides too, so it is read all the
-                // same when that has no side effects.
+                // a negation the right decides too, and logical-mode scoring
+                // observes every term whatever the short circuit, so it is
+                // read all the same when that has no side effects.
                 if !l.has_xz() && l.to_u64() == Some(0) {
-                    if n.op == Op::AndFull && pure(right) {
+                    if (n.op == Op::AndFull || self.cov_logical()) && pure(right) {
                         self.cov_quietly(|me| me.cov_node(nodes, k1, right, vals));
                     }
                     Value::from_u64(0, 1)
@@ -5335,7 +5345,7 @@ impl Simulator {
             (Op::Or | Op::OrFull, ExprKind::Binary { left, right, .. }) => {
                 let l = self.cov_node(nodes, k0, left, vals);
                 if l.to_u64().is_some_and(|v| v != 0) {
-                    if n.op == Op::OrFull && pure(right) {
+                    if (n.op == Op::OrFull || self.cov_logical()) && pure(right) {
                         self.cov_quietly(|me| me.cov_node(nodes, k1, right, vals));
                     }
                     Value::from_u64(1, 1)
@@ -5606,7 +5616,8 @@ impl Simulator {
                 // block is `genblk<n>`.
                 let first = rel.split(['.', '[']).next().unwrap_or(rel);
                 !(bare.contains(first)
-                    || (rel.contains('.') && (blocks.contains(first) || first.starts_with("genblk"))))
+                    || (rel.contains('.')
+                        && (blocks.contains(first) || first.starts_with("genblk"))))
             });
         }
         out.sort();

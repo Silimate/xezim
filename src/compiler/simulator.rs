@@ -2506,6 +2506,7 @@ mod dpi_export;
 mod dpi_task;
 mod event_bits;
 mod event_stamps;
+mod fsm_cov;
 mod module_paths;
 mod names;
 mod rand_csp;
@@ -2528,7 +2529,7 @@ pub(crate) use code_cov::{
     COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
 };
 pub use code_cov::{
-    CodeCoverage, KIND_BRANCH, KIND_STATEMENT, KIND_TOGGLE,
+    CodeCoverage, KIND_ALL, KIND_BRANCH, KIND_FSM, KIND_STATEMENT, KIND_TOGGLE,
     parse_constant_mode as parse_code_coverage_constant_mode,
     parse_kinds as parse_code_coverage_kinds, set_code_coverage,
 };
@@ -20853,6 +20854,8 @@ impl Simulator {
             self.finished = was_finished;
         }
         if self.code_cov.is_some() {
+            // FSM writes of the last time slot, when it ended early.
+            self.cov_fsm_sample();
             self.emit_coverage_summary();
         }
         // Flush any `--warn-x` reports captured during the final region.
@@ -104963,6 +104966,7 @@ impl Simulator {
         }
         if self.code_cov.is_some() {
             self.cov_toggle_sample();
+            self.cov_fsm_sample();
         }
         if self.dump_dirty_active {
             self.dump_dirty.clear();

@@ -233,7 +233,7 @@ fn print_usage() {
                    enabled by XEZIM_COMPAT=1."
     );
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
-    eprintln!("                   stmt, branch, toggle (or all, the default). Counts go to");
+    eprintln!("                   stmt, branch, toggle, fsm (or all, the default). Counts go to");
     eprintln!("                   xezim_cov.json (XEZIM_COV_DB) with the functional coverage;");
     eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
     eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
@@ -419,11 +419,11 @@ fn print_usage() {
     );
     eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
     eprintln!("  -define <N>[=<v>], -incdir <dir>, -top <module>  Same as -D, -I, -s");
-    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, t");
-    eprintln!("                   = stmt, branch, toggle; bare = all three. Other letters are");
-    eprintln!("                   ignored with a warning");
-    eprintln!("  -coverage <types>  all, or B:E:F:T:U letters: B = stmt + branch, T = toggle;");
-    eprintln!("                   E and F are ignored with a warning, U adds nothing");
+    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, t,");
+    eprintln!("                   f = stmt, branch, toggle, fsm; bare = all four. Other letters");
+    eprintln!("                   are ignored with a warning");
+    eprintln!("  -coverage <types>  all, or B:E:F:T:U letters: B = stmt + branch, T = toggle,");
+    eprintln!("                   F = fsm; E is ignored with a warning, U adds nothing");
     eprintln!("  -covworkdir <dir>, -covscope <name>, -covtest <name>  Write the results to");
     eprintln!("                   <dir>/<scope>/<test>/xezim_cov.json (cov_work/scope/test)");
     eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -access <spec>,");
@@ -2470,11 +2470,7 @@ fn run_main() -> i32 {
                 wave = true;
             }
             "--code-coverage" => {
-                code_cov_kinds = Some(
-                    xezim::compiler::simulator::KIND_STATEMENT
-                        | xezim::compiler::simulator::KIND_BRANCH
-                        | xezim::compiler::simulator::KIND_TOGGLE,
-                );
+                code_cov_kinds = Some(xezim::compiler::simulator::KIND_ALL);
             }
             _ if arg.starts_with("--code-coverage=") => {
                 match xezim::compiler::simulator::parse_code_coverage_kinds(
@@ -2873,7 +2869,6 @@ fn run_main() -> i32 {
                 .map(|c| match c {
                     'c' => "condition (c)".to_string(),
                     'e' => "expression (e)".to_string(),
-                    'f' => "FSM (f)".to_string(),
                     'x' => "extended toggle (x)".to_string(),
                     _ => format!("'{}'", c),
                 })
@@ -2882,6 +2877,7 @@ fn run_main() -> i32 {
                 (xezim::compiler::simulator::KIND_STATEMENT, "statement"),
                 (xezim::compiler::simulator::KIND_BRANCH, "branch"),
                 (xezim::compiler::simulator::KIND_TOGGLE, "toggle"),
+                (xezim::compiler::simulator::KIND_FSM, "FSM"),
             ]
             .iter()
             .filter(|(k, _)| kinds & k != 0)

@@ -148,6 +148,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Named blocking `case` branches retain their `%m` scope and `disable`
   targets across suspension (§9.3, §9.6.2).
 
+**Usability**
+
+* FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
+  `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
+  machines (one- and two-process, enum, parameter and `` `define `` encodings,
+  `case` or `if` next-state logic, a continuous-assignment next state) and
+  count each state's visits and each transition, reset and `default`
+  transitions included. `xezim_cov.json` gets `fsm` totals (states and
+  transitions, together and apart) and the details of each FSM per scope.
+  Recognition, state sets, transitions, lines and counts follow the reference
+  simulator; on the CVDP agentic designs both find the same 16 FSMs with the
+  same bins. It costs nothing when off. See docs/coverage-guide.md, "FSMs".
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and

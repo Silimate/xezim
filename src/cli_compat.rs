@@ -52,13 +52,14 @@ pub(crate) struct CompatArgs {
 /// The code coverage `+cover[=<letters>]` and `-coverage [<types>]` ask
 /// for, as `(kinds, letters xezim does not collect, the spelling)`. The
 /// letters are other simulators': `s` statement, `b` branch, `c` condition,
-/// `e` expression and `t` toggle map onto xezim's kinds; `f` (FSM) and `x`
+/// `e` expression, `t` toggle and `f` FSM map onto xezim's kinds; `x`
 /// (extended toggle) have no xezim counterpart. The bare forms ask for the
 /// default set, `sbceft`: all of xezim's kinds. `+cover=<letters>` wins over
 /// `-coverage <types>` (see `coverage_types`).
 pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String, String)> {
     use xezim::compiler::simulator::{
-        KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_STATEMENT, KIND_TOGGLE,
+        KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_FSM, KIND_STATEMENT,
+        KIND_TOGGLE,
     };
     let all = KIND_ALL;
     let spec = match (cx.cover.as_deref(), &cx.coverage_types) {
@@ -79,6 +80,7 @@ pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String, String)> {
             'c' => kinds |= KIND_CONDITION,
             'e' => kinds |= KIND_EXPRESSION,
             't' => kinds |= KIND_TOGGLE,
+            'f' => kinds |= KIND_FSM,
             _ if !unsupported.contains(c) => unsupported.push(c),
             _ => {}
         }
@@ -90,29 +92,29 @@ pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String, String)> {
 /// (block), `E` (expression), `F` (FSM), `T` (toggle) and `U` (functional),
 /// in either case, as `(kinds, letters xezim does not collect)` in
 /// `+cover`'s letters. A block is a statement or a branch arm, so `B` is
-/// statement and branch coverage, and `E` condition and expression coverage.
-/// Functional coverage (covergroups and assertions) is always collected, so
-/// `U` adds nothing. `None` when `spec` is not such a list: then `-coverage`
-/// takes no value.
+/// statement and branch coverage, `E` condition and expression coverage, and
+/// `F` FSM coverage. Functional coverage (covergroups and assertions) is
+/// always collected, so `U` adds nothing. `None` when `spec` is not such a
+/// list: then `-coverage` takes no value.
 pub(crate) fn coverage_types(spec: &str) -> Option<(u8, String)> {
     use xezim::compiler::simulator::{
-        KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_STATEMENT, KIND_TOGGLE,
+        KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_FSM, KIND_STATEMENT,
+        KIND_TOGGLE,
     };
     let all = KIND_ALL;
     if spec.eq_ignore_ascii_case("all") {
         return Some((all, String::new()));
     }
     let mut kinds = 0u8;
-    let mut unsupported = String::new();
+    let unsupported = String::new();
     for t in spec.split(':') {
         match t.to_ascii_lowercase().as_str() {
             "a" => kinds |= all,
             "b" => kinds |= KIND_STATEMENT | KIND_BRANCH,
             "t" => kinds |= KIND_TOGGLE,
             "e" => kinds |= KIND_CONDITION | KIND_EXPRESSION,
+            "f" => kinds |= KIND_FSM,
             "u" => {}
-            "f" if !unsupported.contains('f') => unsupported.push('f'),
-            "f" => {}
             _ => return None,
         }
     }

@@ -233,7 +233,7 @@ fn print_usage() {
                    enabled by XEZIM_COMPAT=1."
     );
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
-    eprintln!("                   stmt, branch, cond, expr, toggle (or all, the default).");
+    eprintln!("                   stmt, branch, cond, expr, toggle, fsm (or all, the default).");
     eprintln!("                   Counts go to xezim_cov.json (XEZIM_COV_DB) with the");
     eprintln!("                   functional coverage; --verbose prints a summary.");
     eprintln!("                   XEZIM_CODE_COVERAGE=<kinds> too.");
@@ -421,10 +421,10 @@ fn print_usage() {
     eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
     eprintln!("  -define <N>[=<v>], -incdir <dir>, -top <module>  Same as -D, -I, -s");
     eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, c,");
-    eprintln!("                   e, t = stmt, branch, cond, expr, toggle; bare = all. Other");
-    eprintln!("                   letters are ignored with a warning");
+    eprintln!("                   e, t, f = stmt, branch, cond, expr, toggle, fsm; bare = all.");
+    eprintln!("                   Other letters are ignored with a warning");
     eprintln!("  -coverage <types>  all, or B:E:F:T:U letters: B = stmt + branch, E = cond +");
-    eprintln!("                   expr, T = toggle; F is ignored with a warning, U adds nothing");
+    eprintln!("                   expr, T = toggle, F = fsm; U adds nothing");
     eprintln!("  -covworkdir <dir>, -covscope <name>, -covtest <name>  Write the results to");
     eprintln!("                   <dir>/<scope>/<test>/xezim_cov.json (cov_work/scope/test)");
     eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -access <spec>,");
@@ -2868,7 +2868,6 @@ fn run_main() -> i32 {
             let names: Vec<String> = unsupported
                 .chars()
                 .map(|c| match c {
-                    'f' => "FSM (f)".to_string(),
                     'x' => "extended toggle (x)".to_string(),
                     _ => format!("'{}'", c),
                 })
@@ -2879,6 +2878,7 @@ fn run_main() -> i32 {
                 (xezim::compiler::simulator::KIND_CONDITION, "condition"),
                 (xezim::compiler::simulator::KIND_EXPRESSION, "expression"),
                 (xezim::compiler::simulator::KIND_TOGGLE, "toggle"),
+                (xezim::compiler::simulator::KIND_FSM, "FSM"),
             ]
             .iter()
             .filter(|(k, _)| kinds & k != 0)

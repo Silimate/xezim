@@ -4488,6 +4488,10 @@ struct BlockScopeSave {
     /// `(depth, len)` of `static_local_syncs` at entry when the block
     /// declares a `static` variable.
     static_mark: Option<(usize, usize)>,
+    /// The subroutine's `static` locals that a non-static block variable of
+    /// the same name hides, as `static_local_syncs` depth and the
+    /// `(name, key)` entries taken out of that frame until the block ends.
+    static_hidden: Option<(usize, Vec<(String, String)>)>,
     /// `next_pid` at entry: a block that forked keeps its collection storage
     /// (a child may still use it).
     pid_mark: usize,
@@ -5751,8 +5755,9 @@ enum PackedHop {
     /// A packed dimension declared `[l:r]` of elements `ew` bits wide.
     /// §7.4.1: the left bound labels the most significant element.
     Dim { l: i64, r: i64, ew: u32 },
-    /// A member of a packed struct or union, `off` bits above its LSB.
-    Field(u32),
+    /// A member of a packed struct or union, `off` bits above its LSB and
+    /// `w` bits wide.
+    Field { off: u32, w: u32 },
 }
 
 /// The §7.8 collection kind of an unpacked-struct member whose declarator
@@ -57385,6 +57390,37 @@ impl Simulator {
             pid_mark: self.next_pid,
             ..Default::default()
         };
+        // §6.21: a block variable that is not `static` hides the
+        // subroutine's same-named static until the block ends, so its reads
+        // and writes must not reach the static's shared cell.
+        let depth = self.static_local_syncs.len();
+        if !self.static_local_names.is_empty()
+            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
+        {
+            for s in stmts {
+                if let StatementKind::VarDecl {
+                    lifetime,
+                    declarators,
+                    ..
+                } = &s.kind
+                    && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                {
+                    for d in declarators {
+                        let nm = &d.name.name;
+                        if !self.static_local_names.contains(nm) {
+                            continue;
+                        }
+                        if let Some(i) = syncs.iter().position(|(n, _)| n == nm) {
+                            let hidden = syncs.remove(i);
+                            sv.static_hidden
+                                .get_or_insert_with(|| (depth, Vec::new()))
+                                .1
+                                .push(hidden);
+                        }
+                    }
+                }
+            }
+        }
         for s in stmts {
             let StatementKind::VarDecl {
                 data_type,
@@ -57477,6 +57513,13 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // The statics the block's variables hid are visible again.
+        if let Some((depth, hidden)) = sv.static_hidden.take()
+            && self.static_local_syncs.len() == depth
+            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
+        {
+            syncs.extend(hidden);
         }
         let forked = self.next_pid != sv.pid_mark;
         for s in stmts {
@@ -67182,6 +67225,12 @@ impl Simulator {
         {
             return changed;
         }
+        if !self.static_local_names.is_empty()
+            && !self.in_const_param_eval
+            && let Some(n) = self.static_select_target(lhs)
+        {
+            return self.assign_static_select(n, lhs, val);
+        }
         // §6.8/§6.11.1: a write to a 2-state procedural local drops X/Z
         // (whole, bit- or part-select). Probed only for an X/Z value.
         let changed = if val.has_xz() {
@@ -67189,6 +67238,40 @@ impl Simulator {
         } else {
             self.assign_value_inner(lhs, val)
         };
+        if changed && !self.condition_waiters.is_empty() {
+            self.check_condition_waiters_for_write(lhs);
+        }
+        changed
+    }
+
+    /// §6.21: `assign_value` for a select or member write to the `static`
+    /// subroutine local `name` (`a[7:0] = v`; see `static_select_target`).
+    /// The write updates the frame copy in place, while reads come from the
+    /// live shared cell, so bring the copy up to date first and store it
+    /// back after, or the write is lost.
+    #[inline(never)]
+    fn assign_static_select(&mut self, name: &str, lhs: &Expression, val: &Value) -> bool {
+        // An index that calls a function can write the same static, so
+        // evaluate the indices (once, §11.4.1) before taking the copy. An
+        // x/z index selects nothing, so the write is discarded (§11.5.1).
+        let frozen;
+        let lhs = if Self::select_indices_plain(lhs) {
+            lhs
+        } else {
+            let mut bad = false;
+            frozen = self.freeze_select_indices(lhs, &mut bad);
+            if bad {
+                return false;
+            }
+            &frozen
+        };
+        self.static_cell_sync(name, false);
+        let changed = if val.has_xz() {
+            self.assign_value_xz(lhs, val)
+        } else {
+            self.assign_value_inner(lhs, val)
+        };
+        self.static_cell_sync(name, true);
         if changed && !self.condition_waiters.is_empty() {
             self.check_condition_waiters_for_write(lhs);
         }
@@ -72699,7 +72782,7 @@ impl Simulator {
                     if width(&md, mb)? != mw {
                         return None;
                     }
-                    hops.push(PackedHop::Field(off));
+                    hops.push(PackedHop::Field { off, w: mw });
                     two = super::elaborate::is_type_two_state_resolved(
                         mdt,
                         &self.module.typedef_types,
@@ -72731,7 +72814,12 @@ impl Simulator {
         let mut ok = true;
         for (k, (hop, step)) in hops.iter().zip(steps).enumerate() {
             let (l, r, ew) = match *hop {
-                PackedHop::Field(off) => {
+                // A chain that ends at a member (`s.f <= v`) names all of it.
+                PackedHop::Field { off, w } if k + 1 == hops.len() => {
+                    let lsb = lsb + off as u64;
+                    return (w, (ok && w > 0).then_some((lsb, 0, w as u64)));
+                }
+                PackedHop::Field { off, .. } => {
                     lsb += off as u64;
                     continue;
                 }
@@ -148554,6 +148642,159 @@ impl Simulator {
             .iter()
             .find(|(n, _)| n == nm)
             .map(|(_, key)| key.clone())
+    }
+
+    /// §6.21/§11.5.1: the `static` local of the current subroutine that a
+    /// select or member write changes in place: `a` in `a[i]`, `a[7:0]`,
+    /// `a[i*8 +: 8]`, `a.f` or `a.f[1:0]`. None for a write to the whole
+    /// variable, which reaches its shared cell by itself, and for any other
+    /// target, including a variable named like another subroutine's static
+    /// or a block variable that hides one.
+    fn static_select_target<'a>(&self, lhs: &'a Expression) -> Option<&'a str> {
+        let mut e = lhs;
+        let mut sel = false;
+        loop {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => {
+                    e = expr;
+                    sel = true;
+                }
+                ExprKind::Paren(x) => e = x,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let seg = h.path.first()?;
+        if h.root.is_some() || !(sel || h.path.len() > 1 || !seg.selects.is_empty()) {
+            return None;
+        }
+        let n = seg.name.name.as_str();
+        let hit = n
+            .as_bytes()
+            .first()
+            .is_some_and(|&b| self.static_local_first[b as usize])
+            && self.static_local_names.contains(n)
+            && self.static_local_syncs.last().is_some_and(|(_, s)| {
+                s.iter()
+                    .any(|(m, k)| m == n && self.static_local_keys.contains(k))
+            });
+        hit.then_some(n)
+    }
+
+    /// Are the indices of the select target `e` literals and variable reads
+    /// alone, so that evaluating them cannot write a variable?
+    fn select_indices_plain(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                Self::init_is_plain(index) && Self::select_indices_plain(expr)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::init_is_plain(left)
+                    && Self::init_is_plain(right)
+                    && Self::select_indices_plain(expr)
+            }
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => {
+                Self::select_indices_plain(expr)
+            }
+            _ => Self::init_is_plain(e),
+        }
+    }
+
+    /// The select target `e` with each index that is not plain (see
+    /// `select_indices_plain`) evaluated once, in order, and replaced by its
+    /// value (§11.4.1). An index that is x/z or does not fit in 64 bits
+    /// selects nothing in a vector (§11.5.1): it sets `bad`, for the caller
+    /// to discard the write, and the indices after it still run.
+    fn freeze_select_indices(&mut self, e: &Expression, bad: &mut bool) -> Expression {
+        let index = |sim: &mut Self, x: &Expression, bad: &mut bool| -> Box<Expression> {
+            if Self::init_is_plain(x) {
+                return Box::new(x.clone());
+            }
+            let v = sim.eval_expr(x);
+            let Some(n) = v.to_i64().filter(|_| !v.has_xz()) else {
+                *bad = true;
+                return Box::new(x.clone());
+            };
+            Box::new(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: n.to_string(),
+                    cached_val: Cell::new(Some((n as u64, 0u64, 64u32))),
+                }),
+                x.span,
+            ))
+        };
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index: i } => ExprKind::Index {
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
+                index: index(self, i, bad),
+            },
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
+                kind: *kind,
+                left: index(self, left, bad),
+                right: index(self, right, bad),
+            },
+            ExprKind::MemberAccess { expr, member } => ExprKind::MemberAccess {
+                expr: Box::new(self.freeze_select_indices(expr, bad)),
+                member: member.clone(),
+            },
+            ExprKind::Paren(x) => return self.freeze_select_indices(x, bad),
+            _ => return e.clone(),
+        };
+        Expression::new(kind, e.span)
+    }
+
+    /// §6.21: copy the `static` local `name` of the current subroutine
+    /// between its frame copy and its live shared cell: into the cell after
+    /// a write in place (`store`), out of it before one (an NBA or another
+    /// activation may have written the cell since the copy was taken). A
+    /// fallback frame's copy comes from a compiled method's register, which
+    /// is newer than the cell, so it is never overwritten.
+    fn static_cell_sync(&mut self, name: &str, store: bool) {
+        let Some(key) = self
+            .static_local_syncs
+            .last()
+            .and_then(|(_, s)| s.iter().find(|(n, _)| n == name))
+            .map(|(_, k)| k)
+        else {
+            return;
+        };
+        if !self.static_local_keys.contains(key) {
+            return;
+        }
+        let depth = self.local_stack.len();
+        if !store && depth > 0 && self.fb_frame_depths.last() == Some(&(depth - 1)) {
+            return;
+        }
+        let Some(copy) = self.local_stack.last_mut().and_then(|f| f.get_mut(name)) else {
+            return;
+        };
+        if !store {
+            if let Some(v) = self.static_local_vars.get(key) {
+                *copy = v.clone();
+            }
+            return;
+        }
+        match self.static_local_vars.get_mut(key) {
+            Some(v) => *v = copy.clone(),
+            None => {
+                self.static_local_vars.insert(key.clone(), copy.clone());
+            }
+        }
     }
 
     /// A `static_local_syncs` frame name: a pooled buffer holding `name`.

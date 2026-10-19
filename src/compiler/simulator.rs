@@ -9299,6 +9299,9 @@ pub struct Simulator {
     /// run (`Some` only then): their values are default sampled values
     /// (`adopt_start_of_simulation_writes`).
     start_of_simulation_writes: Option<Vec<usize>>,
+    /// The pre-process time-0 settle has run: a value read now is no longer
+    /// a default sampled value.
+    time0_settled: bool,
     /// §9.2.2.2 timing: `-> ev` fired from a comb block during the PRE-process
     /// time-0 settle (compile) happens before any `always @(ev)` process has
     /// registered its waiter — the trigger would be lost. Queue them and
@@ -14111,6 +14114,7 @@ impl Simulator {
             sampled_watches: Vec::new(),
             sampled_defaults: HashMap::default(),
             start_of_simulation_writes: None,
+            time0_settled: false,
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),
@@ -19770,6 +19774,7 @@ impl Simulator {
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();
         self.in_pre_process_settle = false;
+        self.time0_settled = true;
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
         if dt.as_millis() > 100 {
@@ -61478,7 +61483,11 @@ impl Simulator {
             return;
         }
         for (name, &id) in self.signal_name_to_id.iter() {
-            // An array cell is named `mem[3]`; an assertion spells `mem`.
+            // An array cell is named `mem[3]`; an assertion spells `mem`. The
+            // cells of a memory too large for per-element names (the packed
+            // arena) are not in this map and keep their current value: only
+            // an `always_comb` or continuous assignment writing one at time
+            // 0 tells the two apart, and copying such a memory is not free.
             let leaf = name.rsplit(['.', ':']).next().unwrap_or_default();
             if !names.contains(leaf.split('[').next().unwrap_or_default()) {
                 continue;
@@ -61714,28 +61723,41 @@ impl Simulator {
         }
         for i in 0..self.sampled_watches.len() {
             let w = &self.sampled_watches[i];
+            // Every operand needs its default: a live one would mix values
+            // from after the time-0 settle into a default.
             if w.sig_id.is_some()
                 || w.default.is_none()
                 || !w.sample_ids.iter().any(|id| ids.contains(id))
+                || !w
+                    .sample_ids
+                    .iter()
+                    .all(|id| self.sampled_defaults.contains_key(id))
             {
                 continue;
             }
-            let mut saved: Vec<(usize, Value)> = w
-                .sample_ids
-                .iter()
-                .filter(|&&id| id < self.signal_table.len())
-                .filter_map(|&id| Some((id, self.sampled_defaults.get(&id)?.clone())))
-                .collect();
-            for (id, v) in &mut saved {
-                std::mem::swap(&mut self.signal_table[*id], v);
-            }
             let e = self.sampled_watches[i].expr.clone();
-            let v = self.eval_expr(&e);
-            for (id, v) in saved.into_iter().rev() {
-                self.signal_table[id] = v;
-            }
+            let ops = self.sampled_watches[i].sample_ids.clone();
+            let v = self.eval_with_defaults(&e, &ops);
             self.sampled_watches[i].default = Some(v);
         }
+    }
+
+    /// `e` evaluated with each signal of `ids` that has a default sampled
+    /// value holding it.
+    fn eval_with_defaults(&mut self, e: &Expression, ids: &[usize]) -> Value {
+        let mut saved: Vec<(usize, Value)> = ids
+            .iter()
+            .filter(|&&id| id < self.signal_table.len())
+            .filter_map(|&id| Some((id, self.sampled_defaults.get(&id)?.clone())))
+            .collect();
+        for (id, v) in &mut saved {
+            std::mem::swap(&mut self.signal_table[*id], v);
+        }
+        let v = self.eval_expr(e);
+        for (id, v) in saved.into_iter().rev() {
+            self.signal_table[id] = v;
+        }
+        v
     }
 
     /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
@@ -62131,7 +62153,23 @@ impl Simulator {
                     .get(&sid)
                     .or(self.signal_table.get(sid))
                     .cloned(),
-                None => Some(self.eval_expr(operand)),
+                // An expression's default is computed from its operands'
+                // defaults, kept for every operand so a later change to one
+                // (`refresh_expr_defaults`) can recompute it.
+                None => {
+                    let mut ids = Vec::new();
+                    self.collect_sva_signal_ids(operand, &mut ids);
+                    if !self.time0_settled {
+                        for &id in &ids {
+                            if !self.sampled_defaults.contains_key(&id)
+                                && let Some(v) = self.signal_table.get(id)
+                            {
+                                self.sampled_defaults.insert(id, v.clone());
+                            }
+                        }
+                    }
+                    Some(self.eval_with_defaults(operand, &ids))
+                }
             }
         };
         let i = self.sampled_watches.len();
@@ -180436,9 +180474,6 @@ pub extern "C" fn vpi_put_value(
             );
             return std::ptr::null_mut();
         }
-        if let Some(w) = sim.start_of_simulation_writes.as_mut() {
-            w.push(sig_id);
-        }
 
         // A slice decodes at its own width, then splices back into its parent.
         let w = if h.kind == VpiKind::Slice {
@@ -180642,6 +180677,9 @@ pub extern "C" fn vpi_put_value(
                 sim.dirty_list.push(sig_id);
             }
             sim.dirty_any = true;
+        }
+        if let Some(w) = sim.start_of_simulation_writes.as_mut() {
+            w.push(sig_id);
         }
 
         std::ptr::null_mut()

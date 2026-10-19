@@ -104,6 +104,10 @@ module top;
   logic g; always_comb g = ri;     // always_comb
   logic f; initial f = 1'b1;       // initial block
   logic m [2]; always_comb m[0] = ri;  // an array cell
+  // A procedural $past at the first tick: the default of `a_in & pb`, from
+  // both operands' defaults (pb is x before the time-0 settle drives it).
+  logic pb; always_comb pb = ri;
+  always @(posedge clk) if ($time == 0) $display("T|ppast0|%b", $past(a_in & pb));
   a_r:  assert property (@(posedge clk) r === 1'bx) $display("T|r|pass|%0t", $time); else $display("T|r|fail|%0t", $time);
   a_ri: assert property (@(posedge clk) ri === 1'b1) $display("T|ri|pass|%0t", $time); else $display("T|ri|fail|%0t", $time);
   a_n:  assert property (@(posedge clk) n === 0) $display("T|n|pass|%0t", $time); else $display("T|n|fail|%0t", $time);
@@ -195,6 +199,7 @@ fn time0_attempt_reads_default_sampled_values() {
             "T|n|pass|0".to_string(),
             "T|n|pass|10".to_string(),
             format!("T|past0|{}", if early { "11" } else { "xx" }),
+            "T|ppast0|x".to_string(),
             format!("T|past|10|{}xx1", if early { "1" } else { "x" }),
             "T|r|pass|0".to_string(),
             "T|r|pass|10".to_string(),

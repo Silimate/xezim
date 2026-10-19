@@ -19916,6 +19916,10 @@ impl Simulator {
         let saved_scope = self.current_scope.clone();
         let saved_hint = self.name_resolve_hint.borrow_mut().take();
         let saved_activation = self.activation_scope.borrow_mut().take();
+        // Not a comb/edge block either: the time-0 settle's last block scope
+        // must not name these sites' instance (`running_instance_scope`).
+        let saved_block_scope = std::mem::take(&mut self.m_block_scope);
+        let saved_block_active = std::mem::replace(&mut self.m_block_active, false);
         for ib in initial_blocks
             .extract_if(.., |ib| declarative(&ib.stmt))
             .chain(early.extract_if(.., |ib| declarative(&ib.stmt)))
@@ -19938,6 +19942,8 @@ impl Simulator {
         self.current_scope = saved_scope;
         *self.name_resolve_hint.borrow_mut() = saved_hint;
         *self.activation_scope.borrow_mut() = saved_activation;
+        self.m_block_scope = saved_block_scope;
+        self.m_block_active = saved_block_active;
         for ib in early
             .into_iter()
             .chain(pending_initial.into_iter().map(&mut rename_pending))

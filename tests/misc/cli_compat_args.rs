@@ -710,7 +710,7 @@ endmodule
 /// A `-g` value is a constant expression (§6.20.2): a concatenation or
 /// replication of sized literals (§11.4.12) sets a packed parameter. The
 /// cocotb runner (contrib/cocotb) passes `parameters` values to `-g` as given,
-/// and some testbenches written for commercial simulators pass such values.
+/// and cocotb testbenches pass such values for packed parameters.
 #[test]
 fn g_takes_constant_expressions() {
     let d = scratch("gexpr");

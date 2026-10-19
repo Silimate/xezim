@@ -60,6 +60,74 @@ static void want(const char *n, int i, int fmt, int v, const char *s) {
 #define L3 "0123456789abcdef"
 #define L5 "fedcba9876543210"
 
+static void at(PLI_INT32 (*rtn)(p_cb_data), unsigned t);
+
+static void override8(int flags, int v) {
+    s_vpi_value val;
+    val.format = vpiIntVal;
+    val.value.integer = v;
+    vpi_put_value(get("top.um8.a", 5), &val, NULL, flags);
+}
+
+static PLI_INT32 released_again(p_cb_data cb) {
+    (void)cb;
+    want("top.um8.a", 5, vpiIntVal, 44, 0);
+    vpi_printf("UPD|same callback release\n");
+    return 0;
+}
+
+static PLI_INT32 released(p_cb_data cb) {
+    (void)cb;
+    want("top.um8.a", 5, vpiIntVal, 44, 0);
+    vpi_printf("UPD|release\n");
+    /* Release must restore the unchanged source even when no settle has
+       occurred since the force. */
+    override8(vpiForceFlag, 99);
+    override8(vpiReleaseFlag, 0);
+    at(released_again, 1);
+    return 0;
+}
+
+static PLI_INT32 forced(p_cb_data cb) {
+    (void)cb;
+    want("top.um8.a", 5, vpiIntVal, 123, 0);
+    vpi_printf("UPD|force holds\n");
+    override8(vpiReleaseFlag, 0);
+    at(released, 1);
+    return 0;
+}
+
+static PLI_INT32 change_forced_source(p_cb_data cb) {
+    (void)cb;
+    put("top.m8", 5, vpiIntVal, 44, 0);
+    at(forced, 1);
+    return 0;
+}
+
+static PLI_INT32 changed(p_cb_data cb) {
+    (void)cb;
+    want("top.um8.a", 3, vpiIntVal, 33, 0);
+    want("top.um64.a", 3, vpiHexStrVal, 0, "1111222233334444");
+    want("top.um1.a", 3, vpiIntVal, 0, 0);
+    /* A change to another element must leave these deposits intact. */
+    want("top.um8.a", 5, vpiIntVal, 88, 0);
+    want("top.um64.a", 5, vpiHexStrVal, 0, L5);
+    want("top.um1.a", 5, vpiIntVal, 1, 0);
+    vpi_printf("UPD|source changes\n");
+    override8(vpiForceFlag, 123);
+    at(change_forced_source, 1);
+    return 0;
+}
+
+static PLI_INT32 change_source(p_cb_data cb) {
+    (void)cb;
+    put("top.m8", 3, vpiIntVal, 33, 0);
+    put("top.m64", 3, vpiHexStrVal, 0, "1111222233334444");
+    put("top.m1", 3, vpiIntVal, 0, 0);
+    at(changed, 1);
+    return 0;
+}
+
 static PLI_INT32 late(p_cb_data cb) {
     (void)cb;
     want("top.u1.a", 0, vpiIntVal, 10, 0);
@@ -82,6 +150,7 @@ static PLI_INT32 late(p_cb_data cb) {
     want("top.um8.a", 5, vpiIntVal, 88, 0);
     want("top.um64.a", 3, vpiHexStrVal, 0, L3);
     want("top.um1.a", 5, vpiIntVal, 1, 0);
+    at(change_source, 2);
     return 0;
 }
 

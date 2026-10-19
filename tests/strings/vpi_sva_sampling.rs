@@ -9,7 +9,7 @@
 //! clock writes it from cbAfterDelay. Under the first, the assertions ticked
 //! in the next delta or the next slot and read every flop's new value; a
 //! value written in the edge's own cbAfterDelay counted as already sampled.
-//! The reference simulator reports no failure in any of these runs.
+//! The properties hold on the sampled values in every run, so none may fail.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -397,8 +397,9 @@ fn vpi_driven_clock_samples_preponed_values() {
 
 /// A routine that ends the run from the clock's value-change callback, as
 /// cocotb does when a test returns on `RisingEdge`, ends it in that delta:
-/// the assertions do not tick at that edge. The reference simulator ticks
-/// at 5 to 85 and not at 95, where the run ends.
+/// the assertions do not tick at that edge. `vpi_control(vpiFinish)` runs
+/// `$finish` when the routine returns (§20.2), before the delta's Observed
+/// region (§4.4.2), so the ticks are at 5 to 85 and not at 95.
 #[test]
 fn vpi_finish_at_an_edge_ticks_no_assertion() {
     let (dir, so) = setup("finish", TOP_SV);
@@ -415,7 +416,7 @@ fn vpi_finish_at_an_edge_ticks_no_assertion() {
 /// cbReadWriteSynch included. A reset released from a cbReadWriteSynch
 /// queued at the second rising edge (15 ns), as cocotb writes after
 /// `RisingEdge`, therefore does not cancel that edge's attempt: attempts from
-/// 15 to 85 ns pass. The reference simulator agrees for each clock.
+/// 15 to 85 ns pass, with each clock.
 #[test]
 fn vpi_reset_release_at_an_edge_keeps_its_attempt() {
     let (dir, so) = setup("reset", EDGE_SV);
@@ -436,8 +437,8 @@ fn vpi_reset_release_at_an_edge_keeps_its_attempt() {
 /// whether or not a cbReadWriteSynch is due there. The attempt at 25 ns
 /// passes before the clocking-event waiter raises `res` at that edge, and
 /// the one at 35 ns is disabled; a no-op cbReadWriteSynch queued at each
-/// rise used to hold the assertions back until after the waiter. The
-/// reference simulator agrees for each clock, with and without it.
+/// rise must not hold the assertions back until after the waiter. The same
+/// holds for each clock, with and without it.
 #[test]
 fn vpi_synch_routine_keeps_observed_before_reactive() {
     let (dir, so) = setup("reactive", CB_SV);
@@ -465,7 +466,7 @@ fn vpi_synch_routine_keeps_observed_before_reactive() {
 /// the next, 100,000 in all, at the third rise) runs before the edge's
 /// assertions one batch after another, not by recursion: the run completes
 /// in an 8 MiB stack, and the attempts from the second rise on pass as in
-/// the reset test. The reference simulator gives the same counts.
+/// the reset test (§4.4.2: the batches all precede the Observed region).
 #[test]
 fn vpi_synch_chain_at_an_edge_runs_iteratively() {
     let (dir, so) = setup("chain", EDGE_SV);
@@ -487,9 +488,7 @@ fn vpi_synch_chain_at_an_edge_runs_iteratively() {
 /// region set too. At the second rise, where a cbReadWriteSynch releases
 /// `rst`, a cbNBASynch chain of 1,000 routines (each queues the next) is due
 /// as well. The assertions wait for the chain and the release, so the
-/// attempts from 15 ns on pass, with each clock. (The reference simulator
-/// accepts cbNBASynch routines but never calls them, so this rests on the
-/// LRM's region order.)
+/// attempts from 15 ns on pass, with each clock.
 #[test]
 fn vpi_nba_synch_chain_before_reset_release_keeps_its_attempt() {
     let (dir, so) = setup("nbachain", EDGE_SV);
@@ -516,8 +515,7 @@ fn vpi_nba_synch_chain_before_reset_release_keeps_its_attempt() {
 /// regions are empty, also while the assertions of a clock edge wait for
 /// the slot's synch routines. The second routine sees the `#0` write of the
 /// child the first one's write forks, with each clock, as without an
-/// assertion clock event. (The reference simulator never calls cbNBASynch
-/// routines, so this rests on the LRM's region order.)
+/// assertion clock event.
 #[test]
 fn vpi_nba_synch_follows_inactive_work() {
     let (dir, so) = setup("nbaorder", GO_SV);
@@ -539,8 +537,7 @@ fn vpi_nba_synch_follows_inactive_work() {
 /// Observed region. The rise is recorded when it happens and evaluated after
 /// those routines, with the design's own clock (19 rises) and with the
 /// driver's cbReadWriteSynch clock (10 rises; `rst` falls at 40 ns, so the
-/// attempts from 45 to 85 ns pass). The reference simulator gives the same
-/// counts.
+/// attempts from 45 to 85 ns pass).
 #[test]
 fn vpi_clock_moved_back_in_its_slot_keeps_its_event() {
     let (dir, so) = setup("glitch", EDGE_SV);

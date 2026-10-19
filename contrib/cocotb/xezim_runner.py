@@ -25,6 +25,7 @@ runs the simulator once on that record. The tests are in ``tests/``.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
@@ -59,12 +60,12 @@ class Xezim(Runner):
          ``hdl_library`` and ``hdl_toplevel_library`` are ignored: xezim keeps
          no libraries.
        * ``parameters`` become ``-gNAME=VALUE``, which sets the default of
-         parameter ``NAME`` in every module that declares it overridable, as
-         other simulators' ``-g`` does; a value given at an instantiation
-         still wins. A value is a constant expression, such as ``8``,
-         ``8'hff`` or ``{3'd7,3'd5}``; a ``string`` parameter also takes plain
-         text. Parameters given to ``test()`` replace those given to
-         ``build()``.
+         parameter ``NAME`` in every module that declares it overridable; a
+         value given at an instantiation still wins. A value is a constant
+         expression, such as ``8``, ``8'hff`` or ``{3'd7,3'd5}``; a
+         ``string`` parameter also takes plain text. Parameters given to
+         ``test()`` replace those given to ``build()`` and remain in effect
+         for later tests until replaced or another build is selected.
        * A ``timescale`` given to ``test()`` replaces the one given to
          ``build()``. It applies to modules without a timescale of their own.
        * A define whose value is ``None`` is defined with no value.
@@ -159,10 +160,11 @@ class Xezim(Runner):
 
         record = {
             "args": args,
-            "parameters": self._get_parameter_options(self.parameters),
+            "parameters": dict(self.parameters),
         }
         self.build_dir.mkdir(parents=True, exist_ok=True)
         self.build_file.write_text(json.dumps(record, indent=1) + "\n")
+        self._parameter_build = self.build_file.resolve()
 
         # Nothing to execute: xezim elaborates at run time, so the "build" is
         # the record above. Returning no commands keeps `build()` a no-op
@@ -171,11 +173,18 @@ class Xezim(Runner):
 
     # -- test --------------------------------------------------------------
 
-    def test(self, *args, parameters=None, **kwargs) -> Path:
-        # cocotb's Runner keeps build()'s parameters on the runner object, so
-        # a runner that did not run the build has none; the record has them.
-        self._replace_parameters = parameters is not None
-        return super().test(*args, parameters=parameters, **kwargs)
+    def test(self, *args, **kwargs) -> Path:
+        # Bind against Runner's signature so positional parameters keep the
+        # same meaning. Seed a fresh runner from its recorded build once;
+        # Runner.test then retains explicit overrides between calls.
+        bound = inspect.signature(Runner.test).bind(self, *args, **kwargs)
+        build_dir = bound.arguments.get("build_dir") or self.build_dir
+        record = Path(build_dir).resolve() / "xezim_build.json"
+        if getattr(self, "_parameter_build", None) != record:
+            if bound.arguments.get("parameters") is None and record.is_file():
+                self.parameters = dict(json.loads(record.read_text())["parameters"])
+            self._parameter_build = record
+        return super().test(*args, **kwargs)
 
     def _test_command(self) -> List[_Command]:
         if self.pre_cmd is not None:
@@ -202,11 +211,7 @@ class Xezim(Runner):
             cmd += ["--fst", self._waves_file()]
         cmd += self.elab_args
         cmd += self.test_args
-        # Parameters given to test() replace build()'s.
-        if self._replace_parameters:
-            cmd += self._get_parameter_options(self.parameters)
-        else:
-            cmd += record["parameters"]
+        cmd += self._get_parameter_options(self.parameters)
         cmd += self.plusargs
         return [cmd]
 

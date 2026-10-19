@@ -89,15 +89,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 **Usability**
 
 * FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
-  `--code-coverage`) and `+cover=f` find the design's state machines (one- and
-  two-process, enum, parameter and `` `define `` encodings, `case` or `if`
-  next-state logic, a continuous-assignment next state) and count each
-  state's visits and each transition, reset and `default` transitions
-  included. `xezim_cov.json` gets `fsm` totals (states and transitions,
-  together and apart) and the details of each FSM per scope. Recognition,
-  state sets, transitions, lines and counts follow the reference simulator;
-  on the CVDP agentic designs both find the same 16 FSMs with the same bins.
-  It costs nothing when off. See docs/coverage-guide.md, "FSMs".
+  `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
+  machines (one- and two-process, enum, parameter and `` `define `` encodings,
+  `case` or `if` next-state logic, a continuous-assignment next state) and
+  count each state's visits and each transition, reset and `default`
+  transitions included. `xezim_cov.json` gets `fsm` totals (states and
+  transitions, together and apart) and the details of each FSM per scope.
+  Recognition, state sets, transitions, lines and counts follow the reference
+  simulator; on the CVDP agentic designs both find the same 16 FSMs with the
+  same bins. It costs nothing when off. See docs/coverage-guide.md, "FSMs".
 
 **Performance**
 
@@ -135,6 +135,28 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   parameters included, in `xezim_build.json` instead of `xezim_sources.f`, so
   `test()` on another runner uses them too. The runner's tests are in
   `contrib/cocotb/tests`.
+
+**Usability**
+
+* `--compat` (or `XEZIM_COMPAT=1`) runs a flow written for commercial
+  simulators with one flag: no time cap, `--relax-implicit-static`,
+  `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
+  or `-do` run time still sets the run length.
+* `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
+  `$finish` or no events remain, as with `-do "run -all"`. The default is
+  unchanged: a design that never finishes still stops.
+* `--version` and `-version` print the version and git revision, as `-V`
+  does, and exit 0.
+* More of other simulators' options run as-is: `-define`, `-incdir` and
+  `-top` (same as `-D`, `-I`, `-s`), `-coverage <types>` (`all`, or `B`,
+  `T`, `U`, `E`, `F` joined by `:`), `-covworkdir`/`-covscope`/`-covtest`
+  (the results file goes in `<dir>/<scope>/<test>/`), and, with no effect,
+  `-covoverwrite`, `-licqueue`, `-R`, `-access`, `+access+`, `-nowarn`,
+  `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
+  to be read as source files or top names, and `-licqueue` as `-l icqueue`,
+  which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
+  (same as `+seed=`) now work on the command line too, where they were read
+  as `-s vseed` and `-s eed`.
 
 **Maintenance**
 

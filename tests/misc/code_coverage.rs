@@ -786,7 +786,9 @@ fn off_by_default_output_unchanged() {
 
 /// Other simulators' spellings: `+cover=<letters>` picks the kinds and warns
 /// once about the ones xezim lacks; bare `+cover` and `-coverage` collect all
-/// four; XEZIM_CODE_COVERAGE does what the flag does.
+/// four, and `-coverage <types>` the types listed (its value used to be read
+/// as a top module name; `F` is FSM coverage); XEZIM_CODE_COVERAGE does what
+/// the flag does.
 #[test]
 fn compatible_spellings() {
     let d = scratch("compat");
@@ -818,6 +820,24 @@ fn compatible_spellings() {
     assert_eq!(kinds(&["+cover"]).0, all);
     assert_eq!(kinds(&["-coverage"]).0, all);
     assert_eq!(kinds(&["-coverage", "+cover=s"]).0, "\"statement\"");
+    assert_eq!(kinds(&["-coverage", "all"]).0, all);
+    assert_eq!(kinds(&["-coverage", "T"]).0, "\"toggle\"");
+    assert_eq!(
+        kinds(&["-coverage", "b:t"]).0,
+        "\"statement\", \"branch\", \"toggle\""
+    );
+    let (k, err) = kinds(&["-coverage", "B:E:F:U"]);
+    assert_eq!(k, "\"statement\", \"branch\", \"fsm\"");
+    assert_eq!(
+        err.matches(
+            "Warning: -coverage B:E:F:U: xezim has no expression (e) coverage; \
+                     collecting statement, branch, FSM coverage"
+        )
+        .count(),
+        1,
+        "{err}"
+    );
+    assert_eq!(kinds(&["-coverage", "B", "+cover=t"]).0, "\"toggle\"");
     assert_eq!(
         kinds(&["--code-coverage=branch,stmt"]).0,
         "\"statement\", \"branch\""
@@ -835,6 +855,64 @@ fn compatible_spellings() {
     let bad = run(&d, SMALL, &["--code-coverage=lines"]);
     assert_eq!(bad.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown code coverage kind 'lines'"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `-covworkdir <dir>`, `-covscope <name>` and `-covtest <name>` put the
+/// results file in `<dir>/<scope>/<test>/` (defaults `cov_work`, `scope`,
+/// `test`), creating it, instead of the current directory. XEZIM_COV_DB
+/// still names the file when it is set. `-covoverwrite` changes nothing:
+/// the file is always replaced.
+#[test]
+fn coverage_work_area() {
+    let d = scratch("workarea");
+    std::fs::write(d.join("t.sv"), SMALL).unwrap();
+    let go = |args: &[&str], db: Option<PathBuf>| {
+        let mut cmd = Command::new(xezim());
+        cmd.current_dir(&d)
+            .env_remove("XEZIM_COV_DB")
+            .env_remove("XEZIM_CODE_COVERAGE")
+            .args(args)
+            .arg("t.sv");
+        if let Some(db) = db {
+            cmd.env("XEZIM_COV_DB", db);
+        }
+        let out = cmd.output().expect("run xezim");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let read = |p: &str| std::fs::read_to_string(d.join(p)).unwrap_or_default();
+    go(
+        &["-coverage", "all", "-covtest", "t1", "-covoverwrite"],
+        None,
+    );
+    assert!(read("cov_work/scope/t1/xezim_cov.json").contains("\"code_coverage\""));
+    assert!(!d.join("xezim_cov.json").exists());
+    go(
+        &[
+            "-covworkdir",
+            "cw",
+            "-covscope",
+            "s",
+            "-covtest",
+            "t2",
+            "-coverage",
+            "T",
+        ],
+        None,
+    );
+    assert!(read("cw/s/t2/xezim_cov.json").contains("\"kinds\": [\"toggle\"]"));
+    go(&["-coverage", "-covscope", "s3"], None);
+    assert!(d.join("cov_work/s3/test/xezim_cov.json").exists());
+    go(
+        &["-coverage", "all", "-covtest", "t4"],
+        Some(d.join("env.json")),
+    );
+    assert!(read("env.json").contains("\"code_coverage\""));
+    assert!(!d.join("cov_work/scope/t4").exists());
     let _ = std::fs::remove_dir_all(&d);
 }
 

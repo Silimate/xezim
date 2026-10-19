@@ -39,8 +39,9 @@ Facts worth knowing before the first run:
 
 - **Default mode is `--simulate`**; `--parse` and `--compile` stop earlier
   and are the fast way to check a design front-end only.
-- **`--max-time` default is 100000 ns** — long benches silently stop there;
-  always set it explicitly. Bare numbers are ns.
+- **`--max-time` default is 100 ms** — long benches silently stop there;
+  always set it explicitly, or `--max-time none` to run until `$finish`.
+  Bare numbers are ns.
 - **Runs are deterministic**: same inputs + same `+seed` ⇒ byte-identical
   output. `+seed=1` is the default. Use two runs + `diff` as a free sanity
   check after any config change.

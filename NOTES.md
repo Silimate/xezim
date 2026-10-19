@@ -22,6 +22,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
+* A value a VPI client writes to an element of an instance's unpacked-array
+  input port reaches the instance, through any number of port levels, and
+  the actual's name reads it too; a value written to the actual reaches the
+  port's name in the same delta. The port and a whole-array actual are one
+  object (§23.3.3.7), as a scalar port and its actual already were. They had
+  storage of their own, connected element by element, while the instance
+  read the actual, so a cocotb test driving `dut.inst.port[i]` left the
+  instance reading z. (#66)
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
@@ -48,6 +56,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   still does not (§16.12). A clock event is recorded when it happens, so a
   routine that moves the clock back in the same slot does not lose it.
   (Silimate/xezim#11, Silimate/xezim#56)
+* In concurrent assertions, `$past` with fewer past clock ticks than asked
+  for returns its operand's default sampled value instead of x, and `$rose`,
+  `$fell`, `$stable` and `$changed` compare the first tick's sample with it.
+  The default sampled value is the value before time 0: a variable's
+  declaration initializer, else its type's default, and a net's type default.
+  Procedural calls now take the same value; they used to take it after the
+  time-0 settle, so a net or a continuously assigned variable read its
+  driver's value. An operand that a property reads only through these
+  functions is now sampled in the Preponed region like the others; it was
+  read after the tick's NBAs, so `$rose(q)` of a flop fired one tick early
+  and `$past(q)` returned the current tick's value (§16.5.1, §16.9.3).
 * Bit-, part- and indexed part-select writes to a variable of a static task
   or function, or to a `static` local of any subroutine or class method,
   update the one variable all calls share. They were lost, so a static
@@ -67,6 +86,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   its first toggle. A toggle is counted once per time slot from the slot's
   net change, so a value changed and changed back in later deltas of the
   same slot no longer counts (§38.36.2, §38.36.3). (Silimate/xezim#35)
+* Concurrent assertions sample the elements of unpacked arrays in the
+  Preponed region like other variables. They read the value an element took
+  in the NBA region of the edge being evaluated, so `a[0] == $past(s)` with
+  `a[0] <= s` failed at every edge. This covers multidimensional arrays,
+  unpacked arrays of packed vectors, arrays of structs, arrays in interfaces,
+  array ports, and dynamic arrays and queues up to index 63. A select with
+  constant indices samples its element. One whose indices read variables
+  samples the element their sampled values name, found again in each time
+  slot, so a large memory is never copied. An index read from a sequence
+  local variable, a procedure's loop variable, a sampled-value function or a
+  call samples the whole array (§16.5.1). (#27)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

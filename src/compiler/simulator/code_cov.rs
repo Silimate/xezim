@@ -3980,8 +3980,8 @@ impl ToggleTypes<'_> {
 /// sources (§27.5): the names declared in an unlabeled branch of a generate
 /// `if` or `case`, which elaboration keeps bare in the instance, and the
 /// names of the generate blocks whose declarations are hierarchical (`g.x`,
-/// `g[1].x`): labeled branches and loops. An unnamed loop's are
-/// `genblk<n>`.
+/// `g[1].x`): labeled branches and loops. An unnamed loop's block is
+/// `genblk<n>`, `n` its construct's number in the scope (§27.6).
 #[allow(clippy::type_complexity)]
 fn generate_decls(
     module: &ElaboratedModule,
@@ -3989,8 +3989,10 @@ fn generate_decls(
     use crate::ast::Description;
     use crate::ast::decl::ModuleItem;
     type Sets = (HashSet<String>, HashSet<String>);
-    // Declarations in `items`, an unlabeled branch: bare names.
+    // Declarations in `items`, an unlabeled branch: bare names. Its
+    // generate constructs are numbered in a scope of their own.
     fn names(items: &[ModuleItem], out: &mut Sets) {
+        let mut n = 0;
         for it in items {
             match it {
                 ModuleItem::DataDeclaration(dd) => out
@@ -3999,15 +4001,25 @@ fn generate_decls(
                 ModuleItem::NetDeclaration(nd) => out
                     .0
                     .extend(nd.declarators.iter().map(|d| d.name.name.clone())),
-                _ => constructs(std::slice::from_ref(it), out),
+                _ => constructs(std::slice::from_ref(it), out, &mut n),
             }
         }
     }
-    // The generate constructs among `items`, at any depth of regions.
-    fn constructs(items: &[ModuleItem], out: &mut Sets) {
+    // The generate constructs among `items`, at any depth of regions; `n`
+    // numbers the scope's constructs (§27.6), which names an unnamed loop's
+    // block `genblk<n>`.
+    fn constructs(items: &[ModuleItem], out: &mut Sets, n: &mut u32) {
         for it in items {
+            if matches!(
+                it,
+                ModuleItem::GenerateIf(_)
+                    | ModuleItem::GenerateCase(_)
+                    | ModuleItem::GenerateFor(_)
+            ) {
+                *n += 1;
+            }
             match it {
-                ModuleItem::GenerateRegion(gr) => constructs(&gr.items, out),
+                ModuleItem::GenerateRegion(gr) => constructs(&gr.items, out, n),
                 ModuleItem::GenerateIf(gi) => {
                     for (bi, (_, items)) in gi.branches.iter().enumerate() {
                         match gi.branch_labels.get(bi).and_then(|l| l.as_ref()) {
@@ -4029,9 +4041,8 @@ fn generate_decls(
                     }
                 }
                 ModuleItem::GenerateFor(gf) => {
-                    if let Some(l) = &gf.name {
-                        out.1.insert(l.clone());
-                    }
+                    out.1
+                        .insert(gf.name.clone().unwrap_or_else(|| format!("genblk{n}")));
                 }
                 _ => {}
             }
@@ -4039,7 +4050,7 @@ fn generate_decls(
     }
     fn add(name: &str, items: &[ModuleItem], out: &mut HashMap<String, Sets>) {
         let mut sets = Sets::default();
-        constructs(items, &mut sets);
+        constructs(items, &mut sets, &mut 0);
         if !sets.0.is_empty() || !sets.1.is_empty() {
             let e = out.entry(name.to_string()).or_default();
             e.0.extend(sets.0);
@@ -5624,12 +5635,10 @@ impl Simulator {
                 let rel = n[inst.len()..].trim_start_matches('.');
                 let def = types.defs.get(inst).copied().unwrap_or(top.as_str());
                 let (bare, blocks) = decls.get(def).unwrap_or(&none);
-                // A member (`s.m`) goes with its variable; an unnamed loop's
-                // block is `genblk<n>`.
+                // A member (`s.m`) goes with its variable; a block's names
+                // are hierarchical under it (an unnamed loop's, `genblk<n>`).
                 let first = rel.split(['.', '[']).next().unwrap_or(rel);
-                !(bare.contains(first)
-                    || (rel.contains('.')
-                        && (blocks.contains(first) || first.starts_with("genblk"))))
+                !(bare.contains(first) || (rel.contains('.') && blocks.contains(first)))
             });
         }
         out.sort();

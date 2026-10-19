@@ -105,11 +105,12 @@ module tb;
   logic clk = 0;
   st_t st;
   struct { logic m; logic [1:0] k; } us;
+  struct { logic m; } genblk_status;
   wire [1:0] o;
   sub u(.clk, .o);
   leaf w(.clk);
   always #5 clk = ~clk;
-  initial begin st = A; us.m = 0; us.k = 0; #12 st = C; us.m = 1; us.k = 3; #20 $finish; end
+  initial begin st = A; us.m = 0; us.k = 0; genblk_status.m = 0; #12 st = C; us.m = 1; us.k = 3; genblk_status.m = 1; #20 $finish; end
 endmodule
 ";
 
@@ -119,14 +120,25 @@ endmodule
 /// members of its struct `gs`), a labeled one's (`lb.lab`), a named loop's
 /// (`fl[0].f`) and an unnamed loop's (`genblk1[0].g2`, in a module with no
 /// other generate block). Module-scope signals, ports and the members of a
-/// module-scope unpacked struct stay. By default both are counted.
+/// module-scope unpacked struct stay, `genblk_status` too: only an unnamed
+/// loop's own `genblk<n>` (§27.6) names a block. By default both are
+/// counted.
 #[test]
 fn toggle_enums_and_generate_blocks_left_out() {
     let d = scratch("toggles");
     let all = run(&d, TOGGLES, &["--code-coverage=toggle"]);
     assert_eq!(
         strings(scope(&all, "tb"), "signal"),
-        ["clk", "o", "st", "us", "us.k", "us.m"]
+        [
+            "clk",
+            "genblk_status",
+            "genblk_status.m",
+            "o",
+            "st",
+            "us",
+            "us.k",
+            "us.m"
+        ]
     );
     assert_eq!(
         strings(scope(&all, "tb.u"), "signal"),
@@ -145,7 +157,15 @@ fn toggle_enums_and_generate_blocks_left_out() {
     );
     assert_eq!(
         strings(scope(&enums, "tb"), "signal"),
-        ["clk", "o", "us", "us.k", "us.m"]
+        [
+            "clk",
+            "genblk_status",
+            "genblk_status.m",
+            "o",
+            "us",
+            "us.k",
+            "us.m"
+        ]
     );
     let generate = run(
         &d,
@@ -154,7 +174,16 @@ fn toggle_enums_and_generate_blocks_left_out() {
     );
     assert_eq!(
         strings(scope(&generate, "tb"), "signal"),
-        ["clk", "o", "st", "us", "us.k", "us.m"]
+        [
+            "clk",
+            "genblk_status",
+            "genblk_status.m",
+            "o",
+            "st",
+            "us",
+            "us.k",
+            "us.m"
+        ]
     );
     assert_eq!(
         strings(scope(&generate, "tb.u"), "signal"),

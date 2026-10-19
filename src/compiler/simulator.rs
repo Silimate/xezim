@@ -2547,6 +2547,7 @@ pub(crate) use code_cov::{
 };
 pub use code_cov::{
     CodeCoverage, KIND_BRANCH, KIND_STATEMENT, KIND_TOGGLE,
+    parse_constant_mode as parse_code_coverage_constant_mode,
     parse_kinds as parse_code_coverage_kinds, set_code_coverage,
 };
 use event_stamps::{EventId, EventStampStore, NamedEventPlan, NamedEventTarget};
@@ -3464,6 +3465,11 @@ struct SvaClockedSite {
     /// LSB of the most recent clock value: 0, 1, X (2), or Z (3).
     /// Declarative sites start with the value before Active processes run.
     prev_clock: u8,
+    // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
+    /// The clock event happened and the attempts it starts have not been
+    /// evaluated yet (`sva_note_edges`).
+    fired: bool,
+    // /silimate
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
@@ -6480,6 +6486,17 @@ pub struct Simulator {
     /// being one clock cycle early. Only populated when `sva_sites` is
     /// non-empty; the referenced ids are those collected per site.
     sva_preponed: HashMap<usize, Value>,
+    // silimate: assertions sample once per time slot, before its VPI callbacks
+    /// The time slot `sva_preponed` was captured for. The Preponed region
+    /// runs once per slot (§4.4.2.1), so the later deltas of a slot (a VPI
+    /// write from cbReadWriteSynch reopening the Active region) keep it.
+    sva_preponed_slot: Option<u64>,
+    // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
+    /// A site's clock event is recorded (`fired`) and not evaluated yet.
+    sva_owed: bool,
+    /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
+    sva_post_nba_busy: bool,
+    // /silimate
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -11185,6 +11202,7 @@ impl Simulator {
         Self::classify_typedef_collection_properties(&mut module);
         let contested_pkg_vars = Self::split_contested_package_vars(&mut module);
         Self::register_struct_member_packed_dims(&mut module);
+        Self::fold_named_sva_members(&mut module);
         // §9.2.2.2: give every dynamic array / queue a REAL `<q>.size` signal.
         // It doubles as the queue's change proxy in the comb dependency graph:
         // sensitivity registration resolves it to an id, and every mutation
@@ -13208,6 +13226,9 @@ impl Simulator {
             sva_default_disable: HashMap::default(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
+            sva_preponed_slot: None,
+            sva_owed: false,
+            sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
@@ -16211,18 +16232,7 @@ impl Simulator {
         // Ident. Resolve it as the hierarchical name it spells; without this
         // `$readmemh("f", r.mem)` in a task loaded nothing.
         if matches!(expr.kind, ExprKind::MemberAccess { .. }) {
-            if let Some(mut flat) = Self::member_chain_as_hier_ident(expr) {
-                // An instance-array select names one element instance, whose
-                // scope is `ra[1]`: fold the (constant) index into the
-                // segment name, the spelling the element's storage uses.
-                if let ExprKind::Ident(h) = &mut flat.kind {
-                    for seg in h.path.iter_mut() {
-                        for sel in std::mem::take(&mut seg.selects) {
-                            let i = self.eval_scalar_self(&sel)?;
-                            seg.name.name = format!("{}[{}]", seg.name.name, i);
-                        }
-                    }
-                }
+            if let Some(flat) = self.member_chain_ident(expr) {
                 return self.resolve_array_name_from_expr(&flat);
             }
         }
@@ -16302,6 +16312,23 @@ impl Simulator {
         self.record_output(m.clone());
         self.stdout_writeln(&m);
         None
+    }
+
+    /// [`member_chain_as_hier_ident`] with each select folded into its
+    /// segment's name: an instance-array element or a generate block scope
+    /// is `ra[1]` / `blk[1]`, the spelling its storage uses. `None` when a
+    /// select is not constant.
+    fn member_chain_ident(&self, e: &Expression) -> Option<Expression> {
+        let mut flat = Self::member_chain_as_hier_ident(e)?;
+        if let ExprKind::Ident(h) = &mut flat.kind {
+            for seg in h.path.iter_mut() {
+                for sel in std::mem::take(&mut seg.selects) {
+                    let i = self.eval_scalar_self(&sel)?;
+                    seg.name.name = format!("{}[{}]", seg.name.name, i);
+                }
+            }
+        }
+        Some(flat)
     }
 
     /// A dotted chain of names and constant-indexed instance-array elements
@@ -20089,6 +20116,8 @@ impl Simulator {
         self.auto_partition_by_clock();
         self.auto_partition_by_scope();
         mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
+        // Every block is instrumented now.
+        self.cov_resolve_constants();
         self.init_value_trace();
         self.rebuild_signal_commit_plans();
         self.compiled = true;
@@ -48264,6 +48293,10 @@ impl Simulator {
         }
     }
 
+    // silimate: keep run_one_tick out of line, as the inliner left it before the assertion tick moved into sva_observed
+    // Inlined into the event loop, it pushed the loop's other callees out of
+    // line (about 1.8% more instructions on a design without assertions).
+    #[inline(never)]
     fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -48288,6 +48321,16 @@ impl Simulator {
         // §14.4: #1step samples precede every callback/active-region write
         // at this time, and remain fixed across this slot's later deltas.
         self.refresh_clocking_preponed();
+        // silimate: assertions sample once per time slot, before its VPI callbacks
+        // LRM §16.5.1: the same holds for the Preponed samples of every
+        // SVA-referenced signal: taken before the slot's Pre-Active VPI
+        // callbacks (cbAtStartOfSimTime, cbAfterDelay; §4.4.3.2) and its
+        // active/NBA regions, and kept by the slot's later deltas, so a
+        // clocked assertion firing later in the slot (a clock written from
+        // cbReadWriteSynch, or one a later delta raises) samples pre-edge
+        // values rather than values written earlier in the slot.
+        self.refresh_sva_preponed();
+        // /silimate
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot
@@ -48309,11 +48352,6 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.fire_timing_timers();
-        // LRM §16.5.1: capture Preponed (slot-entry) samples of every
-        // SVA-referenced signal BEFORE the active/NBA regions run, so a
-        // clocked assertion firing later this slot (tick_sva_sites) samples
-        // pre-edge values rather than same-edge NBA updates.
-        self.refresh_sva_preponed();
 
         if self.sched_trace_on() {
             eprintln!("[sched] t={} +--- tick ---", self.time);
@@ -48548,7 +48586,8 @@ impl Simulator {
         }
         // LRM §16.5 SVA clocked property evaluation. Detects edges on
         // each registered clock signal and ticks pending consequents.
-        self.tick_sva_sites();
+        // silimate: a cbReadWriteSynch due at an assertion clock edge runs before the assertions (sva_post_nba)
+        self.sva_observed();
         if self.finished {
             return;
         }
@@ -53656,6 +53695,7 @@ impl Simulator {
                         | "$clog2"
                         | "$__xz_named_cast"
                         | "$__xz_size_cast"
+                        | SVA_SIG_MARKER
                 ) && args.iter().all(pure)
             }
             ExprKind::Call { func, args } => {
@@ -98054,6 +98094,180 @@ impl Simulator {
         }
     }
 
+    /// §16.5.1: the operands of a named property or sequence are sampled like
+    /// those of an assertion written inline. The parser spells `u.st` as a
+    /// member access, which the elaborator folds into a hierarchical name in
+    /// the top-level process bodies and in every declaration of an inlined
+    /// instance, but not in a top-level or package declaration. Unfolded, the
+    /// reference is not among the signals a concurrent assertion samples, so
+    /// it read the value the clock edge's nonblocking assignments had just
+    /// written. Fold those bodies the same way. A body without a member
+    /// access is left alone: rebuilding it changes nothing but where it lives
+    /// in memory, which cost 0.6% more instructions on a design with 288
+    /// named properties.
+    fn fold_named_sva_members(module: &mut ElaboratedModule) {
+        if !module.property_decls.values().any(Self::has_member_access) {
+            return;
+        }
+        // §3.12.1: keep `$unit::x` where the scope shadows `x`, as the
+        // elaborator's pass over the process bodies does.
+        let unit: std::collections::HashSet<String> = module
+            .signals
+            .keys()
+            .filter(|k| k.starts_with("$unit::"))
+            .cloned()
+            .collect();
+        for body in module.property_decls.values_mut() {
+            if Self::has_member_access(body) {
+                *body = super::elaborate::rewrite_expr(
+                    body,
+                    "",
+                    &HashMap::default(),
+                    &unit,
+                    &HashMap::default(),
+                );
+            }
+        }
+    }
+
+    /// Does `e` hold a member access (`u.st`), clocked bodies included?
+    fn has_member_access(e: &Expression) -> bool {
+        let mut hit = false;
+        Self::walk_operands(e, &mut |x| match &x.kind {
+            ExprKind::MemberAccess { .. } => hit = true,
+            ExprKind::SvaClocked {
+                clock, iff, body, ..
+            } => {
+                hit |= Self::has_member_access(clock)
+                    || Self::has_member_access(body)
+                    || iff.as_deref().is_some_and(Self::has_member_access)
+            }
+            ExprKind::NamedArg { expr, .. } => {
+                hit |= expr.as_deref().is_some_and(Self::has_member_access)
+            }
+            _ => {}
+        });
+        hit
+    }
+
+    /// §16.5.1: a reference into a generate block or an instance-array
+    /// element (`blk[1].sig`, `blk[1].mem[2]`) parses as a member access over
+    /// a select, which the elaborator leaves alone even in a process body.
+    /// Unfolded, the assertion neither sampled it nor kept a `$past` history
+    /// of it. Fold each one with constant selects that names a signal or an
+    /// unpacked array into the flat name the scope's own code uses
+    /// (`blk[1].sig`).
+    fn sva_fold_scopes(&self, e: &mut Expression) {
+        if matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            if let Some(name) = self.sva_scope_name(e) {
+                let span = e.span;
+                let seg = crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier { name, span },
+                    selects: Vec::new(),
+                };
+                *e = Self::hier_ident_expr(vec![seg], span);
+                return;
+            }
+        }
+        let mut sub = |x: &mut Expression| self.sva_fold_scopes(x);
+        match &mut e.kind {
+            ExprKind::Unary { operand: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::SvaClocked { body: x, .. } => sub(x),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Index {
+                expr: left,
+                index: right,
+            }
+            | ExprKind::Range(left, right) => {
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Conditional {
+                condition: a,
+                then_expr: b,
+                else_expr: c,
+            }
+            | ExprKind::RangeSelect {
+                expr: a,
+                left: b,
+                right: c,
+                ..
+            } => {
+                sub(a);
+                sub(b);
+                sub(c);
+            }
+            ExprKind::Concatenation(xs)
+            | ExprKind::SystemCall { args: xs, .. }
+            | ExprKind::Call { args: xs, .. } => xs.iter_mut().for_each(&mut sub),
+            ExprKind::Replication {
+                count: x,
+                exprs: xs,
+            }
+            | ExprKind::Inside {
+                expr: x,
+                ranges: xs,
+            } => {
+                sub(x);
+                xs.iter_mut().for_each(&mut sub);
+            }
+            _ => {}
+        }
+    }
+
+    /// The storage `blk[1].sig` names (see `sva_fold_scopes`): `None` unless
+    /// the chain has a select, every select is a constant (a generate-block
+    /// or instance-array index fixed at elaboration), and it names a signal
+    /// or an unpacked array. A variable index (`a[i].f`) is evaluated at
+    /// every tick, so folding it would freeze the element it picked.
+    fn sva_scope_name(&self, e: &Expression) -> Option<String> {
+        let chain = Self::member_chain_as_hier_ident(e)?;
+        let ExprKind::Ident(h) = &chain.kind else {
+            return None;
+        };
+        let mut sels = h.path.iter().flat_map(|s| &s.selects).peekable();
+        if sels.peek().is_none()
+            || !sels.all(|x| super::elaborate::const_eval_i64_with_params(x, None).is_some())
+        {
+            return None;
+        }
+        let flat = self.member_chain_ident(e)?;
+        let ExprKind::Ident(h) = &flat.kind else {
+            return None;
+        };
+        let path = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        // §23.8: the name is looked up in the assertion's scope, then in each
+        // enclosing one (`comb[0].delay_reg` in instance `dut` is
+        // `dut.comb[0].delay_reg`).
+        let scope = self.active_instance_scope();
+        let mut up = scope.as_str();
+        loop {
+            let name = match up {
+                "" => path.clone(),
+                _ => format!("{up}.{path}"),
+            };
+            if self.signal_name_to_id.contains_key(name.as_str())
+                || self.array_first_id.contains_key(name.as_str())
+                || self.module.arrays.contains_key(&name)
+                || self.module.arrays_2d.contains_key(&name)
+                || self.module.arrays_nd.contains_key(&name)
+            {
+                return Some(name);
+            }
+            if up.is_empty() {
+                return None;
+            }
+            up = up.rsplit_once('.').map_or("", |(p, _)| p);
+        }
+    }
+
     fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
@@ -98707,7 +98921,12 @@ impl Simulator {
         for it in items {
             match it.slot {
                 Some((k, w, signed)) => {
-                    let v = self.sva_eval_env(&it.expr, &mut env);
+                    // §11.6.1: the right-hand side of an assignment is sized
+                    // with its target, so `x = a + b` keeps the carry when
+                    // `x` is wider than `a` and `b`.
+                    std::mem::swap(&mut self.sva_lv, &mut env);
+                    let v = self.eval_expr_ctx(&it.expr, w);
+                    std::mem::swap(&mut self.sva_lv, &mut env);
                     let mut v = v.resize_for_assign(w);
                     v.is_signed = signed;
                     if let Some(slot) = env.get_mut(k) {
@@ -99197,6 +99416,7 @@ impl Simulator {
         // Named sequence / property instances INSIDE the body (`a |=> s`)
         // expand here, once.
         let mut body_expanded = self.sva_expand_named(&body, 0);
+        self.sva_fold_scopes(&mut body_expanded);
         let mut lv_init: Vec<Value> = Vec::new();
         let mut lv_types =
             self.sva_bind_locals(&mut body_expanded, &HashMap::default(), &mut lv_init);
@@ -99257,6 +99477,13 @@ impl Simulator {
                 }
             }
         }
+        // silimate: assertions sample once per time slot, before its VPI callbacks
+        // For the first site these are the slot's only samples: a later delta
+        // of the slot must not retake them (`refresh_sva_preponed`).
+        if self.sva_sites.is_empty() {
+            self.sva_preponed_slot = Some(self.time);
+        }
+        // /silimate
         let mut past_names = Vec::new();
         self.collect_past_arg_names(&body_expanded, &mut past_names);
         // A signal is sampled once per property clock, however many
@@ -99327,6 +99554,7 @@ impl Simulator {
             node: std::sync::Arc::new(node),
             disable,
             prev_clock,
+            fired: false,
             attempts: Vec::new(),
             past_snapshots: HashMap::default(),
             pass_action: a.action.as_deref().cloned(),
@@ -99891,9 +100119,13 @@ impl Simulator {
     }
 
     fn refresh_sva_preponed(&mut self) {
-        if self.sva_sites.is_empty() {
+        // silimate: assertions sample once per time slot, before its VPI callbacks
+        // Once per slot (§4.4.2.1): a later delta of the slot keeps them.
+        if self.sva_sites.is_empty() || self.sva_preponed_slot == Some(self.time) {
             return;
         }
+        self.sva_preponed_slot = Some(self.time);
+        // /silimate
         self.sva_preponed.clear();
         for i in 0..self.sva_sites.len() {
             if !self.sva_sites[i].sels.is_empty() {
@@ -100014,23 +100246,43 @@ impl Simulator {
         self.class_context_stack = saved_cls;
     }
 
-    fn tick_sva_sites_inner(&mut self) {
-        // §16.14.6.2: the procedural instances queued so far mature (no
-        // flush point can drop them any more); each starts an attempt at the
-        // next tick of its leading clock.
-        if !self.sva_proc_pending.is_empty() {
-            for (idx, _, env) in std::mem::take(&mut self.sva_proc_pending) {
-                if let Some(site) = self.sva_sites.get_mut(idx) {
-                    site.matured.push(env);
-                }
-            }
+    // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
+    /// §4.4.2: the Observed region of a delta. It follows the whole active
+    /// region set, the Post-NBA cbReadWriteSynch routines included, so with
+    /// a cbNBASynch or cbReadWriteSynch due in this slot `sva_post_nba`
+    /// finishes that set first; inside it, a delta's Observed region only
+    /// records clock events. Inline in both callers, so a design without
+    /// assertions pays one emptiness check per delta.
+    #[inline(always)]
+    fn sva_observed(&mut self) {
+        if self.sva_sites.is_empty() {
+            return;
         }
-        // Use indices so we can call &mut self methods inside the loop
-        // without holding a borrow on self.sva_sites.
+        if self.sva_post_nba_busy || self.vpi_synch_due() {
+            self.sva_post_nba();
+        } else {
+            self.tick_sva_sites();
+        }
+    }
+
+    /// Record the assertion clocks' events now, for a tick deferred until
+    /// the slot's due cbReadWriteSynch routines have run (`sva_post_nba`): an
+    /// edge such a routine moves back still starts its attempts.
+    fn note_sva_edges(&mut self) {
+        if self.finished || self.sva_sites.is_empty() {
+            return;
+        }
+        let saved_this = std::mem::take(&mut self.this_stack);
+        let saved_cls = std::mem::take(&mut self.class_context_stack);
+        self.sva_note_edges();
+        self.this_stack = saved_this;
+        self.class_context_stack = saved_cls;
+    }
+
+    /// Mark each site whose clock event happened since the last call, with
+    /// its `iff` guard checked then.
+    fn sva_note_edges(&mut self) {
         for i in 0..self.sva_sites.len() {
-            if self.finished {
-                break;
-            }
             let clk_name = &self.sva_sites[i].clock_signal;
             if clk_name.is_empty() {
                 continue;
@@ -100059,6 +100311,40 @@ impl Simulator {
                     continue;
                 }
             }
+            self.sva_sites[i].fired = true;
+            self.sva_owed = true;
+        }
+    }
+    // /silimate
+
+    fn tick_sva_sites_inner(&mut self) {
+        // §16.14.6.2: the procedural instances queued so far mature (no
+        // flush point can drop them any more); each starts an attempt at the
+        // next tick of its leading clock.
+        if !self.sva_proc_pending.is_empty() {
+            for (idx, _, env) in std::mem::take(&mut self.sva_proc_pending) {
+                if let Some(site) = self.sva_sites.get_mut(idx) {
+                    site.matured.push(env);
+                }
+            }
+        }
+        // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
+        // The clock events since the last call, and those a deferred tick
+        // recorded (`note_sva_edges`).
+        self.sva_note_edges();
+        self.sva_owed = false;
+        // /silimate
+        // Use indices so we can call &mut self methods inside the loop
+        // without holding a borrow on self.sva_sites.
+        for i in 0..self.sva_sites.len() {
+            if self.finished {
+                break;
+            }
+            // silimate: only the sites whose clock event was recorded tick
+            if !std::mem::take(&mut self.sva_sites[i].fired) {
+                continue;
+            }
+            // /silimate
             let span_key = self.sva_sites[i].stat_key;
             let site_loc = self.sva_sites[i].stat_loc;
             let site_kind = self.sva_sites[i].kind;
@@ -100255,7 +100541,12 @@ impl Simulator {
                 ) {
                     return;
                 }
-                for a in args {
+                // The width or type of a cast (`W'(x)`) is read by name.
+                let skip = usize::from(matches!(
+                    name.as_str(),
+                    "$__xz_size_cast" | "$__xz_named_cast" | "$__xz_type_cast"
+                ));
+                for a in args.iter_mut().skip(skip) {
                     self.sva_resolve_signals(a);
                 }
             }
@@ -100308,6 +100599,21 @@ impl Simulator {
             v.is_real = true;
         }
         v
+    }
+
+    /// The width of an `SVA_SIG_MARKER` read: its signal's declared width, or
+    /// for a local variable (§16.10) its slot's.
+    fn sva_sig_width(&self, args: &[Expression]) -> Option<u32> {
+        let k = match &args.first()?.kind {
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                value.parse::<usize>().ok()?
+            }
+            _ => return None,
+        };
+        if args.len() == 2 {
+            return self.sva_lv.get(k).map(|v| v.width);
+        }
+        self.signal_widths.get(k).copied()
     }
 
     /// §16.10: a local variable read (a two-argument `SVA_SIG_MARKER`: the
@@ -106241,7 +106547,10 @@ impl Simulator {
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
-                if let Some(w) = self.lookup_signal_width(&n) {
+                if let Some(w) = self
+                    .lookup_signal_width(&n)
+                    .or_else(|| self.packed_field_width(&n))
+                {
                     return Some(w);
                 }
                 // A CLASS-FIELD operand (e.g. a `time` / `longint` member of
@@ -106308,8 +106617,159 @@ impl Simulator {
                 self.lrm_self_width(then_expr)?
                     .max(self.lrm_self_width(else_expr)?),
             ),
+            // A signal read in a concurrent assertion (`sva_resolve_signals`):
+            // the signal's width, kept on the node, or a local variable's
+            // (§16.10).
+            ExprKind::SystemCall { name, args } if name == SVA_SIG_MARKER => {
+                if let Some(w) = expr.cached_width.get() {
+                    return Some(w);
+                }
+                let w = self.sva_sig_width(args)?;
+                if args.len() == 1 {
+                    expr.cached_width.set(Some(w));
+                }
+                Some(w)
+            }
+            // A select or a member of an aggregate: from the declaration when
+            // that says. Else, in a concurrent assertion, the width of its
+            // value: evaluating it for that runs once a tick, and is safe
+            // when nothing in it has an effect (a call would run again).
+            ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::MemberAccess { .. } => {
+                if let Some(w) = self.select_width(expr) {
+                    return Some(w);
+                }
+                (self.active_sva_site.is_some() && Self::cond_expr_is_effect_free(expr, false))
+                    .then(|| self.eval_expr(expr).width)
+            }
+            // §6.24.1: a size cast `N'(x)` is N bits wide.
+            ExprKind::SystemCall { name, args }
+                if name == "$__xz_size_cast" || name == "$__xz_named_cast" =>
+            {
+                self.size_cast_width(name, args)
+            }
+            // §11.4.12: the operands of a concatenation side by side, `count`
+            // times over for a replication.
+            ExprKind::Concatenation(parts) => parts
+                .iter()
+                .try_fold(0, |w, p| Some(w + self.lrm_self_width(p)?)),
+            ExprKind::Replication { count, exprs }
+                if Self::cond_expr_is_effect_free(count, false) =>
+            {
+                let n = u32::try_from(self.eval_expr(count).to_u64()?).ok()?;
+                let w = exprs
+                    .iter()
+                    .try_fold(0u32, |w, p| Some(w + self.lrm_self_width(p)?))?;
+                n.checked_mul(w)
+            }
             _ => None,
         }
+    }
+
+    /// The width of a select of a signal or a one-dimensional array, from the
+    /// declaration alone: a bit of a vector, an element of an array, `|l - r|
+    /// + 1` bits for a part-select `[l:r]` and `w` for `[i +: w]`. None for
+    /// any other base (a packed array of vectors, a local variable) and for
+    /// bounds that are not unsized decimal literals. A select of a vector is
+    /// as wide as its value always is, so the answer is kept on the node, as
+    /// `infer_width` keeps its own.
+    fn select_width(&mut self, expr: &Expression) -> Option<u32> {
+        if let Some(w) = expr.cached_width.get() {
+            return Some(w);
+        }
+        // An unsized decimal literal is its digits. A sized one can be
+        // truncated (`3'd15` is 7), so it is left to the caller.
+        let lit = |e: &Expression| match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                base: NumberBase::Decimal,
+                value,
+                ..
+            }) => value.replace('_', "").parse::<i64>().ok(),
+            _ => None,
+        };
+        let (base, bits) = match &expr.kind {
+            ExprKind::Index { expr: base, .. } => (base, None),
+            ExprKind::RangeSelect {
+                expr: base,
+                kind,
+                left,
+                right,
+            } => {
+                let w = match kind {
+                    RangeKind::Constant => lit(left)?.abs_diff(lit(right)?) + 1,
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => lit(right)?.unsigned_abs(),
+                };
+                (base, Some(u32::try_from(w).ok()?))
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        if let [seg] = h.path.as_slice()
+            && self
+                .local_stack
+                .last()
+                .is_some_and(|m| m.contains_key(&seg.name.name))
+        {
+            return None;
+        }
+        let n = self.resolve_hier_name(h);
+        let n = n.as_ref();
+        if let Some(t) = self.module.arrays.get(n) {
+            return bits.is_none().then_some(t.2);
+        }
+        let id = *self.signal_name_to_id.get(n)?;
+        let vector = !self.signal_real[id]
+            && !self.module.packed_signal_elem_widths.contains_key(n)
+            && !self.module.packed_full_dims.contains_key(n)
+            && !self.module.arrays_2d.contains_key(n)
+            && !self.module.arrays_nd.contains_key(n)
+            && !self.module.dynamic_arrays.contains(n)
+            && !self.module.associative_arrays.contains_key(n)
+            && !self.string_signals.contains(n);
+        if !vector {
+            return None;
+        }
+        let w = bits.unwrap_or(1);
+        expr.cached_width.set(Some(w));
+        Some(w)
+    }
+
+    /// The width of a size cast `N'(x)` (§6.24.1): N, a literal or a name
+    /// that is a constant (a parameter), as the cast's evaluation reads it.
+    /// None for a cast to a type.
+    fn size_cast_width(&mut self, name: &str, args: &[Expression]) -> Option<u32> {
+        let n = args.first()?;
+        if name == "$__xz_named_cast" {
+            let key = self.named_cast_key(n)?;
+            let constant = !self.module.typedef_types.contains_key(&key)
+                && !self.module.typedefs.contains_key(&key)
+                && (self.module.parameters.contains_key(&key)
+                    || self.get_signal_value_by_name(&key).is_some()
+                    || self.class_value_param_in_scope(&key));
+            if !constant {
+                return None;
+            }
+        }
+        let v = self.eval_expr(n);
+        if v.has_xz() {
+            return None;
+        }
+        u32::try_from(v.to_u64()?).ok().filter(|&w| w > 0)
+    }
+
+    /// The width of a packed struct or union member (`s.f`), which has no
+    /// signal of its own: from its parent's field layout.
+    fn packed_field_width(&self, name: &str) -> Option<u32> {
+        let (parent, field) = name.rsplit_once('.')?;
+        let fields = self.module.packed_struct_fields.get(parent)?;
+        fields.iter().find(|(m, _, _)| m == field).map(|f| f.2)
     }
 
     /// §11.4.13: `expr inside {items}` compares like `==`, so every operand
@@ -106535,13 +106995,8 @@ impl Simulator {
                 // signal; its width comes from the parent's field layout. Needed
                 // so a concatenation LHS (`{word3.high, word3.low} = ...`) splits
                 // the rvalue at the right bit boundaries.
-                if let Some(dot) = n.rfind('.') {
-                    let (parent, field) = (&n[..dot], &n[dot + 1..]);
-                    if let Some(fields) = self.module.packed_struct_fields.get(parent) {
-                        if let Some((_, _, w)) = fields.iter().find(|(m, _, _)| m == field) {
-                            return (*w, stable);
-                        }
-                    }
+                if let Some(w) = self.packed_field_width(&n) {
+                    return (w, stable);
                 }
                 (1, false)
             }

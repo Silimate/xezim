@@ -1222,6 +1222,8 @@ fn pure(e: &Expression) -> bool {
         ExprKind::RangeSelect {
             expr, left, right, ..
         } => pure(expr) && pure(left) && pure(right),
+        // System functions that only compute a value from their arguments
+        // (§20.6–§20.9), such as the `$clog2` in a part-select's width.
         ExprKind::SystemCall { name, args } => {
             matches!(
                 name.as_str(),
@@ -1233,6 +1235,16 @@ fn pure(e: &Expression) -> bool {
                     | "$__xz_type_cast"
                     | "$__xz_named_cast"
                     | "$bits"
+                    | "$clog2"
+                    | "$size"
+                    | "$left"
+                    | "$right"
+                    | "$low"
+                    | "$high"
+                    | "$increment"
+                    | "$dimensions"
+                    | "$unpacked_dimensions"
+                    | "$countbits"
                     | "$countones"
                     | "$onehot"
                     | "$onehot0"

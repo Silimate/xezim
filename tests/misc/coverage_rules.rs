@@ -166,6 +166,8 @@ fn toggle_enums_and_generate_blocks_left_out() {
 
 const ITEMS: &str = "\
 module m(input logic clk, input logic a, b, c, input logic [1:0] v, output logic y, z);
+  logic [7:0] w = 8'h0F;
+  int k = 0;
   assign y = a && b;
   always @(posedge clk) begin
     if (a && b) z <= 1;
@@ -176,6 +178,7 @@ module m(input logic clk, input logic a, b, c, input logic [1:0] v, output logic
     if (!(a && b)) z <= 0;
     if (b && a) z <= 1;
     if (b && ok(a)) z <= 0;
+    if (b && w[k*$clog2(4) +: 2] == 2'd3) z <= 1;
   end
   function automatic logic ok(input logic x);
     return x;
@@ -214,6 +217,7 @@ fn logical_conditions_scored_by_term_values() {
             "!(a && b)",
             "b && a",
             "b && ok(a)",
+            "b && w[k*$clog2(4) +: 2] == 2'd3",
             "a && b"
         ]
     );
@@ -235,13 +239,27 @@ fn logical_conditions_scored_by_term_values() {
             "!a && v",
             "!(a && b)",
             "b && a",
-            "b && ok(a)"
+            "b && ok(a)",
+            "b && w[k*$clog2(4) +: 2] == 2'd3"
         ]
     );
     assert_eq!(
         strings(u, "term"),
         [
-            "a", "b", "a & b", "c", "!a", "v", "a", "b", "b", "a", "b", "ok(a)"
+            "a",
+            "b",
+            "a & b",
+            "c",
+            "!a",
+            "v",
+            "a",
+            "b",
+            "b",
+            "a",
+            "b",
+            "ok(a)",
+            "b",
+            "w[k*$clog2(4) +: 2] == 2'd3"
         ]
     );
     // The item's text and its terms.
@@ -254,7 +272,13 @@ fn logical_conditions_scored_by_term_values() {
         "{u}"
     );
     // A short circuit doesn't hide a side-effect-free term (`a`, read while
-    // `b` is 0), but a function call is not read again.
+    // `b` is 0, and a comparison of a part-select whose index holds a
+    // `$clog2`), but a function call is not read again.
+    assert!(
+        item("b && w[k*$clog2(4) +: 2] == 2'd3")
+            .contains("{\"term\": \"w[k*$clog2(4) +: 2] == 2'd3\", \"hits\": [0, 4]}"),
+        "{u}"
+    );
     assert!(
         item("b && a").contains("{\"term\": \"a\", \"hits\": [2, 2]}"),
         "{u}"
@@ -264,7 +288,7 @@ fn logical_conditions_scored_by_term_values() {
         "{u}"
     );
     assert!(
-        u.contains("\"condition\": {\"covered\": 6, \"total\": 12, \"percent\": 50.00}"),
+        u.contains("\"condition\": {\"covered\": 6, \"total\": 14, \"percent\": 42.86}"),
         "{u}"
     );
     assert!(

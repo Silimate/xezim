@@ -5819,26 +5819,44 @@ impl Simulator {
         for n in m.strength_drivers.keys() {
             bad.extend(id(n));
         }
-        // Tied bits, from the constants up: a loop of connections with no
-        // constant in it ties nothing.
-        let mut tied: HashSet<(u32, u32)> = HashSet::default();
-        loop {
-            let more: Vec<(u32, u32)> = drivers
-                .iter()
-                .filter(|(k, _)| !tied.contains(*k) && !bad.contains(&k.0))
-                .filter(|(_, v)| {
-                    v.iter().all(|t| match t {
-                        Tie::Zero | Tie::One => true,
-                        Tie::Bit(i, b) => tied.contains(&(*i, *b)),
-                        Tie::Other => false,
-                    })
-                })
-                .map(|(k, _)| *k)
-                .collect();
-            if more.is_empty() {
-                break;
+        // Tied bits, from the constants up: each bit waits for the bits it
+        // is wired from, so a loop of connections with no constant in it
+        // ties nothing.
+        let mut wait: HashMap<(u32, u32), usize> = HashMap::default();
+        let mut next: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::default();
+        let mut todo: Vec<(u32, u32)> = Vec::new();
+        for (k, v) in &drivers {
+            if bad.contains(&k.0) || v.contains(&Tie::Other) {
+                continue;
             }
-            tied.extend(more);
+            let from: Vec<(u32, u32)> = v
+                .iter()
+                .filter_map(|t| match t {
+                    Tie::Bit(i, b) => Some((*i, *b)),
+                    _ => None,
+                })
+                .collect();
+            if from.is_empty() {
+                todo.push(*k);
+            }
+            wait.insert(*k, from.len());
+            for f in from {
+                next.entry(f).or_default().push(*k);
+            }
+        }
+        let mut tied: HashSet<(u32, u32)> = HashSet::default();
+        while let Some(k) = todo.pop() {
+            if !tied.insert(k) {
+                continue;
+            }
+            for d in next.get(&k).into_iter().flatten() {
+                if let Some(n) = wait.get_mut(d) {
+                    *n -= 1;
+                    if *n == 0 {
+                        todo.push(*d);
+                    }
+                }
+            }
         }
         let mut out: HashMap<usize, Vec<bool>> = HashMap::default();
         for (i, b) in tied {

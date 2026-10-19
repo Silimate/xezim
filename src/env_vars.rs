@@ -816,6 +816,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Coverage: =0 leaves input and inout ports out of toggle coverage, like --no-toggle-input-ports (default: each instance counts its own); the flag wins",
     ),
     (
+        "XEZIM_TOGGLE_INTEGERS",
+        "Coverage: =0 leaves int, integer, shortint, longint and byte variables out of toggle coverage, like --no-toggle-integers; the flag wins",
+    ),
+    (
         "XEZIM_TOPO_JOIN",
         "Default on; =0 disables: order a comb net with a large writers x readers product through one join node instead of W x R edges",
     ),

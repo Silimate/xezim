@@ -99,10 +99,21 @@ fn relax_flag_and_env_downgrade_to_warning() {
         "--relax-implicit-static must let the run proceed:\n{}",
         text
     );
-    assert!(text.contains("T|3"), "simulation still runs:\n{}", text);
+    assert!(
+        text.contains("T|0"),
+        "static initialization precedes the call:\n{}",
+        text
+    );
     assert!(
         text.contains("[xezim][warning]") && text.contains("implicitly static"),
         "downgraded to a warning that still names the variable:\n{}",
+        text
+    );
+
+    assert!(
+        text.contains("in function 'clamp_lo' of package 'math_pkg'")
+            && text.contains("math_pkg.sv:3"),
+        "the warning must locate the declaration:\n{}",
         text
     );
 
@@ -113,8 +124,14 @@ fn relax_flag_and_env_downgrade_to_warning() {
         text
     );
     assert!(
-        text.contains("T|3"),
-        "simulation still runs under the env knob:\n{}",
+        text.contains("T|0"),
+        "static initialization precedes the call under the env knob:\n{}",
+        text
+    );
+    assert!(
+        text.contains("in function 'clamp_lo' of package 'math_pkg'")
+            && text.contains("math_pkg.sv:3"),
+        "the warning must locate the declaration:\n{}",
         text
     );
     let _ = std::fs::remove_dir_all(&dir);

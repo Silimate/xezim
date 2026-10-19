@@ -297,7 +297,9 @@ module top;
     $display("T|K18 %0d", {u - 2} > 1.0);
     $display("T|K22 %0d", (u * 3) > 1.0);
     $display("T|K23 %0d", (u - 2) * 2 > 1.0);
-    $display("T|K24 %0d", -u > 1.0);
+    // Keep this operand explicitly constant; module-variable optimization
+    // differs from a run-time formal (covered by unsigned_negation_359).
+    $display("T|K24 %0d", -UP > 1.0);
   end
 endmodule
 "#,

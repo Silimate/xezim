@@ -22,7 +22,8 @@ fn failing_property_fires_else_action() {
     let o = out(r#"
 module t; logic clk=0, a=1, b=0; always #5 clk=~clk;
   ap: assert property (@(posedge clk) a |-> b) else $display("ELSE at %0t", $time);
-  initial begin repeat(3) @(posedge clk); $finish; end
+  // Let the third edge reach Observed before terminating in Active (§4.4).
+  initial begin repeat(3) @(posedge clk); #1; $finish; end
 endmodule
 "#);
     assert!(
@@ -75,7 +76,8 @@ fn cover_property_fires_on_match() {
     let o = out(r#"
 module t; logic clk=0, a=1; always #5 clk=~clk;
   c: cover property (@(posedge clk) a) $display("COV at %0t", $time);
-  initial begin repeat(3) @(posedge clk); $finish; end
+  // Let the third edge reach Observed before terminating in Active (§4.4).
+  initial begin repeat(3) @(posedge clk); #1; $finish; end
 endmodule
 "#);
     assert!(

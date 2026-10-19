@@ -6,23 +6,24 @@
 //! bit-, part- and indexed part-selects (§11.5.1) write part of that
 //! variable and leave the other bits as they were.
 //!
-//! Such a variable has a live shared cell, which every read uses, and a copy
-//! in the call frame. A whole-variable write updated both, but a select or
-//! member write changed only the frame copy, so it was lost: a static
-//! function building a carry chain with `tb[i] = ...` on a local that starts
-//! all X returned its input unchanged, and `a[15:8] = 8'hA5` left `a` all X.
-//! A local that every call writes whole before reading it is kept per call,
-//! which nothing can observe, so `a = 0; a[7:0] = v;` worked. A nonblocking
-//! select write (§10.4.2) was dropped too, as it committed with no call
-//! frame.
+//! Unless it is allocated with the module, such a variable has a live
+//! shared cell, which every read uses, and a copy in the call frame. A
+//! whole-variable write updated both, but a select or member write changed
+//! only the frame copy, so it was lost: a static function building a carry
+//! chain with `tb[i] = ...` on a local that starts all X returned its input
+//! unchanged, and `a[15:8] = 8'hA5` left `a` all X. A nonblocking write to
+//! a whole member of a static packed struct (`s.lo <= v`, §10.4.2) was
+//! dropped as well.
 //!
-//! Two neighbours of the fix are pinned as well: a block variable that hides
-//! a static of the same name keeps its reads and writes to itself, and an
-//! index that writes the same static is evaluated before the select is
-//! applied (§11.4.1).
+//! Neighbours of the fix are pinned as well: a block variable that hides a
+//! static of the same name keeps its reads and writes to itself, and so does
+//! a queue named like another method's static; an index that writes the
+//! same static is evaluated before the select is applied; and every index
+//! runs once, in order, even after an x index that discards the write
+//! (§11.4.1, §11.5.1).
 //!
 //! The design checks itself. Every expected value follows the LRM and
-//! matches the commercial simulator. It runs with the default method tiering,
+//! matches the reference simulator. It runs with the default method tiering,
 //! with every method and function compiled on its first call, and with none
 //! compiled, so the interpreted and compiled bodies and the switch from one
 //! to the other are all covered.
@@ -201,6 +202,19 @@ const SRC: &str = r##"module top;
     end
     r_loop_outer = b;
   endtask
+  // The same for a static with no initializer.
+  logic [7:0] r_bare_inner, r_bare_outer;
+  task automatic hide_bare;
+    static reg [7:0] a;
+    a = 8'hF0;
+    begin
+      automatic reg [7:0] a;
+      a = 8'h00;
+      a[0] = 1'b1;
+      r_bare_inner = a;
+    end
+    r_bare_outer = a;
+  endtask
 
   // An index whose evaluation writes the same static is evaluated before
   // the select is applied (§11.4.1).
@@ -211,6 +225,18 @@ const SRC: &str = r##"module top;
       return 0;
     end
     a[rec(1)] = 1'b1;
+    return a;
+  endfunction
+  // The same through `$sscanf`, which takes its output target as written,
+  // on a static with no initializer.
+  function automatic logic [7:0] rec_scan(input int n);
+    static reg [7:0] a;
+    if (n == 1) begin
+      a = 8'hF0;
+      return 0;
+    end
+    a = 8'h00;
+    void'($sscanf("1", "%b", a[rec_scan(1)]));
     return a;
   endfunction
 
@@ -292,7 +318,7 @@ const SRC: &str = r##"module top;
   endtask
 
   // A nonblocking member select of a static packed struct, read in the
-  // same time slot, after it, and after a delayed member write.
+  // same time slot, after it, and after a delayed write to a whole member.
   logic [7:0] r_m_now, r_m_next, r_m_late;
   task automatic member_nba;
     static pair_t s;
@@ -339,11 +365,36 @@ const SRC: &str = r##"module top;
       c[7:4] = c[7:4] + 1;
       return c;
     endfunction
+    task shadow(output logic [7:0] i, output logic [7:0] o);
+      static logic [7:0] a = 8'hF0;
+      begin
+        automatic logic [7:0] a = 8'h00;
+        a[0] = 1'b1;
+        i = a;
+      end
+      o = a;
+    endtask
+    // A queue named like the static `q` of `m` keeps its own writes, with
+    // `$` naming its last element (§7.10.1).
+    function int last();
+      int q[$];
+      q = '{1, 2, 3};
+      void'($sscanf("7", "%d", q[$]));
+      return q[2];
+    endfunction
+    // An x index discards the write, but the index after it still runs.
+    function logic [15:0] pair();
+      static logic [1:0][7:0] p;
+      p = 16'h1234;
+      void'($sscanf("1", "%b", p[pick(1)][pick(0)]));
+      return p;
+    endfunction
   endclass
 
   initial begin
     C o;
     logic [7:0] c1, c2, c3;
+    logic [15:0] w;
     check("static function bit-selects", {incr(5), incr(7), incr(15)}, {20'd0, 4'd6, 4'd8, 4'd0});
     sel_forms;
     check("constant part-select", r_const, 16'hA5xx);
@@ -377,7 +428,10 @@ const SRC: &str = r##"module top;
     check("block variable hiding a static", {r_inner, r_outer}, 16'h01F0);
     hide_loop;
     check("loop block variable hiding a static", {r_loop_inner, r_loop_outer}, 16'h02F0);
+    hide_bare;
+    check("block variable hiding an uninitialized static", {r_bare_inner, r_bare_outer}, 16'h01F0);
     check("index that writes the same static", rec(0), 8'hF1);
+    check("index that writes the same static, through $sscanf", rec_scan(0), 8'hF1);
     pick_task;
     check("index with a side effect runs once", {r_pick, idx_calls[7:0]}, 16'h0802);
     pick_scan;
@@ -394,6 +448,12 @@ const SRC: &str = r##"module top;
     o = new;
     check("class method static local", o.m(4'h5), 8'h45);
     check("static class method static local", C::sm(4'h5), 8'h35);
+    o.shadow(c1, c2);
+    check("method block variable hiding a static", {c1, c2}, 16'h01F0);
+    check("queue named like a static", o.last(), 7);
+    idx_calls = 0;
+    w = o.pair();
+    check("x index before another index call", {w, idx_calls[7:0]}, 24'h1234_02);
     // Enough calls for a compiled body to take over part way.
     c1 = count(1);
     repeat (4999) c2 = count(0);

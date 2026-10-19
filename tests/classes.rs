@@ -759,3 +759,15 @@ mod string_frame_teardown;
 
 #[path = "classes/property_seed_order.rs"]
 mod property_seed_order;
+
+#[path = "classes/static_select_346.rs"]
+mod static_select_346;
+
+#[path = "classes/method_types_378.rs"]
+mod next_rest_method_types_378;
+
+#[path = "classes/randomize_hook_signatures.rs"]
+mod randomize_hook_signatures;
+
+#[path = "classes/static_class_members_382.rs"]
+mod static_class_members_382;

@@ -127,6 +127,8 @@ mod vpi_object_model_walk;
 mod vpi_routines;
 #[path = "strings/vpi_seed_option.rs"]
 mod vpi_seed_option;
+#[path = "strings/vpi_sva_sampling.rs"]
+mod vpi_sva_sampling;
 #[path = "strings/vpi_typed_port_kinds.rs"]
 mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]
@@ -139,3 +141,9 @@ mod compiled_method_test_env;
 mod string_char_select_signed;
 #[path = "strings/string_raw_bytes.rs"]
 mod string_raw_bytes;
+
+#[path = "strings/vpi_clocking_357.rs"]
+mod vpi_clocking_357;
+
+#[path = "strings/literal_order_360.rs"]
+mod next_twelve_literal_order_360;

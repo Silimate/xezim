@@ -157,6 +157,8 @@ mod lrm_struct_union_dims;
 mod module_type_param_behavioral;
 #[path = "types/multi_dim_elem_read_and_param_dims.rs"]
 mod multi_dim_elem_read_and_param_dims;
+#[path = "types/nba_context_width.rs"]
+mod nba_context_width;
 #[path = "types/nested_packed_member_lvalue.rs"]
 mod nested_packed_member_lvalue;
 #[path = "types/nested_packed_struct_array_access.rs"]
@@ -187,6 +189,8 @@ mod packed_assignment_patterns;
 mod packed_elem_shift_context_width;
 #[path = "types/packed_element_range_select.rs"]
 mod packed_element_range_select;
+#[path = "types/packed_local_nested_select.rs"]
+mod packed_local_nested_select;
 #[path = "types/packed_multidim_unpacked_select.rs"]
 mod packed_multidim_unpacked_select;
 #[path = "types/packed_struct_array_elem_write.rs"]
@@ -474,3 +478,30 @@ mod package_value_name_collision;
 mod class_type_name_collision;
 #[path = "types/wide_equality.rs"]
 mod wide_equality;
+
+#[path = "types/declaration_scope_p1.rs"]
+mod declaration_scope_p1;
+
+#[path = "types/compiled_typedef_362.rs"]
+mod compiled_typedef_362;
+
+#[path = "types/nested_packed_p2.rs"]
+mod nested_packed_p2;
+
+#[path = "types/static_lifetime_p2.rs"]
+mod static_lifetime_p2;
+
+#[path = "types/unsigned_negation_359.rs"]
+mod next_twelve_unsigned_negation_359;
+
+#[path = "types/two_state_casts_361.rs"]
+mod next_twelve_two_state_casts_361;
+
+#[path = "types/input_formals_376.rs"]
+mod next_rest_input_formals_376;
+
+#[path = "types/typedef_casts_377.rs"]
+mod next_rest_typedef_casts_377;
+
+#[path = "types/unsigned_shift_context_384.rs"]
+mod unsigned_shift_context_384;

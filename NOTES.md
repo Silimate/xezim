@@ -10,6 +10,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* The results file lists every assertion statement per instance in
+  `assertion_instances`: the instance path, the label (or the reference
+  simulator's name for an unlabeled statement), kind, file and line, and the
+  attempts, nonvacuous passes, vacuous passes, failures, disabled attempts and
+  cover matches (§16.14.3). The summed `assertions` list is unchanged.
+* Vacuity follows §16.14.8 through nested properties: `a |-> (c |-> b)`
+  succeeds vacuously while `c` is false, so it runs no pass action and a
+  `cover` of it does not match, and `p or q` with a sequence operand is never
+  vacuous.
+* An assertion in a task or function declared in another module or in a
+  package reports that module's or package's file and line in the results
+  file; it had the calling process's file and a wrong line.
 * Concurrent assertions size their expressions as the rest of the language
   does. A context-determined operand (of `+ - * / % **`, of a bitwise or
   conditional operator, or a shift's left operand) is extended to the width
@@ -42,31 +54,52 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
-* A variable declared in a `for` header keeps its declared signedness when
-  the loop body blocks. With a delay or event control in the body,
-  `for (int i = 2; i >= 0; i--)` never ended and `i > -1` stopped after one
-  pass. An unsigned header variable no longer takes its initializer's
-  signedness (§6.11.1, §11.8.1, §12.7.1). (#341, reported by urbanij)
-* After `$finish` or a VPI `vpi_control(vpiFinish)`, which is how cocotb ends
-  a test, no always block runs again in the finishing time slot. Compiled
-  block code used to keep running, updating counters and NBAs while skipping
-  the block's `$display`. A finish raised before the edge's waiting processes
-  resumed, by an always block, an earlier process or a VPI routine, was also
-  deferred to the end of the slot like one of theirs, so later passes ran
-  more blocks. `final` blocks and coverage then counted a clock edge the log
-  never showed. Only a finish from a resumed waiting process is still
-  deferred to the end of the slot. A finish from a cbAfterDelay callback,
-  or from a value-change callback on a clock that callback drives, also stops
-  that slot's NBAs, assertions and monitors (§20.2, §38.14). (#8)
+* Concurrent assertions read a flop's value from before the clock edge that
+  updates it when the clock is written from a VPI callback: an edge cocotb's
+  `Clock` writes from cbReadWriteSynch ticks the assertions in its own slot,
+  where they ticked in the next slot. Values are sampled once per time slot,
+  before its cbAtStartOfSimTime and cbAfterDelay routines, so a clock edge in
+  a later delta of the slot, or a value written in the edge's own
+  cbAfterDelay, no longer counts as sampled (§16.5.1, §4.4.2.1). A
+  cbReadWriteSynch due at an assertion's clock edge now runs, after the
+  slot's remaining Active, NBA and cbNBASynch work, before the assertions and
+  before that delta's clocking-event waiters (Post-NBA before Observed,
+  §4.4.2), whether a VPI routine or the design drives the clock,
+  so a reset a cocotb test releases after `RisingEdge` no longer disables
+  that edge's attempt, and one a clocking-event waiter raises at the edge
+  still does not (§16.12). A clock event is recorded when it happens, so a
+  routine that moves the clock back in the same slot does not lose it.
+  (Silimate/xezim#11, Silimate/xezim#56)
+* In concurrent assertions, `$past` with fewer past clock ticks than asked
+  for returns its operand's default sampled value instead of x, and `$rose`,
+  `$fell`, `$stable` and `$changed` compare the first tick's sample with it.
+  The default sampled value is the value before time 0: a variable's
+  declaration initializer, else its type's default, and a net's type default.
+  Procedural calls now take the same value; they used to take it after the
+  time-0 settle, so a net or a continuously assigned variable read its
+  driver's value. An operand that a property reads only through these
+  functions is now sampled in the Preponed region like the others; it was
+  read after the tick's NBAs, so `$rose(q)` of a flop fired one tick early
+  and `$past(q)` returned the current tick's value (§16.5.1, §16.9.3).
 * Bit-, part- and indexed part-select writes to a variable of a static task
   or function, or to a `static` local of any subroutine or class method,
   update the one variable all calls share. They were lost, so a static
   function that built a value bit by bit returned its input and
   `a[15:8] = v` left `a` all X. Member writes, increments and output
-  arguments are fixed too (§6.21, §11.5.1). Nonblocking writes to a local
-  of a static task or function, whole or select, commit in the NBA region;
-  select writes were dropped and whole writes to a local the task wrote
-  first took effect at once (§10.4.2). (#4)
+  arguments are fixed too (§6.21, §11.5.1). A nonblocking write to a whole
+  member of a static packed struct (`s.f <= v`) is no longer dropped
+  (§10.4.2), and a block variable that hides a static of the same name no
+  longer reads or writes the static. (#4)
+* A value a VPI client writes at time 0 is the toggle-coverage baseline.
+  Values written from the end-of-slot callbacks (`cbReadWriteSynch`,
+  `cbAtEndOfSimTime`) reach toggle coverage and the waveform dumps in their
+  own time slot, not the next one, and a value written from
+  `cbStartOfSimulation` is evaluated in the time-0 slot even when nothing
+  else runs there. cocotb writes its first values from both, so in a design
+  with nothing of its own at time 0 every signal those values reached lost
+  its first toggle. A toggle is counted once per time slot from the slot's
+  net change, so a value changed and changed back in later deltas of the
+  same slot no longer counts (§38.36.2, §38.36.3). (Silimate/xezim#35)
 * Concurrent assertions sample the elements of unpacked arrays in the
   Preponed region like other variables. They read the value an element took
   in the NBA region of the edge being evaluated, so `a[0] == $past(s)` with
@@ -148,18 +181,148 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Named blocking `case` branches retain their `%m` scope and `disable`
   targets across suspension (§9.3, §9.6.2).
 
-**Usability**
+* Variables declared in a `for` header retain their signed type across
+  suspension and restore the enclosing variable when the loop exits (§12.7.1).
+  (#341, reported by urbanij)
+* Bit and part writes through locals, formals and instance properties use
+  their own storage even when a module variable has the same name (§23.9).
+  (#344, reported by akashlevy)
+* Static `always` block locals retain their values when another task has
+  suspended, and concurrent or nested declarations retain independent
+  storage, widths, signing and string kinds (§6.21, §13.3).
+  (#345, #348 and #350, reported by akashlevy)
+* Compiled typedef locals, formals and results retain their declared width,
+  signing and two-state defaults, including scoped aliases and alias chains (§6.18).
+  (#362, reported by akashlevy)
+* `always` waits on clocking events resume after sampling and NBA updates.
+  Callback-driven clocks deliver those events in the same slot and preserve
+  the slot-entry samples of `#1step` inputs (§14.4, §14.13, §38.36).
+  (#356 and #357, reported by akashlevy)
 
-* FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
-  `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
-  machines (one- and two-process, enum, parameter and `` `define `` encodings,
-  `case` or `if` next-state logic, a continuous-assignment next state) and
-  count each state's visits and each transition, reset and `default`
-  transitions included. `xezim_cov.json` gets `fsm` totals (states and
-  transitions, together and apart) and the details of each FSM per scope.
-  Recognition, state sets, transitions, lines and counts follow the reference
-  simulator; on the CVDP agentic designs both find the same 16 FSMs with the
-  same bins. It costs nothing when off. See docs/coverage-guide.md, "FSMs".
+* Streaming concatenations read every element of class-member queues and
+  arrays, including slices and reversed byte streams (§11.4.14).
+  (#340, reported by urbanij)
+* Arrays of module instances split ANSI-port and expression connections,
+  preserve declared direction in every dimension, and drive output
+  concatenations through their writable parts. Unpacked connections match
+  the instances left to left (§23.3.3.5).
+  (#342 and #343, reported by akashlevy)
+* Nested packed selections retain declared dimension ranges and struct
+  member offsets in locals, formals, results and unpacked-array elements.
+  Selected writes to static class properties update their shared storage
+  (§7.4.1, §8.9, §11.5.1).
+  (#346 and #352–#354, reported by akashlevy)
+* Explicit static subroutine initializers run once before initial processes.
+  Static subroutine arrays, queues and associative arrays retain one store
+  across calls and recursion (§6.21, §13.3, §13.4).
+  (#349 and #355, reported by akashlevy)
+
+* Unpacked port connections match elements in declaration order, including
+  descending and negative ranges, slices and multidimensional arrays (§7.6).
+  (#358, reported by akashlevy)
+* Unary minus preserves operand signing and width, packed string literals use
+  integral ordering in numeric comparisons, and casts through typedef chains
+  retain signing and convert X/Z to zero for two-state targets (§5.9, §6.18,
+  §6.24.1, §11.8.1). (#359–#361 and #377, reported by akashlevy)
+* Sampled-value functions retain explicit clocks, independent history depths,
+  gated samples and slot-entry values of aggregate fields. Assertion action
+  blocks evaluate their gates after NBA updates (§16.9.3).
+  (#363, #364, #366 and #370, reported by akashlevy)
+* Fixed-array declaration patterns initialize every element, and whole-array
+  nonblocking assignments snapshot their right-hand sides before scheduling
+  updates, including negative ranges and multiple dimensions (§10.4.2, §10.9.1).
+  (#365 and #381, reported by akashlevy)
+* Long assertion delays and repetitions retain their complete bounds.
+  Followed-by properties parse with right association and evaluate alternative
+  sequence matches without treating an unmatched antecedent as vacuous success
+  (§16.9.2, §16.12.9). (#367 and #375, reported by akashlevy)
+* `$finish` stops procedural, compiled and callback-driven execution immediately.
+  Final procedures run before end-of-simulation callbacks (§9.2.3, §20.2).
+  (#371–#373, reported by akashlevy)
+* Generated assertions substitute their genvar values, and unnamed generate
+  loops expose canonical scope names in VPI, waveforms and coverage (§27.4, §27.6).
+  (#374 and #380, reported by akashlevy)
+* Compiled class methods retain each specialization's local types, widths,
+  signing and value sets, including inherited bindings. Qualified built-in
+  types remain distinct from typedef names (§8.25).
+  (#378, reported by akashlevy)
+* Added regressions for signed inlined input formals and timed loop scope
+  cleanup (§12.7.1, §13.5.1). (#376 and #379, reported by akashlevy)
+
+* Instance arrays resolve parameter-named sizes before expansion, including
+  imported, scoped and overridden parameters and multiple dimensions. Interface
+  elements retain their clock and reset connections (§7.4.2, §23.3.3.5).
+  (#342 and #343, reported by akashlevy)
+
+* Nonblocking selections of static subroutine locals preserve NBA-region
+  ordering, capture indices when scheduled, and retain their declaration-owned
+  storage after return or suspension. Partial and delayed writes preserve
+  unrelated bits and source order (§6.21, §10.4.2, §23.9).
+  (#368, contributed by akashlevy)
+* Nested packed local selections retain enum base ranges, ascending labels,
+  partial out-of-range behavior and live static storage. Two-state struct
+  members convert X/Z independently of four-state neighbors
+  (§6.19, §6.21, §7.4.1, §11.5.1).
+  (#369, contributed by akashlevy)
+
+* Initializers accepted with `--relax-implicit-static` run once before initial
+  processes and retain their values across calls and activations. Design caches
+  distinguish this lifetime mode from the default policy (§6.21).
+  (#351, reported by akashlevy)
+* Static class calls retain lexical scope and specialization through module
+  type parameters, typedef chains, nested classes and instance handles.
+  Suspended static tasks retain their bindings, and class event OR waits wake
+  once on the selected event (§8.23, §8.25, §9.4.2, §13.4.1, §15.5).
+  Recompile saved designs to refresh scoped class metadata.
+  (#382, reported by Ganesh-TNL)
+* Randomization callbacks reject tasks, non-void returns and argument lists
+  before execution, preserving legal inherited and overridden callbacks
+  (§18.11). (#383, reported by rpjayaraman)
+* Unsigned expression context reaches a shift's left operand before extension
+  and evaluation in compiled and interpreted execution. Self-determined
+  boundaries and function side effects are preserved (§11.8.2, §11.4.10).
+  (#384, reported by akashlevy)
+
+* Concurrent assertions and covers observe clock edges at time zero and
+  four-state clock transitions, using Preponed samples (§16.5, §9.4.2).
+  (#385, reported by akashlevy)
+* Assertion action blocks preserve generated scope and keep their local
+  declarations separate from module variables (§16.14.1, §23.9, §27.4).
+  (#386, reported by akashlevy)
+* Returning an unpacked function-name variable no longer recurses. Dynamic
+  arrays, queues and fixed arrays retain their elements across return,
+  including descending fixed ranges (§13.4.1, §7.6).
+  (#387, reported by Dragon-Git)
+
+
+* Queue elements created from struct-returning expressions retain their
+  string and other members when passed to functions or copied. Arguments
+  run once even when a struct's leaf layout is unavailable
+  (§7.10.2.2, §13.4.1, §13.5.1).
+  (#390, #392, contributed by Ganesh-TNL)
+* Variables declared in `for` headers retain their declared signedness
+  across synchronous and suspended loops, including typedefs and unsigned
+  initializers (§6.11.1, §11.8.1, §12.7.1).
+  (#394, contributed by akashlevy)
+
+* Full-word concatenations preserve value and X/Z bits without overflowing
+  a native shift in debug execution, including nested and wide-block
+  forms (§11.4.12).
+
+* Negated weak sequences fail when the clock stops with an attempt still
+  pending. Nested negation preserves sequence strength, and `disable iff`
+  cancels attempts even without another clock edge (§16.12.2–3).
+  (#393, reported by akashlevy)
+* Followed-by properties settle at the first successful consequent tick,
+  including vacuous successes, so later matches cannot add pass actions,
+  cover hits or end-of-simulation failures (§16.12.9, §16.14.8).
+  (#395, reported by akashlevy)
+
+* Tiered string casts convert bytes without padding concatenations, including
+  casts through typedefs. NUL removal and byte values agree with interpreted
+  calls, and persistent methods recompile for the new conversion
+  (§6.16, §6.18, §6.24.3, §11.4.12).
+  (#391, reported by urbanij; #396, contributed by Ganesh-TNL)
 
 * Code coverage collects condition and expression coverage, as focused
   expression coverage: each logic condition (`if`, `while`, `?:`) and 1-bit
@@ -206,17 +369,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   after enough interpreted loop iterations, including `foreach`; default
   admission continues to use call counts. (#326, contributed by Thomasb81)
 
-**Usability**
-
-* `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
-  an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
-  toggle coverage, as some simulators do by default, so a module-level loop
-  counter no longer adds 64 bins that rarely toggle. By default they are
-  still tracked, as in the reference simulator. Each toggle entry in
-  `xezim_cov.json` gains a `type`, the data type the signal was declared with
-  (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
-  See docs/coverage-guide.md.
-
 **cocotb**
 
 * The cocotb runner (`contrib/cocotb/xezim_runner.py`) applies the options
@@ -230,8 +382,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `test()` on another runner uses them too. The runner's tests are in
   `contrib/cocotb/tests`.
 
+**Command line**
+
+* `--tee <file>` copies stdout/stderr and DPI/VPI output to a transcript while
+  retaining console output. `-vcd` and `-vcd dumpon` enable source-driven VCD
+  dumping like `--wave`. (#347, reported by akashlevy)
+
 **Usability**
 
+* FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
+  `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
+  machines (one- and two-process, enum, parameter and `` `define `` encodings,
+  `case` or `if` next-state logic, a continuous-assignment next state) and
+  count each state's visits and each transition, reset and `default`
+  transitions included. `xezim_cov.json` gets `fsm` totals (states and
+  transitions, together and apart) and the details of each FSM per scope.
+  Recognition, state sets, transitions, lines and counts follow the reference
+  simulator; on the CVDP agentic designs both find the same 16 FSMs with the
+  same bins. It costs nothing when off. See docs/coverage-guide.md, "FSMs".
 * `--compat` (or `XEZIM_COMPAT=1`) runs a flow written for commercial
   simulators with one flag: no time cap, `--relax-implicit-static`,
   `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
@@ -251,6 +419,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
   (same as `+seed=`) now work on the command line too, where they were read
   as `-s vseed` and `-s eed`.
+* `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
+  an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
+  toggle coverage, as some simulators do by default, so a module-level loop
+  counter no longer adds 64 bins that rarely toggle. By default they are
+  still tracked, as in the reference simulator. Each toggle entry in
+  `xezim_cov.json` gains a `type`, the data type the signal was declared with
+  (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
+  See docs/coverage-guide.md.
 
 **Maintenance**
 

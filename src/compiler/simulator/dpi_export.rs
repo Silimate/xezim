@@ -989,6 +989,20 @@ impl Simulator {
         let has_frame = !frame.is_empty();
         if has_frame {
             self.push_local_frame(frame);
+            // §35.5.6: a C string pointer is an unbounded string variable,
+            // not an integral local sized by its current character count.
+            // Preserve that kind when export copy-out grows the value.
+            for (i, arg) in sig.args.iter().enumerate() {
+                if matches!(
+                    arg,
+                    DpiExpArg::Ptr {
+                        ty: DpiCType::Scalar(DpiCScalar::Str),
+                        ..
+                    }
+                ) {
+                    self.record_frame_string_kind(&local(i), true);
+                }
+            }
         }
         let mut ret_val: Option<Value> = None;
         // An instance's export runs in that instance, as a call through its

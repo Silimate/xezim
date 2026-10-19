@@ -458,12 +458,7 @@ Each library's `vlog_startup_routines` entries run before simulation.
   `vpi_handle_by_index`, `vpi_get`, `vpi_get_str`,
   `vpi_get_value`/`vpi_put_value`.
 - `vpi_control`: `vpiStop`/`vpiFinish` end the run once the calling routine
-  returns, as `$finish` does: no always block or waiting process that the
-  routine's writes woke runs afterwards, so `final` blocks see the values from
-  before them. When the routine is a cbAfterDelay, cbNextSimTime or
-  cbAtStartOfSimTime callback, or a value change it caused (the way cocotb
-  ends a test), that time slot's NBAs, assertions and monitors do not run
-  either; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
+  returns; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
   refused (xezim cannot rewind a run).
 - `vpi_chk_error`, `vpi_printf`, `vpi_flush`, `vpi_compare_objects`,
   `vpi_get64`.
@@ -522,7 +517,7 @@ before a callback runs appears before the routine's `vpi_printf` output.
 | `cbDisable` | after a `disable` terminates the named block, fork or task around a `$systf` call | obj = that call's `vpiSysTfCall` handle |
 | `cbStmt` | before each interpreted statement a process of the given module instance runs | obj = a module handle |
 | `cbEndOfCompile`, `cbStartOfSimulation` | before time 0, in that order | |
-| `cbEndOfSimulation` | after the last time step, before `final` blocks | |
+| `cbEndOfSimulation` | after the last time step and all `final` blocks | |
 | `cbError` | after each run-time error: `$error`, `$fatal`, a reported timing violation, an illegal bin | `vpi_chk_error` reports it inside the routine |
 | `cbPLIError` | after each VPI routine error | `vpi_chk_error` reports it inside the routine, and still to the caller after |
 | `cbTchkViolation` | on each timing-check violation | obj NULL; `value` = the violation text (`vpiStringVal`) |
@@ -534,13 +529,30 @@ before a callback runs appears before the routine's `vpi_printf` output.
 
 Within one time step the simulation-time reasons run in the order of the
 table. A value written from any of them except `cbReadOnlySynch` opens a
-fresh delta in the same step, so edge-sensitive processes see it; a pending
-one holds the scheduler at its time even when no HDL event is due there.
+fresh delta in the same step, so edge-sensitive processes see it. Concurrent
+assertions are evaluated in the step of their clock edge, also when a routine
+writes the clock. A `cbReadWriteSynch` due at an assertion's clock edge runs
+before them and before that delta's clocking-event waiters, instead of after
+both, once the step's Active, Inactive and NBA work and its `cbNBASynch`
+routines are done (the Post-NBA region comes before the Observed region,
+§4.4.2): a reset it releases at the edge, as a cocotb test does after
+`RisingEdge`, does not disable that edge's attempt (`disable iff` reads
+current values), and one a clocking-event waiter raises at the edge comes
+after the attempt. They sample the values the step began with (§16.5.1),
+from before even `cbNextSimTime`, `cbAtStartOfSimTime` and `cbAfterDelay`
+run, so a clock written from `cbReadWriteSynch`, as cocotb's `Clock` does,
+samples like one driven from HDL. A pending callback holds the scheduler at
+its time even when no HDL event is due there.
 The time of `cbAfterDelay`, `cbNBASynch`, `cbReadWriteSynch` and
 `cbReadOnlySynch` is a delay (a NULL `time` is a zero delay); that of
 `cbAtStartOfSimTime`/`cbAtEndOfSimTime` is absolute, and a time already begun
 is refused. `vpiScaledRealTime` is in the time unit of `obj` when that is a
 module, else in simulation ticks.
+
+A value written from `cbStartOfSimulation` is evaluated in the time-0 step,
+even when nothing else happens at time 0. Waveform dumps and toggle coverage
+record each write in the step it was made in, the end-of-step callbacks'
+included.
 
 xezim has no statement objects, so `cbStmt` takes a scope and reports that
 scope as `obj`, and `cbForce`/`cbRelease`/`cbAssign`/`cbDeassign` registered

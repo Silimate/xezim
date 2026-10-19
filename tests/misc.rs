@@ -19,6 +19,8 @@ mod ansi_net_port_procedural_assign;
 mod argument_binding;
 #[path = "misc/artifact_compression_modes.rs"]
 mod artifact_compression_modes;
+#[path = "misc/assertion_instances.rs"]
+mod assertion_instances;
 #[path = "misc/assign_z_passthrough.rs"]
 mod assign_z_passthrough;
 #[path = "misc/assignment_compatibility.rs"]
@@ -159,6 +161,8 @@ mod ivtest_tail2_cluster;
 mod ivtest_tail_cluster;
 #[path = "misc/library_flags.rs"]
 mod library_flags;
+#[path = "misc/local_shadow_select.rs"]
+mod local_shadow_select;
 #[path = "misc/log_redirect.rs"]
 mod log_redirect;
 #[path = "misc/lrm_audit2_runner.rs"]
@@ -511,3 +515,12 @@ mod let_declaration_scopes;
 mod constraint_inside_wrap;
 #[path = "misc/loop_var_scope_lint.rs"]
 mod loop_var_scope_lint;
+
+#[path = "misc/cli_transcript_347.rs"]
+mod cli_transcript_347;
+
+#[path = "misc/relaxed_static_initializers_351.rs"]
+mod relaxed_static_initializers_351;
+
+#[path = "misc/string_casts_391.rs"]
+mod string_casts_391;

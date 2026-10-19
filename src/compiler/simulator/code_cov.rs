@@ -2600,19 +2600,31 @@ impl Instr<'_> {
             return;
         }
         match &mut e.kind {
+            // The items of an arm or operand the run never evaluates are
+            // excluded, as in `expr`.
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
+                let c = self.skeleton(condition);
                 self.cond(condition, "ternary", false);
-                self.message(then_expr);
-                self.message(else_expr);
+                let ((), t) = self.region(|me| me.message(then_expr));
+                let ((), f) = self.region(|me| me.message(else_expr));
+                self.choose(c, t, f);
             }
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => self.message(inner),
-            ExprKind::Binary { left, right, .. } => {
+            ExprKind::Binary { op, left, right } => {
+                let decider = matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr)
+                    .then(|| (self.skeleton(left), *op == BinaryOp::LogOr));
                 self.message(left);
-                self.message(right);
+                let ((), r) = self.region(|me| me.message(right));
+                if let Some((c, skip)) = decider
+                    && !r.2.is_empty()
+                    && !matches!(c, Cond::Unknown)
+                {
+                    self.decide(Choice::Operand(c, skip), None, vec![r], Vec::new());
+                }
             }
             ExprKind::Concatenation(parts) => {
                 for p in parts.iter_mut() {

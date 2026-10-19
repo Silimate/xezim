@@ -3232,7 +3232,8 @@ endmodule
 /// `cond,branch`, `expr` and `all`. Left out: the condition items in the
 /// arm of a `?:` a parameter rules out (`a && b`), and in the right
 /// operand of `1'b0 && ...` (`a && c`) and of `1'b1 || ...` (`b || c`),
-/// which are never evaluated. And an arm folded to 0 (`b & 1'b0`) masks
+/// which are never evaluated, also in a message task's arguments
+/// (`a && s`, `b && s`). And an arm folded to 0 (`b & 1'b0`) masks
 /// the condition of a `?:` like a literal 0: `y3`'s rows are `y4`'s.
 #[test]
 fn constant_folding_whatever_the_kinds() {
@@ -3257,6 +3258,7 @@ module tb;
     #1 a = 1; upd();
     #1 s = 0; b = 1; upd();
     #1 a = 0; upd();
+    $display(\"%0d %0d\", P ? ((a && s) ? 1 : 2) : 3, 1'b0 && ((b && s) ? 1'b1 : 1'b0));
     #1 $finish;
   end
 endmodule
@@ -3282,7 +3284,7 @@ endmodule
         );
         let json = results(&d);
         let tb = scope_entry(&json, "tb").to_string();
-        for dead in ["a && b", "a && c", "b || c"] {
+        for dead in ["a && b", "a && c", "b || c", "a && s", "b && s"] {
             assert!(
                 !tb.contains(&format!("\"text\": \"{dead}\"")),
                 "{kinds}: {dead}: {tb}"

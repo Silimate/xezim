@@ -935,13 +935,6 @@ impl Simulator {
         });
     }
 
-    /// §16.9.3: the default sampled value of signal `name`, for a clock tick
-    /// before the first one (see `sampled_defaults`).
-    pub(super) fn sampled_default(&self, name: &str) -> Option<Value> {
-        let id = self.signal_name_to_id.get(name)?;
-        self.sampled_defaults.get(id).cloned()
-    }
-
     /// §16.5.1: a declaration initializer the elaborator could not fold runs
     /// as a time-0 process: a static initializer, or at the top level a
     /// synthesized initial block (dummy spans, as `cov_synthesized_initial`

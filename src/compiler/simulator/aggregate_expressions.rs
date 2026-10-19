@@ -2030,14 +2030,8 @@ impl Simulator {
                         if let Some(v) = ring.get(n_cycles) {
                             return v.clone();
                         }
-                        // §16.9.3: fewer than N ticks so far: the operand's
-                        // default sampled value (§16.5.1), not its current
-                        // one. A full ring has lost the older ticks instead.
-                        if ring.len() < SVA_PAST_DEPTH {
-                            if let Some(v) = self.sampled_default(&sig_name) {
-                                return v;
-                            }
-                        }
+                        // §16.9.3: no such tick yet (before the first clock):
+                        // the expression's default value, not its current one.
                         let w = args.first().map(|a| self.infer_width(a)).unwrap_or(1);
                         return Value::new(w.max(1));
                     }
@@ -2112,13 +2106,11 @@ impl Simulator {
                 let cur = self
                     .get_signal_value_by_name(&sig_name)
                     .unwrap_or_else(|| Value::zero(32));
-                // §16.9.3: at the first tick the sampled value is compared
-                // with the default sampled value (§16.5.1).
                 let prev_opt = self.active_sva_site.and_then(|si| {
-                    let ring = self.sva_sites.get(si)?.past_snapshots.get(&*sig_name)?;
-                    ring.get(1)
-                        .cloned()
-                        .or_else(|| self.sampled_default(&sig_name))
+                    self.sva_sites
+                        .get(si)
+                        .and_then(|s| s.past_snapshots.get(&*sig_name))
+                        .and_then(|r| r.get(1).cloned())
                 });
                 if Self::sampled_change_fn(&name, &cur, prev_opt.as_ref()) {
                     Value::ones(1)

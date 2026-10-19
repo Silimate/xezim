@@ -1961,11 +1961,23 @@ impl Simulator {
                     self.collect_sva_signal_ids(e, out);
                 }
             }
-            // The operand of `$past`/`$rose`/`$fell`/`$stable`/`$changed` is
-            // sampled too (§16.9.3): its history (`past_snapshots`) and the
-            // current value a value-change function compares are the
-            // Preponed values, not the ones this tick's NBAs wrote.
-            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+            ExprKind::SystemCall { name, args } => {
+                // `$past/$rose/$fell/$stable/$changed` already read from the
+                // per-site ring buffers; their bare argument must NOT be
+                // preponed here (that would double-sample). Skip a leading
+                // bare-Ident argument to those calls; still walk the rest.
+                let skip_first = matches!(
+                    name.as_str(),
+                    "$past" | "$rose" | "$fell" | "$stable" | "$changed"
+                );
+                for (i, a) in args.iter().enumerate() {
+                    if skip_first && i == 0 && matches!(a.kind, ExprKind::Ident(_)) {
+                        continue;
+                    }
+                    self.collect_sva_signal_ids(a, out);
+                }
+            }
+            ExprKind::Call { args, .. } => {
                 for a in args {
                     self.collect_sva_signal_ids(a, out);
                 }
@@ -2404,6 +2416,7 @@ impl Simulator {
     /// max depth. Each unique signal gets its own ring; index 0 = this
     /// cycle, index N = N cycles ago.
     pub(super) fn refresh_sva_past_snapshots(&mut self, site_idx: usize, sampled_ids: &[usize]) {
+        const PAST_MAX_DEPTH: usize = 16;
         // Deduplicated at registration: a duplicate name would make ring[1]
         // another copy of the current cycle instead of the prior one.
         if self.sva_sites[site_idx].past_names.is_empty() {
@@ -2427,7 +2440,7 @@ impl Simulator {
                 None => snaps.entry(name.clone()).or_default(),
             };
             ring.push_front(v);
-            while ring.len() > SVA_PAST_DEPTH {
+            while ring.len() > PAST_MAX_DEPTH {
                 ring.pop_back();
             }
         }

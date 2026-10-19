@@ -497,9 +497,6 @@ const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
-/// Ticks of history a concurrent assertion keeps per `$past` operand
-/// (`SvaClockedSite::past_snapshots`).
-const SVA_PAST_DEPTH: usize = 16;
 /// §16.3: the message of the `$error` a failed assertion with no `else`
 /// clause reports (the reference simulator's wording).
 const ASSERT_DEFAULT_ERROR: &str = "Assertion error.";

@@ -89324,6 +89324,25 @@ impl Simulator {
                     }
                     None => lvalue,
                 };
+                // §11.4.1: an lvalue index with a side effect
+                // (`v[i++ +: 18] <= ...`) is evaluated once. Fold it to the
+                // literal it evaluates to now, as the blocking path does, so
+                // the target's width and the captured target below read the
+                // same index. Before, `i` advanced more than once per
+                // assignment and the value landed in the wrong slice.
+                if Self::lvalue_has_incdec_index(lvalue)
+                    && let Some(folded) = self.rewrite_lvalue_index_side_effects(lvalue)
+                {
+                    self.exec_statement(&Statement::new(
+                        StatementKind::NonblockingAssign {
+                            lvalue: folded,
+                            delay: delay.clone(),
+                            rvalue: rvalue.clone(),
+                        },
+                        stmt.span,
+                    ));
+                    return;
+                }
                 // §14.4: normalize a plain dotted-chain lvalue (`vif.cb.data`
                 // inside a method) to the flat Ident the clocking-drive check
                 // below expects — the chain shape skipped the check and the
@@ -125206,8 +125225,13 @@ impl Simulator {
     /// 18-bit `s` keeps the carry. Evaluated self-determined, the sum lost
     /// it whenever the statement ran here instead of as bytecode, for
     /// example in a `for` loop bounded by `$clog2(...)`.
+    ///
+    /// The target's width is not looked up when an lvalue index has a side
+    /// effect (`v[i++ +: 18] <= ...`): `infer_lhs_width` evaluates part-select
+    /// bounds, and §11.4.1 has the index evaluated once, when the assignment
+    /// captures its target. Such a right-hand side stays self-determined.
     fn eval_target_rhs(&mut self, lvalue: &Expression, rvalue: &Expression) -> Value {
-        if !Self::rhs_takes_context(rvalue) {
+        if !Self::rhs_takes_context(rvalue) || Self::lvalue_has_incdec_index(lvalue) {
             return self.eval_expr(rvalue);
         }
         match self.infer_lhs_width(lvalue) {
@@ -125216,15 +125240,17 @@ impl Simulator {
         }
     }
 
-    /// Only an operator takes a width from its context; a plain operand
-    /// converts to the same real either way, so only then does an
-    /// assignment need `assign_rhs_ctx`.
+    /// Only an operator takes a width from its context (§11.6.1: unary `+`,
+    /// `-` and `~` too); a plain operand converts to the same real either
+    /// way, so only then does an assignment need `assign_rhs_ctx`.
     #[inline]
     fn rhs_takes_context(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Paren(x) => Self::rhs_takes_context(x),
             ExprKind::Binary { .. } | ExprKind::Conditional { .. } => true,
-            ExprKind::Unary { op, .. } => matches!(op, UnaryOp::Minus | UnaryOp::BitNot),
+            ExprKind::Unary { op, .. } => {
+                matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot)
+            }
             _ => false,
         }
     }

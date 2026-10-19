@@ -9,6 +9,10 @@
 //! `repeat` loop bounded by `$clog2(...)` whose body also writes a part-select
 //! (the pipelined adder of a CVDP matrix multiplier). The reference simulator
 //! prints 1fffe for every sum here and 30001 for `-a`.
+//!
+//! A side-effecting index in a nonblocking target (`v[(k++)*18 +: 18]`) is
+//! evaluated once (§11.4.1), as in a blocking assignment; it advanced `k` twice
+//! and wrote x into the slices.
 
 use xezim::simulate;
 
@@ -24,10 +28,12 @@ const SRC: &str = r#"
 module tb;
   logic clk = 0;
   logic [15:0] a = 16'hFFFF, b = 16'hFFFF;
-  logic [17:0] s_for, s_rep, s_ev, s_bev, s_cat, s_neg;
+  logic [17:0] s_for, s_rep, s_ev, s_bev, s_cat, s_neg, s_plus;
   logic [7:0]  s_narrow;
   logic [35:0] v;
   logic [127:0] v2, v3;
+  logic [35:0] v4;
+  int k = 0;
   always_ff @(posedge clk)
     for (int l = 0; l < $clog2(4); l++) begin
       s_for <= a + b;
@@ -46,6 +52,13 @@ module tb;
       s_cat <= {a + b};
       s_neg <= -a;
       v3[80 +: 18] <= 0;
+    end
+  // Unary plus is context-determined too; a side-effecting index in the
+  // target (§11.4.1) runs once per assignment.
+  always_ff @(posedge clk)
+    for (int l = 0; l < $clog2(4); l++) begin
+      s_plus <= +(a + b);
+      v4[(k++)*18 +: 18] <= a + b;
     end
   initial begin
     s_ev <= @(posedge clk) a + b;
@@ -74,6 +87,17 @@ fn nonblocking_right_hand_sides_take_the_target_width() {
         "each v[l*18 +: 18] keeps the carry"
     );
     assert_eq!(hex(&sim, "s_neg"), 0x30001, "-a extends a to 18 bits first");
+    assert_eq!(hex(&sim, "s_plus"), 0x1FFFE, "+(a + b) keeps the carry");
+    assert_eq!(
+        hex(&sim, "k"),
+        2,
+        "v4[(k++)*18 +: 18] advances k once per write"
+    );
+    assert_eq!(
+        hex(&sim, "v4"),
+        (0x1FFFE << 18) | 0x1FFFE,
+        "each write lands in its own slice and keeps the carry"
+    );
     assert_eq!(
         hex(&sim, "s_narrow"),
         0xFE,

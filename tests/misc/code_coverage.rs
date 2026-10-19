@@ -818,6 +818,210 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The signals of a scope's toggle entries, in report order.
+fn toggled(scope: &str) -> Vec<&str> {
+    scope
+        .split("\"signal\": \"")
+        .skip(1)
+        .map(|s| &s[..s.find('"').unwrap()])
+        .collect()
+}
+
+/// §6.8: a variable declaration's initializer sets the variable before any
+/// process starts, so a variable nothing else writes holds that one value
+/// for the whole run and has no toggle to count. Toggle coverage leaves it
+/// out (`k`), as the reference simulator does with full signal visibility,
+/// and leaves out one only a constant assignment at time 0 sets (`w`). A
+/// variable nothing writes at all (`n`) stays, as there.
+#[test]
+fn toggle_leaves_out_variables_fixed_before_the_run() {
+    let d = scratch("init_only");
+    let src = "\
+module dut(input logic [3:0] a, output logic [3:0] y, output logic [3:0] z);
+  logic [3:0] k = 4'b1010;
+  logic [3:0] n;
+  logic [3:0] w;
+  initial w = 4'b0101;
+  assign y = a ^ k;
+  assign z = n ^ w;
+endmodule
+module tb;
+  logic [3:0] a = 0;
+  wire [3:0] y, z;
+  dut u(.a, .y, .z);
+  initial begin #1 a = 4'hf; #1 a = 0; #1 $finish; end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let u = scope(&json, "tb.u");
+    assert_eq!(toggled(u), ["a", "n", "y", "z"], "{u}");
+    assert!(u.contains(&toggle_total(16, 32, "50.00")), "{u}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Which variables count as fixed, against the reference simulator's report
+/// on this design with full signal visibility (the same signals and bins in
+/// every scope). Left out: an initializer from literals or parameters, 4- or
+/// 2-state, with no other write (`k`, `b`, `p`, `fr`, which a function only
+/// reads, and `tb.t`, which only feeds an input port), and a single constant
+/// assignment in an `initial` block without timing controls (`w`, `j1`,
+/// `j2`, `g.gi`). Kept: a variable nothing writes (`n`, `bn`); two writes
+/// (`w2`, `i3`); a write after a delay in the block (`d1`, `d2`); a write
+/// that never runs (`ka`); a task's output argument, `$sscanf`, `++` and a
+/// clocking block drive (`v5`, `v6`, `v9`, `bi.cd`); a class method's write
+/// (`tb.cv`); an initializer that calls a function or reads a port (`fc`,
+/// `wp`); a struct (`sp`); and an initialized variable in a generate block
+/// (`g.gv`).
+#[test]
+fn toggle_keeps_variables_other_code_writes() {
+    let d = scratch("init_kept");
+    let src = "\
+interface bus_if(input logic clk);
+  logic [1:0] cd = 2'b01;
+  logic [1:0] idle = 2'b11;
+  clocking cb @(posedge clk); output cd; endclocking
+endinterface
+module dut(input logic clk, input logic [3:0] a, input logic [3:0] tied, output logic [3:0] y);
+  localparam logic [3:0] P = 4'd3;
+  function automatic logic [3:0] inc(input logic [3:0] x); return x + 1; endfunction
+  task automatic get(output logic [3:0] o); o = 4'b0000; endtask
+  logic [3:0] k = 4'b1010;
+  bit   [3:0] b = 4'b0110;
+  logic [3:0] p = P + 1;
+  logic [3:0] n;
+  bit   [3:0] bn;
+  logic [3:0] w; initial w = 4'b0101;
+  logic [3:0] j1, j2; initial begin j1 = P; $display(\"j\"); j2 = '1; end
+  logic [3:0] w2; initial begin w2 = 4'b0001; w2 = 4'b0010; end
+  logic [3:0] d1, d2; initial begin d1 = 4'b0001; #1 d2 = 4'b0010; end
+  logic [3:0] i3 = 4'b0001; initial i3 = 4'b0101;
+  logic [3:0] ka = 4'b1010; always @(posedge clk) if (a == 4'h7) ka <= 4'b0000;
+  logic [3:0] v5 = 4'b0001; initial get(v5);
+  logic [3:0] v6 = 4'b0001; initial $sscanf(\"5\", \"%d\", v6);
+  logic [3:0] v9 = 4'b0001; initial v9++;
+  logic [3:0] fc = inc(4'd2);
+  logic [3:0] fr = 4'b0100; logic [3:0] fo; always_comb fo = inc(fr);
+  logic [3:0] wp; initial wp = tied;
+  struct packed { logic [1:0] hi, lo; } sp = 4'b1001;
+  if (1) begin : g
+    logic [3:0] gv = 4'b0001;
+    logic [3:0] gi; initial gi = 4'b0001;
+  end
+  assign y = a ^ k ^ b ^ p ^ n ^ bn ^ w ^ j1 ^ j2 ^ w2 ^ d1 ^ d2 ^ i3 ^ ka ^ v5 ^ v6 ^ v9
+           ^ fc ^ fo ^ wp ^ sp ^ g.gv ^ g.gi;
+endmodule
+module tb;
+  logic clk = 0;
+  logic [3:0] a = 0;
+  logic [3:0] t = 4'b1100;
+  logic [3:0] cv = 4'b0001;
+  wire  [3:0] y;
+  class writer; task go(); tb.cv = 4'b1110; endtask endclass
+  bus_if bi(clk);
+  dut u(.clk, .a, .tied(t), .y);
+  initial begin
+    writer wr = new;
+    wr.go();
+    #1 a = 4'hf; clk = 1; bi.cb.cd <= 2'b10;
+    #1 clk = 0; a = 0;
+    #1 clk = 1; bi.cb.cd <= 2'b01;
+    #1 clk = 0;
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let u = scope(&json, "tb.u");
+    assert_eq!(
+        toggled(u),
+        [
+            "a", "bn", "clk", "d1", "d2", "fc", "fo", "g.gv", "i3", "ka", "n", "sp", "tied", "v5",
+            "v6", "v9", "w2", "wp", "y"
+        ],
+        "{u}"
+    );
+    assert!(u.contains(&toggle_total(15, 146, "10.27")), "{u}");
+    let tb = scope(&json, "tb");
+    assert_eq!(toggled(tb), ["a", "clk", "cv", "y"], "{tb}");
+    assert!(tb.contains(&toggle_total(14, 26, "53.85")), "{tb}");
+    let bi = scope(&json, "tb.bi");
+    assert_eq!(toggled(bi), ["cd", "clk"], "{bi}");
+    assert!(bi.contains(&toggle_total(6, 6, "100.00")), "{bi}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Writes that are easy to miss keep a variable, as on the reference
+/// simulator: `i` changes only through `x[i++]`, `drv` only through the
+/// renamed clocking output `oalias` (§14.3), and `b2` is assigned after the
+/// intra-assignment delay of `a2 = #2 ...` (§9.4.5), not at time 0. A write
+/// the census can't place keeps every variable of that name: `bi.data`,
+/// which a class drives through a virtual interface, stays, where the
+/// reference simulator leaves it out; `bi.idle`, which nothing writes after
+/// its initializer, does not.
+#[test]
+fn toggle_keeps_variables_written_through_selects_aliases_and_delays() {
+    let d = scratch("init_hidden");
+    let src = "\
+interface bus_if(input logic clk);
+  logic [1:0] data = 2'b01;
+  logic [1:0] idle = 2'b11;
+endinterface
+class drv_c;
+  virtual bus_if vif;
+  task run(); vif.data <= 2'b10; @(posedge vif.clk); vif.data <= 2'b01; endtask
+endclass
+module dut(input logic clk, output logic [3:0] y);
+  logic [1:0] i = 2'd1;
+  logic [3:0] x = 4'd0;
+  always @(posedge clk) x[i++] = 1'b1;
+  logic [7:0] drv = 8'd0;
+  clocking cb @(posedge clk); output oalias = drv; endclocking
+  logic [3:0] a2, b2;
+  initial begin a2 = #2 4'b0101; b2 = 4'b0011; end
+  initial begin #1 cb.oalias <= 8'hff; #2 cb.oalias <= 8'h00; end
+  assign y = x ^ {2'b0, i} ^ drv[3:0] ^ a2 ^ b2;
+endmodule
+module tb;
+  logic clk = 0;
+  wire [3:0] y;
+  bus_if bi(clk);
+  dut u(.clk, .y);
+  initial begin
+    drv_c d = new;
+    d.vif = bi;
+    fork d.run(); join_none
+    repeat (8) #1 clk = ~clk;
+    $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let u = scope(&json, "tb.u");
+    assert_eq!(toggled(u), ["a2", "b2", "clk", "drv", "i", "x", "y"], "{u}");
+    assert!(u.contains("\"total\": 54,"), "{u}");
+    let bi = scope(&json, "tb.bi");
+    assert_eq!(toggled(bi), ["clk", "data"], "{bi}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The two-state executors take back a count when they hand a block to the
 /// four-state VM, so both give the same counts (the flop reads x before
 /// `d` is driven).

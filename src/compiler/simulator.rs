@@ -6860,7 +6860,9 @@ pub struct Simulator {
     code_cov_hits: Vec<u64>,
     /// Toggle coverage candidates and their data types, named while `new`
     /// still has the elaboration signal table; resolved to ids in `compile`.
-    code_cov_toggle_names: Vec<(String, &'static str)>,
+    /// Each also carries what `cov_drop_fixed` needs (see
+    /// `cov_toggle_candidates`).
+    code_cov_toggle_names: Vec<(String, &'static str, Option<bool>)>,
     /// Call stack for tracking 'this' and local variables.
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,

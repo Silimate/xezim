@@ -755,13 +755,14 @@ impl Simulator {
     /// Pre-NBA cbNBASynch and Post-NBA cbReadWriteSynch routines), and the
     /// Observed region before the Reactive work (clocking-event waiters,
     /// program code). xezim runs cbReadWriteSynch at the end of a delta,
-    /// after that Reactive work, so `disable iff` read a reset a cocotb test
-    /// releases after `RisingEdge` too late, or one a clocking-event waiter
-    /// raises at that edge too early. With a clock event recorded, this runs
-    /// the three steps in order, in one loop that a routine queuing another
-    /// cannot turn into recursion: the nested `sva_observed` of a delta
-    /// opened here only records clock events (a routine that moves the clock
-    /// back does not lose one), and that delta holds its Reactive work.
+    /// after that Reactive work, so evaluated there, `disable iff` would
+    /// read a reset a cocotb test releases after `RisingEdge` too late. With
+    /// a clock event recorded, this runs the three steps in order, in one
+    /// loop that a routine queuing another cannot turn into recursion: the
+    /// nested `sva_observed` of a delta opened here only records clock
+    /// events (a routine that moves the clock back does not lose one), and
+    /// that delta holds its Reactive work, so a reset a clocking-event waiter
+    /// raises at the edge still comes after the attempt.
     #[inline(never)]
     pub(super) fn sva_post_nba(&mut self) {
         self.note_sva_edges();

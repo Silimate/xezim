@@ -111,6 +111,8 @@ mod force_release_semantics;
 mod foreach_loop_variable_count;
 #[path = "misc/forever_break_continue.rs"]
 mod forever_break_continue;
+#[path = "misc/fsm_coverage.rs"]
+mod fsm_coverage;
 #[path = "misc/function_return_bit_select.rs"]
 mod function_return_bit_select;
 #[path = "misc/gate_terminal_counts.rs"]

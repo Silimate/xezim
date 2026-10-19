@@ -1519,8 +1519,9 @@ fn off_by_default_output_unchanged() {
 
 /// Other simulators' spellings: `+cover=<letters>` picks the kinds and warns
 /// once about the ones xezim lacks; bare `+cover` and `-coverage` collect all
-/// three, and `-coverage <types>` the types listed (its value used to be read
-/// as a top module name); XEZIM_CODE_COVERAGE does what the flag does.
+/// four, and `-coverage <types>` the types listed (its value used to be read
+/// as a top module name; `F` is FSM coverage); XEZIM_CODE_COVERAGE does what
+/// the flag does.
 #[test]
 fn compatible_spellings() {
     let d = scratch("compat");
@@ -1536,13 +1537,13 @@ fn compatible_spellings() {
         let k = json[start..start + json[start..].find(']').unwrap()].to_string();
         (k, String::from_utf8_lossy(&out.stderr).into_owned())
     };
-    let all = "\"statement\", \"branch\", \"toggle\"";
+    let all = "\"statement\", \"branch\", \"toggle\", \"fsm\"";
     let (k, err) = kinds(&["+cover=sbcf"]);
-    assert_eq!(k, "\"statement\", \"branch\"");
+    assert_eq!(k, "\"statement\", \"branch\", \"fsm\"");
     assert_eq!(
         err.matches(
-            "Warning: +cover=sbcf: xezim has no condition (c), FSM (f) coverage; \
-                     collecting statement, branch coverage"
+            "Warning: +cover=sbcf: xezim has no condition (c) coverage; \
+                     collecting statement, branch, FSM coverage"
         )
         .count(),
         1,
@@ -1554,13 +1555,16 @@ fn compatible_spellings() {
     assert_eq!(kinds(&["-coverage", "+cover=s"]).0, "\"statement\"");
     assert_eq!(kinds(&["-coverage", "all"]).0, all);
     assert_eq!(kinds(&["-coverage", "T"]).0, "\"toggle\"");
-    assert_eq!(kinds(&["-coverage", "b:t"]).0, all);
+    assert_eq!(
+        kinds(&["-coverage", "b:t"]).0,
+        "\"statement\", \"branch\", \"toggle\""
+    );
     let (k, err) = kinds(&["-coverage", "B:E:F:U"]);
-    assert_eq!(k, "\"statement\", \"branch\"");
+    assert_eq!(k, "\"statement\", \"branch\", \"fsm\"");
     assert_eq!(
         err.matches(
-            "Warning: -coverage B:E:F:U: xezim has no expression (e), FSM (f) coverage; \
-                     collecting statement, branch coverage"
+            "Warning: -coverage B:E:F:U: xezim has no expression (e) coverage; \
+                     collecting statement, branch, FSM coverage"
         )
         .count(),
         1,

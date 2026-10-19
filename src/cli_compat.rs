@@ -8,11 +8,15 @@
 //! Pure parsing lives here (no simulator state), so the `-do` subset is
 //! unit-testable: tests/misc/cli_compat_args.rs includes this file directly.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// State collected from these spellings that outlives the token that set it.
 #[derive(Default)]
 pub(crate) struct CompatArgs {
+    /// `--compat`: the defaults of commercial simulators (no time cap,
+    /// conflicting drivers and implicitly static initializers accepted with
+    /// a warning, a failing exit status after `$error`). Applied in main.rs.
+    pub compat_mode: bool,
     /// `-g`/`-G` overrides in command-line order: (module named by a
     /// `/top/NAME` path, parameter name, value text, `-G`).
     pub param_overrides: Vec<(Option<String>, String, String, bool)>,
@@ -28,6 +32,13 @@ pub(crate) struct CompatArgs {
     pub cover: Option<String>,
     /// `-coverage`.
     pub coverage: bool,
+    /// `-coverage <types>`, the last one given: the types as written and
+    /// what `coverage_types` makes of them.
+    pub coverage_types: Option<(String, (u8, String))>,
+    /// `-covworkdir`, `-covscope`, `-covtest`; see `cov_db`.
+    pub cov_workdir: Option<String>,
+    pub cov_scope: Option<String>,
+    pub cov_test: Option<String>,
     /// `-uvm` / `--uvm`: add the UVM library named by `XEZIM_UVM_DIR`
     /// (see src/uvm_dir.rs).
     pub uvm: bool,
@@ -38,20 +49,24 @@ pub(crate) struct CompatArgs {
     pub seed: Option<String>,
 }
 
-/// The code coverage `+cover[=<letters>]` and `-coverage` ask for, as
-/// `(kinds, letters xezim does not collect)`. The letters are other
-/// simulators': `s` statement, `b` branch and `t` toggle map onto xezim's
-/// kinds; `c` (condition), `e` (expression), `f` (FSM) and `x` (extended
-/// toggle) have no xezim counterpart. The bare forms ask for the default
-/// set, `sbceft`: all three of xezim's kinds.
-pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String)> {
+/// The code coverage `+cover[=<letters>]` and `-coverage [<types>]` ask
+/// for, as `(kinds, letters xezim does not collect, the spelling)`. The
+/// letters are other simulators': `s` statement, `b` branch and `t` toggle
+/// map onto xezim's kinds; `c` (condition), `e` (expression), `f` (FSM) and
+/// `x` (extended toggle) have no xezim counterpart. The bare forms ask for
+/// the default set, `sbceft`: all three of xezim's kinds. `+cover=<letters>`
+/// wins over `-coverage <types>` (see `coverage_types`).
+pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String, String)> {
     use xezim::compiler::simulator::{KIND_BRANCH, KIND_STATEMENT, KIND_TOGGLE};
-    let spec = match cx.cover.as_deref() {
-        None if !cx.coverage => return None,
-        None | Some("") => {
-            return Some((KIND_STATEMENT | KIND_BRANCH | KIND_TOGGLE, String::new()));
+    let all = KIND_STATEMENT | KIND_BRANCH | KIND_TOGGLE;
+    let spec = match (cx.cover.as_deref(), &cx.coverage_types) {
+        (None, Some((types, (kinds, unsupported)))) => {
+            return Some((*kinds, unsupported.clone(), format!("-coverage {}", types)));
         }
-        Some(spec) => spec,
+        (None, None) if !cx.coverage => return None,
+        (None, None) => return Some((all, String::new(), "-coverage".to_string())),
+        (Some(""), _) => return Some((all, String::new(), "+cover".to_string())),
+        (Some(spec), _) => spec,
     };
     let mut kinds = 0u8;
     let mut unsupported = String::new();
@@ -64,7 +79,52 @@ pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String)> {
             _ => {}
         }
     }
+    Some((kinds, unsupported, format!("+cover={}", spec)))
+}
+
+/// `-coverage <types>`: `all` (or `A`), or a `:`-separated list of `B`
+/// (block), `E` (expression), `F` (FSM), `T` (toggle) and `U` (functional),
+/// in either case, as `(kinds, letters xezim does not collect)` in
+/// `+cover`'s letters. A block is a statement or a branch arm, so `B` is
+/// statement and branch coverage. Functional coverage (covergroups and
+/// assertions) is always collected, so `U` adds nothing. `None` when `spec`
+/// is not such a list: then `-coverage` takes no value.
+pub(crate) fn coverage_types(spec: &str) -> Option<(u8, String)> {
+    use xezim::compiler::simulator::{KIND_BRANCH, KIND_STATEMENT, KIND_TOGGLE};
+    let all = KIND_STATEMENT | KIND_BRANCH | KIND_TOGGLE;
+    if spec.eq_ignore_ascii_case("all") {
+        return Some((all, String::new()));
+    }
+    let mut kinds = 0u8;
+    let mut unsupported = String::new();
+    for t in spec.split(':') {
+        match t.to_ascii_lowercase().as_str() {
+            "a" => kinds |= all,
+            "b" => kinds |= KIND_STATEMENT | KIND_BRANCH,
+            "t" => kinds |= KIND_TOGGLE,
+            "u" => {}
+            l @ ("e" | "f") if !unsupported.contains(l) => unsupported.push_str(l),
+            "e" | "f" => {}
+            _ => return None,
+        }
+    }
     Some((kinds, unsupported))
+}
+
+/// `-covworkdir <dir>`, `-covscope <name>`, `-covtest <name>`: the results
+/// file goes in the test's directory of a coverage work area,
+/// `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`, `scope`,
+/// `test`). `None` when none of them was given.
+pub(crate) fn cov_db(cx: &CompatArgs) -> Option<PathBuf> {
+    if cx.cov_workdir.is_none() && cx.cov_scope.is_none() && cx.cov_test.is_none() {
+        return None;
+    }
+    Some(
+        Path::new(cx.cov_workdir.as_deref().unwrap_or("cov_work"))
+            .join(cx.cov_scope.as_deref().unwrap_or("scope"))
+            .join(cx.cov_test.as_deref().unwrap_or("test"))
+            .join("xezim_cov.json"),
+    )
 }
 
 /// `-sv_lib <name>` loads `<sv_root>/<name>.so`; a name that already carries
@@ -90,8 +150,15 @@ pub(crate) fn resolve_sv_libs(cx: &CompatArgs) -> Vec<String> {
 }
 
 /// One of the spellings above at `toks[i]`: apply it and return how many
-/// tokens it used, or 0 when `toks[i]` is not one of them.
-pub(crate) fn handle_flag(toks: &[String], i: usize, cx: &mut CompatArgs) -> Result<usize, String> {
+/// tokens it used, or 0 when `toks[i]` is not one of them. `base` is where
+/// a relative source file name is also looked up: the args file's directory,
+/// or `.` on the command line.
+pub(crate) fn handle_flag(
+    toks: &[String],
+    i: usize,
+    base: &Path,
+    cx: &mut CompatArgs,
+) -> Result<usize, String> {
     let t = toks[i].as_str();
     let value = || {
         toks.get(i + 1)
@@ -104,10 +171,35 @@ pub(crate) fn handle_flag(toks: &[String], i: usize, cx: &mut CompatArgs) -> Res
         // files), and there is no separate optimizer, GUI or 32-bit mode.
         "-sv" | "-mfcu" | "-quiet" | "-64" | "-32" | "-nologo" | "-batch" => Ok(1),
         _ if t.starts_with("-mfcu=") || is_pass_through_args(t) => Ok(1),
+        // No license to queue for, and no elaborated snapshot to rerun
+        // (`-R`): every run compiles the sources it is given.
+        "-licqueue" | "-R" => Ok(1),
+        // The library and scratch directories of a tool that keeps them:
+        // xezim writes neither.
+        "-xmlibdirname" | "-cds_implicit_tmpdir" => {
+            value()?;
+            Ok(2)
+        }
+        // A cap on the number of errors before the tool gives up: xezim
+        // reports compile errors and stops, and never stops a simulation on
+        // an error count.
+        "-errormax" => {
+            value()?;
+            Ok(2)
+        }
+        // `--compat`; see `CompatArgs::compat_mode`.
+        "--compat" => {
+            cx.compat_mode = true;
+            Ok(1)
+        }
         // Design visibility for debug: xezim keeps every object visible.
         // Assertions and covergroups are always compiled and evaluated.
         "+acc" | "+fcover" | "-sva" | "-assertdebug" => Ok(1),
-        _ if t.starts_with("+acc=") => Ok(1),
+        _ if t.starts_with("+acc=") || t.starts_with("+access+") => Ok(1),
+        "-access" => {
+            value()?;
+            Ok(2)
+        }
         // Code coverage; see `cover_request`.
         "+cover" => {
             cx.cover = Some(String::new());
@@ -117,10 +209,36 @@ pub(crate) fn handle_flag(toks: &[String], i: usize, cx: &mut CompatArgs) -> Res
             cx.cover = Some(t["+cover=".len()..].to_string());
             Ok(1)
         }
+        // `-coverage` alone, or with the types to collect (`-coverage all`,
+        // `-coverage B:T`) when the next token is such a list and no file.
         "-coverage" => {
             cx.coverage = true;
-            Ok(1)
+            let types = toks
+                .get(i + 1)
+                .filter(|n| !Path::new(n.as_str()).exists() && !base.join(n.as_str()).exists())
+                .and_then(|n| coverage_types(n).map(|k| (n.clone(), k)));
+            match types {
+                Some(types) => {
+                    cx.coverage_types = Some(types);
+                    Ok(2)
+                }
+                None => Ok(1),
+            }
         }
+        "-covworkdir" => {
+            cx.cov_workdir = Some(value()?);
+            Ok(2)
+        }
+        "-covscope" => {
+            cx.cov_scope = Some(value()?);
+            Ok(2)
+        }
+        "-covtest" => {
+            cx.cov_test = Some(value()?);
+            Ok(2)
+        }
+        // xezim replaces its results file on every run.
+        "-covoverwrite" => Ok(1),
         "-uvm" | "--uvm" => {
             cx.uvm = true;
             Ok(1)
@@ -153,7 +271,7 @@ pub(crate) fn handle_flag(toks: &[String], i: usize, cx: &mut CompatArgs) -> Res
             Ok(1)
         }
         // Message-number suppression: the numbers belong to another tool.
-        "-suppress" => {
+        "-suppress" | "-nowarn" => {
             value()?;
             Ok(2)
         }

@@ -373,7 +373,10 @@ xezim writes `xezim_cov.json` to the current directory, replacing any earlier on
   assertion that was evaluated, or when the run collects code coverage. A run
   with none of them leaves an old `xezim_cov.json` as it was.
 - `XEZIM_COV_DB=<path>` writes it to `<path>` instead. The directory must exist.
-  When the file can't be written, xezim prints
+- Other simulators' `-covworkdir <dir>`, `-covscope <name>` and `-covtest <name>`
+  write it to `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`,
+  `scope`, `test`), creating the directory. `XEZIM_COV_DB` wins over them.
+- When the file can't be written, xezim prints
   `[COV] warning: could not write <path>: <reason>` and the run's result is
   unchanged.
 
@@ -552,6 +555,7 @@ branch went and which bits of each signal toggled, and writes the counts to
 | `+cover` | All three |
 | `+cover=<letters>` | `s` statement, `b` branch, `t` toggle. Other simulators' other letters (`c` condition, `e` expression, `f` FSM, `x` extended toggle) are ignored with one warning, for example `Warning: +cover=sbcf: xezim has no condition (c), FSM (f) coverage; collecting statement, branch coverage` |
 | `-coverage` | All three, unless a `+cover=<letters>` names fewer |
+| `-coverage <types>` | `all` (or `A`): all three. Otherwise types joined by `:`, in either case: `B` block (statement and branch), `T` toggle, `U` functional (always collected). `E` expression and `F` FSM are ignored with one warning, for example `Warning: -coverage B:E: xezim has no expression (e) coverage; collecting statement, branch coverage`. A `+cover=<letters>` wins |
 
 `--code-coverage-scope=<path>[,<path>...]` (repeatable) limits every kind to the
 instances at or below the given paths (`tb.dut`, or `dut` for the instance of that
@@ -1014,6 +1018,8 @@ it.
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees and packages |
 | `--no-toggle-input-ports`, `XEZIM_TOGGLE_INPUT_PORTS=0` | Leave input and inout ports out of toggle coverage; by default each instance counts its own (`--toggle-input-ports`). See [Toggles](#toggles) |
 | `--code-coverage-constant=<exclude\|keep>`, `XEZIM_CODE_COVERAGE_CONSTANT` | Leave out (`exclude`, the default) or count (`keep`) the code that [constant conditions](#constant-conditions) rule out |
-| `+cover`, `+cover=<letters>`, `-coverage` | Other simulators' spellings of `--code-coverage`: `s`, `b` and `t` select the kinds; other letters are ignored with a warning |
+| `+cover`, `+cover=<letters>`, `-coverage [<types>]` | Other simulators' spellings of `--code-coverage`: `s`, `b` and `t` (or `B` and `T`) select the kinds; other letters are ignored with a warning |
+| `-covworkdir <dir>`, `-covscope <name>`, `-covtest <name>` | Write the results file to `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`, `scope`, `test`) |
+| `-covoverwrite` | Accepted for compatibility with other simulators; no effect (the file is always replaced) |
 | `+fcover` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |

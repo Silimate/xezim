@@ -1,7 +1,8 @@
 //! The other counting rules of code coverage (docs/coverage-guide.md,
 //! "Counting rules"), each off by default: `--no-toggle-enums`,
 //! `--no-toggle-generate`, `--code-coverage-expressions=logical`,
-//! `--code-coverage-granularity=block` and `--no-fsm-reset-transitions`.
+//! `--code-coverage-granularity=block`, `--no-fsm-reset-transitions` and
+//! `--no-toggle-tied`.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,6 +36,7 @@ fn run(dir: &Path, src: &str, args: &[&str]) -> String {
         .env_remove("XEZIM_CODE_COVERAGE_EXPRESSIONS")
         .env_remove("XEZIM_CODE_COVERAGE_GRANULARITY")
         .env_remove("XEZIM_FSM_RESET_TRANSITIONS")
+        .env_remove("XEZIM_TOGGLE_TIED")
         .args(args)
         .arg("t.sv")
         .output()
@@ -532,6 +534,91 @@ fn fsm_reset_transitions_left_out() {
     let enabled = ["IDLE->RUN", "RUN->DONE", "DONE->IDLE"];
     assert_eq!(pairs(&all, "tb.g"), enabled);
     assert_eq!(pairs(&logic, "tb.g"), enabled);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const TIED: &str = "\
+module fa(input logic a, input logic b, input logic cin, output logic s, output logic co);
+  assign s = a ^ b ^ cin;
+  assign co = (a & b) | (b & cin) | (a & cin);
+endmodule
+module sub(input logic [3:0] a, input logic c, output logic [3:0] y, output logic [7:0] w);
+  wire [7:0] z = {4'b0000, a};
+  wire [11:4] n;
+  wire [0:3] asc;
+  assign n[11:8] = 4'd0;
+  assign n[7:4] = a;
+  assign asc[0:1] = a[1:0];
+  assign asc[2:3] = 2'b00;
+  assign w = z;
+  assign y = {1'b0, a[2:1], c};
+endmodule
+module tb;
+  localparam logic P = 1'b1;
+  logic [3:0] a = 0;
+  logic b = 0;
+  wire [3:0] y;
+  wire [7:0] w;
+  wire s, co, q, k;
+  sub u(.a(a), .c(1'b0), .y(y), .w(w));
+  fa f(.a(b), .b(P), .cin(1'b0), .s(s), .co(co));
+  assign q = 1'b0;
+  assign k = 1'b1;
+  initial begin
+    #1 force k = 1'b0;
+    repeat (6) begin #5 a = (a + 1) % 4; b = ~b; end
+    $finish;
+  end
+endmodule
+";
+
+/// Each toggle entry of `scope` that has tied bits: `signal: [bits]`.
+fn tied(json: &str, scope_name: &str) -> Vec<String> {
+    scope(json, scope_name)
+        .split("{\"signal\": \"")
+        .skip(1)
+        .filter_map(|e| {
+            let e = &e[..e.find('}').unwrap()];
+            let at = e.find("\"tied\": [")? + "\"tied\": [".len();
+            let name = &e[..e.find('"').unwrap()];
+            Some(format!("{name}: [{}]", &e[at..at + e[at..].find(']').unwrap()]))
+        })
+        .collect()
+}
+
+/// `--no-toggle-tied` leaves out the toggle bins of the bits whose only
+/// drivers are constants: literal and parameter bits of a continuous
+/// assignment or port connection (`z`, `n`, `asc`, `y[3]`, `u.c`, `f.b`,
+/// `f.cin`, `q`), and the bits wired to such a bit (`w`, `y[0]`, the
+/// parent's `y` and `w`). An operator on a constant (`f.co`) ties nothing,
+/// nor does a value range (`a[3:2]` stay 0), nor a net a `force` writes
+/// (`k`). The bits are listed by position in the vector, least significant
+/// first, whichever way its range runs.
+#[test]
+fn toggle_tied_bits_left_out() {
+    let d = scratch("tied");
+    let all = run(&d, TIED, &["--code-coverage=toggle"]);
+    assert!(!all.contains("\"tied\""), "{all}");
+    let left = run(&d, TIED, &["--code-coverage=toggle", "--no-toggle-tied"]);
+    assert_eq!(
+        tied(&left, "tb.u"),
+        [
+            "asc: [0, 1]",
+            "c: [0]",
+            "n: [4, 5, 6, 7]",
+            "w: [4, 5, 6, 7]",
+            "y: [0, 3]",
+            "z: [4, 5, 6, 7]"
+        ],
+        "{left}"
+    );
+    assert_eq!(tied(&left, "tb.f"), ["b: [0]", "cin: [0]"], "{left}");
+    assert_eq!(
+        tied(&left, "tb"),
+        ["q: [0]", "w: [4, 5, 6, 7]", "y: [0, 3]"],
+        "{left}"
+    );
+    assert!(scope(&left, "tb.f").contains("\"excluded\": 4}"), "{left}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

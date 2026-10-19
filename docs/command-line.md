@@ -66,6 +66,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--code-coverage-expressions=<all\|logical>` | Score every condition and expression item (`all`, the default), or only the conditions with a `&&` or `\|\|`, a term covered once it was 0 and 1 (`logical`) |
 | `--code-coverage-granularity=<statement\|block>` | Count statements (the default) or straight-line blocks, implicit `else` and `default` arms included and continuous assignments not |
 | `--no-fsm-reset-transitions`, `--fsm-reset-transitions` | Leave out the FSM transitions only a reset makes, or keep them (the default) |
+| `--no-toggle-tied`, `--toggle-tied` | Leave the bits whose only drivers are constants (literal or parameter bits, through continuous assignments and port connections) out of toggle coverage, or keep them (the default) |
 | `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters) together with the `--verbose` engine lines. Same as `XEZIM_PROFILE_REPORT=1`. Adds overhead |
 | `--show-env-avail` | List every `XEZIM_*` environment variable with a one-line description, then exit |
 
@@ -105,7 +106,7 @@ unless noted.
 | `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |
 | `XEZIM_TOGGLE_INTEGERS=0` | Same as `--no-toggle-integers` (`1`, the default, is `--toggle-integers`); the flag wins |
 | `XEZIM_CODE_COVERAGE_CONSTANT=<exclude\|keep>` | Same as `--code-coverage-constant=<mode>`; the flag wins |
-| `XEZIM_TOGGLE_ENUMS=0`, `XEZIM_TOGGLE_GENERATE=0`, `XEZIM_FSM_RESET_TRANSITIONS=0` | Same as `--no-toggle-enums`, `--no-toggle-generate`, `--no-fsm-reset-transitions`; the flags win |
+| `XEZIM_TOGGLE_ENUMS=0`, `XEZIM_TOGGLE_GENERATE=0`, `XEZIM_TOGGLE_TIED=0`, `XEZIM_FSM_RESET_TRANSITIONS=0` | Same as `--no-toggle-enums`, `--no-toggle-generate`, `--no-toggle-tied`, `--no-fsm-reset-transitions`; the flags win |
 | `XEZIM_CODE_COVERAGE_EXPRESSIONS=<all\|logical>`, `XEZIM_CODE_COVERAGE_GRANULARITY=<statement\|block>` | Same as `--code-coverage-expressions`, `--code-coverage-granularity`; the flags win |
 | `XEZIM_COV_DB=<path>` | Write the coverage results somewhere other than `xezim_cov.json` |
 | `XEZIM_TOGGLE_INPUT_PORTS=0` | Same as `--no-toggle-input-ports`; the flag wins |

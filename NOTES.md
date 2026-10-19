@@ -231,9 +231,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Usability**
 
-* Five code coverage counting rules, each its own option and off by
-  default, follow the code coverage defaults the reference simulator
-  documents:
+* Code coverage counting rules, each its own option and off by default.
+  Five follow the code coverage defaults the reference simulator documents:
   `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
   signals declared in generate blocks out of toggle coverage;
   `--code-coverage-expressions=logical` scores only the conditions with a
@@ -241,8 +240,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `--code-coverage-granularity=block` counts straight-line blocks, implicit
   `else` and `default` arms included and continuous assignments not; and
   `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
-  makes, an asynchronous reset's included. Each has an `XEZIM_*` variable. See docs/coverage-guide.md,
-  "Counting rules".
+  makes, an asynchronous reset's included. A sixth, `--no-toggle-tied`,
+  leaves out the toggle bins of bits whose only drivers are constants
+  (`{4'b0, x}`, a port tied to `1'b0` and the ports wired to it). Each has an
+  `XEZIM_*` variable. See docs/coverage-guide.md, "Counting rules".
 * `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
   an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
   toggle coverage, as some simulators do by default, so a module-level loop

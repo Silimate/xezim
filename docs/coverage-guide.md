@@ -1084,8 +1084,9 @@ reference simulator's "FSM States" and "FSM Transitions".
 
 #### Counting rules
 
-Five options change what is counted. Each is off by default; together they
-follow the code coverage defaults the reference simulator documents.
+Six options change what is counted. Each is off by default. The first five
+follow the code coverage defaults the reference simulator documents; the last
+leaves out the bits that are constant by construction.
 
 | Option | What it counts |
 |---|---|
@@ -1094,6 +1095,7 @@ follow the code coverage defaults the reference simulator documents.
 | `--code-coverage-expressions=logical`, `XEZIM_CODE_COVERAGE_EXPRESSIONS=logical` | Only conditions (`if`, `while`, `do`, `?:`) that hold a `&&` or `||` are items, and only those operators split one into terms: `(a & b) \|\| c` has the terms `a & b` and `c`, `!a && v` has `!a` and `v`, and a vector term counts as nonzero or zero. An assignment's value is no item. A term is covered once it has been seen at 0 and at 1, whether or not it decided the value (sum-of-products scoring). A term a `&&` or `\|\|` short-circuits is still read for coverage when reading it has no side effects: no increment, assignment or function call, apart from system functions that only compute a value from their arguments (`$clog2`, `$bits`, `$size`, `$signed`, ...). A bit-select or part-select qualifies when its index and bounds do. The design's evaluation is unchanged. |
 | `--code-coverage-granularity=block`, `XEZIM_CODE_COVERAGE_GRANULARITY=block` | `statement` counts straight-line blocks instead of statements (below). |
 | `--no-fsm-reset-transitions`, `XEZIM_FSM_RESET_TRANSITIONS=0` | A transition that only the state process's reset branch makes is no transition. With an asynchronous control (`always @(posedge clk or negedge rst_n)`), the reset branch is the `if` that tests it (`if (!rst_n)`). Otherwise it is the first `if` of the state process, past any declarations, when it has an `else` and does not test the state variable itself; a clock enable around the state logic (`if (en) case (st) ...`) is none. |
+| `--no-toggle-tied`, `XEZIM_TOGGLE_TIED=0` | A bit whose only drivers are constants is not tracked for toggles (its two bins are left out of the totals and listed in the entry's `tied`, by bit). A driver is a continuous assignment: an `assign`, a net declaration assignment or a port connection. Each must give the bit a constant: a bit of a literal or parameter, in a concatenation or replication too (`{4'b0, x}` ties the top four bits), or a bit of another net or variable that is tied, through whole, bit and part-select connections (a port connected to `1'b0`, and the ports wired to it further down). An operator ties nothing, even on constant operands (`a & 1'b0`), and a bit that never changes because of the values it gets stays. A signal a process, subroutine, `force`, primitive or switch writes is not tied. |
 
 A state that stays put is never a transition, with or without these.
 
@@ -1418,6 +1420,7 @@ it.
 | `--code-coverage-expressions=<all\|logical>`, `XEZIM_CODE_COVERAGE_EXPRESSIONS` | Score every condition and expression item (`all`, the default), or only the conditions with a `&&` or `\|\|`, by term values (`logical`) |
 | `--code-coverage-granularity=<statement\|block>`, `XEZIM_CODE_COVERAGE_GRANULARITY` | Count statements (the default) or straight-line blocks |
 | `--no-fsm-reset-transitions`, `XEZIM_FSM_RESET_TRANSITIONS=0` | Leave out the FSM transitions only a reset makes |
+| `--no-toggle-tied`, `XEZIM_TOGGLE_TIED=0` | Leave the bits whose only drivers are constants out of toggle coverage |
 | `+cover`, `+cover=<letters>`, `-coverage` | Other simulators' spellings of `--code-coverage`: `s`, `b`, `c`, `e`, `t` and `f` select the kinds; other letters are ignored with a warning |
 | `+fcover` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |

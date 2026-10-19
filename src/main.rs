@@ -246,6 +246,10 @@ fn print_usage() {
     eprintln!("                   XEZIM_TOGGLE_ENUMS=0 too.");
     eprintln!("  --no-toggle-generate  Leave the signals declared in generate blocks out of");
     eprintln!("                   toggle coverage. XEZIM_TOGGLE_GENERATE=0 too.");
+    eprintln!("  --no-toggle-tied  Leave the bits whose only drivers are constants (a");
+    eprintln!("                   literal or parameter bit, through continuous assignments");
+    eprintln!("                   and port connections) out of toggle coverage.");
+    eprintln!("                   XEZIM_TOGGLE_TIED=0 too.");
     eprintln!("  --code-coverage-expressions=<all|logical>  Score every condition and");
     eprintln!("                   expression item (all, the default), or only the conditions");
     eprintln!("                   with a && or ||, a term covered once it was 0 and 1");
@@ -2071,11 +2075,12 @@ fn run_main() -> i32 {
     // `--[no-]toggle-integers`.
     let mut code_cov_integers: Option<bool> = None;
     let mut code_cov_keep: Option<bool> = None;
-    // `--[no-]toggle-enums`, `--[no-]toggle-generate`,
+    // `--[no-]toggle-enums`, `--[no-]toggle-generate`, `--[no-]toggle-tied`,
     // `--code-coverage-expressions`, `--code-coverage-granularity`,
     // `--[no-]fsm-reset-transitions`.
     let mut code_cov_enums: Option<bool> = None;
     let mut code_cov_generate: Option<bool> = None;
+    let mut code_cov_tied: Option<bool> = None;
     let mut code_cov_logical: Option<bool> = None;
     let mut code_cov_blocks: Option<bool> = None;
     let mut code_cov_fsm_reset: Option<bool> = None;
@@ -2720,6 +2725,8 @@ fn run_main() -> i32 {
             "--no-toggle-enums" => code_cov_enums = Some(false),
             "--toggle-generate" => code_cov_generate = Some(true),
             "--no-toggle-generate" => code_cov_generate = Some(false),
+            "--toggle-tied" => code_cov_tied = Some(true),
+            "--no-toggle-tied" => code_cov_tied = Some(false),
             "--fsm-reset-transitions" => code_cov_fsm_reset = Some(true),
             "--no-fsm-reset-transitions" => code_cov_fsm_reset = Some(false),
             _ if arg == "--code-coverage-expressions"
@@ -3205,6 +3212,7 @@ fn run_main() -> i32 {
     };
     let enums = switch(code_cov_enums, "XEZIM_TOGGLE_ENUMS", true);
     let generate = switch(code_cov_generate, "XEZIM_TOGGLE_GENERATE", true);
+    let tied = switch(code_cov_tied, "XEZIM_TOGGLE_TIED", true);
     let fsm_reset = switch(code_cov_fsm_reset, "XEZIM_FSM_RESET_TRANSITIONS", true);
     let logical = pick(
         code_cov_logical,
@@ -3229,6 +3237,7 @@ fn run_main() -> i32 {
                 logical,
                 blocks,
                 fsm_reset,
+                tied,
             },
         ));
     } else if !code_cov_scopes.is_empty() {

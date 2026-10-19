@@ -184,6 +184,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Coverage: collect code coverage, like --code-coverage=<kinds> (stmt,branch,cond,expr,toggle,all); the flag wins",
     ),
     (
+        "XEZIM_CODE_COVERAGE_CONSTANT",
+        "Coverage: exclude (default) or keep the code a constant condition rules out, like --code-coverage-constant; the flag wins",
+    ),
+    (
         "XEZIM_COMB_GRAPH",
         "Profiling: write the comb operand graph (entry read/write ids, edge-block write ids) to the given path",
     ),

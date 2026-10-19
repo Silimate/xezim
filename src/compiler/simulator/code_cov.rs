@@ -274,10 +274,13 @@ pub(crate) enum Op {
 }
 
 /// A node of an item's logic tree, in pre-order; `kids` index the tree.
+/// `value`: a `Const` node's value (0 or 1) when the plan folded it to a
+/// known one, `UNEVALUATED` otherwise.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Node {
     op: Op,
     kids: [u32; 3],
+    value: u8,
 }
 
 /// A node value in an item's evaluation: 0, 1, x (or z), or not evaluated.
@@ -2522,8 +2525,10 @@ impl Instr<'_> {
             }
             _ => {}
         }
+        // (Whatever the operand holds: `?:` branches, or with branch
+        // coverage off only their condition items.)
         if let (Some((cond, skip)), Some(r)) = (decider, operand)
-            && !r.1.is_empty()
+            && !(r.1.is_empty() && r.2.is_empty())
             && !matches!(cond, Cond::Unknown)
         {
             self.decide(Choice::Operand(cond, skip), None, vec![r], Vec::new());
@@ -2719,13 +2724,21 @@ impl Instr<'_> {
                 let ctl = |c: Option<Option<u64>>| {
                     c.flatten().is_some_and(|v| (v != 0) as u64 == decides)
                 };
-                if ctl(k(0)) || ctl(k(1)) {
-                    Some(Some(decides))
-                } else {
-                    (k(0).is_some() && k(1).is_some()).then_some(None)
+                match (k(0), k(1)) {
+                    _ if ctl(k(0)) || ctl(k(1)) => Some(Some(decides)),
+                    // Known, and neither decides: both are the other value.
+                    (Some(Some(_)), Some(Some(_))) => Some(Some(decides ^ 1)),
+                    (Some(_), Some(_)) => Some(None),
+                    _ => None,
                 }
             }
-            Op::BitXor | Op::BitXnor => (k(0).is_some() && k(1).is_some()).then_some(None),
+            Op::BitXor | Op::BitXnor => match (k(0), k(1)) {
+                (Some(Some(a)), Some(Some(b))) => {
+                    Some(Some(((a != 0) ^ (b != 0) ^ (op == Op::BitXnor)) as u64))
+                }
+                (Some(_), Some(_)) => Some(None),
+                _ => None,
+            },
             _ => None,
         };
         let Some(value) = value else {
@@ -2751,6 +2764,7 @@ impl Instr<'_> {
         p.nodes.push(Node {
             op: Op::Const,
             kids: [0; 3],
+            value: UNEVALUATED,
         });
         p.relational.push(false);
         p.konst.push(self.ctx.constant(e, &self.here));
@@ -2837,7 +2851,15 @@ impl Instr<'_> {
             p.system = system;
             ks = [0; 3];
         }
-        p.nodes[i] = Node { op, kids: ks };
+        let value = match (op, p.konst[i]) {
+            (Op::Const, Some(Some(v))) => (v != 0) as u8,
+            _ => UNEVALUATED,
+        };
+        p.nodes[i] = Node {
+            op,
+            kids: ks,
+            value,
+        };
         i as u32
     }
 
@@ -4709,6 +4731,7 @@ impl Simulator {
             let v = match nodes[i].op {
                 Op::Term(t, _) if cur[t as usize] != UNEVALUATED => continue,
                 _ if v != UNEVALUATED => v,
+                Op::Const if nodes[i].value != UNEVALUATED => nodes[i].value,
                 _ => match self.cov_quietly(|me| me.eval_expr(x)).is_nonzero() {
                     Some(true) => 1,
                     Some(false) => 0,
@@ -4976,8 +4999,8 @@ impl Simulator {
                 // a negation the right decides too, so it is read all the
                 // same when that has no side effects.
                 if !l.has_xz() && l.to_u64() == Some(0) {
-                    if n.op == Op::AndFull && pure(right) {
-                        self.cov_quietly(|me| me.cov_node(nodes, k1, right, vals));
+                    if n.op == Op::AndFull {
+                        self.cov_skipped(nodes, k1, right, vals);
                     }
                     Value::from_u64(0, 1)
                 } else {
@@ -4988,8 +5011,8 @@ impl Simulator {
             (Op::Or | Op::OrFull, ExprKind::Binary { left, right, .. }) => {
                 let l = self.cov_node(nodes, k0, left, vals);
                 if l.to_u64().is_some_and(|v| v != 0) {
-                    if n.op == Op::OrFull && pure(right) {
-                        self.cov_quietly(|me| me.cov_node(nodes, k1, right, vals));
+                    if n.op == Op::OrFull {
+                        self.cov_skipped(nodes, k1, right, vals);
                     }
                     Value::from_u64(1, 1)
                 } else {
@@ -5050,13 +5073,8 @@ impl Simulator {
                         (else_expr, k2, then_expr, k1)
                     };
                     let v = self.cov_node(nodes, kt, taken, vals);
-                    // (Only a literal or a parameter: reading it does nothing.)
-                    let pure = matches!(
-                        unparen(other).kind,
-                        ExprKind::Number(_) | ExprKind::Ident(_)
-                    );
-                    if nodes[ko as usize].op == Op::Const && pure {
-                        self.cov_node(nodes, ko, other, vals);
+                    if nodes[ko as usize].op == Op::Const {
+                        self.cov_skipped(nodes, ko, other, vals);
                     }
                     v
                 }
@@ -5069,6 +5087,19 @@ impl Simulator {
             None => X,
         };
         v
+    }
+
+    /// Note the value of node `k` (`e`), an operand or arm the design
+    /// skipped, for the rows it decides: a constant's folded value, whatever
+    /// its shape (`b & 1'b0` as `1'b0`), decided once by the plan; otherwise
+    /// `e` is read only when that has no side effects, counting nothing.
+    fn cov_skipped(&mut self, nodes: &[Node], k: u32, e: &Expression, vals: &mut [u8]) {
+        let n = nodes[k as usize];
+        if n.op == Op::Const && n.value != UNEVALUATED {
+            vals[k as usize] = n.value;
+        } else if pure(e) {
+            self.cov_quietly(|me| me.cov_node(nodes, k, e, vals));
+        }
     }
 
     /// Nets and variables toggle coverage tracks, by name, taken while the

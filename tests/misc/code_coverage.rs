@@ -3224,3 +3224,93 @@ endmodule
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// What constants make of an item is decided once, from the folded value
+/// of each operand and arm, whatever other kinds are collected and however
+/// the constant is written (§11.2.1, §11.3.5, §11.4.11): the condition and
+/// expression totals of a design are the same under `cond`,
+/// `cond,branch`, `expr` and `all`. Left out: the condition items in the
+/// arm of a `?:` a parameter rules out (`a && b`), and in the right
+/// operand of `1'b0 && ...` (`a && c`) and of `1'b1 || ...` (`b || c`),
+/// which are never evaluated. And an arm folded to 0 (`b & 1'b0`) masks
+/// the condition of a `?:` like a literal 0: `y3`'s rows are `y4`'s.
+#[test]
+fn constant_folding_whatever_the_kinds() {
+    let d = scratch("constant-kinds");
+    let src = "\
+module tb;
+  parameter bit P = 0;
+  logic a, b, c, s;
+  logic [7:0] y8;
+  logic y1, y2, y3, y4;
+  always_comb begin
+    y8 = P ? ((a && b) ? 8'd1 : 8'd2) : ((a || b) ? 8'd3 : 8'd0);
+    y1 = 1'b0 && ((a && c) ? 1'b1 : 1'b0);
+    y2 = 1'b1 || ((b || c) ? 1'b1 : 1'b0);
+  end
+  task automatic upd;
+    y3 = s ? a : (b & 1'b0);
+    y4 = s ? a : 1'b0;
+  endtask
+  initial begin
+    s = 1; a = 0; b = 0; c = 0; upd();
+    #1 a = 1; upd();
+    #1 s = 0; b = 1; upd();
+    #1 a = 0; upd();
+    #1 $finish;
+  end
+endmodule
+";
+    // The `kind` tally of a results entry, as written.
+    let tally = |e: &str, kind: &str| -> Option<String> {
+        let key = format!("\"{kind}\": {{");
+        let at = e.find(&key)?;
+        Some(e[at..at + e[at..].find('}').unwrap() + 1].to_string())
+    };
+    let mut seen: Vec<(&str, Option<String>, Option<String>)> = Vec::new();
+    for kinds in [
+        "--code-coverage=cond",
+        "--code-coverage=cond,branch",
+        "--code-coverage=expr",
+        "--code-coverage=all",
+    ] {
+        let out = run(&d, src, &[kinds]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json = results(&d);
+        let tb = scope_entry(&json, "tb").to_string();
+        for dead in ["a && b", "a && c", "b || c"] {
+            assert!(
+                !tb.contains(&format!("\"text\": \"{dead}\"")),
+                "{kinds}: {dead}: {tb}"
+            );
+        }
+        let cond = tally(&tb, "condition");
+        let expr = tally(&tb, "expression");
+        if kinds.contains("cond") || kinds.contains("all") {
+            assert!(tb.contains("\"text\": \"a || b\""), "{kinds}: {tb}");
+            assert!(cond.as_deref().is_some_and(|t| t.contains("\"total\": 2")), "{kinds}: {tb}");
+        }
+        if kinds.contains("expr") || kinds.contains("all") {
+            assert_eq!(
+                terms(&tb, 12, "statement"),
+                terms(&tb, 13, "statement"),
+                "{kinds}: {tb}"
+            );
+            assert!(expr.as_deref().is_some_and(|t| t.contains("\"total\": 4")), "{kinds}: {tb}");
+        }
+        seen.push((kinds, cond, expr));
+    }
+    // The same totals in every run that collects the kind.
+    for k in 0..2 {
+        let got: Vec<&String> = seen
+            .iter()
+            .filter_map(|s| if k == 0 { s.1.as_ref() } else { s.2.as_ref() })
+            .collect();
+        assert!(got.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -76,3 +76,33 @@ endmodule
         o
     );
 }
+
+/// §16.5.1, §4.4.2.1: values are sampled once per time slot, in its Preponed
+/// region. Here the property's clock rises two deltas into the slot, from the
+/// process that the NBA update of `d` wakes, and `d` is still sampled with
+/// its value from the start of the slot. The samples used to be retaken in
+/// every delta the scheduler re-entered, which saw the new `d`. Verilator
+/// 5.038 passes all 10 ticks (with `$display` action blocks; it stops with
+/// an internal error on the counters).
+#[test]
+fn clock_in_a_later_delta_samples_slot_entry_values() {
+    let o = out(r#"
+module top;
+  logic clk0 = 0, clk = 0, d = 0, e = 0;
+  int fails = 0, n = 0;
+  always #5 clk0 = ~clk0;
+  always @(posedge clk0) d <= ~d;
+  always @(negedge clk0) e = d;
+  always @(d) begin #0 clk = 1; #1 clk = 0; end
+  a_d: assert property (@(posedge clk) d == e)
+    else begin fails++; $display("[FAIL] a_d t=%0t", $time); end
+  c_n: cover property (@(posedge clk) 1) n++;
+  initial #100 begin $display("[RESULT] ticks=%0d fails=%0d", n, fails); $finish; end
+endmodule
+"#);
+    assert!(
+        o.contains("[RESULT] ticks=10 fails=0"),
+        "a tick in a later delta must use the slot's Preponed samples; got: {}",
+        o
+    );
+}

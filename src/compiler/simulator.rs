@@ -3435,6 +3435,9 @@ struct SvaClockedSite {
     /// LSB of the most recent clock value: 0, 1, X (2), or Z (3).
     /// Declarative sites start with the value before Active processes run.
     prev_clock: u8,
+    /// The clock event happened and the attempts it starts have not been
+    /// evaluated yet (`sva_note_edges`).
+    fired: bool,
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
@@ -6376,6 +6379,14 @@ pub struct Simulator {
     /// being one clock cycle early. Only populated when `sva_sites` is
     /// non-empty; the referenced ids are those collected per site.
     sva_preponed: HashMap<usize, Value>,
+    /// The time slot `sva_preponed` was captured for. The Preponed region
+    /// runs once per slot (§4.4.2.1), so the later deltas of a slot (a VPI
+    /// write from cbReadWriteSynch reopening the Active region) keep it.
+    sva_preponed_slot: Option<u64>,
+    /// A site's clock event is recorded (`fired`) and not evaluated yet.
+    sva_owed: bool,
+    /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
+    sva_post_nba_busy: bool,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -13082,6 +13093,9 @@ impl Simulator {
             sva_default_disable: HashMap::default(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
+            sva_preponed_slot: None,
+            sva_owed: false,
+            sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
@@ -47699,6 +47713,10 @@ impl Simulator {
         }
     }
 
+    // Kept out of line: inlined into the event loop, it pushed the loop's
+    // other callees out of line, which cost instructions on designs without
+    // assertions.
+    #[inline(never)]
     fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -47723,6 +47741,14 @@ impl Simulator {
         // §14.4: #1step samples precede every callback/active-region write
         // at this time, and remain fixed across this slot's later deltas.
         self.refresh_clocking_preponed();
+        // LRM §16.5.1: the same holds for the Preponed samples of every
+        // SVA-referenced signal: taken before the slot's Pre-Active VPI
+        // callbacks (cbAtStartOfSimTime, cbAfterDelay; §4.4.3.2) and its
+        // active/NBA regions, and kept by the slot's later deltas, so a
+        // clocked assertion firing later in the slot (a clock written from
+        // cbReadWriteSynch, or one a later delta raises) samples pre-edge
+        // values rather than values written earlier in the slot.
+        self.refresh_sva_preponed();
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot
@@ -47744,11 +47770,6 @@ impl Simulator {
             self.dirty_any = true;
         }
         self.fire_timing_timers();
-        // LRM §16.5.1: capture Preponed (slot-entry) samples of every
-        // SVA-referenced signal BEFORE the active/NBA regions run, so a
-        // clocked assertion firing later this slot (tick_sva_sites) samples
-        // pre-edge values rather than same-edge NBA updates.
-        self.refresh_sva_preponed();
 
         if self.sched_trace_on() {
             eprintln!("[sched] t={} +--- tick ---", self.time);
@@ -47983,7 +48004,9 @@ impl Simulator {
         }
         // LRM §16.5 SVA clocked property evaluation. Detects edges on
         // each registered clock signal and ticks pending consequents.
-        self.tick_sva_sites();
+        // A cbNBASynch or cbReadWriteSynch due at a clock edge runs first
+        // (`sva_post_nba`).
+        self.sva_observed();
         if self.finished {
             return;
         }
@@ -97970,6 +97993,11 @@ impl Simulator {
                 self.sva_preponed.insert(id, self.signal_table[id].clone());
             }
         }
+        // For the first site these are the slot's only samples: a later delta
+        // of the slot must not retake them (`refresh_sva_preponed`).
+        if self.sva_sites.is_empty() {
+            self.sva_preponed_slot = Some(self.time);
+        }
         let mut past_names = Vec::new();
         self.collect_past_arg_names(&body_expanded, &mut past_names);
         // A signal is sampled once per property clock, however many
@@ -98032,6 +98060,7 @@ impl Simulator {
             node: std::sync::Arc::new(node),
             disable,
             prev_clock,
+            fired: false,
             attempts: Vec::new(),
             past_snapshots: HashMap::default(),
             pass_action: a.action.as_deref().cloned(),
@@ -98362,9 +98391,11 @@ impl Simulator {
     }
 
     fn refresh_sva_preponed(&mut self) {
-        if self.sva_sites.is_empty() {
+        // Once per slot (§4.4.2.1): a later delta of the slot keeps them.
+        if self.sva_sites.is_empty() || self.sva_preponed_slot == Some(self.time) {
             return;
         }
+        self.sva_preponed_slot = Some(self.time);
         self.sva_preponed.clear();
         for i in 0..self.sva_sites.len() {
             for j in 0..self.sva_sites[i].sampled_ids.len() {
@@ -98419,23 +98450,42 @@ impl Simulator {
         self.class_context_stack = saved_cls;
     }
 
-    fn tick_sva_sites_inner(&mut self) {
-        // §16.14.6.2: the procedural instances queued so far mature (no
-        // flush point can drop them any more); each starts an attempt at the
-        // next tick of its leading clock.
-        if !self.sva_proc_pending.is_empty() {
-            for (idx, _, env) in std::mem::take(&mut self.sva_proc_pending) {
-                if let Some(site) = self.sva_sites.get_mut(idx) {
-                    site.matured.push(env);
-                }
-            }
+    /// §4.4.2: the Observed region of a delta. It follows the whole active
+    /// region set, the Post-NBA cbReadWriteSynch routines included, so with
+    /// a cbNBASynch or cbReadWriteSynch due in this slot `sva_post_nba`
+    /// finishes that set first; inside it, a delta's Observed region only
+    /// records clock events. Inline in both callers, so a design without
+    /// assertions pays one emptiness check per delta.
+    #[inline(always)]
+    fn sva_observed(&mut self) {
+        if self.sva_sites.is_empty() {
+            return;
         }
-        // Use indices so we can call &mut self methods inside the loop
-        // without holding a borrow on self.sva_sites.
+        if self.sva_post_nba_busy || self.vpi_synch_due() {
+            self.sva_post_nba();
+        } else {
+            self.tick_sva_sites();
+        }
+    }
+
+    /// Record the assertion clocks' events now, for a tick deferred until
+    /// the slot's due cbReadWriteSynch routines have run (`sva_post_nba`): an
+    /// edge such a routine moves back still starts its attempts.
+    fn note_sva_edges(&mut self) {
+        if self.finished || self.sva_sites.is_empty() {
+            return;
+        }
+        let saved_this = std::mem::take(&mut self.this_stack);
+        let saved_cls = std::mem::take(&mut self.class_context_stack);
+        self.sva_note_edges();
+        self.this_stack = saved_this;
+        self.class_context_stack = saved_cls;
+    }
+
+    /// Mark each site whose clock event happened since the last call, with
+    /// its `iff` guard checked then.
+    fn sva_note_edges(&mut self) {
         for i in 0..self.sva_sites.len() {
-            if self.finished {
-                break;
-            }
             let clk_name = &self.sva_sites[i].clock_signal;
             if clk_name.is_empty() {
                 continue;
@@ -98463,6 +98513,36 @@ impl Simulator {
                     self.sva_cancel_disabled(i);
                     continue;
                 }
+            }
+            self.sva_sites[i].fired = true;
+            self.sva_owed = true;
+        }
+    }
+
+    fn tick_sva_sites_inner(&mut self) {
+        // §16.14.6.2: the procedural instances queued so far mature (no
+        // flush point can drop them any more); each starts an attempt at the
+        // next tick of its leading clock.
+        if !self.sva_proc_pending.is_empty() {
+            for (idx, _, env) in std::mem::take(&mut self.sva_proc_pending) {
+                if let Some(site) = self.sva_sites.get_mut(idx) {
+                    site.matured.push(env);
+                }
+            }
+        }
+        // The clock events since the last call, and those a deferred tick
+        // recorded (`note_sva_edges`).
+        self.sva_note_edges();
+        self.sva_owed = false;
+        // Use indices so we can call &mut self methods inside the loop
+        // without holding a borrow on self.sva_sites.
+        for i in 0..self.sva_sites.len() {
+            if self.finished {
+                break;
+            }
+            // Only the sites whose clock event was recorded tick.
+            if !std::mem::take(&mut self.sva_sites[i].fired) {
+                continue;
             }
             let span_key = self.sva_sites[i].stat_key;
             let site_loc = self.sva_sites[i].stat_loc;

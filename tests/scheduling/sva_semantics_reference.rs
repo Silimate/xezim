@@ -162,7 +162,7 @@ endmodule
 }
 
 #[test]
-fn not_of_a_sequence_fails_only_on_a_match() {
+fn not_of_a_sequence_fails_when_its_weak_operand_is_unfinished() {
     let text = run(
         "not_of_a_sequence_fails_only_on_a_match",
         r#"
@@ -174,7 +174,7 @@ endmodule
 "#,
     );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    assert_eq!(fails(&text), vec![] as Vec<&str>, "FAIL lines:\n{text}");
+    assert_eq!(fails(&text), vec!["FAIL 41"], "FAIL lines:\n{text}");
 }
 
 #[test]

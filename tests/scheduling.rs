@@ -115,6 +115,8 @@ mod expect_statement_blocks;
 mod explicit_level_suspend;
 #[path = "scheduling/explicit_sensitivity_and_delay_task.rs"]
 mod explicit_sensitivity_and_delay_task;
+#[path = "scheduling/for_decl_signed_across_wait.rs"]
+mod for_decl_signed_across_wait;
 #[path = "scheduling/forever_break_and_disable_fork_label.rs"]
 mod forever_break_and_disable_fork_label;
 #[path = "scheduling/fork_automatic_capture.rs"]
@@ -303,10 +305,18 @@ mod phase_jump_static_latch;
 mod release_from_level_sensitive_block;
 #[path = "scheduling/static_recursion_shared_cell.rs"]
 mod static_recursion_shared_cell;
+#[path = "scheduling/sva_array_sampling.rs"]
+mod sva_array_sampling;
+#[path = "scheduling/sva_context_width.rs"]
+mod sva_context_width;
 #[path = "scheduling/sva_instances_and_sequences.rs"]
 mod sva_instances_and_sequences;
 #[path = "scheduling/sva_local_diagnostics.rs"]
 mod sva_local_diagnostics;
+#[path = "scheduling/sva_named_property_hier_sampling.rs"]
+mod sva_named_property_hier_sampling;
+#[path = "scheduling/sva_past_first_tick.rs"]
+mod sva_past_first_tick;
 #[path = "scheduling/sva_semantics_reference.rs"]
 mod sva_semantics_reference;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]
@@ -332,3 +342,14 @@ mod next_rest_followed_by_375;
 
 #[path = "scheduling/loop_scope_379.rs"]
 mod next_rest_loop_scope_379;
+
+#[path = "scheduling/clock_edges_385.rs"]
+mod clock_edges_385;
+
+#[path = "scheduling/action_scopes_386.rs"]
+mod action_scopes_386;
+
+#[path = "scheduling/pending_negation_393.rs"]
+mod pending_negation_393;
+#[path = "scheduling/followed_vacuity_395.rs"]
+mod followed_vacuity_395;

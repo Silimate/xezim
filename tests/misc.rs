@@ -19,6 +19,8 @@ mod ansi_net_port_procedural_assign;
 mod argument_binding;
 #[path = "misc/artifact_compression_modes.rs"]
 mod artifact_compression_modes;
+#[path = "misc/assertion_instances.rs"]
+mod assertion_instances;
 #[path = "misc/assign_z_passthrough.rs"]
 mod assign_z_passthrough;
 #[path = "misc/assignment_compatibility.rs"]
@@ -360,6 +362,8 @@ mod spec_canonical_keying;
 mod static_collection_per_spec;
 #[path = "misc/static_init_sysfuncs.rs"]
 mod static_init_sysfuncs;
+#[path = "misc/static_local_partial_write.rs"]
+mod static_local_partial_write;
 #[path = "misc/static_local_per_spec.rs"]
 mod static_local_per_spec;
 #[path = "misc/static_method_via_handle.rs"]
@@ -415,6 +419,8 @@ mod class_collection_storage;
 mod class_queue_locators;
 #[path = "misc/cli_compat_args.rs"]
 mod cli_compat_args;
+#[path = "misc/compat_defaults.rs"]
+mod compat_defaults;
 #[path = "misc/cross_checked_constructs.rs"]
 mod cross_checked_constructs;
 #[path = "misc/dead_giant_declaration_elision.rs"]
@@ -514,3 +520,9 @@ mod loop_var_scope_lint;
 
 #[path = "misc/cli_transcript_347.rs"]
 mod cli_transcript_347;
+
+#[path = "misc/relaxed_static_initializers_351.rs"]
+mod relaxed_static_initializers_351;
+
+#[path = "misc/string_casts_391.rs"]
+mod string_casts_391;

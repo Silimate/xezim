@@ -594,8 +594,11 @@ impl Simulator {
                         set!(*d, p);
                     }
                     TsInsn::Concat { d, parts } => {
-                        let (mut av, mut ax) = (0u64, 0u64);
-                        for &(r, w) in parts.iter() {
+                        // §11.4.12: preserve both planes of a full-word
+                        // first part without shifting zero by 64.
+                        let (mut av, mut ax) =
+                            parts.first().map_or((0, 0), |&(r, _)| (v!(r), x!(r)));
+                        for &(r, w) in parts.iter().skip(1) {
                             av = (av << w) | v!(r);
                             ax = (ax << w) | x!(r);
                         }

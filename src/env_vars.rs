@@ -224,6 +224,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Signal commits: enable experimental per-destination sidecar specialization (1 enables)",
     ),
     (
+        "XEZIM_COMPAT",
+        "CLI: same as --compat (no time cap, relaxed implicit-static and driver checks, --error-exit)",
+    ),
+    (
         "XEZIM_COMPILE_FAIL_STATS",
         "Bytecode: print why statements failed to compile (bail census)",
     ),

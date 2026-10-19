@@ -10,7 +10,7 @@ use std::process::Command;
 #[path = "../../src/cli_compat.rs"]
 mod cli_compat;
 
-use cli_compat::{DoPlan, DoRun, bare_top_name, c_takes_file, plan_do_scripts};
+use cli_compat::{DoPlan, DoRun, bare_top_name, c_takes_file, coverage_types, plan_do_scripts};
 
 fn xezim() -> String {
     let mut p = std::env::current_exe().expect("current_exe");
@@ -157,6 +157,90 @@ fn bare_names_and_dash_c() {
     assert!(!c_takes_file(Some("tb_top"), &libs));
     assert!(!c_takes_file(Some("work.tb_top"), &libs));
     assert!(!c_takes_file(None, &libs));
+}
+
+/// `-coverage <types>`: `all`/`A` or a `:` list of B, E, F, T, U in either
+/// case. Blocks are statements and branch arms, expressions are condition
+/// and expression coverage, `F` is FSM coverage; functional coverage is
+/// always on. Anything else is not a list, and `-coverage` then takes no
+/// value.
+#[test]
+fn coverage_type_lists() {
+    use xezim::compiler::simulator::{
+        KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_FSM, KIND_STATEMENT,
+        KIND_TOGGLE,
+    };
+    let all = KIND_ALL;
+    let none = String::new();
+    assert_eq!(coverage_types("all"), Some((all, none.clone())));
+    assert_eq!(coverage_types("ALL"), Some((all, none.clone())));
+    assert_eq!(coverage_types("A"), Some((all, none.clone())));
+    assert_eq!(
+        coverage_types("B:T"),
+        Some((KIND_STATEMENT | KIND_BRANCH | KIND_TOGGLE, none.clone()))
+    );
+    assert_eq!(
+        coverage_types("b"),
+        Some((KIND_STATEMENT | KIND_BRANCH, none.clone()))
+    );
+    assert_eq!(coverage_types("T"), Some((KIND_TOGGLE, none.clone())));
+    assert_eq!(
+        coverage_types("B:E:F:U:e"),
+        Some((
+            KIND_STATEMENT | KIND_BRANCH | KIND_CONDITION | KIND_EXPRESSION | KIND_FSM,
+            String::new()
+        ))
+    );
+    assert_eq!(coverage_types("U"), Some((0, none)));
+    for bad in ["", "tb", "B:", ":T", "B,T", "x", "t.sv", "+cover=s"] {
+        assert_eq!(coverage_types(bad), None, "{}", bad);
+    }
+}
+
+/// A source file whose name reads as coverage types stays a source file
+/// after `-coverage`: in the working directory, and in an args file, where
+/// a relative name is also looked up beside the args file.
+#[test]
+fn coverage_types_never_take_a_source_file() {
+    let d = scratch("covsrc");
+    std::fs::create_dir_all(d.join("cfg")).unwrap();
+    std::fs::write(
+        d.join("cfg/all"),
+        "module tb; initial $display(\"ALL\"); endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("cfg/files.f"), "-coverage all\n").unwrap();
+    for (dir, args) in [
+        (d.clone(), &["-f", "cfg/files.f"][..]),
+        (d.join("cfg"), &["-coverage", "all"][..]),
+    ] {
+        let _ = std::fs::remove_file(dir.join("xezim_cov.json"));
+        let out = ok_stdout(&dir, args);
+        assert!(out.contains("ALL"), "{:?}: {}", args, out);
+        let cov = std::fs::read_to_string(dir.join("xezim_cov.json")).unwrap_or_default();
+        assert!(cov.contains("\"code_coverage\""), "{:?}: {}", args, cov);
+    }
+}
+
+/// `--version` and `-version` print what `-V` prints, the version and the
+/// git revision, and exit 0.
+#[test]
+fn version_flags() {
+    let d = scratch("version");
+    let v = ok_stdout(&d, &["-V"]);
+    let head = format!(
+        "xezim version {}\ngit {} ({})\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("XEZIM_GIT_HASH"),
+        env!("XEZIM_GIT_DATE")
+    );
+    assert!(v.starts_with(&head), "{}", v);
+    for flag in ["--version", "-version"] {
+        let (code, out, err) = run_in(&d, &[flag]);
+        assert_eq!(code, 0, "{}: {}", flag, err);
+        assert_eq!(out, v, "{}", flag);
+        assert_eq!(err, "", "{}", flag);
+    }
 }
 
 const TIMED: &str = "\
@@ -339,6 +423,84 @@ fn defines_incdirs_and_args_files() {
     .unwrap();
     assert_eq!(ok_stdout(&d.join("run"), &["-F", "../files.f"]), native);
     assert_eq!(ok_stdout(&d, &["-file", "files.f"]), native);
+}
+
+/// `-define`, `-incdir` and `-top` are `-D`, `-I` and `-s`, on the command
+/// line and in args files (where `-incdir`, like `-I`, is relative to the
+/// file). Their values used to be read as a source file or a top name.
+#[test]
+fn long_define_incdir_top() {
+    let d = scratch("long");
+    std::fs::create_dir_all(d.join("inc1")).unwrap();
+    std::fs::write(d.join("inc1/one.svh"), "`define ONE 11\n").unwrap();
+    std::fs::write(
+        d.join("t.sv"),
+        "`include \"one.svh\"\n\
+         module tb; initial $display(\"VAL=%0d ONE=%0d\", `VAL, `ONE); endmodule\n\
+         module other; initial $display(\"other\"); endmodule\n",
+    )
+    .unwrap();
+    let native = ok_stdout(&d, &["-D", "VAL=7", "-I", "inc1", "-s", "tb", "t.sv"]);
+    assert!(
+        native.contains("VAL=7 ONE=11") && !native.contains("other"),
+        "{}",
+        native
+    );
+    let (code, out, err) = run_in(
+        &d,
+        &["-define", "VAL=7", "-incdir", "inc1", "-top", "tb", "t.sv"],
+    );
+    assert_eq!((code, out.as_str(), err.as_str()), (0, native.as_str(), ""));
+    std::fs::create_dir_all(d.join("run")).unwrap();
+    std::fs::write(
+        d.join("files.f"),
+        "-define VAL=7\n-incdir inc1\n-top tb\nt.sv\n",
+    )
+    .unwrap();
+    assert_eq!(ok_stdout(&d.join("run"), &["-f", "../files.f"]), native);
+}
+
+/// Options that change nothing in xezim are accepted silently, together
+/// with their values: coverage overwrite, license queueing, rerunning a
+/// snapshot, debug access, message suppression, an error cap and library
+/// or scratch directories. The run is the same as without them; no value
+/// is read as a source file or a top name, and `-licqueue` is no longer the
+/// glued `-l icqueue` that sent the transcript to a file named `icqueue`.
+/// `-seed` and `-svseed` are `+seed=` on the command line too, where the
+/// glued `-s<top>` took them for tops named `eed` and `vseed`.
+#[test]
+fn accepted_without_effect() {
+    let d = scratch("noeffect");
+    std::fs::write(d.join("tb.sv"), RANDOM).unwrap();
+    let native = ok_stdout(&d, &["tb.sv", "+seed=3"]);
+    let ignored = [
+        "-covoverwrite",
+        "-licqueue",
+        "-R",
+        "-access",
+        "+rwc",
+        "+access+r",
+        "-nowarn",
+        "DLCPTH",
+        "-errormax",
+        "15",
+        "-xmlibdirname",
+        "xlib",
+        "-cds_implicit_tmpdir",
+        "tmpd",
+    ];
+    let mut args = ignored.to_vec();
+    args.extend(["tb.sv", "-seed", "3"]);
+    let (code, out, err) = run_in(&d, &args);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, native.as_str(), ""));
+    assert!(!d.join("icqueue").exists());
+    std::fs::write(d.join("files.f"), format!("{}\ntb.sv\n", ignored.join(" "))).unwrap();
+    assert_eq!(ok_stdout(&d, &["-f", "files.f", "-svseed", "3"]), native);
+    for flag in ["-seed", "-svseed"] {
+        let (code, _, err) = run_in(&d, &["tb.sv", flag, "random"]);
+        assert_eq!(code, 0, "{}", err);
+        assert!(err.contains("random seed:"), "{}: {}", flag, err);
+    }
 }
 
 /// `+incdir+.` in a `-F` file elsewhere is the file's own directory. `.`

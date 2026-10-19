@@ -1309,6 +1309,27 @@ fn check_class(c: &ClassDeclaration, errs: &mut Vec<String>) {
     let has_base = c.extends.is_some();
     for item in &c.items {
         if let ClassItem::Method(m) = item {
+            // §18.11: randomization callbacks are functions returning void
+            // with no arguments, including declarations in derived classes
+            // and extern prototypes. Check before dispatch can execute them.
+            let (name, valid_hook) = match &m.kind {
+                ClassMethodKind::Function(f)
+                | ClassMethodKind::PureVirtual(f)
+                | ClassMethodKind::Extern(f) => (
+                    f.name.name.name.as_str(),
+                    matches!(f.return_type, DataType::Void(_))
+                        && f.ports.is_empty()
+                        && f.strict_body_ports.is_empty(),
+                ),
+                ClassMethodKind::Task(t) => (t.name.name.name.as_str(), false),
+            };
+            if matches!(name, "pre_randomize" | "post_randomize") && !valid_hook {
+                errs.push(format!(
+                    "class '{}': '{}' must be a function returning void with no arguments \
+                     (LRM 1800-2017 §18.11)",
+                    c.name.name, name
+                ));
+            }
             let (body, is_new) = match &m.kind {
                 ClassMethodKind::Function(f) => (Some(&f.items), f.name.name.name == "new"),
                 ClassMethodKind::Task(t) => (Some(&t.items), t.name.name.name == "new"),

@@ -529,8 +529,20 @@ before a callback runs appears before the routine's `vpi_printf` output.
 
 Within one time step the simulation-time reasons run in the order of the
 table. A value written from any of them except `cbReadOnlySynch` opens a
-fresh delta in the same step, so edge-sensitive processes see it; a pending
-one holds the scheduler at its time even when no HDL event is due there.
+fresh delta in the same step, so edge-sensitive processes see it. Concurrent
+assertions are evaluated in the step of their clock edge, also when a routine
+writes the clock. A `cbReadWriteSynch` due at an assertion's clock edge runs
+before them and before that delta's clocking-event waiters, instead of after
+both, once the step's Active, Inactive and NBA work and its `cbNBASynch`
+routines are done (the Post-NBA region comes before the Observed region,
+§4.4.2): a reset it releases at the edge, as a cocotb test does after
+`RisingEdge`, does not disable that edge's attempt (`disable iff` reads
+current values), and one a clocking-event waiter raises at the edge comes
+after the attempt. They sample the values the step began with (§16.5.1),
+from before even `cbNextSimTime`, `cbAtStartOfSimTime` and `cbAfterDelay`
+run, so a clock written from `cbReadWriteSynch`, as cocotb's `Clock` does,
+samples like one driven from HDL. A pending callback holds the scheduler at
+its time even when no HDL event is due there.
 The time of `cbAfterDelay`, `cbNBASynch`, `cbReadWriteSynch` and
 `cbReadOnlySynch` is a delay (a NULL `time` is a zero delay); that of
 `cbAtStartOfSimTime`/`cbAtEndOfSimTime` is absolute, and a time already begun
@@ -597,6 +609,15 @@ hook.
   whose limits differ from its delay is refused). `append_flag` adds to the
   current delays. A module path's `vpiFullName` is its output net's; a timing
   check's is its scope plus the check's name.
+- An input or inout port connected to a whole net of its own shape is one
+  object with it (§23.3.3.7), an unpacked-array port connected to a whole
+  array included: a value written through VPI to `top.u.a[3]` is what
+  instance `u` reads, and the actual's name `top.a[3]` reads it too, through
+  any number of port levels; one written to `top.a[3]` reaches `top.u.a[3]`.
+  A port on a bit- or part-select, an array slice, a concatenation or an
+  expression keeps a net of its own. xezim also shares the storage when the
+  actual is a variable, which the standard does not merge with a net port: a
+  write to the port's name then changes the variable too.
 - `vpiInterModPath` delays live where SDF `INTERCONNECT` delays do, on the
   input port's net. When elaboration collapsed the two ports into one net
   there is no interconnect between them, and `vpi_handle_multi` returns NULL.

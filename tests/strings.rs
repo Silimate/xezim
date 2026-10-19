@@ -113,6 +113,8 @@ mod system_task_gaps;
 mod uvm_dpi_driver_linkage;
 #[path = "strings/uvm_dpi_user_library_wins.rs"]
 mod uvm_dpi_user_library_wins;
+#[path = "strings/vpi_array_ports.rs"]
+mod vpi_array_ports;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
@@ -125,6 +127,8 @@ mod vpi_object_model_walk;
 mod vpi_routines;
 #[path = "strings/vpi_seed_option.rs"]
 mod vpi_seed_option;
+#[path = "strings/vpi_sva_sampling.rs"]
+mod vpi_sva_sampling;
 #[path = "strings/vpi_typed_port_kinds.rs"]
 mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]

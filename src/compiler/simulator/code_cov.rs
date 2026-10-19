@@ -1,6 +1,6 @@
-//! Code coverage: statement, branch, condition, expression and toggle counts,
-//! collected when the run asks for them (`--code-coverage`, `+cover`) and
-//! written to the results file beside the functional coverage.
+//! Code coverage: statement, branch, condition, expression, toggle and FSM
+//! counts, collected when the run asks for them (`--code-coverage`,
+//! `+cover`) and written to the results file beside the functional coverage.
 //!
 //! Statements and branches are instrumented at compile time, on the
 //! elaborated design, before any block is lowered: a counted statement gets a
@@ -329,10 +329,13 @@ pub(crate) enum Op {
 }
 
 /// A node of an item's logic tree, in pre-order; `kids` index the tree.
+/// `value`: a `Const` node's value (0 or 1) when the plan folded it to a
+/// known one, `UNEVALUATED` otherwise.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Node {
     op: Op,
     kids: [u32; 3],
+    value: u8,
 }
 
 /// A node value in an item's evaluation: 0, 1, x (or z), or not evaluated.
@@ -372,6 +375,10 @@ pub(crate) struct ExprSite {
     /// An item at the top level of a combinational `always` block (it runs
     /// each time the block does): the block's scope and source offset.
     proc: Option<(String, usize)>,
+    /// An item anywhere in a combinational `always` block: the block, in
+    /// `CodeCov::blocks`. A run of the block that skips the item drops its
+    /// deferred evaluations (`Simulator::cov_block_ran`).
+    comb: Option<u32>,
     /// A continuous assignment's, or a `proc` item's: the term values of
     /// its last evaluation (empty before the first), and the earliest and
     /// latest step each term can settle at (`None` until first needed,
@@ -1357,9 +1364,9 @@ enum Cond {
     Unknown,
 }
 
-/// The statement sites and branch sites one arm or condition holds, as
-/// ranges of `CodeCov::stmts` and `CodeCov::branches`.
-/// The statement, branch and condition/expression item sites some code made.
+/// The statement sites, branch sites and condition and expression items one
+/// arm or condition holds, as ranges of `CodeCov::stmts`, `CodeCov::branches`
+/// and `CodeCov::exprs`.
 type Region = (
     std::ops::Range<usize>,
     std::ops::Range<usize>,
@@ -1519,7 +1526,7 @@ pub(crate) struct CodeCov {
     /// `--code-coverage-expressions=logical` (see `CodeCoverage`).
     logical: bool,
     /// `--code-coverage-granularity=block` (see `CodeCoverage`).
-    blocks: bool,
+    blockwise: bool,
     limit: Vec<String>,
     scopes: Vec<Scope>,
     scope_index: HashMap<String, u32>,
@@ -1552,18 +1559,25 @@ pub(crate) struct CodeCov {
     assigned: Vec<(String, String)>,
     /// Item evaluations not counted yet, by item (see `Simulator::cov_expr`).
     pending: HashMap<u32, Pending>,
+    /// The combinational `always` blocks with items, by source offset and
+    /// scope (`ExprSite::comb`), and the runs of each a process's writes
+    /// made while evaluations were pending (`Simulator::cov_block_ran`).
+    blocks: HashMap<usize, HashMap<String, u32>>,
+    ran: Vec<u64>,
     /// Inside a read that only coverage makes (`Simulator::cov_quietly`):
     /// count nothing.
     quiet: u32,
 }
 
 /// An item's evaluations not counted yet: the process whose write ran its
-/// block and the settle that did, and each evaluation's node values and
-/// term and constant values.
+/// block and the settle that did, the runs of the item's combinational
+/// block that had ended by then (`CodeCov::ran`), and each evaluation's
+/// node values and term and constant values.
 #[allow(clippy::type_complexity)]
 struct Pending {
     pid: usize,
     run: u64,
+    ended: u64,
     evals: Vec<(Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)>,
 }
 
@@ -1636,6 +1650,9 @@ struct Instr<'a> {
     /// statement runs every time the block does: the block's source offset
     /// (for `ExprSite::proc`).
     top: Option<usize>,
+    /// Anywhere in a combinational `always` block: its source offset (for
+    /// `ExprSite::comb`).
+    comb: Option<usize>,
     /// `--code-coverage-expressions=logical`: only `&&` and `||` split an
     /// item into terms, and only conditions are items.
     logical: bool,
@@ -1658,7 +1675,7 @@ impl<'a> Instr<'a> {
         consts: Option<&'a ElaboratedModule>,
     ) -> Self {
         let kinds = cov.kinds;
-        let (logical, blocks) = (cov.logical, cov.blocks);
+        let (logical, blocks) = (cov.logical, cov.blockwise);
         let block = split_scope(inst_paths, path).1.to_string();
         let consts = consts.filter(|_| !cov.keep_constant);
         Instr {
@@ -1675,6 +1692,7 @@ impl<'a> Instr<'a> {
             block,
             hint: None,
             top: None,
+            comb: None,
             logical,
             blocks,
             open: false,
@@ -1742,9 +1760,14 @@ impl Instr<'_> {
         self.open = false;
     }
 
-    /// Run `f`, and return the statement and branch sites it created.
+    /// Run `f`, and return the statement sites, branch sites and items it
+    /// created.
     fn region<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, Region) {
-        let (s0, b0, x0) = (self.cov.stmts.len(), self.cov.branches.len(), self.cov.exprs.len());
+        let (s0, b0, x0) = (
+            self.cov.stmts.len(),
+            self.cov.branches.len(),
+            self.cov.exprs.len(),
+        );
         let r = f(self);
         (
             r,
@@ -2055,9 +2078,9 @@ impl Instr<'_> {
                 stmt: inner,
             } => {
                 self.process(span, kind, &mut v);
-                self.top = top;
+                (self.top, self.comb) = (top, top);
                 self.stmt(*inner, &mut v);
-                self.top = None;
+                (self.top, self.comb) = (None, None);
                 Statement::new(
                     StatementKind::TimingControl {
                         control,
@@ -2068,9 +2091,9 @@ impl Instr<'_> {
             }
             other => {
                 self.process(span, kind, &mut v);
-                self.top = top;
+                (self.top, self.comb) = (top, top);
                 self.stmt(Statement::new(other, span), &mut v);
-                self.top = None;
+                (self.top, self.comb) = (None, None);
                 block(v, span)
             }
         }
@@ -2721,6 +2744,16 @@ impl Instr<'_> {
         );
     }
 
+    /// A `?:` that is no branch (branch coverage is off): what constants make
+    /// of its condition still decides which arm's items are excluded, as
+    /// `ternary` does for a branch, so the condition and expression totals
+    /// do not depend on the other kinds collected.
+    fn choose(&mut self, cond: Cond, t: Region, f: Region) {
+        if !matches!(cond, Cond::Unknown) {
+            self.decide(Choice::Ternary(cond), None, vec![t, f], Vec::new());
+        }
+    }
+
     /// Instrument every `?:` in `e`: its condition as a condition item, and
     /// the `?:` as a branch (see `COND_FN`). Stops at system calls, whose
     /// arguments some tasks read by shape. A `?:` whose condition constants
@@ -2754,6 +2787,8 @@ impl Instr<'_> {
                 let ((), f) = self.region(|me| me.expr(else_expr));
                 if self.kinds & KIND_BRANCH != 0 {
                     self.ternary(e, cond, t, f);
+                } else {
+                    self.choose(cond, t, f);
                 }
             }
             ExprKind::Unary { operand, .. } => self.expr(operand),
@@ -2783,8 +2818,10 @@ impl Instr<'_> {
             }
             _ => {}
         }
+        // (Whatever the operand holds: `?:` branches, or with branch
+        // coverage off only their condition items.)
         if let (Some((cond, skip)), Some(r)) = (decider, operand)
-            && !r.1.is_empty()
+            && !(r.1.is_empty() && r.2.is_empty())
             && !matches!(cond, Cond::Unknown)
         {
             self.decide(Choice::Operand(cond, skip), None, vec![r], Vec::new());
@@ -2856,19 +2893,31 @@ impl Instr<'_> {
             return;
         }
         match &mut e.kind {
+            // The items of an arm or operand the run never evaluates are
+            // excluded, as in `expr`.
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
+                let c = self.skeleton(condition);
                 self.cond(condition, "ternary", false);
-                self.message(then_expr);
-                self.message(else_expr);
+                let ((), t) = self.region(|me| me.message(then_expr));
+                let ((), f) = self.region(|me| me.message(else_expr));
+                self.choose(c, t, f);
             }
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => self.message(inner),
-            ExprKind::Binary { left, right, .. } => {
+            ExprKind::Binary { op, left, right } => {
+                let decider = matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr)
+                    .then(|| (self.skeleton(left), *op == BinaryOp::LogOr));
                 self.message(left);
-                self.message(right);
+                let ((), r) = self.region(|me| me.message(right));
+                if let Some((c, skip)) = decider
+                    && !r.2.is_empty()
+                    && !matches!(c, Cond::Unknown)
+                {
+                    self.decide(Choice::Operand(c, skip), None, vec![r], Vec::new());
+                }
             }
             ExprKind::Concatenation(parts) => {
                 for p in parts.iter_mut() {
@@ -2991,13 +3040,21 @@ impl Instr<'_> {
                 let ctl = |c: Option<Option<u64>>| {
                     c.flatten().is_some_and(|v| (v != 0) as u64 == decides)
                 };
-                if ctl(k(0)) || ctl(k(1)) {
-                    Some(Some(decides))
-                } else {
-                    (k(0).is_some() && k(1).is_some()).then_some(None)
+                match (k(0), k(1)) {
+                    _ if ctl(k(0)) || ctl(k(1)) => Some(Some(decides)),
+                    // Known, and neither decides: both are the other value.
+                    (Some(Some(_)), Some(Some(_))) => Some(Some(decides ^ 1)),
+                    (Some(_), Some(_)) => Some(None),
+                    _ => None,
                 }
             }
-            Op::BitXor | Op::BitXnor => (k(0).is_some() && k(1).is_some()).then_some(None),
+            Op::BitXor | Op::BitXnor => match (k(0), k(1)) {
+                (Some(Some(a)), Some(Some(b))) => {
+                    Some(Some(((a != 0) ^ (b != 0) ^ (op == Op::BitXnor)) as u64))
+                }
+                (Some(_), Some(_)) => Some(None),
+                _ => None,
+            },
             _ => None,
         };
         let Some(value) = value else {
@@ -3023,6 +3080,7 @@ impl Instr<'_> {
         p.nodes.push(Node {
             op: Op::Const,
             kids: [0; 3],
+            value: UNEVALUATED,
         });
         p.relational.push(false);
         p.konst.push(self.ctx.constant(e, &self.here));
@@ -3134,7 +3192,15 @@ impl Instr<'_> {
             p.system = system;
             ks = [0; 3];
         }
-        p.nodes[i] = Node { op, kids: ks };
+        let value = match (op, p.konst[i]) {
+            (Op::Const, Some(Some(v))) => (v != 0) as u8,
+            _ => UNEVALUATED,
+        };
+        p.nodes[i] = Node {
+            op,
+            kids: ks,
+            value,
+        };
         i as u32
     }
 
@@ -3236,6 +3302,8 @@ impl Instr<'_> {
                 }
                 if deep && self.kinds & KIND_BRANCH != 0 {
                     self.ternary(e, parts.0, parts.1, parts.2);
+                } else {
+                    self.choose(parts.0, parts.1, parts.2);
                 }
             }
             _ => match &mut e.kind {
@@ -3260,6 +3328,20 @@ impl Instr<'_> {
             .iter()
             .any(|n| matches!(n.op, Op::BitXor | Op::BitXnor | Op::Mux));
         self.cov.counters += (2 + 2 * bimodal as u32) * p.terms.len() as u32;
+        let comb = self.comb.map(|s| {
+            let next = self.cov.ran.len() as u32;
+            let b = *self
+                .cov
+                .blocks
+                .entry(s)
+                .or_default()
+                .entry(self.here.path.clone())
+                .or_insert(next);
+            if b == next {
+                self.cov.ran.push(0);
+            }
+            b
+        });
         self.cov.exprs.push(ExprSite {
             scope: self.scope,
             span: e.span,
@@ -3283,6 +3365,7 @@ impl Instr<'_> {
                 .top
                 .filter(|_| matches!(kind, "if" | "statement"))
                 .map(|s| (self.here.path.clone(), s)),
+            comb,
             last: Vec::new(),
             steps: None,
             excluded: false,
@@ -4158,7 +4241,7 @@ impl Simulator {
             kinds,
             keep_constant: cfg.keep_constant,
             logical: cfg.logical,
-            blocks: cfg.blocks,
+            blockwise: cfg.blocks,
             limit: cfg.scopes,
             scopes: Vec::new(),
             scope_index: HashMap::default(),
@@ -4178,6 +4261,8 @@ impl Simulator {
             inverters: Vec::new(),
             assigned: Vec::new(),
             pending: HashMap::default(),
+            blocks: HashMap::default(),
+            ran: Vec::new(),
             quiet: 0,
         };
         // Initial blocks and continuous assignments are instrumented where
@@ -4460,7 +4545,7 @@ impl Simulator {
             }
             ins.value(&mut ca.rhs, &ca.lhs, "assign", true);
             // In block granularity a continuous assignment is no block.
-            (kinds & KIND_STATEMENT != 0 && !ins.cov.blocks).then(|| {
+            (kinds & KIND_STATEMENT != 0 && !ins.cov.blockwise).then(|| {
                 let key = (span.start, span.end, scope.clone());
                 match ins.cov.ca_counter.get(&key) {
                     Some(&c) => c,
@@ -4926,13 +5011,15 @@ impl Simulator {
             if let Some(c) = self.code_cov.as_mut() {
                 // A later run of the block replaces an earlier one; a loop in
                 // it evaluates the item more than once in one run.
+                let ended = c.exprs[id as usize].comb.map_or(0, |b| c.ran[b as usize]);
                 let p = c.pending.entry(id).or_insert(Pending {
                     pid,
                     run,
+                    ended,
                     evals: Vec::new(),
                 });
-                if p.run != run {
-                    p.run = run;
+                if p.run != run || p.ended != ended {
+                    (p.run, p.ended) = (run, ended);
                     p.evals.clear();
                 }
                 p.evals.push((vals, terms));
@@ -4983,9 +5070,35 @@ impl Simulator {
             return;
         };
         let s = &c.exprs[id as usize];
+        // A later run of its block skipped the item (`cov_block_ran`).
+        if s.comb.is_some_and(|b| p.ended + 1 < c.ran[b as usize]) {
+            return;
+        }
         let (nodes, row0) = (s.nodes.clone(), (s.row0, s.bimodal));
         for (vals, terms) in p.evals {
             self.cov_count_item(id, &nodes, row0, &vals, terms);
+        }
+    }
+
+    /// A run of combinational block `entry` inside a process ended. Only the
+    /// evaluations of the block's last run count once the process waits
+    /// (`cov_expr`), so an item of the block that this run skipped drops
+    /// those of an earlier run (the reference simulator runs the block once
+    /// then, and does not evaluate it): `cov_flush_item` drops evaluations
+    /// made before the block's last run. Counting the runs is enough, and
+    /// only while evaluations are pending.
+    #[inline]
+    pub(super) fn cov_block_ran(&mut self, entry: &CombEntry) {
+        let Some(c) = self.code_cov.as_deref_mut().filter(|c| !c.pending.is_empty()) else {
+            return;
+        };
+        let scope = entry.cold.scope_hint.as_deref().unwrap_or("");
+        if let Some(&b) = c
+            .blocks
+            .get(&entry.cold.span.start)
+            .and_then(|m| m.get(scope))
+        {
+            c.ran[b as usize] += 1;
         }
     }
 
@@ -5137,6 +5250,7 @@ impl Simulator {
             let v = match nodes[i].op {
                 Op::Term(t, _) if cur[t as usize] != UNEVALUATED => continue,
                 _ if v != UNEVALUATED => v,
+                Op::Const if nodes[i].value != UNEVALUATED => nodes[i].value,
                 _ => match self.cov_quietly(|me| me.eval_expr(x)).is_nonzero() {
                     Some(true) => 1,
                     Some(false) => 0,
@@ -5405,8 +5519,8 @@ impl Simulator {
                 // observes every term whatever the short circuit, so it is
                 // read all the same when that has no side effects.
                 if !l.has_xz() && l.to_u64() == Some(0) {
-                    if (n.op == Op::AndFull || self.cov_logical()) && pure(right) {
-                        self.cov_quietly(|me| me.cov_node(nodes, k1, right, vals));
+                    if n.op == Op::AndFull || self.cov_logical() {
+                        self.cov_skipped(nodes, k1, right, vals);
                     }
                     Value::from_u64(0, 1)
                 } else {
@@ -5417,8 +5531,8 @@ impl Simulator {
             (Op::Or | Op::OrFull, ExprKind::Binary { left, right, .. }) => {
                 let l = self.cov_node(nodes, k0, left, vals);
                 if l.to_u64().is_some_and(|v| v != 0) {
-                    if (n.op == Op::OrFull || self.cov_logical()) && pure(right) {
-                        self.cov_quietly(|me| me.cov_node(nodes, k1, right, vals));
+                    if n.op == Op::OrFull || self.cov_logical() {
+                        self.cov_skipped(nodes, k1, right, vals);
                     }
                     Value::from_u64(1, 1)
                 } else {
@@ -5479,13 +5593,8 @@ impl Simulator {
                         (else_expr, k2, then_expr, k1)
                     };
                     let v = self.cov_node(nodes, kt, taken, vals);
-                    // (Only a literal or a parameter: reading it does nothing.)
-                    let pure = matches!(
-                        unparen(other).kind,
-                        ExprKind::Number(_) | ExprKind::Ident(_)
-                    );
-                    if nodes[ko as usize].op == Op::Const && pure {
-                        self.cov_node(nodes, ko, other, vals);
+                    if nodes[ko as usize].op == Op::Const {
+                        self.cov_skipped(nodes, ko, other, vals);
                     }
                     v
                 }
@@ -5498,6 +5607,19 @@ impl Simulator {
             None => X,
         };
         v
+    }
+
+    /// Note the value of node `k` (`e`), an operand or arm the design
+    /// skipped, for the rows it decides: a constant's folded value, whatever
+    /// its shape (`b & 1'b0` as `1'b0`), decided once by the plan; otherwise
+    /// `e` is read only when that has no side effects, counting nothing.
+    fn cov_skipped(&mut self, nodes: &[Node], k: u32, e: &Expression, vals: &mut [u8]) {
+        let n = nodes[k as usize];
+        if n.op == Op::Const && n.value != UNEVALUATED {
+            vals[k as usize] = n.value;
+        } else if pure(e) {
+            self.cov_quietly(|me| me.cov_node(nodes, k, e, vals));
+        }
     }
 
     /// Nets and variables toggle coverage tracks, by name, taken while the
@@ -6264,7 +6386,7 @@ impl Simulator {
                 .collect();
             // In block granularity an implicit `else` or `default` is a
             // block of its own, run when no written arm is.
-            if cov.blocks && cov.kinds & KIND_STATEMENT != 0 {
+            if cov.blockwise && cov.kinds & KIND_STATEMENT != 0 {
                 for a in arms.iter().filter(|a| a.label.ends_with("(implicit)")) {
                     reports[b.scope as usize].stmts.push(StmtRow {
                         file: file.clone(),

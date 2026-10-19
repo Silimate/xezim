@@ -266,6 +266,10 @@ pub enum StrOpKind {
     /// family of operators compares strings by (§6.16 Table 6-9). Only the
     /// `compare()` METHOD takes signed-byte differences.
     Order,
+    /// [v] -> the operand converted to a `string` value: its bytes with
+    /// every NUL removed (§6.16 — `string'(24'hab0063)` is 2 characters,
+    /// not 3). Appended last so cached bytecode keeps its variant indices.
+    ToStr,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2824,11 +2828,13 @@ impl<'a> BytecodeCompiler<'a> {
     /// concat semantics). We can only see syntactic clues at compile time —
     /// the full `string_signals` set lives on the simulator, not the
     /// bytecode compiler. A string-literal operand is always a string; a
-    /// `$sformatf` / `$psprintf` call returns a string. Bare idents whose
-    /// declared type we don't have here remain false — those cases get
-    /// folded into the bit-vector concat path, which is the existing
-    /// behavior. The interpreter side's special-case is what carries the
-    /// LRM-correct path when the compiler can't see the type.
+    /// `$sformatf` / `$psprintf` call returns a string, as does a
+    /// `string'(x)` cast (§6.24.3) and a function-LOCAL `string` variable
+    /// (`out` in {out, string'(c)}). Other bare idents whose declared type
+    /// we don't have here remain false — those cases get folded into the
+    /// bit-vector concat path, which is the existing behavior. The
+    /// interpreter side's special-case is what carries the LRM-correct
+    /// path when the compiler can't see the type.
     fn expr_is_string_concat_operand(&self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::StringLiteral(_) => true,
@@ -2836,8 +2842,17 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Concatenation(parts) => {
                 parts.iter().any(|p| self.expr_is_string_concat_operand(p))
             }
-            ExprKind::SystemCall { name, .. } => matches!(name.as_str(), "$sformatf" | "$psprintf"),
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$sformatf" | "$psprintf" => true,
+                // §6.24.3: `string'(x)` compiles to a string value (ToStr),
+                // so it is a string operand of an §11.4.12 concat.
+                "$__xz_type_cast" | "$__xz_named_cast" => self.cast_arg_targets_string(args),
+                _ => false,
+            },
             ExprKind::Ident(h) => {
+                if self.local_var_is_string.contains(&Self::hier_raw_name(h)) {
+                    return true;
+                }
                 if let Some(set) = self.string_signals {
                     let last = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                     if set.contains(last) {
@@ -6963,6 +6978,63 @@ impl<'a> BytecodeCompiler<'a> {
         )
     }
 
+    /// §6.24.3: keyword and named casts to a scalar string use the same
+    /// conversion, including aliases in the callee's lexical scope.
+    fn cast_arg_targets_string(&self, args: &[Expression]) -> bool {
+        use crate::ast::types::{TypeName, TypeScope};
+        let Some(arg) = args.first() else {
+            return false;
+        };
+        if let ExprKind::TypeLiteral(dt) = &arg.kind {
+            return self.decl_is_string(dt, None);
+        }
+        fn names(e: &Expression, out: &mut Vec<crate::ast::Identifier>) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.iter().all(|p| p.selects.is_empty()) =>
+                {
+                    out.extend(h.path.iter().map(|p| p.name.clone()));
+                    true
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    if !names(expr, out) {
+                        return false;
+                    }
+                    out.push(member.clone());
+                    true
+                }
+                ExprKind::Paren(inner) => names(inner, out),
+                _ => false,
+            }
+        }
+        let mut parts = Vec::new();
+        if !names(arg, &mut parts) {
+            return false;
+        }
+        let Some(name) = parts.pop() else {
+            return false;
+        };
+        let name = TypeName {
+            scopes: parts
+                .into_iter()
+                .map(|name| TypeScope {
+                    name,
+                    type_args: Vec::new(),
+                })
+                .collect(),
+            name,
+            span: arg.span,
+        };
+        if self
+            .typedef_entry(&self.typedef_coll_dims, &name, None)
+            .is_some_and(|(_, dims)| !dims.is_empty())
+        {
+            return false;
+        }
+        self.typedef_type_entry(&name, None)
+            .is_some_and(|(key, dt)| self.decl_is_string(dt, Some(key)))
+    }
+
     /// §13.4.1 / §6.8: the initial value of a variable of `dt` — x for a
     /// 4-state type, 0 for a 2-state one. Getting this wrong for an inlined
     /// function's return variable makes a partially-assigned function return 0
@@ -7151,9 +7223,12 @@ impl<'a> BytecodeCompiler<'a> {
             // array (`q[0]` on `string q[$]`) is a string.
             ExprKind::Index { expr: base, .. } => self.local_string_coll(base),
             ExprKind::Paren(inner) => self.expr_is_string_static(inner),
-            ExprKind::SystemCall { name, .. } => {
-                matches!(name.as_str(), "$sformatf" | "$psprintf")
-            }
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$sformatf" | "$psprintf" => true,
+                // §6.24.3: `string'(x)` compiles to a string value (ToStr).
+                "$__xz_type_cast" | "$__xz_named_cast" => self.cast_arg_targets_string(args),
+                _ => false,
+            },
             ExprKind::Ident(h) => {
                 let raw = Self::hier_raw_name(h);
                 if self.local_var_is_string.contains(&raw) {
@@ -12979,6 +13054,40 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
+        self.compile_expr_typed(expr, ctx_width, false)
+    }
+
+    /// §11.8.2: an unsigned expression changes operand type before any
+    /// context widening or nested operation, rather than after it finishes.
+    fn compile_expr_typed(
+        &mut self,
+        expr: &Expression,
+        ctx_width: u32,
+        unsigned_context: bool,
+    ) -> Option<RegId> {
+        let result = self.compile_expr_inner(expr, ctx_width, unsigned_context)?;
+        let propagates = matches!(
+            expr.kind,
+            ExprKind::Binary { .. }
+                | ExprKind::Conditional { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Unary {
+                    op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
+                    ..
+                }
+        );
+        if unsigned_context && !propagates && self.expr_signedness(expr) != Some(false) {
+            self.emit(Insn::ClearSigned(result));
+        }
+        Some(result)
+    }
+
+    fn compile_expr_inner(
+        &mut self,
+        expr: &Expression,
+        ctx_width: u32,
+        unsigned_context: bool,
+    ) -> Option<RegId> {
         if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
             let dest = self.alloc_reg();
             if self.signal_signed[id] {
@@ -13307,7 +13416,12 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     ctx_width
                 };
-                let src = self.compile_expr(operand, operand_ctx)?;
+                let src = self.compile_expr_typed(
+                    operand,
+                    operand_ctx,
+                    unsigned_context
+                        && matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot),
+                )?;
                 // §11.6.1: `~` and unary `-` are CONTEXT-determined — the
                 // operand is extended to the context width BEFORE the
                 // operation, not after. Passing `operand_ctx` down is not
@@ -13462,7 +13576,40 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     ctx_width
                 };
-                let l = self.compile_expr(left, sub_ctx)?;
+                let is_shift = matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                );
+                let self_determined_operands = matches!(
+                    op,
+                    BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::LogImplies | BinaryOp::LogEquiv
+                );
+                let joint_unsigned = !string_cmp
+                    && !self_determined_operands
+                    && ((!is_self_determined && unsigned_context)
+                        || self.expr_signedness(left) == Some(false)
+                        || (!is_shift
+                            && !matches!(op, BinaryOp::Power)
+                            && self.expr_signedness(right) == Some(false)));
+                let sub_ctx = if joint_unsigned
+                    && !is_self_determined
+                    && !is_shift
+                    && !matches!(op, BinaryOp::Power)
+                {
+                    sub_ctx
+                        .max(self.lrm_self_width(left))
+                        .max(self.lrm_self_width(right))
+                } else {
+                    sub_ctx
+                };
+                let left_unsigned =
+                    joint_unsigned && (!is_self_determined || has_context_shift(left));
+                let right_unsigned =
+                    joint_unsigned && (!is_self_determined || has_context_shift(right));
+                let l = self.compile_expr_typed(left, sub_ctx, left_unsigned)?;
                 // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
                 // width never affects the result, so it keeps its own.
                 let is_shift = matches!(
@@ -13472,10 +13619,10 @@ impl<'a> BytecodeCompiler<'a> {
                         | BinaryOp::ArithShiftLeft
                         | BinaryOp::ArithShiftRight
                 );
-                let r = if is_shift {
+                let r = if is_shift || matches!(op, BinaryOp::Power) {
                     self.compile_expr(right, self.expr_max_width(right))?
                 } else {
-                    self.compile_expr(right, sub_ctx)?
+                    self.compile_expr_typed(right, sub_ctx, right_unsigned)?
                 };
                 // Context width resizing for arithmetic / bitwise ops only.
                 // For self-determined comparisons we must NOT resize to
@@ -13503,10 +13650,10 @@ impl<'a> BytecodeCompiler<'a> {
                     let ls = self.expr_signedness(left);
                     let rs = self.expr_signedness(right);
                     if ls == Some(false) || rs == Some(false) {
-                        if !self.operand_scrub_is_noop(left) {
+                        if !left_unsigned && !self.operand_scrub_is_noop(left) {
                             self.emit(Insn::ClearSigned(l));
                         }
-                        if !self.operand_scrub_is_noop(right) {
+                        if !right_unsigned && !self.operand_scrub_is_noop(right) {
                             self.emit(Insn::ClearSigned(r));
                         }
                     }
@@ -13531,10 +13678,10 @@ impl<'a> BytecodeCompiler<'a> {
                         let ls = self.expr_signedness(left);
                         let rs = self.expr_signedness(right);
                         if ls == Some(false) || rs == Some(false) {
-                            if !self.operand_scrub_is_noop(left) {
+                            if !left_unsigned && !self.operand_scrub_is_noop(left) {
                                 self.emit(Insn::ClearSigned(l));
                             }
-                            if !self.operand_scrub_is_noop(right) {
+                            if !right_unsigned && !self.operand_scrub_is_noop(right) {
                                 self.emit(Insn::ClearSigned(r));
                             }
                         }
@@ -13706,8 +13853,18 @@ impl<'a> BytecodeCompiler<'a> {
                 // Evaluate both branches unconditionally so Select can do a
                 // per-bit merge when the condition has X/Z (IEEE 1800 §11.4.11).
                 let cond = self.compile_expr(condition, 0)?;
-                let then_reg = self.compile_expr(then_expr, ctx_width)?;
-                let else_reg = self.compile_expr(else_expr, ctx_width)?;
+                let arms_unsigned = unsigned_context
+                    || self.expr_signedness(then_expr) == Some(false)
+                    || self.expr_signedness(else_expr) == Some(false);
+                let arm_ctx = if arms_unsigned {
+                    ctx_width
+                        .max(self.lrm_self_width(then_expr))
+                        .max(self.lrm_self_width(else_expr))
+                } else {
+                    ctx_width
+                };
+                let then_reg = self.compile_expr_typed(then_expr, arm_ctx, arms_unsigned)?;
+                let else_reg = self.compile_expr_typed(else_expr, arm_ctx, arms_unsigned)?;
                 // §11.8.1: a ternary with ANY unsigned arm is unsigned — both
                 // arms then ZERO-extend (a signed arm sign-extended, so
                 // `c ? sa : b` in a 32-bit context read ffffff9c for
@@ -13718,10 +13875,10 @@ impl<'a> BytecodeCompiler<'a> {
                     let ts = self.expr_signedness(then_expr);
                     let es = self.expr_signedness(else_expr);
                     if ts == Some(false) || es == Some(false) {
-                        if !self.operand_scrub_is_noop(then_expr) {
+                        if !arms_unsigned && !self.operand_scrub_is_noop(then_expr) {
                             self.emit(Insn::ClearSigned(then_reg));
                         }
-                        if !self.operand_scrub_is_noop(else_expr) {
+                        if !arms_unsigned && !self.operand_scrub_is_noop(else_expr) {
                             self.emit(Insn::ClearSigned(else_reg));
                         }
                     }
@@ -13732,7 +13889,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Select(dest, cond, then_reg, else_reg));
                 Some(dest)
             }
-            ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
+            ExprKind::Paren(inner) => self.compile_expr_typed(inner, ctx_width, unsigned_context),
             ExprKind::Index { expr, index } => {
                 // Step 8 (string formals): a select on a string formal takes
                 // the interpreter's char-select path (`string_signals`
@@ -14741,6 +14898,16 @@ impl<'a> BytecodeCompiler<'a> {
                             | crate::ast::types::DataType::IntegerVector { .. }
                     );
                     let src = self.compile_expr(inner, if integral { w } else { 0 })?;
+                    // §6.16/§6.24.3: a `string` target CONVERTS the operand
+                    // to a string value — every NUL byte removed. Resizing to
+                    // the 1024-bit string placeholder instead let each
+                    // character appended by {out, string'(c)} carry 127 NUL
+                    // bytes into the concat (#391).
+                    if self.decl_is_string(&dt, None) {
+                        let r = self.alloc_reg();
+                        self.emit(Insn::StrOp(r, StrOpKind::ToStr, Box::new(vec![src])));
+                        return Some(r);
+                    }
                     let r = self.alloc_reg();
                     self.emit(Insn::Move(r, src));
                     if is_real {
@@ -14762,6 +14929,12 @@ impl<'a> BytecodeCompiler<'a> {
                     Some(r)
                 }
                 "$__xz_named_cast" => {
+                    if self.cast_arg_targets_string(args) {
+                        let src = self.compile_expr(args.get(1)?, 0)?;
+                        let result = self.alloc_reg();
+                        self.emit(Insn::StrOp(result, StrOpKind::ToStr, Box::new(vec![src])));
+                        return Some(result);
+                    }
                     // `pkg::T'(x)` prefers the qualified `pkg::T` entry.
                     let target = args.first().and_then(|a| match &a.kind {
                         // §8.23: a scoped `cls::N` identifier path prefers
@@ -27785,4 +27958,50 @@ pub(crate) fn type_name_key(tn: &crate::ast::types::TypeName) -> String {
     }
     k.push_str(&tn.name.name);
     k
+}
+
+/// A shift whose type can be changed by a surrounding integral expression.
+/// Self-determined operands (casts, concatenations, calls and reductions)
+/// stop propagation; a conditional's condition does not determine its type.
+pub(crate) fn has_context_shift(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Binary {
+            op:
+                BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ArithShiftRight,
+            ..
+        } => true,
+        ExprKind::Binary {
+            op:
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor,
+            left,
+            right,
+        } => has_context_shift(left) || has_context_shift(right),
+        ExprKind::Binary {
+            op: BinaryOp::Power,
+            left,
+            ..
+        } => has_context_shift(left),
+        ExprKind::Unary {
+            op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
+            operand,
+        }
+        | ExprKind::Paren(operand) => has_context_shift(operand),
+        ExprKind::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => has_context_shift(then_expr) || has_context_shift(else_expr),
+        _ => false,
+    }
 }

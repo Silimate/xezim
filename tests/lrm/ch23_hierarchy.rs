@@ -27,7 +27,9 @@ fn c23_10_1_defparam() {
 #[test]
 fn c23_11_bind_and_unit_scope() {
     // Known gap (§23.11): `23.11a`: 3 reference lines differ from xezim's 3, e.g. reference `t23i.u2.c_path P=8 a=22`, xezim `t23i.u2.c_list P=3 a=22`
-    // Known gap (§23.11): `23.11b` reference `3 15 24 9`, xezim `3 15 x 9`
+    // `23.11b` leaves out `u2.c_path.cnt`: xezim does not apply that bind
+    // (the `23.11a` gap), so the name does not resolve, and a hierarchical
+    // name that does not resolve is an elaboration error (§23.8).
     // Known gap (§23.11): `23.11c` reference `11 z3`, xezim `11 03`
     // The bound instances print from their own initial blocks at time 0; IEEE 1800 §4.7 leaves their order open.
     check(

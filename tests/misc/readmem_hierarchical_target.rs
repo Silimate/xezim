@@ -170,15 +170,13 @@ endmodule
     );
 }
 
-/// A target that names no memory is reported (the reference simulator
-/// rejects the design) instead of being skipped silently, and so is a file
-/// that cannot be opened (a warning there, the memory left unchanged).
+/// A target that names no memory rejects the design at elaboration: `r.nomem`
+/// is a hierarchical name that does not resolve (IEEE 1800-2023 §23.8).
 #[test]
-fn readmem_reports_missing_target_and_file() {
+fn readmem_rejects_missing_target() {
     let dir = scratch("missing");
     let hex = dir.join("m.hex");
     std::fs::write(&hex, "deeeddde\n").unwrap();
-    let nofile = dir.join("nofile.hex");
     let src = format!(
         r#"
 module ram;
@@ -189,7 +187,35 @@ module top;
   task load;
     $readmemh("{0}", r.nomem);
     $writememh("{0}.out", r.nomem);
-    $readmemh("{1}", r.mem);
+  endtask
+  initial load();
+endmodule
+"#,
+        hex.display()
+    );
+    let err = simulate(&src, 100).err().expect("elaboration error");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        err.contains("hierarchical name 'r.nomem' does not resolve"),
+        "{err}"
+    );
+}
+
+/// A file that cannot be opened is a warning, and the memory is left
+/// unchanged.
+#[test]
+fn readmem_reports_missing_file() {
+    let dir = scratch("nofile");
+    let nofile = dir.join("nofile.hex");
+    let src = format!(
+        r#"
+module ram;
+  reg [31:0] mem [0:7];
+endmodule
+module top;
+  ram r ();
+  task load;
+    $readmemh("{0}", r.mem);
   endtask
   initial begin
     load();
@@ -197,7 +223,6 @@ module top;
   end
 endmodule
 "#,
-        hex.display(),
         nofile.display()
     );
     let sim = simulate(&src, 100).expect("simulate");
@@ -210,23 +235,11 @@ endmodule
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("[xezim][error] $readmemh: 'r.nomem'")),
-        "{lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("[xezim][error] $writememh: 'r.nomem'")),
-        "{lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
             .any(|l| l.contains("[xezim][warning] $readmemh: cannot open file")),
         "{lines:?}"
     );
     assert!(lines.iter().any(|l| l == "T|done xxxxxxxx"), "{lines:?}");
-    assert_eq!(sim.error_count, 2);
+    assert_eq!(sim.error_count, 0);
 }
 
 /// Generate-block scopes: a for-generate element (`g[1].gm`), an instance

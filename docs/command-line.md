@@ -20,6 +20,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); each is a root of its own in `%m`, messages, `$root` paths and waveform scopes, as when several tops are found automatically. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
 | `--no-strict-top` | When an `-s` names no module, warn and find the tops automatically instead of exiting 1 |
 | `--sv2017` | Parse with the IEEE 1800-2017 grammar instead of the default 1800-2023 |
+| `--no-strict` (`--lenient`) | Accept some LRM-illegal constructs that are errors by default, among them a hierarchical name that does not resolve (§23.8), which is then left unchecked |
 | `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines`. Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. Repeatable. See the [user guide](user-guide.md#module-timescale-extension) |

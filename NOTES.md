@@ -10,6 +10,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A hierarchical name that does not resolve is an elaboration error (§23.8),
+  wherever it is written: a read or a write, a continuous assignment, an
+  event control, an assertion, a system task argument, or a task or function
+  that is never called. The message gives the file and line, the name, the
+  scope that does not declare it and the scope the search started from. Such
+  a name was accepted silently: a testbench that wrote to a guessed internal
+  name (`dut.mem_data[3] = ...`) ran as if the write had happened, and a read
+  returned x. A name inside a generate block a constant rules out is not
+  elaborated, so it is not checked. `--no-strict` turns the check off, for
+  designs that relied on the old behaviour.
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).

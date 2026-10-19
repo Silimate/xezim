@@ -540,9 +540,9 @@ routines are done (the Post-NBA region comes before the Observed region,
 current values), and one a clocking-event waiter raises at the edge comes
 after the attempt. They sample the values the step began with (§16.5.1),
 from before even `cbNextSimTime`, `cbAtStartOfSimTime` and `cbAfterDelay`
-run, so a clock written from `cbReadWriteSynch`, as cocotb's `Clock` does,
-samples like one driven from HDL. A pending callback holds the scheduler at
-its time even when no HDL event is due there.
+run, so a clock written from `cbReadWriteSynch`, as cocotb's Python `Clock`
+does, samples like one driven from HDL. A pending callback holds the
+scheduler at its time even when no HDL event is due there.
 The time of `cbAfterDelay`, `cbNBASynch`, `cbReadWriteSynch` and
 `cbReadOnlySynch` is a delay (a NULL `time` is a zero delay); that of
 `cbAtStartOfSimTime`/`cbAtEndOfSimTime` is absolute, and a time already begun
@@ -615,9 +615,10 @@ hook.
   instance `u` reads, and the actual's name `top.a[3]` reads it too, through
   any number of port levels; one written to `top.a[3]` reaches `top.u.a[3]`.
   A port on a bit- or part-select, an array slice, a concatenation or an
-  expression keeps a net of its own. xezim also shares the storage when the
-  actual is a variable, which the standard does not merge with a net port: a
-  write to the port's name then changes the variable too.
+  expression keeps a net of its own. An unpacked-array connection with a
+  variable formal or actual also keeps its propagation step (§23.3.3.3).
+  Scalar identity ports can still share storage with a variable actual;
+  a VPI write through such a scalar port then changes the variable too.
 - `vpiInterModPath` delays live where SDF `INTERCONNECT` delays do, on the
   input port's net. When elaboration collapsed the two ports into one net
   there is no interconnect between them, and `vpi_handle_multi` returns NULL.

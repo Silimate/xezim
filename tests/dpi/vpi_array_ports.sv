@@ -78,6 +78,6 @@ module top (
     $display("T|variable 64|%h %h", q643, q645);
     $display("T|variable 1|%b%b", q13, q15);
     $display("T|names|%0d %0d %0d %0d %0d", a8[0], o.a[1], o.m.a[1], c8[0], ur.a[1]);
-    $finish;
+    #7; $finish;
   end
 endmodule

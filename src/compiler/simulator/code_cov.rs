@@ -98,6 +98,21 @@ const LIBRARY_PACKAGES: [&str; 2] = ["std", "uvm_pkg"];
 /// `--no-toggle-integers` turns it off.
 /// `keep_constant` keeps the statements and branch arms a constant
 /// condition rules out in the totals (see `Decision`).
+///
+/// The rest select other counting rules, each off by default (see
+/// docs/coverage-guide.md, "Counting rules"):
+/// - `enums` keeps enum variables in toggle coverage; `--no-toggle-enums`
+///   leaves them out.
+/// - `generate` keeps the signals declared in generate blocks in toggle
+///   coverage; `--no-toggle-generate` leaves them out.
+/// - `logical` scores only the conditions that hold a `&&` or `||`, a term
+///   counting once it has been 0 and 1 (`--code-coverage-expressions=logical`).
+/// - `blocks` counts straight-line blocks instead of statements
+///   (`--code-coverage-granularity=block`).
+/// - `fsm_reset` keeps the FSM transitions that only a reset makes;
+///   `--no-fsm-reset-transitions` leaves them out.
+/// - `tied` keeps the bits whose only drivers are constants in toggle
+///   coverage; `--no-toggle-tied` leaves them out (see `cov_tied`).
 #[derive(Clone, Debug)]
 pub struct CodeCoverage {
     pub kinds: u8,
@@ -105,6 +120,12 @@ pub struct CodeCoverage {
     pub exclude_input_ports: bool,
     pub integers: bool,
     pub keep_constant: bool,
+    pub enums: bool,
+    pub generate: bool,
+    pub logical: bool,
+    pub blocks: bool,
+    pub fsm_reset: bool,
+    pub tied: bool,
 }
 
 impl Default for CodeCoverage {
@@ -115,7 +136,40 @@ impl Default for CodeCoverage {
             exclude_input_ports: false,
             integers: true,
             keep_constant: false,
+            enums: true,
+            generate: true,
+            logical: false,
+            blocks: false,
+            fsm_reset: true,
+            tied: true,
         }
+    }
+}
+
+/// `--code-coverage-expressions=<mode>`: `all` (the default) scores every
+/// condition and expression item; `logical` only the conditions with a `&&`
+/// or `||`, their operands the terms, each covered once it has been 0 and 1.
+pub fn parse_expression_mode(spec: &str) -> Result<bool, String> {
+    match spec.trim() {
+        "all" => Ok(false),
+        "logical" => Ok(true),
+        other => Err(format!(
+            "unknown expression mode '{}' (want all or logical)",
+            other
+        )),
+    }
+}
+
+/// `--code-coverage-granularity=<unit>`: `statement` (the default) counts
+/// each statement; `block` each straight-line block.
+pub fn parse_granularity(spec: &str) -> Result<bool, String> {
+    match spec.trim() {
+        "statement" => Ok(false),
+        "block" => Ok(true),
+        other => Err(format!(
+            "unknown granularity '{}' (want statement or block)",
+            other
+        )),
     }
 }
 
@@ -997,6 +1051,21 @@ fn sensitize(nodes: &[Node], i: u32, vals: &[u8], rows: &mut [u8]) {
     }
 }
 
+/// Mark in `rows` every term an evaluation of a logical-mode item read, at
+/// the value it had: sum-of-products scoring, where a term is covered once
+/// it has been 0 and 1, whether or not it decided the item's value. A term a
+/// short circuit skips is read quietly when it has no side effects (see
+/// `cov_node`); one with side effects is not read.
+fn sop(nodes: &[Node], vals: &[u8], rows: &mut [u8]) {
+    for (i, n) in nodes.iter().enumerate() {
+        if let Op::Term(t, inv) = n.op {
+            if vals[i] <= 1 {
+                rows[t as usize] |= 1 << (vals[i] ^ inv as u8);
+            }
+        }
+    }
+}
+
 /// The leaves of node `i`'s subtree (`e` is its expression): each term and
 /// constant node, with its expression.
 fn leaves_of<'e>(nodes: &[Node], i: u32, e: &'e Expression, out: &mut Vec<(u32, &'e Expression)>) {
@@ -1131,8 +1200,9 @@ fn order(steps: &[(u32, u32)], mut terms: Vec<usize>) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Reading `e` has no side effects (no function call), so coverage may read
-/// it again (quietly: the coverage markers in it count nothing then).
+/// Reading `e` has no side effects (no function call, increment or
+/// assignment), so coverage may read it again (quietly: the coverage markers
+/// in it count nothing then).
 fn pure(e: &Expression) -> bool {
     match &e.kind {
         ExprKind::Number(_) | ExprKind::TypeLiteral(_) => true,
@@ -1146,7 +1216,9 @@ fn pure(e: &Expression) -> bool {
                 UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
             ) && pure(operand)
         }
-        ExprKind::Binary { left, right, .. } => pure(left) && pure(right),
+        ExprKind::Binary { op, left, right } => {
+            *op != BinaryOp::Assign && pure(left) && pure(right)
+        }
         ExprKind::Conditional {
             condition,
             then_expr,
@@ -1161,6 +1233,8 @@ fn pure(e: &Expression) -> bool {
         ExprKind::RangeSelect {
             expr, left, right, ..
         } => pure(expr) && pure(left) && pure(right),
+        // System functions that only compute a value from their arguments
+        // (§20.6–§20.9), such as the `$clog2` in a part-select's width.
         ExprKind::SystemCall { name, args } => {
             matches!(
                 name.as_str(),
@@ -1172,6 +1246,16 @@ fn pure(e: &Expression) -> bool {
                     | "$__xz_type_cast"
                     | "$__xz_named_cast"
                     | "$bits"
+                    | "$clog2"
+                    | "$size"
+                    | "$left"
+                    | "$right"
+                    | "$low"
+                    | "$high"
+                    | "$increment"
+                    | "$dimensions"
+                    | "$unpacked_dimensions"
+                    | "$countbits"
                     | "$countones"
                     | "$onehot"
                     | "$onehot0"
@@ -1349,6 +1433,19 @@ pub(crate) struct Toggle {
     /// (scope, name within the scope, tracked index, data type); aliases of
     /// one signal share the tracked index.
     names: Vec<(u32, String, u32, &'static str)>,
+    /// `--no-toggle-tied`: the bits (indexed like `rise`) whose only drivers
+    /// are constants; empty without it.
+    tied: Vec<bool>,
+}
+
+/// What drives one bit, for `cov_tied`: a constant, a bit of a signal (by
+/// id and bit), or anything else.
+#[derive(Clone, Copy, PartialEq)]
+enum Tie {
+    Zero,
+    One,
+    Bit(u32, u32),
+    Other,
 }
 
 impl Toggle {
@@ -1426,6 +1523,10 @@ pub(crate) struct CodeCov {
     kinds: u8,
     /// `--code-coverage-constant=keep`: nothing is excluded.
     keep_constant: bool,
+    /// `--code-coverage-expressions=logical` (see `CodeCoverage`).
+    logical: bool,
+    /// `--code-coverage-granularity=block` (see `CodeCoverage`).
+    blockwise: bool,
     limit: Vec<String>,
     scopes: Vec<Scope>,
     scope_index: HashMap<String, u32>,
@@ -1463,6 +1564,10 @@ pub(crate) struct CodeCov {
     /// made while evaluations were pending (`Simulator::cov_block_ran`).
     blocks: HashMap<usize, HashMap<String, u32>>,
     ran: Vec<u64>,
+    /// The last `if` of an `else if` chain, by branch site: where block
+    /// granularity puts the chain's implicit `else`, as without branch
+    /// coverage.
+    tails: HashMap<usize, Span>,
     /// Inside a read that only coverage makes (`Simulator::cov_quietly`):
     /// count nothing.
     quiet: u32,
@@ -1552,6 +1657,14 @@ struct Instr<'a> {
     /// Anywhere in a combinational `always` block: its source offset (for
     /// `ExprSite::comb`).
     comb: Option<usize>,
+    /// `--code-coverage-expressions=logical`: only `&&` and `||` split an
+    /// item into terms, and only conditions are items.
+    logical: bool,
+    /// `--code-coverage-granularity=block`: `count` counts a straight-line
+    /// block at its first statement; `open` while the statements being
+    /// instrumented continue the block counted last.
+    blocks: bool,
+    open: bool,
 }
 
 impl<'a> Instr<'a> {
@@ -1566,6 +1679,7 @@ impl<'a> Instr<'a> {
         consts: Option<&'a ElaboratedModule>,
     ) -> Self {
         let kinds = cov.kinds;
+        let (logical, blocks) = (cov.logical, cov.blockwise);
         let block = split_scope(inst_paths, path).1.to_string();
         let consts = consts.filter(|_| !cov.keep_constant);
         Instr {
@@ -1583,6 +1697,9 @@ impl<'a> Instr<'a> {
             hint: None,
             top: None,
             comb: None,
+            logical,
+            blocks,
+            open: false,
         }
     }
 
@@ -1617,6 +1734,16 @@ impl Instr<'_> {
         if self.kinds & KIND_STATEMENT == 0 {
             return;
         }
+        // `--code-coverage-granularity=block`: one counter per straight-line
+        // block, at its first statement (see `boundary`).
+        let kind = match self.blocks {
+            true if self.open => return,
+            true => {
+                self.open = true;
+                "block"
+            }
+            false => kind,
+        };
         let counter = self.counter();
         self.cov.stmts.push(StmtSite {
             scope: self.scope,
@@ -1626,6 +1753,15 @@ impl Instr<'_> {
             excluded: false,
         });
         out.push(hit(counter, span));
+    }
+
+    /// The end of a straight-line block: in block granularity the next
+    /// statement starts a new one. Branches (`if`, `case` and their arms),
+    /// loops and their bodies, `begin`/`end`, `fork` branches, event and
+    /// delay controls and `wait` are boundaries, and so are a `return`,
+    /// `break`, `continue` or `disable`.
+    fn boundary(&mut self) {
+        self.open = false;
     }
 
     /// Run `f`, and return the statement sites, branch sites and items it
@@ -1906,6 +2042,7 @@ impl Instr<'_> {
     fn wrap(&mut self, s: Statement) -> Statement {
         let span = s.span;
         let mut v = Vec::new();
+        self.boundary();
         let top = self.top.take();
         self.stmt(s, &mut v);
         self.top = top;
@@ -1917,6 +2054,7 @@ impl Instr<'_> {
     fn arm(&mut self, s: Statement, counter: u32) -> (Statement, Region) {
         let span = s.span;
         let mut v = vec![hit(counter, span)];
+        self.boundary();
         let top = self.top.take();
         let ((), r) = self.region(|me| me.stmt(s, &mut v));
         self.top = top;
@@ -1943,7 +2081,7 @@ impl Instr<'_> {
                 control,
                 stmt: inner,
             } => {
-                self.count(span, kind, &mut v);
+                self.process(span, kind, &mut v);
                 (self.top, self.comb) = (top, top);
                 self.stmt(*inner, &mut v);
                 (self.top, self.comb) = (None, None);
@@ -1956,12 +2094,41 @@ impl Instr<'_> {
                 )
             }
             other => {
-                self.count(span, kind, &mut v);
+                self.process(span, kind, &mut v);
                 (self.top, self.comb) = (top, top);
                 self.stmt(Statement::new(other, span), &mut v);
                 (self.top, self.comb) = (None, None);
                 block(v, span)
             }
+        }
+    }
+
+    /// In block granularity without branch coverage, the counter of an
+    /// implicit `else` or `default` (`kind`), as a statement to put in it.
+    /// With branch coverage the arm's count comes from the branch instead
+    /// (see `cov_report`).
+    fn implicit_block(&mut self, span: Span, kind: &'static str) -> Option<Statement> {
+        if !self.blocks || self.kinds & KIND_STATEMENT == 0 {
+            return None;
+        }
+        let counter = self.counter();
+        self.cov.stmts.push(StmtSite {
+            scope: self.scope,
+            span,
+            kind,
+            counter,
+            excluded: false,
+        });
+        Some(hit(counter, span))
+    }
+
+    /// An `always` construct's own count, each time its body starts; in
+    /// block granularity the body's first block counts that instead.
+    fn process(&mut self, span: Span, kind: &'static str, out: &mut Vec<Statement>) {
+        if self.blocks {
+            self.boundary();
+        } else {
+            self.count(span, kind, out);
         }
     }
 
@@ -1975,7 +2142,9 @@ impl Instr<'_> {
             StatementKind::SeqBlock { name, stmts } => {
                 // A block's declarations end with it.
                 let outer = self.here.locals.clone();
+                self.boundary();
                 let stmts = self.stmts(stmts);
+                self.boundary();
                 self.here.locals = outer;
                 out.push(rebuilt(StatementKind::SeqBlock { name, stmts }));
             }
@@ -1987,6 +2156,7 @@ impl Instr<'_> {
             } => {
                 let outer = self.here.locals.clone();
                 let stmts = stmts.into_iter().map(|c| self.wrap(c)).collect();
+                self.boundary();
                 self.here.locals = outer;
                 out.push(rebuilt(StatementKind::ParBlock {
                     name,
@@ -1999,14 +2169,30 @@ impl Instr<'_> {
                 condition,
                 then_stmt,
                 else_stmt,
-            } => self.if_stmt(unique_priority, condition, then_stmt, else_stmt, span, out),
+            } => {
+                // (A decision ends the block that evaluates it.)
+                if self.blocks {
+                    self.count(span, "statement", out);
+                }
+                self.if_stmt(unique_priority, condition, then_stmt, else_stmt, span, out);
+                self.boundary();
+            }
             StatementKind::Case {
                 unique_priority,
                 kind,
                 expr,
                 items,
-            } => self.case_stmt(unique_priority, kind, expr, items, span, out),
+            } => {
+                if self.blocks {
+                    self.count(span, "statement", out);
+                }
+                self.case_stmt(unique_priority, kind, expr, items, span, out);
+                self.boundary();
+            }
             StatementKind::RandCase { items } => {
+                if self.blocks {
+                    self.count(span, "statement", out);
+                }
                 let items = if self.kinds & KIND_BRANCH != 0 {
                     let mut arms = Vec::new();
                     let items = items
@@ -2037,6 +2223,7 @@ impl Instr<'_> {
                         .map(|(w, st)| (w, self.wrap(st)))
                         .collect()
                 };
+                self.boundary();
                 out.push(rebuilt(StatementKind::RandCase { items }));
             }
             StatementKind::For {
@@ -2058,6 +2245,7 @@ impl Instr<'_> {
                     }
                 }
                 let body = Box::new(self.wrap(*body));
+                self.boundary();
                 self.here.locals = outer;
                 out.push(rebuilt(StatementKind::For {
                     init,
@@ -2076,6 +2264,7 @@ impl Instr<'_> {
                     self.here.locals.insert(v.name.clone(), index);
                 }
                 let body = Box::new(self.wrap(*body));
+                self.boundary();
                 self.here.locals = outer;
                 out.push(rebuilt(StatementKind::Foreach { array, vars, body }));
             }
@@ -2086,6 +2275,7 @@ impl Instr<'_> {
                 self.count(span, "while", out);
                 self.cond(&mut condition, "while", false);
                 let body = Box::new(self.wrap(*body));
+                self.boundary();
                 out.push(rebuilt(StatementKind::While { condition, body }));
             }
             StatementKind::DoWhile {
@@ -2094,17 +2284,20 @@ impl Instr<'_> {
             } => {
                 self.count(span, "do", out);
                 let body = Box::new(self.wrap(*body));
+                self.boundary();
                 self.cond(&mut condition, "do", false);
                 out.push(rebuilt(StatementKind::DoWhile { body, condition }));
             }
             StatementKind::Repeat { count, body } => {
                 self.count(span, "repeat", out);
                 let body = Box::new(self.wrap(*body));
+                self.boundary();
                 out.push(rebuilt(StatementKind::Repeat { count, body }));
             }
             StatementKind::Forever { body } => {
                 self.count(span, "forever", out);
                 let body = Box::new(self.wrap(*body));
+                self.boundary();
                 out.push(rebuilt(StatementKind::Forever { body }));
             }
             StatementKind::TimingControl {
@@ -2115,7 +2308,11 @@ impl Instr<'_> {
                     TimingControl::Delay(_) => "delay",
                     TimingControl::Event(_) => "event",
                 };
-                self.count(span, kind, out);
+                // In block granularity the control ends the block before it
+                // and the statement it controls starts one (in `wrap`).
+                if !self.blocks {
+                    self.count(span, kind, out);
+                }
                 let inner = Box::new(self.wrap(*inner));
                 out.push(rebuilt(StatementKind::TimingControl {
                     control,
@@ -2126,7 +2323,9 @@ impl Instr<'_> {
                 condition,
                 stmt: inner,
             } => {
-                self.count(span, "wait", out);
+                if !self.blocks {
+                    self.count(span, "wait", out);
+                }
                 let inner = Box::new(self.wrap(*inner));
                 out.push(rebuilt(StatementKind::Wait {
                     condition,
@@ -2210,10 +2409,20 @@ impl Instr<'_> {
             StatementKind::Return(Some(mut e)) => {
                 self.count(span, "statement", out);
                 self.expr(&mut e);
+                self.boundary();
                 out.push(rebuilt(StatementKind::Return(Some(e))));
             }
             kind => {
                 self.count(span, "statement", out);
+                if matches!(
+                    kind,
+                    StatementKind::Return(_)
+                        | StatementKind::Break
+                        | StatementKind::Continue
+                        | StatementKind::Disable(_)
+                ) {
+                    self.boundary();
+                }
                 out.push(rebuilt(kind));
             }
         }
@@ -2236,7 +2445,14 @@ impl Instr<'_> {
             let cond = self.skeleton(&condition);
             self.cond(&mut condition, "if", true);
             let (then_stmt, t) = self.region(|me| Box::new(me.wrap(*then_stmt)));
-            let (else_stmt, e) = self.region(|me| else_stmt.map(|e| Box::new(me.wrap(*e))));
+            let implicit = else_stmt.is_none() && unique_priority.is_none();
+            let (else_stmt, e) = self.region(|me| match else_stmt {
+                Some(e) => Some(Box::new(me.wrap(*e))),
+                // Block granularity counts the implicit `else` without
+                // branch coverage too: an `else` holding only its counter.
+                None if implicit => me.implicit_block(span, "else (implicit)").map(Box::new),
+                None => None,
+            });
             if !matches!(cond, Cond::Unknown) {
                 self.decide(Choice::If(vec![cond]), None, vec![t, e], Vec::new());
             }
@@ -2253,6 +2469,7 @@ impl Instr<'_> {
         }
         let mut conds = vec![self.skeleton(&condition)];
         let mut has_else = false;
+        let mut last = span;
         let mut tail = else_stmt.as_deref();
         while let Some(e) = tail {
             match &e.kind {
@@ -2262,6 +2479,7 @@ impl Instr<'_> {
                     ..
                 } => {
                     conds.push(self.skeleton(condition));
+                    last = e.span;
                     tail = else_stmt.as_deref();
                 }
                 _ => {
@@ -2281,6 +2499,9 @@ impl Instr<'_> {
             arms: Vec::new(),
             excluded: false,
         });
+        if last.start != span.start {
+            self.cov.tails.insert(site, last);
+        }
         let mut chain = Chain::default();
         let ((), c) = self.region(|me| me.cond(&mut condition, "if", true));
         chain.conds.push(c);
@@ -2348,9 +2569,20 @@ impl Instr<'_> {
                     then_stmt: t,
                     else_stmt: el,
                 } => {
-                    let ((), c) = self.region(|me| me.cond(&mut cond, "if", true));
+                    // Block granularity: the `else` that makes this decision
+                    // is a block, counted at it as without branch coverage
+                    // (and ruled out with the condition).
+                    let mut v = Vec::new();
+                    let ((), c) = self.region(|me| {
+                        if me.blocks {
+                            me.boundary();
+                            me.count(espan, "statement", &mut v);
+                        }
+                        me.cond(&mut cond, "if", true)
+                    });
                     chain.conds.push(c);
-                    self.if_arms(up, cond, t, el, espan, false, chain)
+                    v.push(self.if_arms(up, cond, t, el, espan, false, chain));
+                    block(v, espan)
                 }
                 kind => {
                     let c = self.counter();
@@ -2392,12 +2624,32 @@ impl Instr<'_> {
         let choice = self.case_choice(kind, &expr, &items);
         let mut regions = Vec::with_capacity(items.len() + 1);
         let mut site = None;
+        // What the implicit `default` holds: nothing, or its block.
+        let mut fallback: Region = (0..0, 0..0, 0..0);
         if self.kinds & KIND_BRANCH == 0 {
             for it in items.iter_mut() {
                 let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
                 let (s, r) = self.region(|me| me.wrap(st));
                 it.stmt = s;
                 regions.push(r);
+            }
+            // Block granularity counts the implicit `default` without branch
+            // coverage too: a `default` item holding only its counter (an
+            // ordinary `case`; not a `case matches`).
+            let implicit = !items.iter().any(|it| it.is_default)
+                && unique_priority.is_none()
+                && items.first().is_some_and(|it| it.pattern.is_none());
+            if implicit {
+                let (stmt, r) = self.region(|me| me.implicit_block(span, "default (implicit)"));
+                fallback = r;
+                if let Some(stmt) = stmt {
+                    let mut d = items[0].clone();
+                    d.patterns.clear();
+                    d.is_default = true;
+                    d.stmt = stmt;
+                    d.span = span;
+                    items.push(d);
+                }
             }
         } else {
             let implicit = !items.iter().any(|it| it.is_default) && unique_priority.is_none();
@@ -2445,8 +2697,7 @@ impl Instr<'_> {
                 out.push(hit(e, span));
             }
         }
-        // The implicit `default` holds nothing.
-        regions.push((0..0, 0..0, 0..0));
+        regions.push(fallback);
         if let Some(choice) = choice {
             self.decide(choice, site, regions, Vec::new());
         }
@@ -2604,7 +2855,7 @@ impl Instr<'_> {
 /// reduction operator), so that whether it is zero, or has a 1 bit, does
 /// not depend on the operator it is an operand of. `4'hf + 4'h1` is 0 on
 /// its own but 8'h10 beside an 8-bit operand.
-fn context_free(e: &Expression) -> bool {
+pub(super) fn context_free(e: &Expression) -> bool {
     match &e.kind {
         ExprKind::Paren(x) => context_free(x),
         ExprKind::Number(_)
@@ -2724,7 +2975,8 @@ impl Instr<'_> {
         // The `?:`s of an expression item are its multiplexers, not
         // conditions, whichever kinds are collected: the item is planned
         // for condition coverage too, so that it never counts them.
-        if self.kinds & (KIND_EXPRESSION | KIND_CONDITION) != 0 && !compound {
+        // `--code-coverage-expressions=logical`: only conditions are items.
+        if self.kinds & (KIND_EXPRESSION | KIND_CONDITION) != 0 && !compound && !self.logical {
             if let Some(p) = self.plan(e, true) {
                 // `~`, the bitwise operators and `?:` take their width from
                 // where the value goes.
@@ -2769,6 +3021,16 @@ impl Instr<'_> {
             return None;
         }
         let constant = |k: u32| p.nodes[k as usize].op == Op::Const;
+        // `--code-coverage-expressions=logical`: an item has a `&&` or `||`
+        // on two non-constant operands; a relation alone is none.
+        if self.logical {
+            let logical = p.nodes.iter().any(|n| {
+                matches!(n.op, Op::And | Op::Or | Op::AndFull | Op::OrFull)
+                    && !constant(n.kids[0])
+                    && !constant(n.kids[1])
+            });
+            return logical.then_some(p);
+        }
         let operators = p.nodes.iter().any(|n| match n.op {
             Op::And
             | Op::Or
@@ -2856,6 +3118,31 @@ impl Instr<'_> {
         let (op, kids): (Op, Vec<(&Expression, Option<String>)>) = match &e.kind {
             // Folded away, as by the reference simulator: no term.
             _ if p.konst[i].is_some() => (Op::Const, Vec::new()),
+            // `--code-coverage-expressions=logical`: only `&&` and `||`
+            // split an item; anything else under them is a term.
+            ExprKind::Binary {
+                op: BinaryOp::LogAnd | BinaryOp::LogOr,
+                ..
+            } if self.logical => self.split_logical(e, t),
+            // A `!` over a `&&` or `||` keeps the tree below it.
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } if self.logical
+                && matches!(
+                    &unparen(operand).kind,
+                    ExprKind::Binary {
+                        op: BinaryOp::LogAnd | BinaryOp::LogOr,
+                        ..
+                    }
+                ) =>
+            {
+                (
+                    Op::Not,
+                    vec![(operand, t.and_then(|t| unary_operand(t, '!')))],
+                )
+            }
+            _ if self.logical => (self.term(e, t, p, i), Vec::new()),
             ExprKind::Unary {
                 op: UnaryOp::LogNot,
                 operand,
@@ -2935,6 +3222,28 @@ impl Instr<'_> {
             value,
         };
         i as u32
+    }
+
+    /// A `&&` or `||` node of a logical-mode item (see `build`): its
+    /// operator and operands, each with its source text.
+    #[allow(clippy::type_complexity)]
+    fn split_logical<'e>(
+        &self,
+        e: &'e Expression,
+        t: Option<&str>,
+    ) -> (Op, Vec<(&'e Expression, Option<String>)>) {
+        let ExprKind::Binary { op, left, right } = &e.kind else {
+            unreachable!("split_logical takes a binary operator");
+        };
+        let (op, tok) = match op {
+            BinaryOp::LogAnd => (Op::And, "&&"),
+            _ => (Op::Or, "||"),
+        };
+        let (l, r) = match t.and_then(|t| split_binary(t, tok)) {
+            Some((l, r)) => (Some(l), Some(r)),
+            None => (None, None),
+        };
+        (op, vec![(left, l), (right, r)])
     }
 
     /// The term `e` (node `i` of `p`, source text `text`) stands for. A
@@ -3200,6 +3509,15 @@ struct ToggleRow {
     ty: &'static str,
     rise: Vec<u32>,
     fall: Vec<u32>,
+    /// The bits `--no-toggle-tied` leaves out (indexed like `rise`); empty
+    /// without it.
+    tied: Vec<bool>,
+}
+
+impl ToggleRow {
+    fn tied(&self, b: usize) -> bool {
+        self.tied.get(b).copied().unwrap_or(false)
+    }
 }
 
 /// A condition or expression item: each term with the counts of its two
@@ -3414,9 +3732,14 @@ impl Report {
             }
         }
         for r in &self.toggles {
-            t[2].total += 2 * r.rise.len() as u64;
-            t[2].covered += r.rise.iter().filter(|&&c| c > 0).count() as u64
-                + r.fall.iter().filter(|&&c| c > 0).count() as u64;
+            for b in 0..r.rise.len() {
+                if r.tied(b) {
+                    t[2].excluded += 2;
+                    continue;
+                }
+                t[2].total += 2;
+                t[2].covered += u64::from(r.rise[b] > 0) + u64::from(r.fall[b] > 0);
+            }
         }
         // A term is covered once both of its rows are.
         for (k, items) in [(3, &self.conds), (4, &self.exprs)] {
@@ -3519,12 +3842,22 @@ impl Report {
         for r in &o.toggles {
             match by_name.get(&r.name) {
                 Some(&i) if self.toggles[i].rise.len() == r.rise.len() => {
+                    // A bit stays tied only when it is in both; an untied
+                    // bit does not take in a tied one's counts.
                     let t = &mut self.toggles[i];
-                    for (a, b) in t.rise.iter_mut().zip(&r.rise) {
-                        *a = a.saturating_add(*b);
-                    }
-                    for (a, b) in t.fall.iter_mut().zip(&r.fall) {
-                        *a = a.saturating_add(*b);
+                    for b in 0..r.rise.len() {
+                        match (t.tied(b), r.tied(b)) {
+                            (true, false) => {
+                                t.rise[b] = r.rise[b];
+                                t.fall[b] = r.fall[b];
+                                t.tied[b] = false;
+                            }
+                            (false, true) => {}
+                            _ => {
+                                t.rise[b] = t.rise[b].saturating_add(r.rise[b]);
+                                t.fall[b] = t.fall[b].saturating_add(r.fall[b]);
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -3610,14 +3943,22 @@ impl Report {
                     .join(", ")
             };
             for (i, r) in self.toggles.iter().enumerate() {
+                let tied: Vec<u32> = (0..r.rise.len() as u32)
+                    .filter(|&b| r.tied(b as usize))
+                    .collect();
                 out.push_str(&format!(
-                    "{}{{\"signal\": \"{}\", \"width\": {}, \"type\": \"{}\", \"rise\": [{}], \"fall\": [{}]}}",
+                    "{}{{\"signal\": \"{}\", \"width\": {}, \"type\": \"{}\", \"rise\": [{}], \"fall\": [{}]{}}}",
                     if i == 0 { "" } else { ", " },
                     json_escape(&r.name),
                     r.rise.len(),
                     r.ty,
                     list(&r.rise),
-                    list(&r.fall)
+                    list(&r.fall),
+                    if tied.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", \"tied\": [{}]", list(&tied))
+                    }
                 ));
             }
             out.push_str("],\n");
@@ -3787,6 +4128,118 @@ impl ToggleTypes<'_> {
     }
 }
 
+/// The generate scopes of each module, interface or program, read from the
+/// sources (§27.5): the names declared in an unlabeled branch of a generate
+/// `if` or `case`, which elaboration keeps bare in the instance, and the
+/// names of the generate blocks whose declarations are hierarchical (`g.x`,
+/// `g[1].x`): labeled branches and loops. An unnamed loop's block is
+/// `genblk<n>`, `n` its construct's number in the scope (§27.6).
+#[allow(clippy::type_complexity)]
+fn generate_decls(
+    module: &ElaboratedModule,
+) -> HashMap<String, (HashSet<String>, HashSet<String>)> {
+    use crate::ast::Description;
+    use crate::ast::decl::ModuleItem;
+    type Sets = (HashSet<String>, HashSet<String>);
+    // Declarations in `items`, an unlabeled branch: bare names. Its
+    // generate constructs are numbered in a scope of their own.
+    fn names(items: &[ModuleItem], out: &mut Sets) {
+        let mut n = 0;
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(dd) => out
+                    .0
+                    .extend(dd.declarators.iter().map(|d| d.name.name.clone())),
+                ModuleItem::NetDeclaration(nd) => out
+                    .0
+                    .extend(nd.declarators.iter().map(|d| d.name.name.clone())),
+                _ => constructs(std::slice::from_ref(it), out, &mut n),
+            }
+        }
+    }
+    // The generate constructs among `items`, at any depth of regions; `n`
+    // numbers the scope's constructs (§27.6), which names an unnamed loop's
+    // block `genblk<n>`.
+    fn constructs(items: &[ModuleItem], out: &mut Sets, n: &mut u32) {
+        for it in items {
+            if matches!(
+                it,
+                ModuleItem::GenerateIf(_)
+                    | ModuleItem::GenerateCase(_)
+                    | ModuleItem::GenerateFor(_)
+            ) {
+                *n += 1;
+            }
+            match it {
+                ModuleItem::GenerateRegion(gr) => constructs(&gr.items, out, n),
+                ModuleItem::GenerateIf(gi) => {
+                    for (bi, (_, items)) in gi.branches.iter().enumerate() {
+                        match gi.branch_labels.get(bi).and_then(|l| l.as_ref()) {
+                            None => names(items, out),
+                            Some(l) => {
+                                out.1.insert(l.clone());
+                            }
+                        }
+                    }
+                }
+                ModuleItem::GenerateCase(gc) => {
+                    for arm in &gc.arms {
+                        match &arm.label {
+                            None => names(&arm.items, out),
+                            Some(l) => {
+                                out.1.insert(l.clone());
+                            }
+                        }
+                    }
+                }
+                ModuleItem::GenerateFor(gf) => {
+                    out.1
+                        .insert(gf.name.clone().unwrap_or_else(|| format!("genblk{n}")));
+                }
+                _ => {}
+            }
+        }
+    }
+    fn add(name: &str, items: &[ModuleItem], out: &mut HashMap<String, Sets>) {
+        let mut sets = Sets::default();
+        constructs(items, &mut sets, &mut 0);
+        if !sets.0.is_empty() || !sets.1.is_empty() {
+            let e = out.entry(name.to_string()).or_default();
+            e.0.extend(sets.0);
+            e.1.extend(sets.1);
+        }
+        for it in items {
+            if let ModuleItem::NestedModule(m) = it {
+                add(&m.name.name, &m.items, out);
+            }
+        }
+    }
+    let mut out = HashMap::default();
+    let mut scan = |text: &str| {
+        let tokens = xezim_core::lexer::Lexer::new(text).tokenize();
+        for d in &xezim_core::parse::Parser::new(tokens)
+            .parse_source_text()
+            .descriptions
+        {
+            match d {
+                Description::Module(m) => add(&m.name.name, &m.items, &mut out),
+                Description::Interface(i) => add(&i.name.name, &i.items, &mut out),
+                Description::Program(p) => add(&p.name.name, &p.items, &mut out),
+                _ => {}
+            }
+        }
+    };
+    for text in &module.source_texts {
+        scan(text);
+    }
+    for (path, _) in xezim_core::adopted_lib_files() {
+        if let Some(text) = xezim_core::preprocess_adopted_lib(&path) {
+            scan(&text);
+        }
+    }
+    out
+}
+
 impl Simulator {
     /// Instrument the design for the code coverage the command line asked
     /// for. Runs first in `compile`, before any block is lowered.
@@ -3807,6 +4260,8 @@ impl Simulator {
         let mut cov = CodeCov {
             kinds,
             keep_constant: cfg.keep_constant,
+            logical: cfg.logical,
+            blockwise: cfg.blocks,
             limit: cfg.scopes,
             scopes: Vec::new(),
             scope_index: HashMap::default(),
@@ -3827,6 +4282,7 @@ impl Simulator {
             assigned: Vec::new(),
             pending: HashMap::default(),
             blocks: HashMap::default(),
+            tails: HashMap::default(),
             ran: Vec::new(),
             quiet: 0,
         };
@@ -4109,7 +4565,8 @@ impl Simulator {
                 return None;
             }
             ins.value(&mut ca.rhs, &ca.lhs, "assign", true);
-            (kinds & KIND_STATEMENT != 0).then(|| {
+            // In block granularity a continuous assignment is no block.
+            (kinds & KIND_STATEMENT != 0 && !ins.cov.blockwise).then(|| {
                 let key = (span.start, span.end, scope.clone());
                 match ins.cov.ca_counter.get(&key) {
                     Some(&c) => c,
@@ -4666,6 +5123,11 @@ impl Simulator {
         }
     }
 
+    /// `--code-coverage-expressions=logical`.
+    fn cov_logical(&self) -> bool {
+        self.code_cov.as_ref().is_some_and(|c| c.logical)
+    }
+
     /// Inside a read that only coverage makes.
     fn cov_quiet(&self) -> bool {
         self.code_cov.as_ref().is_some_and(|c| c.quiet > 0)
@@ -4707,7 +5169,11 @@ impl Simulator {
             return;
         }
         let mut rows = [0u8; MAX_TERMS];
-        sensitize(nodes, 0, vals, &mut rows);
+        if self.cov_logical() {
+            sop(nodes, vals, &mut rows);
+        } else {
+            sensitize(nodes, 0, vals, &mut rows);
+        }
         for (t, r) in rows.iter().enumerate() {
             for b in 0..2 {
                 if r & (1 << b) != 0 {
@@ -5070,10 +5536,11 @@ impl Simulator {
             (Op::And | Op::AndFull, ExprKind::Binary { left, right, .. }) => {
                 let l = self.cov_node(nodes, k0, left, vals);
                 // §11.3.5: only a known 0 on the left skips the right. Under
-                // a negation the right decides too, so it is read all the
-                // same when that has no side effects.
+                // a negation the right decides too, and logical-mode scoring
+                // observes every term whatever the short circuit, so it is
+                // read all the same when that has no side effects.
                 if !l.has_xz() && l.to_u64() == Some(0) {
-                    if n.op == Op::AndFull {
+                    if n.op == Op::AndFull || self.cov_logical() {
                         self.cov_skipped(nodes, k1, right, vals);
                     }
                     Value::from_u64(0, 1)
@@ -5085,7 +5552,7 @@ impl Simulator {
             (Op::Or | Op::OrFull, ExprKind::Binary { left, right, .. }) => {
                 let l = self.cov_node(nodes, k0, left, vals);
                 if l.to_u64().is_some_and(|v| v != 0) {
-                    if n.op == Op::OrFull {
+                    if n.op == Op::OrFull || self.cov_logical() {
                         self.cov_skipped(nodes, k1, right, vals);
                     }
                     Value::from_u64(1, 1)
@@ -5338,7 +5805,34 @@ impl Simulator {
                 )
             })
             .filter(|(_, ty, _)| cfg.integers || !TOGGLE_INTEGER_TYPES.contains(ty))
+            .filter(|(_, ty, _)| cfg.enums || *ty != "enum")
             .collect();
+        if !cfg.generate {
+            // §27.5: a labeled generate block or a loop's names are
+            // hierarchical (`g.x`, `g[1].x`); an unlabeled `if` or `case`
+            // branch's stay bare in its instance, so they are found in the
+            // source.
+            let decls = generate_decls(module);
+            let none = (HashSet::default(), HashSet::default());
+            let top = xezim_core::bind_spec_base(&module.name).to_string();
+            out.retain(|(n, _, _)| {
+                // The instance the signal belongs to: the longest instance
+                // path it starts with.
+                let inst = n
+                    .match_indices('.')
+                    .map(|(k, _)| &n[..k])
+                    .filter(|p| inst_paths.contains(p))
+                    .last()
+                    .unwrap_or("");
+                let rel = n[inst.len()..].trim_start_matches('.');
+                let def = types.defs.get(inst).copied().unwrap_or(top.as_str());
+                let (bare, blocks) = decls.get(def).unwrap_or(&none);
+                // A member (`s.m`) goes with its variable; a block's names
+                // are hierarchical under it (an unnamed loop's, `genblk<n>`).
+                let first = rel.split(['.', '[']).next().unwrap_or(rel);
+                !(bare.contains(first) || (rel.contains('.') && blocks.contains(first)))
+            });
+        }
         out.sort();
         out
     }
@@ -5368,59 +5862,9 @@ impl Simulator {
         if index.is_empty() {
             return names.into_iter().map(|(n, t, _)| (n, t)).collect();
         }
-        let mut leaves: HashMap<String, Vec<usize>> = HashMap::default();
-        for (n, &i) in &index {
-            let leaf = n.rsplit('.').next().unwrap_or(n);
-            leaves.entry(leaf.to_string()).or_default().push(i);
-        }
         let m = &self.module;
-        let mut c = Census {
-            sim: self,
-            index,
-            top: format!("{}.", m.name),
-            scope: String::new(),
-            leaves,
-            once: vec![0; names.len()],
-            more: vec![false; names.len()],
-        };
-        for b in &m.always_blocks {
-            c.process(&b.stmt, &b.scope, false);
-        }
-        for p in &m.pending_always {
-            let b = p.clone().materialize();
-            c.process(&b.stmt, &b.scope, false);
-        }
-        for b in &m.initial_blocks {
-            c.process(&b.stmt, &b.scope, true);
-        }
-        for p in &m.pending_initial {
-            let b = p.clone().materialize();
-            c.scope = b.scope.clone();
-            c.stmt(&b.stmt, &p.source, !timed(&b.stmt));
-        }
-        for b in m
-            .final_blocks
-            .iter()
-            .chain(&m.program_initial_blocks)
-            .chain(&m.static_init_blocks)
-        {
-            c.process(&b.stmt, &b.scope, false);
-        }
-        for (k, f) in m.functions.iter() {
-            c.subroutine(k, &f.items);
-        }
-        for (k, t) in m.tasks.iter() {
-            c.subroutine(k, &t.items);
-        }
-        for cls in m.classes.values() {
-            for meth in cls.methods.values() {
-                use crate::ast::decl::ClassMethodKind as K;
-                match &meth.kind {
-                    K::Function(f) | K::Extern(f) | K::PureVirtual(f) => c.subroutine("", &f.items),
-                    K::Task(t) => c.subroutine("", &t.items),
-                }
-            }
-        }
+        let mut c = Census::new(self, index, names.len());
+        c.procedures();
         c.scope.clear();
         for ca in &m.continuous_assigns {
             c.mark(&ca.lhs, false);
@@ -5439,6 +5883,374 @@ impl Simulator {
             .collect()
     }
 
+    /// `--no-toggle-tied`: the bits whose only drivers are constants, by
+    /// signal id, which toggle coverage leaves out. A driver is a continuous
+    /// assignment: an `assign`, a net declaration assignment or a port
+    /// connection (§23.3.3). A bit is tied when it has at least one and each
+    /// gives it a constant: a bit of a literal or parameter (in a
+    /// concatenation or replication too, and the zero extension of one), or
+    /// a bit of a net or variable that is tied itself, through whole, bit and
+    /// part-select connections. An operator ties nothing, even on constant
+    /// operands (`a & 1'b0`), and neither does a value range a bit never
+    /// leaves. A signal some other code writes, tracked for toggles or not,
+    /// is not tied: a process, a subroutine or a `force` (`Census`), a
+    /// user-defined primitive, a
+    /// bidirectional switch, a driver with a strength, or an assignment whose
+    /// target bits can't be told. Writes from a VPI client don't count.
+    fn cov_tied(&self) -> HashMap<usize, Vec<bool>> {
+        let m = &self.module;
+        let mut drivers: HashMap<(u32, u32), Vec<Tie>> = HashMap::default();
+        let mut bad: HashSet<u32> = HashSet::default();
+        let pending: Vec<crate::compiler::elaborate::ContinuousAssignment> = m
+            .pending_cont_assign
+            .iter()
+            .map(|p| p.clone().materialize(&m.parameters))
+            .collect();
+        for ca in m.continuous_assigns.iter().chain(&pending) {
+            let scope = ca
+                .origin
+                .as_ref()
+                .map(|(_, s)| s.as_str())
+                .filter(|s| !s.is_empty());
+            let lhs = self
+                .tie_bits(&ca.lhs, scope)
+                .map(|(v, _)| v)
+                .filter(|v| v.iter().all(|t| matches!(t, Tie::Bit(..))));
+            let Some(lhs) = lhs else {
+                self.tie_bad(&ca.lhs, scope, &mut bad);
+                continue;
+            };
+            let (rhs, ext) = self
+                .tie_bits(&ca.rhs, scope.filter(|_| !ca.rhs_parent_scoped))
+                .unwrap_or((Vec::new(), Tie::Other));
+            // A port whose net elaboration merged with its connection's
+            // drives itself: no driver.
+            for (i, t) in lhs.into_iter().enumerate() {
+                let src = rhs.get(i).copied().unwrap_or(ext);
+                if let Tie::Bit(id, b) = t
+                    && src != t
+                {
+                    drivers.entry((id, b)).or_default().push(src);
+                }
+            }
+        }
+        // Every name of every signal in the graph, tracked for toggles or
+        // not (a generate block's, say), for the writes the census finds.
+        let graph: HashSet<u32> = drivers
+            .iter()
+            .flat_map(|(k, v)| {
+                std::iter::once(k.0).chain(v.iter().filter_map(|t| match t {
+                    Tie::Bit(i, _) => Some(*i),
+                    _ => None,
+                }))
+            })
+            .collect();
+        let known: Vec<(String, u32)> = self
+            .signal_name_to_id
+            .iter()
+            .map(|(n, &i)| (n.to_string(), i as u32))
+            .filter(|(_, i)| graph.contains(i))
+            .collect();
+        let index: HashMap<String, usize> = known
+            .iter()
+            .enumerate()
+            .map(|(k, (n, _))| (n.clone(), k))
+            .collect();
+        let mut c = Census::new(self, index, known.len());
+        c.procedures();
+        for (k, (_, i)) in known.iter().enumerate() {
+            if c.more[k] || c.once[k] > 0 {
+                bad.insert(*i);
+            }
+        }
+        let top = format!("{}.", m.name);
+        let id = |n: &str| {
+            self.signal_name_to_id
+                .get(n)
+                .or_else(|| self.signal_name_to_id.get(format!("{top}{n}").as_str()))
+                .map(|&i| i as u32)
+        };
+        for u in &m.udp_instances {
+            self.tie_bad(&u.output, None, &mut bad);
+        }
+        for t in &m.tran_switches {
+            self.tie_bad(&t.a, None, &mut bad);
+            self.tie_bad(&t.b, None, &mut bad);
+        }
+        for n in m.strength_drivers.keys() {
+            bad.extend(id(n));
+        }
+        // Tied bits, from the constants up: each bit waits for the bits it
+        // is wired from, so a loop of connections with no constant in it
+        // ties nothing.
+        let mut wait: HashMap<(u32, u32), usize> = HashMap::default();
+        let mut next: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::default();
+        let mut todo: Vec<(u32, u32)> = Vec::new();
+        for (k, v) in &drivers {
+            if bad.contains(&k.0) || v.contains(&Tie::Other) {
+                continue;
+            }
+            let from: Vec<(u32, u32)> = v
+                .iter()
+                .filter_map(|t| match t {
+                    Tie::Bit(i, b) => Some((*i, *b)),
+                    _ => None,
+                })
+                .collect();
+            if from.is_empty() {
+                todo.push(*k);
+            }
+            wait.insert(*k, from.len());
+            for f in from {
+                next.entry(f).or_default().push(*k);
+            }
+        }
+        let mut tied: HashSet<(u32, u32)> = HashSet::default();
+        while let Some(k) = todo.pop() {
+            if !tied.insert(k) {
+                continue;
+            }
+            for d in next.get(&k).into_iter().flatten() {
+                if let Some(n) = wait.get_mut(d) {
+                    *n -= 1;
+                    if *n == 0 {
+                        todo.push(*d);
+                    }
+                }
+            }
+        }
+        let mut out: HashMap<usize, Vec<bool>> = HashMap::default();
+        for (i, b) in tied {
+            let i = i as usize;
+            let w = self.signal_widths.get(i).copied().unwrap_or(0) as usize;
+            out.entry(i).or_insert_with(|| vec![false; w])[b as usize] = true;
+        }
+        out
+    }
+
+    /// The bits of `e`, least significant first, as `cov_tied` sees them,
+    /// and the bit that extends it to a wider target; `None` when its width
+    /// can't be told. `scope` is the instance its names may be relative to.
+    fn tie_bits(&self, e: &Expression, scope: Option<&str>) -> Option<(Vec<Tie>, Tie)> {
+        let bit = |v: bool| if v { Tie::One } else { Tie::Zero };
+        match &e.kind {
+            ExprKind::Paren(x) => self.tie_bits(x, scope),
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => {
+                let t = match c {
+                    '0' => Tie::Zero,
+                    '1' => Tie::One,
+                    _ => Tie::Other,
+                };
+                Some((vec![t], t))
+            }
+            ExprKind::Number(NumberLiteral::Integer {
+                size,
+                signed,
+                base,
+                value,
+                ..
+            }) => {
+                let w = size.unwrap_or(32) as usize;
+                let digits: String = value.chars().filter(|&c| c != '_').collect();
+                let bits: Vec<Tie> = match base {
+                    NumberBase::Decimal => {
+                        let v = digits.parse::<u64>().ok()?;
+                        (0..w).map(|i| bit(i < 64 && v >> i & 1 == 1)).collect()
+                    }
+                    _ => {
+                        let k = match base {
+                            NumberBase::Binary => 1,
+                            NumberBase::Octal => 3,
+                            _ => 4,
+                        };
+                        let mut out = Vec::new();
+                        for c in digits.chars().rev() {
+                            let d = c.to_digit(1 << k)?;
+                            out.extend((0..k).map(|j| bit(d >> j & 1 == 1)));
+                        }
+                        out.resize(w, Tie::Zero);
+                        out
+                    }
+                };
+                let ext = if *signed {
+                    bits.last().copied().unwrap_or(Tie::Zero)
+                } else {
+                    Tie::Zero
+                };
+                Some((bits, ext))
+            }
+            // A parameter first: elaboration may give it a signal too, which a
+            // port connected to it shares.
+            ExprKind::Ident(h) => {
+                if let Some(v) = self.tie_param(h, scope) {
+                    let bits = (0..v.width as usize)
+                        .map(|i| match v.get_bit_code(i) {
+                            0 => Tie::Zero,
+                            1 => Tie::One,
+                            _ => Tie::Other,
+                        })
+                        .collect();
+                    return Some((bits, Tie::Zero));
+                }
+                let id = self.tie_id(h, scope)?;
+                let w = self.signal_widths[id];
+                Some(((0..w).map(|b| Tie::Bit(id as u32, b)).collect(), Tie::Other))
+            }
+            ExprKind::Index { expr, index } => {
+                // A bit of a concatenation: an input port's reads become
+                // its connection (`{1'b0, c, c, 1'b0}[i]`).
+                let ExprKind::Ident(h) = &expr.kind else {
+                    let v = self.tie_bits(expr, scope)?.0;
+                    let i = usize::try_from(self.tie_int(index, scope)?).ok()?;
+                    return Some((vec![*v.get(i)?], Tie::Other));
+                };
+                let id = self.tie_id(h, scope)?;
+                let b = self.tie_phys(h, scope, self.tie_int(index, scope)?)?;
+                (b < self.signal_widths[id]).then(|| (vec![Tie::Bit(id as u32, b)], Tie::Other))
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let (l, r) = (self.tie_int(left, scope)?, self.tie_int(right, scope)?);
+                let (lo, hi) = match kind {
+                    crate::ast::expr::RangeKind::Constant => (l.min(r), l.max(r)),
+                    crate::ast::expr::RangeKind::IndexedUp => (l, l + r - 1),
+                    crate::ast::expr::RangeKind::IndexedDown => (l - r + 1, l),
+                };
+                let ExprKind::Ident(h) = &expr.kind else {
+                    let v = self.tie_bits(expr, scope)?.0;
+                    let (lo, hi) = (usize::try_from(lo).ok()?, usize::try_from(hi).ok()?);
+                    return Some((v.get(lo..=hi)?.to_vec(), Tie::Other));
+                };
+                let id = self.tie_id(h, scope)?;
+                // A part-select keeps the vector's bit order, whichever way
+                // its range runs.
+                let mut bits = (lo..=hi)
+                    .map(|i| self.tie_phys(h, scope, i))
+                    .collect::<Option<Vec<u32>>>()?;
+                bits.sort_unstable();
+                let w = self.signal_widths[id];
+                bits.iter().all(|&b| b < w).then(|| {
+                    (
+                        bits.into_iter().map(|b| Tie::Bit(id as u32, b)).collect(),
+                        Tie::Other,
+                    )
+                })
+            }
+            ExprKind::Concatenation(parts) => {
+                let mut out = Vec::new();
+                for p in parts.iter().rev() {
+                    out.extend(self.tie_bits(p, scope)?.0);
+                }
+                Some((out, Tie::Zero))
+            }
+            ExprKind::Replication { count, exprs } => {
+                let n = usize::try_from(self.tie_int(count, scope)?).ok()?;
+                let mut one = Vec::new();
+                for p in exprs.iter().rev() {
+                    one.extend(self.tie_bits(p, scope)?.0);
+                }
+                Some((one.repeat(n), Tie::Zero))
+            }
+            ExprKind::SystemCall { name, args } if name == "$unsigned" && args.len() == 1 => {
+                self.tie_bits(&args[0], scope).map(|(v, _)| (v, Tie::Zero))
+            }
+            _ => None,
+        }
+    }
+
+    /// The signal a name refers to, from `scope` or the top.
+    fn tie_id(&self, h: &HierarchicalIdentifier, scope: Option<&str>) -> Option<usize> {
+        self.resolve_ident_id(h, scope)
+            .or_else(|| self.resolve_ident_id(h, Some(self.module.name.as_str())))
+    }
+
+    /// The names a table may know `h` by: as written, from `scope`, and its
+    /// last part.
+    fn tie_names(
+        h: &HierarchicalIdentifier,
+        scope: Option<&str>,
+        m: &ElaboratedModule,
+    ) -> Vec<String> {
+        let n = Self::resolve_hier_name_static(h, m);
+        let leaf = h.path.last().map(|s| s.name.name.clone());
+        let scoped = scope.map(|s| format!("{s}.{n}"));
+        std::iter::once(n).chain(scoped).chain(leaf).collect()
+    }
+
+    /// A parameter's value, when `h` names one.
+    fn tie_param(&self, h: &HierarchicalIdentifier, scope: Option<&str>) -> Option<&Value> {
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let n = Self::resolve_hier_name_static(h, &self.module);
+        let scoped = scope.map(|s| format!("{s}.{n}"));
+        std::iter::once(n)
+            .chain(scoped)
+            .find_map(|k| self.module.parameters.get(k.as_str()))
+    }
+
+    /// A constant integer: a literal, a parameter, or a sum, difference or
+    /// product of those (an index, a bound, a replication count).
+    fn tie_int(&self, e: &Expression, scope: Option<&str>) -> Option<i64> {
+        match &e.kind {
+            ExprKind::Paren(x) => self.tie_int(x, scope),
+            ExprKind::Number(_) => Simulator::try_const_u64(e).and_then(|v| i64::try_from(v).ok()),
+            ExprKind::Ident(h) => self.tie_param(h, scope)?.to_i64(),
+            ExprKind::Binary { op, left, right } => {
+                let (l, r) = (self.tie_int(left, scope)?, self.tie_int(right, scope)?);
+                match op {
+                    BinaryOp::Add => l.checked_add(r),
+                    BinaryOp::Sub => l.checked_sub(r),
+                    BinaryOp::Mul => l.checked_mul(r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The bit of vector `h` that index `i` selects (§7.4.1: a range that
+    /// doesn't end at 0, or ascends, moves it); `None` for an element of an
+    /// array or of a multidimensional packed vector.
+    fn tie_phys(&self, h: &HierarchicalIdentifier, scope: Option<&str>, i: i64) -> Option<u32> {
+        let m = &self.module;
+        let names = Self::tie_names(h, scope, m);
+        let find = |k: &dyn Fn(&str) -> bool| names.iter().any(|n| k(n));
+        if find(&|n| m.arrays.contains_key(n) || m.packed_signal_elem_widths.contains_key(n)) {
+            return None;
+        }
+        if let Some(&(lo, hi)) = names.iter().find_map(|n| m.ascending_packed.get(n.as_str())) {
+            return (lo..=hi).contains(&i).then(|| u32::try_from(hi - i).ok()).flatten();
+        }
+        let lo = match names.iter().find_map(|n| m.packed_full_dims.get(n.as_str())) {
+            Some(d) if d.len() > 1 => return None,
+            Some(d) => d[0].0.min(d[0].1),
+            None => 0,
+        };
+        u32::try_from(i - lo).ok()
+    }
+
+    /// Mark every signal the lvalue `e` names as not tied.
+    fn tie_bad(&self, e: &Expression, scope: Option<&str>, bad: &mut HashSet<u32>) {
+        match &e.kind {
+            ExprKind::Ident(h) => bad.extend(self.tie_id(h, scope).map(|i| i as u32)),
+            ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. }
+            | ExprKind::MemberAccess { expr, .. }
+            | ExprKind::Paren(expr) => self.tie_bad(expr, scope, bad),
+            ExprKind::Concatenation(v) => {
+                for x in v {
+                    self.tie_bad(x, scope, bad);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn cov_build_toggle(
         &mut self,
         cov: &mut CodeCov,
@@ -5455,7 +6267,12 @@ impl Simulator {
             rise: Vec::new(),
             fall: Vec::new(),
             names: Vec::new(),
+            tied: Vec::new(),
         };
+        let ties = code_coverage()
+            .filter(|c| !c.tied)
+            .map(|_| self.cov_tied())
+            .unwrap_or_default();
         let top_prefix = format!("{}.", self.module.name);
         for (name, ty) in names {
             let Some(&id) = self.signal_name_to_id.get(name.as_str()).or_else(|| {
@@ -5508,6 +6325,13 @@ impl Simulator {
                 }
                 t.rise.resize(t.rise.len() + width as usize, 0);
                 t.fall.resize(t.fall.len() + width as usize, 0);
+                if !ties.is_empty() {
+                    t.tied.resize(t.rise.len() - width as usize, false);
+                    match ties.get(&id) {
+                        Some(b) => t.tied.extend(b),
+                        None => t.tied.resize(t.rise.len(), false),
+                    }
+                }
                 k
             };
             t.names.push((sc, rest.to_string(), k, ty));
@@ -5582,11 +6406,11 @@ impl Simulator {
                 excluded: s.excluded,
             });
         }
-        for b in &cov.branches {
+        for (i, b) in cov.branches.iter().enumerate() {
             let src = cov.scopes[b.scope as usize].src;
             let (file, line) = lines.locate(b.span, src).unwrap_or_default();
             let taken: u64 = b.arms.iter().filter_map(|a| a.counter).map(count).sum();
-            let arms = b
+            let arms: Vec<ArmRow> = b
                 .arms
                 .iter()
                 .map(|a| ArmRow {
@@ -5599,6 +6423,23 @@ impl Simulator {
                     excluded: a.excluded,
                 })
                 .collect();
+            // In block granularity an implicit `else` or `default` is a
+            // block of its own, run when no written arm is.
+            if cov.blockwise && cov.kinds & KIND_STATEMENT != 0 {
+                let at = cov.tails.get(&i).copied();
+                for a in arms.iter().filter(|a| a.label.ends_with("(implicit)")) {
+                    reports[b.scope as usize].stmts.push(StmtRow {
+                        file: file.clone(),
+                        line: at
+                            .and_then(|t| lines.locate(t, src))
+                            .map_or(a.line, |(_, l)| l),
+                        start: at.map_or(b.span.start, |t| t.start),
+                        kind: a.label,
+                        count: a.count,
+                        excluded: b.excluded || a.excluded,
+                    });
+                }
+            }
             reports[b.scope as usize].branches.push(BranchRow {
                 file,
                 line,
@@ -5654,6 +6495,7 @@ impl Simulator {
                     ty,
                     rise: t.rise[b..b + w].to_vec(),
                     fall: t.fall[b..b + w].to_vec(),
+                    tied: t.tied.get(b..b + w).map(<[bool]>::to_vec).unwrap_or_default(),
                 });
             }
         }
@@ -5815,6 +6657,71 @@ struct Census<'a> {
 }
 
 impl<'a> Census<'a> {
+    /// A census of the writes to the candidates `index` names, numbered
+    /// below `len`.
+    fn new(sim: &'a Simulator, index: HashMap<String, usize>, len: usize) -> Self {
+        let mut leaves: HashMap<String, Vec<usize>> = HashMap::default();
+        for (n, &i) in &index {
+            let leaf = n.rsplit('.').next().unwrap_or(n);
+            leaves.entry(leaf.to_string()).or_default().push(i);
+        }
+        Census {
+            sim,
+            index,
+            top: format!("{}.", sim.module.name),
+            scope: String::new(),
+            leaves,
+            once: vec![0; len],
+            more: vec![false; len],
+        }
+    }
+
+    /// Count the procedural writes: processes, subroutines and class
+    /// methods.
+    fn procedures(&mut self) {
+        let m = &self.sim.module;
+        for b in &m.always_blocks {
+            self.process(&b.stmt, &b.scope, false);
+        }
+        for p in &m.pending_always {
+            let b = p.clone().materialize();
+            self.process(&b.stmt, &b.scope, false);
+        }
+        for b in &m.initial_blocks {
+            self.process(&b.stmt, &b.scope, true);
+        }
+        for p in &m.pending_initial {
+            let b = p.clone().materialize();
+            self.scope = b.scope.clone();
+            self.stmt(&b.stmt, &p.source, !timed(&b.stmt));
+        }
+        for b in m
+            .final_blocks
+            .iter()
+            .chain(&m.program_initial_blocks)
+            .chain(&m.static_init_blocks)
+        {
+            self.process(&b.stmt, &b.scope, false);
+        }
+        for (k, f) in m.functions.iter() {
+            self.subroutine(k, &f.items);
+        }
+        for (k, t) in m.tasks.iter() {
+            self.subroutine(k, &t.items);
+        }
+        for cls in m.classes.values() {
+            for meth in cls.methods.values() {
+                use crate::ast::decl::ClassMethodKind as K;
+                match &meth.kind {
+                    K::Function(f) | K::Extern(f) | K::PureVirtual(f) => {
+                        self.subroutine("", &f.items)
+                    }
+                    K::Task(t) => self.subroutine("", &t.items),
+                }
+            }
+        }
+    }
+
     fn process(&mut self, s: &Statement, scope: &str, initial: bool) {
         self.scope = scope.to_string();
         self.stmt(s, s, initial && !timed(s));

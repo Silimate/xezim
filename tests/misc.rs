@@ -63,6 +63,8 @@ mod cli_files;
 mod clocked_loop_case_nest_compiled;
 #[path = "misc/code_coverage.rs"]
 mod code_coverage;
+#[path = "misc/coverage_rules.rs"]
+mod coverage_rules;
 #[path = "misc/comb_regvar_loop_fallback.rs"]
 mod comb_regvar_loop_fallback;
 #[path = "misc/compliance_tests.rs"]
@@ -360,10 +362,10 @@ mod spec_canonical_keying;
 mod static_collection_per_spec;
 #[path = "misc/static_init_sysfuncs.rs"]
 mod static_init_sysfuncs;
-#[path = "misc/static_local_partial_write.rs"]
-mod static_local_partial_write;
 #[path = "misc/static_local_per_spec.rs"]
 mod static_local_per_spec;
+#[path = "misc/static_local_select_write.rs"]
+mod static_local_select_write;
 #[path = "misc/static_method_via_handle.rs"]
 mod static_method_via_handle;
 #[path = "misc/static_property_access.rs"]

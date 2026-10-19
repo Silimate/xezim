@@ -247,6 +247,24 @@ fn print_usage() {
     eprintln!("                   shortint, longint, byte) out of toggle coverage, as some");
     eprintln!("                   simulators do by default. --toggle-integers keeps them (the");
     eprintln!("                   default). XEZIM_TOGGLE_INTEGERS=0 too.");
+    eprintln!("  --no-toggle-enums  Leave enum variables out of toggle coverage.");
+    eprintln!("                   XEZIM_TOGGLE_ENUMS=0 too.");
+    eprintln!("  --no-toggle-generate  Leave the signals declared in generate blocks out of");
+    eprintln!("                   toggle coverage. XEZIM_TOGGLE_GENERATE=0 too.");
+    eprintln!("  --no-toggle-tied  Leave the bits whose only drivers are constants (a");
+    eprintln!("                   literal or parameter bit, through continuous assignments");
+    eprintln!("                   and port connections) out of toggle coverage.");
+    eprintln!("                   XEZIM_TOGGLE_TIED=0 too.");
+    eprintln!("  --code-coverage-expressions=<all|logical>  Score every condition and");
+    eprintln!("                   expression item (all, the default), or only the conditions");
+    eprintln!("                   with a && or ||, a term covered once it was 0 and 1");
+    eprintln!("                   (logical). XEZIM_CODE_COVERAGE_EXPRESSIONS too.");
+    eprintln!("  --code-coverage-granularity=<statement|block>  Count statements (the");
+    eprintln!("                   default) or straight-line blocks, implicit else and default");
+    eprintln!("                   arms included and continuous assignments not.");
+    eprintln!("                   XEZIM_CODE_COVERAGE_GRANULARITY too.");
+    eprintln!("  --no-fsm-reset-transitions  Leave out the FSM transitions only a reset makes.");
+    eprintln!("                   XEZIM_FSM_RESET_TRANSITIONS=0 too.");
     eprintln!("  --code-coverage-constant=<exclude|keep>  Statements and branch arms a");
     eprintln!("                   constant condition (a parameter's value) rules out are left");
     eprintln!("                   out of the totals (exclude, the default) or counted (keep).");
@@ -2079,6 +2097,15 @@ fn run_main() -> i32 {
     // `--[no-]toggle-integers`.
     let mut code_cov_integers: Option<bool> = None;
     let mut code_cov_keep: Option<bool> = None;
+    // `--[no-]toggle-enums`, `--[no-]toggle-generate`, `--[no-]toggle-tied`,
+    // `--code-coverage-expressions`, `--code-coverage-granularity`,
+    // `--[no-]fsm-reset-transitions`.
+    let mut code_cov_enums: Option<bool> = None;
+    let mut code_cov_generate: Option<bool> = None;
+    let mut code_cov_tied: Option<bool> = None;
+    let mut code_cov_logical: Option<bool> = None;
+    let mut code_cov_blocks: Option<bool> = None;
+    let mut code_cov_fsm_reset: Option<bool> = None;
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
@@ -2719,6 +2746,50 @@ fn run_main() -> i32 {
             "--no-toggle-integers" => {
                 code_cov_integers = Some(false);
             }
+            "--toggle-enums" => code_cov_enums = Some(true),
+            "--no-toggle-enums" => code_cov_enums = Some(false),
+            "--toggle-generate" => code_cov_generate = Some(true),
+            "--no-toggle-generate" => code_cov_generate = Some(false),
+            "--toggle-tied" => code_cov_tied = Some(true),
+            "--no-toggle-tied" => code_cov_tied = Some(false),
+            "--fsm-reset-transitions" => code_cov_fsm_reset = Some(true),
+            "--no-fsm-reset-transitions" => code_cov_fsm_reset = Some(false),
+            _ if arg == "--code-coverage-expressions"
+                || arg.starts_with("--code-coverage-expressions=") =>
+            {
+                let mode = match arg.strip_prefix("--code-coverage-expressions=") {
+                    Some(m) => m.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i).cloned().unwrap_or_default()
+                    }
+                };
+                match xezim::compiler::simulator::parse_code_coverage_expression_mode(&mode) {
+                    Ok(l) => code_cov_logical = Some(l),
+                    Err(e) => {
+                        eprintln!("Error: --code-coverage-expressions: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ if arg == "--code-coverage-granularity"
+                || arg.starts_with("--code-coverage-granularity=") =>
+            {
+                let unit = match arg.strip_prefix("--code-coverage-granularity=") {
+                    Some(m) => m.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i).cloned().unwrap_or_default()
+                    }
+                };
+                match xezim::compiler::simulator::parse_code_coverage_granularity(&unit) {
+                    Ok(b) => code_cov_blocks = Some(b),
+                    Err(e) => {
+                        eprintln!("Error: --code-coverage-granularity: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             _ if arg == "--code-coverage-constant"
                 || arg.starts_with("--code-coverage-constant=") =>
             {
@@ -3153,6 +3224,42 @@ fn run_main() -> i32 {
             _ => false,
         },
     };
+    // The other counting rules: the flag wins over its environment
+    // variable, which takes 0 or 1 (a mode for the two with values).
+    let switch = |flag: Option<bool>, var: &str, default: bool| -> bool {
+        flag.unwrap_or_else(|| match env::var(var).as_deref() {
+            Err(_) | Ok("") => default,
+            Ok("1") => true,
+            Ok("0") => false,
+            Ok(v) => {
+                eprintln!("Error: {}={}: want 0 or 1", var, v);
+                std::process::exit(1);
+            }
+        })
+    };
+    let pick = |flag: Option<bool>, var: &str, parse: fn(&str) -> Result<bool, String>| -> bool {
+        flag.unwrap_or_else(|| match env::var(var) {
+            Ok(v) if !v.is_empty() => parse(&v).unwrap_or_else(|e| {
+                eprintln!("Error: {}: {}", var, e);
+                std::process::exit(1);
+            }),
+            _ => false,
+        })
+    };
+    let enums = switch(code_cov_enums, "XEZIM_TOGGLE_ENUMS", true);
+    let generate = switch(code_cov_generate, "XEZIM_TOGGLE_GENERATE", true);
+    let tied = switch(code_cov_tied, "XEZIM_TOGGLE_TIED", true);
+    let fsm_reset = switch(code_cov_fsm_reset, "XEZIM_FSM_RESET_TRANSITIONS", true);
+    let logical = pick(
+        code_cov_logical,
+        "XEZIM_CODE_COVERAGE_EXPRESSIONS",
+        xezim::compiler::simulator::parse_code_coverage_expression_mode,
+    );
+    let blocks = pick(
+        code_cov_blocks,
+        "XEZIM_CODE_COVERAGE_GRANULARITY",
+        xezim::compiler::simulator::parse_code_coverage_granularity,
+    );
     if code_cov != 0 {
         xezim::compiler::simulator::set_code_coverage(Some(
             xezim::compiler::simulator::CodeCoverage {
@@ -3161,6 +3268,12 @@ fn run_main() -> i32 {
                 exclude_input_ports: !input_ports,
                 integers,
                 keep_constant,
+                enums,
+                generate,
+                logical,
+                blocks,
+                fsm_reset,
+                tied,
             },
         ));
     } else if !code_cov_scopes.is_empty() {

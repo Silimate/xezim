@@ -1,7 +1,7 @@
 /* VPI writes to tests/dpi/vpi_array_ports_kept.sv (see
  * tests/strings/vpi_array_ports.rs). At time 1 it writes an element of the
- * two-state port, an element of the actual of the port with a second driver,
- * and an element of the port that collapses; at time 6 it reads them back.
+ * actual of the port with a second driver and an element of the port that
+ * collapses; at time 6 it reads them back.
  * Prints `CHK|<name>` per read that holds, `FAIL:` otherwise. */
 #include <string.h>
 #include "vpi_user.h"
@@ -46,12 +46,6 @@ static void at(PLI_INT32 (*rtn)(p_cb_data), unsigned t) {
 
 static PLI_INT32 late(p_cb_data cb) {
     (void)cb;
-    /* The two-state port holds the write and 0 for the actual's z; the
-     * actual keeps its z. */
-    want("top.up.a", 0, "00010010");
-    want("top.up.a", 1, "00000000");
-    want("top.p", 0, "zzzzzzzz");
-    want("top.p", 1, "zzzzzzzz");
     /* The port with a second driver follows its actual through its
      * connection. */
     want("top.ue.a", 0, "00110100");
@@ -62,7 +56,6 @@ static PLI_INT32 late(p_cb_data cb) {
 
 static PLI_INT32 early(p_cb_data cb) {
     (void)cb;
-    put("top.up.a", 0, 0x12);
     put("top.e", 0, 0x34);
     put("top.uk.a", 0, 0x56);
     at(late, 5);

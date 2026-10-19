@@ -3,20 +3,22 @@
 //! writes to an element of an instance's array port is what the instance
 //! reads, and the actual's name reads it too; a value written to the actual
 //! reaches the port's name. xezim gave the port's elements storage of their
-//! own, which the instance never read (it reads the actual), so writes to
-//! `u.a[i]` were lost: a cocotb test driving `dut.inst.port[i]` left the
-//! instance reading z.
+//! own, so a value written to `u.a[i]` reached the instance but not `a[i]`
+//! or an outer port: a cocotb test that wrote `dut.inst.port[i]` read z back
+//! from the parent's array.
 //!
 //! tests/dpi/vpi_array_ports.c writes through one, two and three port
 //! levels, to wide, one-bit, two-dimensional and descending arrays, to a
 //! whole port with `vpi_put_value_array`, to the actual of a port, and to
-//! ports connected to variables, then reads every element back. The expected
-//! lines are the reference simulator's with the ports of net kind, as
-//! §23.2.2.3 declares an `input logic` port.
+//! ports connected to variables, then reads every element back. An `input
+//! logic` port is a net (§23.2.2.3), so a port on a whole net is that net
+//! (§23.3.3.7) and a value written to either name is read through both. A
+//! port on a variable is a net the variable drives (§23.3.3.3); a value
+//! written to it holds until the variable changes (§38.34), so the instance
+//! reads it.
 //!
-//! tests/dpi/vpi_array_ports_kept.c covers the ports that keep storage of
-//! their own: a two-state port on a four-state actual, and a port with a
-//! second continuous driver on one element.
+//! tests/dpi/vpi_array_ports_kept.c covers a port that keeps storage of its
+//! own: one with a second continuous driver on an element.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,13 +45,28 @@ fn setup(stem: &str) -> (PathBuf, PathBuf) {
 
 /// Run `tests/dpi/<stem>.sv` with the library loaded, `env` set.
 fn run(dir: &Path, so: &Path, stem: &str, env: &[(&str, &str)]) -> String {
+    run_cached(dir, so, stem, env, None)
+}
+
+fn run_cached(
+    dir: &Path,
+    so: &Path,
+    stem: &str,
+    env: &[(&str, &str)],
+    cache: Option<&Path>,
+) -> String {
     let sv = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/dpi/{stem}.sv"));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.arg("--vpi-lib")
         .arg(so)
-        .args(["--no-cache", "-s", "top"])
+        .args(["-s", "top"])
         .arg(sv)
         .current_dir(dir);
+    if let Some(cache) = cache {
+        cmd.arg("--verbose").arg("--cache-dir").arg(cache);
+    } else {
+        cmd.arg("--no-cache");
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -97,6 +114,10 @@ const EXPECTED: &[&str] = &[
     "CHK|top.um8.a[5]",
     "CHK|top.um64.a[3]",
     "CHK|top.um1.a[5]",
+    "UPD|source changes",
+    "UPD|force holds",
+    "UPD|release",
+    "UPD|same callback release",
 ];
 
 fn expect(text: &str) {
@@ -133,20 +154,35 @@ fn vpi_writes_reach_unpacked_array_ports() {
             ("XEZIM_MEM_CENSUS", "1"),
         ],
     );
-    let _ = std::fs::remove_dir_all(&dir);
     expect(&packed);
     assert!(
         packed.contains("[PACKED-MEM] arrays=3 cells=24"),
         "the variables are not in the packed arena:\n{packed}"
     );
+    // Cached lowering must retain the same deposit and force/release
+    // behavior on both the first run and a later prepared-cache hit.
+    let cache = dir.join("cache");
+    for warm in [false, true] {
+        let text = run_cached(
+            &dir,
+            &so,
+            stem,
+            &[
+                ("XEZIM_LARGE_ARRAY_NAME_THRESHOLD", "4"),
+                ("XEZIM_PACKED_MEM", "1"),
+                ("AP_BY_NAME", "1"),
+            ],
+            Some(&cache),
+        );
+        expect(&text);
+        assert_eq!(text.contains("CACHE] hit"), warm, "cache state:\n{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A port whose cells cannot hold its actual's values, or with a driver of
-/// its own beside its connection, is not collapsed: only `uk` is. The
-/// two-state port keeps the write and its conversion of the actual's z, the
-/// actual keeps its z, and the port with the second driver still follows
-/// its actual through its connection, as the instance reading the actual
-/// does.
+/// A port with a driver of its own beside its connection is not collapsed:
+/// only `uk` is. The port with the second driver still follows its actual
+/// through its connection, as the instance reading the actual does.
 #[test]
 fn unpacked_array_ports_kept_apart() {
     let stem = "vpi_array_ports_kept";
@@ -154,10 +190,6 @@ fn unpacked_array_ports_kept_apart() {
     let text = run(&dir, &so, stem, &[("XEZIM_DEBUG", "1")]);
     let _ = std::fs::remove_dir_all(&dir);
     for line in [
-        "CHK|top.up.a[0]",
-        "CHK|top.up.a[1]",
-        "CHK|top.p[0]",
-        "CHK|top.p[1]",
         "CHK|top.ue.a[0]",
         "CHK|top.uk.a[0]",
         "CHK|top.k[0]",

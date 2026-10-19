@@ -148,3 +148,46 @@ def test_fresh_runner_uses_the_build(tmp_path):
 def test_test_needs_a_build(tmp_path):
     with pytest.raises(FileNotFoundError, match="call build"):
         run(get_runner("xezim"), tmp_path, {}, hdl_toplevel_lang="verilog")
+
+
+def test_parameter_override_persists(tmp_path):
+    r = get_runner("xezim")
+    build(r, tmp_path, parameters={"W": 8})
+    run(r, tmp_path, {"w": 3}, parameters={"W": 3})
+    run(r, tmp_path, {"w": 3})
+
+
+def test_fresh_runner_override_persists(tmp_path):
+    build(get_runner("xezim"), tmp_path, parameters={"W": 8})
+    r = get_runner("xezim")
+    run(r, tmp_path, {"w": 8}, hdl_toplevel_lang="verilog")
+    run(r, tmp_path, {"w": 3}, hdl_toplevel_lang="verilog", parameters={"W": 3})
+    run(r, tmp_path, {"w": 3}, hdl_toplevel_lang="verilog")
+
+
+def test_empty_parameter_override_persists(tmp_path):
+    r = get_runner("xezim")
+    build(r, tmp_path, parameters={"W": 8})
+    run(r, tmp_path, {"w": 3}, parameters={"W": 3})
+    run(r, tmp_path, {"w": 1}, parameters={})
+    run(r, tmp_path, {"w": 1})
+
+
+def test_new_build_replaces_parameter_override(tmp_path):
+    r = get_runner("xezim")
+    build(r, tmp_path, parameters={"W": 8})
+    run(r, tmp_path, {"w": 3}, parameters={"W": 3})
+    build(r, tmp_path, parameters={"W": 5})
+    run(r, tmp_path, {"w": 5})
+
+
+def test_positional_parameter_override(tmp_path):
+    r = get_runner("xezim")
+    build(r, tmp_path, parameters={"W": 8})
+    # Runner.test accepts its optional parameters positionally as well.
+    results = r.test(
+        "runner_checks", TOP, "top", "verilog", None, None, None,
+        [], [], [], {"EXPECT": json.dumps({"w": 5})}, False, False, {"W": 5},
+        build_dir=tmp_path / "build", test_dir=tmp_path / "test",
+    )
+    assert get_results(results) == (1, 0)

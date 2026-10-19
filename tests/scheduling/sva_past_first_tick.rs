@@ -8,17 +8,17 @@
 //! `bit`), and the type's default for a net. A write at time 0 does not count,
 //! but an initializer xezim runs as a time-0 process (`fv` below) does.
 //!
-//! A concurrent assertion read x there for every operand and treated the
-//! value-change functions as "no change", so an unguarded
-//! `q == $past(d)` with `logic d = 0` failed at the first edge. The sampled
-//! value compared at that tick is the Preponed one: an operand read only
-//! inside sampled-value calls (`t1` below) used to be read after the tick's
-//! NBAs, so `$rose(t1)` fired one tick early and `$past(t1)` was the
-//! current tick's value.
+//! The defaults were taken when the watches registered: after the time-0
+//! settle, so the net `w` read its driver's value instead of x; before a
+//! function-call initializer ran, so `fv` read x instead of 9; and, for an
+//! assertion inside a procedure, after the procedure's own time-0 writes.
+//! Procedural calls (`always @(posedge clk) ... $past(w)`) had the same
+//! problems.
 //!
-//! The reference simulator, run with full visibility (`+acc`), reports only
-//! the `FIRST 5` line here. In its default optimized mode it folds the net
-//! `w` into `r`'s initial value.
+//! Expected values follow §16.5.1 and §16.9.3. Verilator 5.038 can't check
+//! them: it is two-state and starts `$past` at 0 rather than at the
+//! declaration's value, and it doesn't run procedural concurrent assertions,
+//! `wait_order` or `randsequence`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -113,8 +113,8 @@ endmodule
 }
 
 /// An assertion written inline in a procedure under a `wait` reads the same
-/// defaults. The scan that saves them before time 0 skipped the body of a
-/// `wait`, so `$past(b)` there read x at the first tick (§16.9.3, §16.14.6).
+/// defaults, though the procedure writes its operands at time 0 before the
+/// assertion registers (§16.9.3, §16.14.6).
 #[test]
 fn inline_assertion_under_wait_uses_default_sampled_values() {
     let text = run(
@@ -125,18 +125,35 @@ module t;
   always #5 clk = ~clk;
   bit b = 0;
   logic [3:0] v = 4'h9;
-  initial wait (1)
-    a_wb: assert property (@(posedge clk) $past(b) === 1'b0) else $display("FAIL wait_b %0t", $time);
-  initial fork
-    wait (clk == 0) a_wv: assert property (@(posedge clk) $past(v) === 4'h9 && !$rose(v[0])) else $display("FAIL wait_v %0t", $time);
-  join_none
+  initial begin
+    b = 1;
+    wait (1)
+      a_wb: assert property (@(posedge clk) $past(b) === 1'b0) $display("ran wait_b");
+        else $display("FAIL wait_b %0t", $time);
+  end
+  initial begin
+    v = 4'h6;
+    fork
+      wait (clk == 0) a_wv: assert property (@(posedge clk) $past(v) === 4'h9) $display("ran wait_v");
+        else $display("FAIL wait_v %0t", $time);
+    join_none
+  end
   initial begin repeat (3) @(negedge clk); $finish; end
 endmodule
 "#,
     );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    let fails: Vec<&str> = text.lines().map(str::trim).filter(|l| l.starts_with("FAIL")).collect();
-    assert!(fails.is_empty(), "report lines:\n{text}");
+    let mut reports: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("FAIL") || l.starts_with("ran "))
+        .collect();
+    reports.sort_unstable();
+    assert_eq!(
+        reports,
+        ["ran wait_b", "ran wait_v"],
+        "report lines:\n{text}"
+    );
 }
 
 /// An inline assertion in any statement that can hold one reads the same

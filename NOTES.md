@@ -10,6 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A hierarchical name that does not resolve is an elaboration error (§23.8),
+  wherever it is written: a read or a write, a continuous assignment, an
+  event control, an assertion, a system task argument, or a task or function
+  that is never called. The message gives the file and line, the name, the
+  scope that does not declare it and the scope the search started from. Such
+  a name was accepted silently: a testbench that wrote to a guessed internal
+  name (`dut.mem_data[3] = ...`) ran as if the write had happened, and a read
+  returned x. A name inside a generate block a constant rules out is not
+  elaborated, so it is not checked. `--no-strict` turns the check off.
 * An assertion attempt at time 0 reads default sampled values (§16.5.1): a
   variable's declaration initializer, else its type's default, and x for a
   net. It read the values the time-0 continuous assignments and
@@ -31,28 +40,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
-* Concurrent assertions size their expressions as the rest of the language
-  does. A context-determined operand (of `+ - * / % **`, of a bitwise or
-  conditional operator, or a shift's left operand) is extended to the width
-  of the whole expression before the operation: over 16-bit `a` and `b`,
-  `a * b == 32'sh0001_0000` multiplies at 32 bits, where it multiplied at 16
-  and failed. This holds in properties, sequences, `disable iff`, clocking
-  event guards and cover properties, for the results of `$past`, and for
-  property local variables, whose match item assignments (`x = a + b`) are
-  now sized with `x`. A size cast to a parameter width (`W'(r)`) keeps its
-  width in an assertion; its parameter was read like a signal and the cast
-  lost its width. The evaluator now also sizes a size cast, a select, an array
-  element, a struct member and a concatenation in a comparison, which
-  corrects them in procedural code it runs, such as an `initial` block
-  (§6.24.1, §11.6.1, §11.8.2, §16.10). (Silimate/xezim#55)
-* A value a VPI client writes to an element of an instance's unpacked-array
-  input port reaches the instance, through any number of port levels, and
-  the actual's name reads it too; a value written to the actual reaches the
-  port's name in the same delta. The port and a whole-array actual are one
-  object (§23.3.3.7), as a scalar port and its actual already were. They had
-  storage of their own, connected element by element, while the instance
-  read the actual, so a cocotb test driving `dut.inst.port[i]` left the
-  instance reading z. (#66)
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
@@ -63,42 +50,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
-* Concurrent assertions read a flop's value from before the clock edge that
-  updates it when the clock is written from a VPI callback: an edge cocotb's
-  `Clock` writes from cbReadWriteSynch ticks the assertions in its own slot,
-  where they ticked in the next slot. Values are sampled once per time slot,
-  before its cbAtStartOfSimTime and cbAfterDelay routines, so a clock edge in
-  a later delta of the slot, or a value written in the edge's own
-  cbAfterDelay, no longer counts as sampled (§16.5.1, §4.4.2.1). A
-  cbReadWriteSynch due at an assertion's clock edge now runs, after the
-  slot's remaining Active, NBA and cbNBASynch work, before the assertions and
-  before that delta's clocking-event waiters (Post-NBA before Observed,
-  §4.4.2), whether a VPI routine or the design drives the clock,
-  so a reset a cocotb test releases after `RisingEdge` no longer disables
-  that edge's attempt, and one a clocking-event waiter raises at the edge
-  still does not (§16.12). A clock event is recorded when it happens, so a
-  routine that moves the clock back in the same slot does not lose it.
-  (Silimate/xezim#11, Silimate/xezim#56)
-* In concurrent assertions, `$past` with fewer past clock ticks than asked
-  for returns its operand's default sampled value instead of x, and `$rose`,
-  `$fell`, `$stable` and `$changed` compare the first tick's sample with it.
-  The default sampled value is the value before time 0: a variable's
-  declaration initializer, else its type's default, and a net's type default.
-  Procedural calls now take the same value; they used to take it after the
-  time-0 settle, so a net or a continuously assigned variable read its
-  driver's value. An operand that a property reads only through these
-  functions is now sampled in the Preponed region like the others; it was
-  read after the tick's NBAs, so `$rose(q)` of a flop fired one tick early
-  and `$past(q)` returned the current tick's value (§16.5.1, §16.9.3).
-* Bit-, part- and indexed part-select writes to a variable of a static task
-  or function, or to a `static` local of any subroutine or class method,
-  update the one variable all calls share. They were lost, so a static
-  function that built a value bit by bit returned its input and
-  `a[15:8] = v` left `a` all X. Member writes, increments and output
-  arguments are fixed too (§6.21, §11.5.1). A nonblocking write to a whole
-  member of a static packed struct (`s.f <= v`) is no longer dropped
-  (§10.4.2), and a block variable that hides a static of the same name no
-  longer reads or writes the static. (#4)
 * A value a VPI client writes at time 0 is the toggle-coverage baseline.
   Values written from the end-of-slot callbacks (`cbReadWriteSynch`,
   `cbAtEndOfSimTime`) reach toggle coverage and the waveform dumps in their
@@ -109,29 +60,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   its first toggle. A toggle is counted once per time slot from the slot's
   net change, so a value changed and changed back in later deltas of the
   same slot no longer counts (§38.36.2, §38.36.3). (Silimate/xezim#35)
-* Concurrent assertions sample the elements of unpacked arrays in the
-  Preponed region like other variables. They read the value an element took
-  in the NBA region of the edge being evaluated, so `a[0] == $past(s)` with
-  `a[0] <= s` failed at every edge. This covers multidimensional arrays,
-  unpacked arrays of packed vectors, arrays of structs, arrays in interfaces,
-  array ports, and dynamic arrays and queues up to index 63. A select with
-  constant indices samples its element. One whose indices read variables
-  samples the element their sampled values name, found again in each time
-  slot, so a large memory is never copied. An index read from a sequence
-  local variable, a procedure's loop variable, a sampled-value function or a
-  call samples the whole array (§16.5.1). (#27)
-* A hierarchical reference (`u.st`) in a named property or sequence declared
-  in the top-level module is sampled in the Preponed region, as it is when
-  written inline in `assert property`. It was read after the clock edge's
-  NBAs, so an antecedent on a state that changes at that edge never matched
-  and the assertion passed only vacuously, and a consequent on such a state
-  failed. `$past` and `$rose` of such a reference also behave as they do
-  inline, and a hierarchical clock (`@(posedge u.clk)`) there ticks; it
-  named no signal, so the property never ran. A reference into a generate
-  block or an instance-array element (`blk[1].sig`, `ra[0].sig`) is now
-  sampled too, inline, in a named property and through a bound checker's
-  port connected to it, and `$past` of it keeps a history as for any other
-  variable (§16.5.1). (Silimate/xezim#52, Silimate/xezim#68)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -353,6 +281,34 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* Interpreted nonblocking and event-controlled assignments evaluate their
+  right-hand sides at the target width, preserving carries and unary results
+  (§11.6.1). (#399, reported by akashlevy; #407, contributed by akashlevy)
+* Concurrent assertion operands and local match assignments retain their
+  expression context width (§11.6.1, §16.10).
+  (#402, reported by akashlevy; #408, contributed by akashlevy)
+* VPI-driven clocks evaluate assertions in the edge's time slot, with fixed
+  slot-entry samples and Post-NBA callbacks before assertion evaluation
+  (§16.5.1, §4.4.2). (#404, reported by akashlevy; #409, contributed by akashlevy)
+* The cocotb runner honors build arguments, timescales and parameter overrides,
+  including later tests and positional arguments.
+  (#406, reported by akashlevy; #410, contributed by akashlevy)
+* VPI writes through unpacked-array net ports reach every alias. Variable
+  connections retain their propagation timing (§23.3.3.3, §23.3.3.7).
+  (#405, reported by akashlevy; #411, contributed by akashlevy)
+* Sampled-value functions use declaration defaults from before time zero,
+  including deferred initializers and procedural assertions (§16.5.1, §16.9.3).
+  (#403, reported by akashlevy; #412, contributed by akashlevy)
+* Select writes to static subroutine locals update their shared storage and
+  preserve packed member writes (§6.21, §11.5.1).
+  (#413, reported by akashlevy; #414, contributed by akashlevy)
+* Concurrent assertions sample unpacked-array elements, including large
+  memories, variable indices and forced values. Out-of-range slice sampling
+  clips safely at extreme indices (§16.5.1, §11.5.1).
+  (#415, reported by akashlevy; #416, contributed by akashlevy)
+* Named and inline assertions sample generate-block, instance-array and
+  top-rooted references and recognize hierarchical clocks (§16.5.1).
+  (#417, reported by akashlevy; #418, contributed by akashlevy)
 
 **Performance**
 
@@ -377,19 +333,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   An explicit `XEZIM_METHOD_TIER` also attempts compilation on a later call
   after enough interpreted loop iterations, including `foreach`; default
   admission continues to use call counts. (#326, contributed by Thomasb81)
-
-**cocotb**
-
-* The cocotb runner (`contrib/cocotb/xezim_runner.py`) applies the options
-  cocotb's other runners do. `parameters` were ignored and now become
-  `-gNAME=VALUE`; a value is any constant expression, such as `{3'd7,3'd5}`.
-  `build_args` and a `timescale` given to `build()` were dropped and now
-  apply at run time. `elab_args` are passed too, and a `string` define becomes
-  a string literal, as with the other runners. The toplevel comes from
-  `test()`, and VHDL sources are an error. `build()` records its arguments,
-  parameters included, in `xezim_build.json` instead of `xezim_sources.f`, so
-  `test()` on another runner uses them too. The runner's tests are in
-  `contrib/cocotb/tests`.
 
 **Command line**
 
@@ -428,6 +371,22 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
   (same as `+seed=`) now work on the command line too, where they were read
   as `-s vseed` and `-s eed`.
+* Code coverage counting rules, each its own option and off by default.
+  Five follow the code coverage defaults the reference simulator documents:
+  `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
+  signals declared in generate blocks out of toggle coverage;
+  `--code-coverage-expressions=logical` scores only the conditions with a
+  `&&` or `||`, a term covered once it has been 0 and 1;
+  `--code-coverage-granularity=block` counts straight-line blocks, implicit
+  `else` and `default` arms included and continuous assignments not; and
+  `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
+  makes, an asynchronous reset's included. FSM coverage skips the code a
+  constant condition rules out, as statement and branch coverage do, also
+  where the rest of the condition can't change it (`if (EN && go)` with `EN`
+  0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of bits whose
+  only drivers are constants (`{4'b0, x}`, a port tied to `1'b0` and the
+  ports wired to it). Each has an `XEZIM_*` variable. See
+  docs/coverage-guide.md, "Counting rules".
 * `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
   an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
   toggle coverage, as some simulators do by default, so a module-level loop

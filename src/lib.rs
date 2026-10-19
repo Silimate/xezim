@@ -61,6 +61,7 @@ pub fn rss_trace(label: &str) {
 pub mod benchw;
 pub mod compiler;
 pub mod env_vars;
+pub mod hier_ref_lint;
 pub mod intra_delay;
 pub mod should_fail_lint;
 pub mod type_lint;

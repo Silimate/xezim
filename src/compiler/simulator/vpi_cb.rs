@@ -92,7 +92,6 @@ const MASK_SLOT_END: u64 =
 /// writing the object it watches recurses without bound otherwise).
 const MAX_CB_DEPTH: u32 = 1000;
 
-// silimate: bound on the deltas sva_post_nba runs before evaluating a clock event's assertions
 /// Deltas `sva_post_nba` runs before it evaluates a clock event anyway: a
 /// slot that never settles is the event loop's livelock to report.
 const SVA_POST_NBA_ROUNDS: u32 = 1 << 24;
@@ -702,7 +701,7 @@ impl Simulator {
         // the next snapshot. Otherwise @(cb) remains deferred until another
         // clock toggle, and #0 inputs still expose the preceding edge.
         self.drain_observed_region();
-        // silimate: assertions tick in the slot of a clock edge a VPI routine makes
+        // §16.5.1: the assertions tick in the slot of an edge a routine makes.
         self.vpi_observed();
         self.tick_clocking_blocks();
         if self.clocking_mirror_dirty {
@@ -713,18 +712,17 @@ impl Simulator {
             self.edge_dispatch_phase = saved;
             let _ = self.drain_edge_cascade(self.cascade_limit);
         }
-        // silimate: Reactive work waits for the assertions of a clock event whose slot sva_post_nba is still finishing
+        // The Reactive work waits while `sva_post_nba` finishes the slot
+        // before an assertion clock event (§4.4.2).
         if !self.sva_post_nba_busy {
             self.drain_deferred_clocking_conts();
             self.drain_reactive_region();
             self.drain_nba_region_waiters();
         }
-        // /silimate
         self.snapshot_edge_signals();
         self.vpi_same_time_work()
     }
 
-    // silimate: assertions tick in the slot of a clock edge a VPI routine makes
     /// A cbNBASynch or cbReadWriteSynch due now: the active region set
     /// (§4.4.2) still has work, which comes before the Observed region.
     #[inline]
@@ -739,11 +737,11 @@ impl Simulator {
     /// cocotb's Clock writes the clock from cbReadWriteSynch; the concurrent
     /// assertions tick in that slot, with its Preponed samples
     /// (`sva_observed`). Without this they ticked in a later delta or the
-    /// next slot and read every flop's new value. A
-    /// slot the nested scheduler ran took no samples. Once a routine has
-    /// finished the run nothing is evaluated (§38.14): cocotb ends a test
-    /// from the value-change callback of the edge, and the reference
-    /// simulator reports no assertion at that edge.
+    /// next slot and read every flop's new value. A slot the nested
+    /// scheduler ran took no samples. Once a routine has finished the run
+    /// (`vpi_control(vpiFinish)` runs `$finish`, §20.2) nothing is
+    /// evaluated: cocotb ends a test from the value-change callback of an
+    /// edge, and that edge's Observed region never comes.
     fn vpi_observed(&mut self) {
         if self.finished || self.sva_preponed_slot != Some(self.time) {
             return;
@@ -757,13 +755,14 @@ impl Simulator {
     /// Pre-NBA cbNBASynch and Post-NBA cbReadWriteSynch routines), and the
     /// Observed region before the Reactive work (clocking-event waiters,
     /// program code). xezim runs cbReadWriteSynch at the end of a delta,
-    /// after that Reactive work, so `disable iff` read a reset a cocotb test
-    /// releases after `RisingEdge` too late, or one a clocking-event waiter
-    /// raises at that edge too early. With a clock event recorded, this runs
-    /// the three steps in order, in one loop that a routine queuing another
-    /// cannot turn into recursion: the nested `sva_observed` of a delta
-    /// opened here only records clock events (a routine that moves the clock
-    /// back does not lose one), and that delta holds its Reactive work.
+    /// after that Reactive work, so evaluated there, `disable iff` would
+    /// read a reset a cocotb test releases after `RisingEdge` too late. With
+    /// a clock event recorded, this runs the three steps in order, in one
+    /// loop that a routine queuing another cannot turn into recursion: the
+    /// nested `sva_observed` of a delta opened here only records clock
+    /// events (a routine that moves the clock back does not lose one), and
+    /// that delta holds its Reactive work, so a reset a clocking-event waiter
+    /// raises at the edge still comes after the attempt.
     #[inline(never)]
     pub(super) fn sva_post_nba(&mut self) {
         self.note_sva_edges();
@@ -854,7 +853,6 @@ impl Simulator {
         //    waiters, program code and Re-NBA waiters, held by the deltas
         //    above.
     }
-    // /silimate
 
     /// Earliest tick a pending simulation-time callback holds the scheduler
     /// at. Same-time cbNBASynch/cbReadWriteSynch/cbAtEndOfSimTime/

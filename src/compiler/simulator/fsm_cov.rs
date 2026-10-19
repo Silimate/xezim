@@ -141,6 +141,34 @@ fn whole(e: &Expression) -> Option<&str> {
     }
 }
 
+/// The value of the one-bit control `sig` under which `cond` holds when it
+/// only tests `sig`: `rst` at 1, `!rst_n` and `rst == 1'b0` at 0.
+fn level(cond: &Expression, sig: &str) -> Option<bool> {
+    if whole(cond) == Some(sig) {
+        return Some(true);
+    }
+    match &cond.kind {
+        ExprKind::Paren(x) => level(x, sig),
+        ExprKind::Unary {
+            op: UnaryOp::LogNot | UnaryOp::BitNot,
+            operand,
+        } => level(operand, sig).map(|l| !l),
+        ExprKind::Binary { op, left, right } => {
+            let c = match (whole(strip(left)), whole(strip(right))) {
+                (Some(n), _) if n == sig => Simulator::try_const_u64(right)?,
+                (_, Some(n)) if n == sig => Simulator::try_const_u64(left)?,
+                _ => return None,
+            };
+            match op {
+                BinaryOp::Eq | BinaryOp::CaseEq => Some(c != 0),
+                BinaryOp::Neq | BinaryOp::CaseNeq => Some(c == 0),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Every identifier `e` names, selects included.
 fn idents<'a>(e: &'a Expression, out: &mut Vec<&'a str>) {
     match &e.kind {
@@ -605,9 +633,11 @@ struct Walk<'a> {
     /// Some assignment of the target, a hold included, is made under a
     /// test of the variable.
     guarded: bool,
-    /// The address of the state process's reset `if`, and whether the walk
-    /// is in its first branch.
+    /// The address of the state process's reset `if`, whether its `else`
+    /// is the reset branch instead of its first, and whether the walk is in
+    /// the reset branch.
     reset_at: usize,
+    reset_else: bool,
     resetting: bool,
     /// The innermost case item or `if` testing the variable around the walk.
     at: Option<Span>,
@@ -627,6 +657,45 @@ impl Walk<'_> {
             return None;
         }
         self.sim.eval_expr(cond).is_nonzero()
+    }
+
+    /// The value of a condition its constant parts decide, as constant
+    /// condition exclusion takes it (code_cov's `Cond`): a `&&` or `&` with
+    /// a constantly false operand is false, a `||` or `|` with a constantly
+    /// true one true, whatever the other operand is; `!` turns it around. A
+    /// bitwise operand counts only when its value does not depend on the
+    /// other's width.
+    fn decide(&mut self, cond: &Expression) -> Option<bool> {
+        if let Some(t) = self.fold(cond) {
+            return Some(t);
+        }
+        match &cond.kind {
+            ExprKind::Paren(x) => self.decide(x),
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } => self.decide(operand).map(|t| !t),
+            ExprKind::Binary { op, left, right } => {
+                let bitwise = matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr);
+                let mut side = |x: &Expression| {
+                    if bitwise && !super::code_cov::context_free(x) {
+                        return None;
+                    }
+                    self.decide(x)
+                };
+                let (l, r) = (side(left), side(right));
+                match op {
+                    BinaryOp::LogAnd | BinaryOp::BitAnd => {
+                        (l == Some(false) || r == Some(false)).then_some(false)
+                    }
+                    BinaryOp::LogOr | BinaryOp::BitOr => {
+                        (l == Some(true) || r == Some(true)).then_some(true)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The item a `case` on parameters selects (`Some(None)`: none does),
@@ -876,7 +945,7 @@ impl Walk<'_> {
                 then_expr,
                 else_expr,
             } => {
-                if let Some(taken) = self.fold(condition) {
+                if let Some(taken) = self.decide(condition) {
                     return self.eval(if taken { then_expr } else { else_expr }, ctx);
                 }
                 let (t, f) = match (self.pure(condition), self.then(condition)) {
@@ -942,8 +1011,10 @@ impl Walk<'_> {
                 else_stmt,
                 ..
             } => {
-                // A branch on parameters: only the branch they select is code.
-                if let Some(taken) = self.fold(condition) {
+                // A branch on parameters: only the branch they select is
+                // code, also when the rest of the condition can't change it
+                // (`if (EN && go)` with `EN` 0).
+                if let Some(taken) = self.decide(condition) {
                     match (taken, else_stmt) {
                         (true, _) => self.stmt(then_stmt, ctx),
                         (false, Some(e)) => self.stmt(e, ctx),
@@ -963,7 +1034,7 @@ impl Walk<'_> {
                 };
                 let reset = then.is_none() && self.reset_at == s as *const Statement as usize;
                 let was = self.resetting;
-                self.resetting |= reset;
+                self.resetting |= reset && !self.reset_else;
                 let outer = self.at;
                 if then.is_some() {
                     self.at = Some(s.span);
@@ -976,7 +1047,9 @@ impl Walk<'_> {
                         Some(p) => ctx.and(&p.not()),
                         None => ctx.clone(),
                     };
+                    self.resetting |= reset && self.reset_else;
                     self.stmt(e, &f);
+                    self.resetting = was;
                 }
             }
             StatementKind::Case {
@@ -1442,6 +1515,7 @@ impl Simulator {
             ran: Vec::new(),
             scratch: Vec::new(),
         };
+        let reset_transitions = super::code_cov::code_coverage().is_none_or(|c| c.fsm_reset);
         // Who assigns what: variable -> blocks assigning it whole, and the
         // variables some block assigns in part.
         let mut writers: HashMap<&str, Vec<usize>> = HashMap::default();
@@ -1471,6 +1545,26 @@ impl Simulator {
             let Some((proc_body, true)) = body(ab) else {
                 continue;
             };
+            // Asynchronous controls: the edges of an event control with more
+            // than one (`rst` of `@(posedge clk or posedge rst)`), each with
+            // the level its edge goes to (none for `edge`).
+            let asyncs: Vec<(&str, Option<bool>)> = match &ab.stmt.kind {
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::EventExpr(items)),
+                    ..
+                } if items.iter().filter(|i| i.edge.is_some()).count() > 1 => items
+                    .iter()
+                    .filter_map(|i| {
+                        let level = match i.edge? {
+                            Edge::Posedge => Some(true),
+                            Edge::Negedge => Some(false),
+                            Edge::Edge => None,
+                        };
+                        Some((whole(&i.expr)?, level))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             let mut full = BTreeSet::new();
             let mut part = BTreeSet::new();
             targets(proc_body, &mut full, &mut part);
@@ -1495,15 +1589,68 @@ impl Simulator {
                 {
                     continue;
                 }
-                // The reset: a first `if` of the body (tested in the walk not
-                // to be a test of the variable).
-                let first = match &proc_body.kind {
-                    StatementKind::SeqBlock { stmts, .. } => stmts.first(),
-                    _ => Some(proc_body),
+                // The reset (tested in the walk not to be a test of the
+                // variable): with an asynchronous control, the `if` of the
+                // body that tests it (`if (rst)` of `always @(posedge clk or
+                // posedge rst)`); otherwise the first statement past the
+                // block's declarations, when it is an `if`.
+                let stmts = match &proc_body.kind {
+                    StatementKind::SeqBlock { stmts, .. } => stmts.as_slice(),
+                    _ => std::slice::from_ref(proc_body),
                 };
+                let arm = stmts.iter().find_map(|s| match &s.kind {
+                    StatementKind::If { condition, .. } => {
+                        let mut n = Vec::new();
+                        idents(condition, &mut n);
+                        asyncs
+                            .iter()
+                            .find(|(a, _)| n.contains(a))
+                            .map(|&(a, active)| (s, a, active))
+                    }
+                    _ => None,
+                });
+                // The control resets in the arm where it is at its edge's
+                // level: the `else` of `if (!rst) ... else` under `posedge
+                // rst`.
+                let reset_else = arm.is_some_and(|(s, a, active)| match &s.kind {
+                    StatementKind::If {
+                        condition,
+                        else_stmt: Some(_),
+                        ..
+                    } => active.is_some() && level(condition, a) == active.map(|l| !l),
+                    _ => false,
+                });
+                let arm = arm.map(|(s, _, _)| s);
+                let first = arm.or_else(|| {
+                    stmts.iter().find(|s| {
+                        !matches!(
+                            s.kind,
+                            StatementKind::VarDecl { .. } | StatementKind::Typedef(_)
+                        )
+                    })
+                });
                 let reset_at = first
                     .filter(|f| matches!(f.kind, StatementKind::If { .. }))
                     .map_or(0, |f| f as *const Statement as usize);
+                // For `--no-fsm-reset-transitions`, an asynchronous control's
+                // `if` is a reset; another first `if` only when it has an
+                // `else` and its own branch does not test the variable: a
+                // clock enable (`if (en) case (st) ...`) guards the state
+                // logic itself and has neither.
+                let reset_branch = arm.is_some()
+                    || first.is_some_and(|f| match &f.kind {
+                        StatementKind::If {
+                            then_stmt,
+                            else_stmt: Some(_),
+                            ..
+                        } => {
+                            let mut t = HashSet::default();
+                            stmt_tests(then_stmt, &mut t);
+                            let leaf = var.rsplit('.').next().unwrap_or(var);
+                            !t.contains(var) && !t.contains(leaf)
+                        }
+                        _ => false,
+                    });
                 let mut w = Walk {
                     sim: self,
                     var,
@@ -1518,6 +1665,7 @@ impl Simulator {
                     bad: false,
                     guarded: false,
                     reset_at,
+                    reset_else,
                     resetting: false,
                     at: None,
                 };
@@ -1594,6 +1742,7 @@ impl Simulator {
                         bad: false,
                         guarded: false,
                         reset_at: 0,
+                        reset_else: false,
                         resetting: false,
                         at: None,
                     };
@@ -1657,6 +1806,9 @@ impl Simulator {
                 // the last in the source.
                 let mut best: BTreeMap<(u32, u32), ((bool, bool, usize), Span, Span)> =
                     BTreeMap::new();
+                // The transitions some assignment outside a reset branch
+                // makes (see `reset_branch`).
+                let mut logic: HashSet<(u32, u32)> = HashSet::default();
                 for r in &recs {
                     let Some(&to) = index.get(&r.value) else {
                         continue;
@@ -1666,11 +1818,19 @@ impl Simulator {
                         if v == r.value || !r.ctx.holds(v) {
                             continue;
                         }
+                        if !r.reset || !reset_branch {
+                            logic.insert((from, to));
+                        }
                         let e = best.entry((from, to)).or_insert((rank, r.span, r.from));
                         if rank >= e.0 {
                             *e = (rank, r.span, r.from);
                         }
                     }
+                }
+                // `--no-fsm-reset-transitions`: a transition only the reset
+                // branch makes is no transition.
+                if !reset_transitions {
+                    best.retain(|k, _| logic.contains(k));
                 }
                 if best.is_empty() {
                     continue;

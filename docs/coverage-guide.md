@@ -839,6 +839,10 @@ is left out of the instance's totals (*excluded*):
   code (an excluded arm, an operand that is never evaluated, the condition of
   an `else if` after a constantly true one) are excluded too. They are left
   out of the results altogether.
+- FSM coverage reads only the code that can run: an assignment in an
+  excluded arm or `?:` operand makes no state and no transition, and a
+  state machine whose state logic is all excluded is none (with `EN` 0,
+  `if (EN && go) st <= HALT;` adds neither `HALT` nor a transition to it).
 
 Constants are literals (strings included), parameters and `localparam`s, enum
 constants, package parameters (`pkg::P`), the genvar of a generate loop, and an
@@ -1185,6 +1189,46 @@ FSM coverage is the states and transitions together: `fsm` in the results has
 the covered and total counts of both, and `states` and `transitions` apart, the
 reference simulator's "FSM States" and "FSM Transitions".
 
+#### Counting rules
+
+Six options change what is counted. Each is off by default. The first five
+follow the code coverage defaults the reference simulator documents; the last
+leaves out the bits that are constant by construction.
+
+| Option | What it counts |
+|---|---|
+| `--no-toggle-enums`, `XEZIM_TOGGLE_ENUMS=0` | Enum variables are not tracked for toggles (entries of `type` `enum`). |
+| `--no-toggle-generate`, `XEZIM_TOGGLE_GENERATE=0` | Signals declared in a generate block are not tracked for toggles: a labeled block's (`g.x`), a generate loop's, named or not (`g[1].x`, `genblk1[1].x`), and an unlabeled `if` or `case` branch's, which keep their bare name in the instance (the members of a struct declared there too). Signals declared directly in a `generate` region are module items and stay. |
+| `--code-coverage-expressions=logical`, `XEZIM_CODE_COVERAGE_EXPRESSIONS=logical` | Only conditions (`if`, `while`, `do`, `?:`) that hold a `&&` or `||` are items, and only those operators split one into terms: `(a & b) \|\| c` has the terms `a & b` and `c`, `!a && v` has `!a` and `v`, and a vector term counts as nonzero or zero. An assignment's value is no item. A term is covered once it has been seen at 0 and at 1, whether or not it decided the value (sum-of-products scoring). A term a `&&` or `\|\|` short-circuits is still read for coverage when reading it has no side effects: no increment, assignment or function call, apart from system functions that only compute a value from their arguments (`$clog2`, `$bits`, `$size`, `$signed`, ...). A bit-select or part-select qualifies when its index and bounds do. The design's evaluation is unchanged. |
+| `--code-coverage-granularity=block`, `XEZIM_CODE_COVERAGE_GRANULARITY=block` | `statement` counts straight-line blocks instead of statements (below). |
+| `--no-fsm-reset-transitions`, `XEZIM_FSM_RESET_TRANSITIONS=0` | A transition that only the state process's reset branch makes is no transition. With an asynchronous control (`always @(posedge clk or negedge rst_n)`), the reset branch is the `if` that tests it (`if (!rst_n)`). Otherwise it is the first `if` of the state process, past any declarations, when it has an `else` and does not test the state variable itself; a clock enable around the state logic (`if (en) case (st) ...`) is none. |
+| `--no-toggle-tied`, `XEZIM_TOGGLE_TIED=0` | A bit whose only drivers are constants is not tracked for toggles (its two bins are left out of the totals and listed in the entry's `tied`, by bit). A driver is a continuous assignment: an `assign`, a net declaration assignment or a port connection. Each must give the bit a constant: a bit of a literal or parameter, in a concatenation or replication too (`{4'b0, x}` ties the top four bits), or a bit of another net or variable that is tied, through whole, bit and part-select connections (a port connected to `1'b0`, and the ports wired to it further down). An operator ties nothing, even on constant operands (`a & 1'b0`), and a bit that never changes because of the values it gets stays. A signal a process, subroutine, `force`, primitive or switch writes is not tied. |
+
+A state that stays put is never a transition, with or without these.
+
+In block granularity a block is a run of statements that execute together:
+nothing branches into it or out of it in the middle. It counts once per run,
+at its first statement, and its `kind` in the results is `block`. A new
+block starts:
+
+- where a process body starts (after the event or delay control of an
+  `always`), and where a task or function body starts;
+- at each arm of an `if` chain or a `case`, written or implicit: an `if`
+  without an `else`, or a `case` without a `default`, has an implicit arm
+  that is a block of its own (`kind` `else (implicit)` or `default
+  (implicit)`, counted when no written arm runs), except in a `unique` or
+  `priority` decision. Its count comes from branch coverage when that is
+  collected, and from a counter of its own otherwise;
+- after an `if`, `case` or loop, where the paths meet again;
+- at a loop body, and at the statement an event control, delay or `wait`
+  controls;
+- at `begin` and after `end`, and after a `return`, `break`, `continue` or
+  `disable`.
+
+The decision of an `if` or `case`, and a loop's start, belong to the block
+before them. A continuous assignment and the `always` construct itself are
+no blocks. Constant conditions exclude blocks as they do statements.
+
 #### Scopes
 
 Code in a module body (generate blocks included) belongs to its instance. The
@@ -1299,7 +1343,7 @@ The results file gains a `code_coverage` member:
 | `scopes[].design_unit` | The module or interface of the instance; the scope's own name otherwise |
 | `scopes[].kind` | `instance`, `package`, `unit` or `module` (see [Scopes](#scopes)) |
 | `scopes[].statement`, `.branch`, `.toggle`, `.condition`, `.expression`, `.fsm` | The scope's totals, like the design totals |
-| `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait`. An excluded statement has `"excluded": "constant"` and is not in the totals |
+| `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait`; in block granularity it is `block`, `else (implicit)` or `default (implicit)` (see [Counting rules](#counting-rules)). An excluded statement has `"excluded": "constant"` and is not in the totals |
 | `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count`. `"excluded": "constant"` after `kind` marks a branch whose decision is a constant or that is in an excluded arm: none of its arms is in the totals. On an arm, it marks one that can never run |
 | `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, `type`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first. `type` is the data type the signal was declared with, after any typedef: `logic` (also a net declared without a data type), `bit`, `reg`, `byte`, `shortint`, `int`, `longint`, `integer`, `enum`, `struct` or `union`. A member of an unpacked struct or union has the type of the variable it belongs to, `struct` or `union`. `--no-toggle-integers` leaves out the entries of type `byte`, `shortint`, `int`, `longint` and `integer` |
 | `scopes[].conditions[]`, `.expressions[]` | Every condition and expression item, never-evaluated ones included: `file`, `line`, `kind` (a condition's `if`, `while`, `do` or `ternary`; an expression's `statement`, `assign` or `port`), `block` (the generate block within the scope, when there is one), `text` (the source text) and `terms[]`, each with `term` (its source text), `hits` (the counts of its rows 0 and 1) and, in a bimodal item (one with `^`, `~^` or `?:`), `outputs` (`[[row 0 at 0, row 0 at 1], [row 1 at 0, row 1 at 1]]`, by the item's value). An item in code that [constant conditions](#constant-conditions) rule out is neither listed nor in the totals |
@@ -1486,5 +1530,11 @@ it.
 | `-covworkdir <dir>`, `-covscope <name>`, `-covtest <name>` | Write the results file to `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`, `scope`, `test`) |
 | `-covoverwrite` | Accepted for compatibility with other simulators; no effect (the file is always replaced) |
 | `--no-toggle-integers`, `XEZIM_TOGGLE_INTEGERS=0` | Leave variables of an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of toggle coverage. `--toggle-integers` keeps them (the default) |
+| `--no-toggle-enums`, `XEZIM_TOGGLE_ENUMS=0` | Leave enum variables out of toggle coverage. See [Counting rules](#counting-rules) |
+| `--no-toggle-generate`, `XEZIM_TOGGLE_GENERATE=0` | Leave the signals declared in generate blocks out of toggle coverage |
+| `--code-coverage-expressions=<all\|logical>`, `XEZIM_CODE_COVERAGE_EXPRESSIONS` | Score every condition and expression item (`all`, the default), or only the conditions with a `&&` or `\|\|`, by term values (`logical`) |
+| `--code-coverage-granularity=<statement\|block>`, `XEZIM_CODE_COVERAGE_GRANULARITY` | Count statements (the default) or straight-line blocks |
+| `--no-fsm-reset-transitions`, `XEZIM_FSM_RESET_TRANSITIONS=0` | Leave out the FSM transitions only a reset makes |
+| `--no-toggle-tied`, `XEZIM_TOGGLE_TIED=0` | Leave the bits whose only drivers are constants out of toggle coverage |
 | `+fcover` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |

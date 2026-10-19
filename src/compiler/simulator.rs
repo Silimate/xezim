@@ -1629,6 +1629,12 @@ struct NbaEntry {
     /// all while the other advanced at double rate, so its `forever` divider
     /// never reached its threshold and the clock it drove never toggled.
     static_key: Option<String>,
+    /// With `static_key`, for a select or member write (`a[3:0] <= v`): the
+    /// bits of the variable that the write replaces, resolved at schedule
+    /// time while the local's declared type and layout are in scope (names
+    /// can mean another variable by the NBA region). `value` then holds the
+    /// new values of those bits, at the same positions.
+    static_mask: Option<Value>,
     /// §8.3 + §4.9.4: the `this` handle in scope when the NBA was SCHEDULED.
     ///
     /// The slow path commits through `assign_value` in the NBA region, AFTER
@@ -4366,6 +4372,10 @@ struct BlockScopeSave {
     /// `(depth, len)` of `static_local_syncs` at entry when the block
     /// declares a `static` variable.
     static_mark: Option<(usize, usize)>,
+    /// The subroutine's `static` locals that a non-static block variable of
+    /// the same name hides, as `static_local_syncs` depth and the
+    /// `(name, key)` entries taken out of that frame until the block ends.
+    static_hidden: Option<(usize, Vec<(String, String)>)>,
     /// `next_pid` at entry: a block that forked keeps its collection storage
     /// (a child may still use it).
     pid_mark: usize,
@@ -6486,6 +6496,10 @@ pub struct Simulator {
     /// maturity): these commit in the target slot's NBA region, after that
     /// slot's Active reads.
     delayed_nba: Vec<(u64, usize, Value)>,
+    /// §6.21/§9.4.5: future-time nonblocking writes to `static` subroutine
+    /// locals (`a[0] <= #5 v`), as `(due time, entry)`. Their target is the
+    /// persistent store, not a signal, so `delayed_nba` cannot hold them.
+    delayed_static_nba: Vec<(u64, NbaEntry)>,
     /// NBA writes into PACKED-ARENA cells (issue #147). A packed cell has no
     /// `signal_table` slot, so it cannot ride `nba_fast` (apply indexes the
     /// per-signal tables) — and committing immediately gave NBAs into big
@@ -13031,6 +13045,7 @@ impl Simulator {
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
             delayed_nba: Vec::new(),
+            delayed_static_nba: Vec::new(),
             packed_nba: Vec::new(),
             udp_runtime: Vec::new(),
             has_udp: false,
@@ -48231,6 +48246,7 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
+                && self.delayed_static_nba.is_empty()
                 && !has_reactive
                 // A pending VPI timer (cbAfterDelay, a future cbReadWriteSynch,
                 // ...) is real future work even when the HDL side is idle — a
@@ -48254,6 +48270,7 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
+                && self.delayed_static_nba.is_empty()
                 && !self.vpi_timed_future()
             {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
@@ -54606,17 +54623,7 @@ impl Simulator {
                                 name,
                                 init: e,
                             } => {
-                                let v = self.eval_expr(e);
-                                let w = super::elaborate::resolve_type_width(
-                                    data_type,
-                                    Some(&self.module.parameters),
-                                    Some(&self.module.typedefs),
-                                );
-                                self.widths.insert(name.name.clone(), w);
-                                let mut rv = v.resize(w);
-                                if super::elaborate::is_type_signed(data_type) {
-                                    rv.is_signed = true;
-                                }
+                                let rv = self.declare_for_init_var(data_type, &name.name, e);
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
                                 } else {
@@ -55691,10 +55698,10 @@ impl Simulator {
                         && declarators.iter().any(|d| {
                             d.dimensions.is_empty()
                                 && d.init.is_none()
-                                && super::bytecode::BytecodeCompiler::static_local_carries(
+                                && (super::bytecode::BytecodeCompiler::static_local_carries(
                                     &d.name.name,
                                     rest,
-                                )
+                                ) || rest.iter().any(|r| Self::nba_writes(&d.name.name, r)))
                         })
                     {
                         *lifetime = Some(crate::ast::types::Lifetime::Static);
@@ -55730,6 +55737,48 @@ impl Simulator {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// §6.21/§10.4.2: is `name` the target, whole or in part, of a
+    /// nonblocking assignment in `s`? Such a variable changes in the NBA
+    /// region, after the statement, so it needs storage that outlives the
+    /// call frame even when every call writes it before reading it.
+    fn nba_writes(name: &str, s: &Statement) -> bool {
+        fn target(name: &str, e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Paren(expr) => target(name, expr),
+                ExprKind::Concatenation(parts) => parts.iter().any(|p| target(name, p)),
+                ExprKind::Ident(h) => {
+                    h.root.is_none() && h.path.first().is_some_and(|g| g.name.name == name)
+                }
+                _ => false,
+            }
+        }
+        let walk = |c: &Statement| Self::nba_writes(name, c);
+        match &s.kind {
+            StatementKind::NonblockingAssign { lvalue, .. } => target(name, lvalue),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(walk)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => walk(then_stmt) || else_stmt.as_deref().is_some_and(walk),
+            StatementKind::Case { items, .. } => items.iter().any(|it| walk(&it.stmt)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => walk(body),
+            _ => false,
         }
     }
 
@@ -56162,6 +56211,37 @@ impl Simulator {
             pid_mark: self.next_pid,
             ..Default::default()
         };
+        // §6.21: a block variable that is not `static` hides the
+        // subroutine's same-named static until the block ends, so its reads
+        // and writes must not reach the static's shared cell.
+        let depth = self.static_local_syncs.len();
+        if !self.static_local_names.is_empty()
+            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
+        {
+            for s in stmts {
+                if let StatementKind::VarDecl {
+                    lifetime,
+                    declarators,
+                    ..
+                } = &s.kind
+                    && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                {
+                    for d in declarators {
+                        let nm = &d.name.name;
+                        if !self.static_local_names.contains(nm) {
+                            continue;
+                        }
+                        if let Some(i) = syncs.iter().position(|(n, _)| n == nm) {
+                            let hidden = syncs.remove(i);
+                            sv.static_hidden
+                                .get_or_insert_with(|| (depth, Vec::new()))
+                                .1
+                                .push(hidden);
+                        }
+                    }
+                }
+            }
+        }
         for s in stmts {
             let StatementKind::VarDecl {
                 data_type,
@@ -56239,6 +56319,13 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // The statics the block's variables hid are visible again.
+        if let Some((depth, hidden)) = sv.static_hidden
+            && self.static_local_syncs.len() == depth
+            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
+        {
+            syncs.extend(hidden);
         }
         let forked = self.next_pid != sv.pid_mark;
         for s in stmts {
@@ -57884,6 +57971,17 @@ impl Simulator {
                 }
             }
         }
+        if !self.delayed_static_nba.is_empty() {
+            let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.delayed_static_nba)
+                .into_iter()
+                .partition(|(t, _)| *t <= self.time);
+            self.delayed_static_nba = rest;
+            for (_, e) in due {
+                if let Some(key) = e.static_key {
+                    self.commit_static_nba(key, e.static_mask, e.value);
+                }
+            }
+        }
         // JIT Stage 4 Path C1: drain any JIT-emitted inline NBA writes
         // into nba_fast BEFORE clearing the per-window index, so
         // partial-bit follow-ups (NbaAssignRange) see them.
@@ -57908,7 +58006,7 @@ impl Simulator {
             // NBA was SCHEDULED; re-resolving here would consult whichever call
             // frame is current in the NBA region (see NbaEntry::static_key).
             if let Some(key) = entry.static_key {
-                self.static_local_vars.insert(key, entry.value);
+                self.commit_static_nba(key, entry.static_mask, entry.value);
                 continue;
             }
             if let Some(lhs) = entry.lhs {
@@ -58111,11 +58209,8 @@ impl Simulator {
     fn next_delayed_time(&self) -> Option<u64> {
         let a = self.delayed_updates.iter().map(|(t, _, _)| *t).min();
         let b = self.delayed_nba.iter().map(|(t, _, _)| *t).min();
-        match (a, b) {
-            (Some(x), Some(y)) => Some(x.min(y)),
-            (x, None) => x,
-            (None, y) => y,
-        }
+        let c = self.delayed_static_nba.iter().map(|(t, _)| *t).min();
+        [a, b, c].into_iter().flatten().min()
     }
 
     /// Next scheduler-visible timer: a VPI simulation-time callback (see
@@ -58142,6 +58237,7 @@ impl Simulator {
     /// Any future-time NBA matured at (or before) the current time?
     fn delayed_nba_due(&self) -> bool {
         self.delayed_nba.iter().any(|(t, _, _)| *t <= self.time)
+            || self.delayed_static_nba.iter().any(|(t, _)| *t <= self.time)
     }
 
     /// Schedule a delayed signal update (inertial delay model).
@@ -65686,6 +65782,31 @@ impl Simulator {
         {
             return changed;
         }
+        // §6.21: a select or member write to a `static` subroutine local
+        // (`a[7:0] = v`) updates the frame copy in place, while reads come
+        // from the live shared cell. Bring the copy up to date first and
+        // write it back after, or the write is lost.
+        let cell = if self.static_local_names.is_empty() || self.in_const_param_eval {
+            None
+        } else {
+            self.static_select_target(lhs)
+        };
+        // An index that calls a function can write the same static, so
+        // evaluate the indices (once, §11.4.1) before taking the copy. An
+        // x/z index selects nothing, so the write is discarded (§11.5.1).
+        let frozen;
+        let lhs = if cell.is_some() && !Self::select_indices_plain(lhs) {
+            let Some(e) = self.freeze_select_indices(lhs, false) else {
+                return false;
+            };
+            frozen = e;
+            &frozen
+        } else {
+            lhs
+        };
+        if let Some(n) = cell {
+            self.static_cell_sync(n, false);
+        }
         // §6.8/§6.11.1: a write to a 2-state procedural local drops X/Z
         // (whole, bit- or part-select). Probed only for an X/Z value.
         let changed = if val.has_xz() {
@@ -65693,6 +65814,9 @@ impl Simulator {
         } else {
             self.assign_value_inner(lhs, val)
         };
+        if let Some(n) = cell {
+            self.static_cell_sync(n, true);
+        }
         if changed && !self.condition_waiters.is_empty() {
             self.check_condition_waiters_for_write(lhs);
         }
@@ -87605,26 +87729,26 @@ impl Simulator {
                         .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
                         .unwrap_or(0),
                 };
-                if d == 0 {
-                    // A `static` subroutine local is checked BEFORE the signal
-                    // resolution below: it is backed by a persistent store keyed
-                    // per declaring subroutine, but `resolve_nba_target` finds a
-                    // bare same-named SIGNAL, which every instance of an
-                    // interface shares. Two instances each running
-                    // `task Gen; static int count; … count <= count + 1;` then
-                    // wrote one cell — one instance's counter never advanced and
-                    // the divider it fed never reached its threshold.
-                    if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
-                        self.nba_queue.push(NbaEntry {
-                            lhs: None,
-                            value: val.resize_for_assign(w),
-                            resolved_id: None,
-                            static_key: Some(key),
-                            // No `lhs` to re-resolve, so no context needed.
-                            this_handle: None,
-                        });
-                        return;
+                // A `static` subroutine local is checked BEFORE the signal
+                // resolution below: it is backed by a persistent store keyed
+                // per declaring subroutine, but `resolve_nba_target` finds a
+                // bare same-named SIGNAL, which every instance of an
+                // interface shares. Two instances each running
+                // `task Gen; static int count; … count <= count + 1;` then
+                // wrote one cell — one instance's counter never advanced and
+                // the divider it fed never reached its threshold. A delayed
+                // write waits for its own slot (§9.4.5).
+                if let Some(entry) = self.static_nba_entry(lvalue, &val, w) {
+                    if let Some(e) = entry {
+                        if d == 0 {
+                            self.nba_queue.push(e);
+                        } else {
+                            self.delayed_static_nba.push((self.time + d, e));
+                        }
                     }
+                    return;
+                }
+                if d == 0 {
                     let id_opt = self.resolve_nba_target(lvalue);
                     if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
@@ -87669,6 +87793,7 @@ impl Simulator {
                             value: qval,
                             resolved_id: None,
                             static_key,
+                            static_mask: None,
                             this_handle,
                         });
                     }
@@ -87710,6 +87835,7 @@ impl Simulator {
                         value: qval,
                         resolved_id: None,
                         static_key,
+                        static_mask: None,
                         this_handle,
                     });
                 }
@@ -87913,29 +88039,7 @@ impl Simulator {
                             name,
                             init: e,
                         } => {
-                            let v = self.eval_expr(e);
-                            let w = super::elaborate::resolve_type_width(
-                                data_type,
-                                Some(&self.module.parameters),
-                                Some(&self.module.typedefs),
-                            );
-                            self.widths.insert(name.name.clone(), w);
-                            let mut rv = v.resize(w);
-                            // Preserve declared signedness: `resize` yields an
-                            // unsigned Value, so a `for (int i = ...; i >= 0;
-                            // --i)` loop var would read as unsigned and `i >= 0`
-                            // would be always-true -> infinite descending loop
-                            // in any count-down loop.
-                            if super::elaborate::is_type_signed(data_type) {
-                                rv.is_signed = true;
-                            }
-                            // Keep `signed_signals` authoritative for the
-                            // fitted frame-write stamp (§6.11.1).
-                            if super::elaborate::is_type_signed(data_type) {
-                                self.signed_signals.insert(name.name.clone());
-                            } else {
-                                self.signed_signals.remove(&name.name);
-                            }
+                            let rv = self.declare_for_init_var(data_type, &name.name, e);
                             // Declare the loop variable in the current call
                             // frame's local scope (highest read/write
                             // precedence) so its init, the step, and condition
@@ -87966,7 +88070,7 @@ impl Simulator {
                     .filter_map(|fi| match fi {
                         ForInit::VarDecl {
                             data_type, name, ..
-                        } if super::elaborate::is_type_signed(data_type) => Some(name.name.clone()),
+                        } if self.type_is_signed_concrete(data_type) => Some(name.name.clone()),
                         _ => None,
                     })
                     .collect();
@@ -115576,6 +115680,36 @@ impl Simulator {
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
         let types = self.take_pooled_types();
         self.push_local_frame_typed(f, types);
+    }
+
+    /// §12.7.1: a variable declared in a `for` header has the header's data
+    /// type. Returns its initial value, fitted to the declared width and
+    /// carrying the declared signedness rather than the initializer's
+    /// (§6.11.1), so `for (bit [3:0] i = 2; i > -1; i--)` compares unsigned
+    /// (§11.8.1). Registers the width and signedness by name, as a block
+    /// declaration does: the frame-write path fits every later write to the
+    /// variable, the step included, from them. Both the synchronous `for`
+    /// and the lowering for a body that blocks declare through here; the
+    /// lowering used to register no signedness, so after a delay `i--`
+    /// stored an unsigned value and `for (int i = 2; i >= 0; i--)` never
+    /// ended.
+    fn declare_for_init_var(&mut self, data_type: &DataType, name: &str, e: &Expression) -> Value {
+        let v = self.eval_expr(e);
+        let w = super::elaborate::resolve_type_width(
+            data_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        self.widths.insert(name.to_string(), w);
+        let signed = self.type_is_signed_concrete(data_type);
+        if signed {
+            self.signed_signals.insert(name.to_string());
+        } else {
+            self.signed_signals.remove(name);
+        }
+        let mut v = v.resize(w);
+        v.is_signed = signed;
+        v
     }
 
     /// The frame a loop pushes for its loop variables in a process that has
@@ -145333,6 +145467,251 @@ impl Simulator {
             .iter()
             .find(|(n, _)| n == nm)
             .map(|(_, key)| key.clone())
+    }
+
+    /// §6.21/§11.5.1: the `static` subroutine local that a select or member
+    /// write changes in place: `a` in `a[i]`, `a[7:0]`, `a[i*8 +: 8]`,
+    /// `a.f` or `a.f[1:0]`. None for a write to the whole variable, which
+    /// reaches its shared cell by itself, and for any other target.
+    fn static_select_target<'a>(&self, lhs: &'a Expression) -> Option<&'a str> {
+        let mut e = lhs;
+        let mut sel = false;
+        loop {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => {
+                    e = expr;
+                    sel = true;
+                }
+                ExprKind::Paren(x) => e = x,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let seg = h.path.first()?;
+        if h.root.is_some() || !(sel || h.path.len() > 1 || !seg.selects.is_empty()) {
+            return None;
+        }
+        let n = seg.name.name.as_str();
+        let hit = n
+            .as_bytes()
+            .first()
+            .is_some_and(|&b| self.static_local_first[b as usize])
+            && self.static_local_names.contains(n);
+        hit.then_some(n)
+    }
+
+    /// Are the indices of the select target `e` literals and variable reads
+    /// alone, so that evaluating them cannot write a variable?
+    fn select_indices_plain(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                Self::init_is_plain(index) && Self::select_indices_plain(expr)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::init_is_plain(left)
+                    && Self::init_is_plain(right)
+                    && Self::select_indices_plain(expr)
+            }
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => {
+                Self::select_indices_plain(expr)
+            }
+            _ => Self::init_is_plain(e),
+        }
+    }
+
+    /// The select target `e` with its indices evaluated once and replaced by
+    /// their values (§11.4.1): every index for a nonblocking write (`all`,
+    /// §10.4.2), else only those that are not plain (see
+    /// `select_indices_plain`). None when such an index is x/z or does not
+    /// fit in 64 bits: it selects nothing in a vector (§11.5.1).
+    fn freeze_select_indices(&mut self, e: &Expression, all: bool) -> Option<Expression> {
+        let index = |sim: &mut Self, x: &Expression| -> Option<Box<Expression>> {
+            if matches!(x.kind, ExprKind::Number(_)) || (!all && Self::init_is_plain(x)) {
+                return Some(Box::new(x.clone()));
+            }
+            let v = sim.eval_expr(x);
+            if v.has_xz() {
+                return None;
+            }
+            let n = v.to_i64()?;
+            Some(Box::new(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: n.to_string(),
+                    cached_val: Cell::new(Some((n as u64, 0u64, 64u32))),
+                }),
+                x.span,
+            )))
+        };
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index: i } => {
+                let base = self.freeze_select_indices(expr, all)?;
+                ExprKind::Index {
+                    expr: Box::new(base),
+                    index: index(self, i)?,
+                }
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let base = self.freeze_select_indices(expr, all)?;
+                ExprKind::RangeSelect {
+                    expr: Box::new(base),
+                    kind: *kind,
+                    left: index(self, left)?,
+                    right: index(self, right)?,
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => ExprKind::MemberAccess {
+                expr: Box::new(self.freeze_select_indices(expr, all)?),
+                member: member.clone(),
+            },
+            ExprKind::Paren(x) => return self.freeze_select_indices(x, all),
+            _ => return Some(e.clone()),
+        };
+        Some(Expression::new(kind, e.span))
+    }
+
+    /// §6.21: copy the `static` local `name` of the current subroutine
+    /// between its frame copy and its live shared cell: into the cell after
+    /// a write in place, out of it before one (an NBA or another activation
+    /// may have written the cell since the copy was taken). A fallback
+    /// frame's copy comes from a compiled method's register, which is
+    /// newer than the cell, so it is never overwritten.
+    fn static_cell_sync(&mut self, name: &str, to_cell: bool) {
+        let Some(key) = self
+            .static_local_syncs
+            .last()
+            .and_then(|(_, s)| s.iter().find(|(n, _)| n == name))
+            .map(|(_, k)| k)
+        else {
+            return;
+        };
+        if !self.static_local_keys.contains(key) {
+            return;
+        }
+        let depth = self.local_stack.len();
+        if !to_cell && depth > 0 && self.fb_frame_depths.last() == Some(&(depth - 1)) {
+            return;
+        }
+        let Some(copy) = self.local_stack.last_mut().and_then(|f| f.get_mut(name)) else {
+            return;
+        };
+        if !to_cell {
+            if let Some(v) = self.static_local_vars.get(key) {
+                *copy = v.clone();
+            }
+            return;
+        }
+        match self.static_local_vars.get_mut(key) {
+            Some(v) => *v = copy.clone(),
+            None => {
+                self.static_local_vars.insert(key.clone(), copy.clone());
+            }
+        }
+    }
+
+    /// The persistent-store key of the `static` local a nonblocking select
+    /// or member write targets (`a[3:0] <= v`), resolved at schedule time
+    /// like `nba_static_key_for_lvalue`.
+    fn nba_static_select_key(&self, lvalue: &Expression) -> Option<String> {
+        if self.in_const_param_eval || self.static_local_names.is_empty() {
+            return None;
+        }
+        let k = self.static_local_key_for(self.static_select_target(lvalue)?)?;
+        self.static_local_keys.contains(&k).then_some(k)
+    }
+
+    /// §6.21/§10.4.2: the queue entry of a nonblocking write to a `static`
+    /// local of the current subroutine. None when `lvalue` is no such
+    /// variable; Some(None) when the write is discarded (an x/z index
+    /// selects nothing, §11.5.1). The key, the indices (§10.4.2) and, for a
+    /// select, the bits written are all resolved now.
+    fn static_nba_entry(
+        &mut self,
+        lvalue: &Expression,
+        val: &Value,
+        w: u32,
+    ) -> Option<Option<NbaEntry>> {
+        let entry = |key, value, mask| NbaEntry {
+            lhs: None,
+            value,
+            resolved_id: None,
+            static_key: Some(key),
+            static_mask: mask,
+            // No `lhs` to re-resolve, so no context needed.
+            this_handle: None,
+        };
+        if let Some(key) = self.nba_static_key_for_lvalue(lvalue) {
+            return Some(Some(entry(key, val.resize_for_assign(w), None)));
+        }
+        let key = self.nba_static_select_key(lvalue)?;
+        let Some(frozen) = self.freeze_select_indices(lvalue, true) else {
+            return Some(None);
+        };
+        let (mask, bits) = self.static_select_bits(&frozen, &val.resize_for_assign(w))?;
+        Some(Some(entry(key, bits, Some(mask))))
+    }
+
+    /// What the select or member write `lhs = val` to a `static` local of
+    /// the current subroutine changes: the bits it writes (`mask`) and their
+    /// new values, both as wide as the local. Worked out by running the
+    /// write on a zero copy, so the local's declared type, layout and
+    /// two-state-ness all apply.
+    fn static_select_bits(&mut self, lhs: &Expression, val: &Value) -> Option<(Value, Value)> {
+        let n = self.static_select_target(lhs)?;
+        let orig = self.local_stack.last()?.get(n)?.clone();
+        let w = orig.width;
+        let pass = |sim: &mut Self, v: &Value| -> Option<Value> {
+            *sim.local_stack.last_mut()?.get_mut(n)? = Value::zero(w);
+            if v.has_xz() {
+                sim.assign_value_xz(lhs, v);
+            } else {
+                sim.assign_value_inner(lhs, v);
+            }
+            sim.local_stack.last()?.get(n).cloned()
+        };
+        // The trial writes must not reach the shared cell, and their reads
+        // must see the zero copy: a member write can come back through
+        // `assign_value`, which would copy the cell in and the result out.
+        // Statics are kept out of this window as they are while a constant
+        // function is evaluated.
+        let shared = std::mem::replace(&mut self.in_const_param_eval, true);
+        let mask = pass(self, &Value::ones(val.width));
+        let bits = pass(self, val);
+        self.in_const_param_eval = shared;
+        if let Some(c) = self.local_stack.last_mut().and_then(|f| f.get_mut(n)) {
+            *c = orig;
+        }
+        Some((mask?, bits?))
+    }
+
+    /// §6.21: commit a nonblocking write to the `static` local whose cell is
+    /// `key`: the bits `mask` selects, or the whole value without one.
+    fn commit_static_nba(&mut self, key: String, mask: Option<Value>, value: Value) {
+        let Some(mask) = mask else {
+            self.static_local_vars.insert(key, value);
+            return;
+        };
+        let Some(cell) = self.static_local_vars.get_mut(&key) else {
+            return;
+        };
+        for i in 0..cell.width.min(mask.width) as usize {
+            if mask.get_bit(i) == LogicBit::One {
+                cell.set_bit(i, value.get_bit(i));
+            }
+        }
     }
 
     /// A `static_local_syncs` frame name: a pooled buffer holding `name`.

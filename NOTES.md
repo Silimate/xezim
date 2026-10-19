@@ -241,7 +241,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `--code-coverage-granularity=block` counts straight-line blocks, implicit
   `else` and `default` arms included and continuous assignments not; and
   `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
-  makes. Each has an `XEZIM_*` variable. See docs/coverage-guide.md,
+  makes, an asynchronous reset's included. Each has an `XEZIM_*` variable. See docs/coverage-guide.md,
   "Counting rules".
 * `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
   an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of

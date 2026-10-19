@@ -1472,6 +1472,19 @@ impl Simulator {
             let Some((proc_body, true)) = body(ab) else {
                 continue;
             };
+            // Asynchronous controls: the edges of an event control with more
+            // than one (`rst` of `@(posedge clk or posedge rst)`).
+            let asyncs: Vec<&str> = match &ab.stmt.kind {
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::EventExpr(items)),
+                    ..
+                } if items.iter().filter(|i| i.edge.is_some()).count() > 1 => items
+                    .iter()
+                    .filter(|i| i.edge.is_some())
+                    .filter_map(|i| whole(&i.expr))
+                    .collect(),
+                _ => Vec::new(),
+            };
             let mut full = BTreeSet::new();
             let mut part = BTreeSet::new();
             targets(proc_body, &mut full, &mut part);
@@ -1496,32 +1509,53 @@ impl Simulator {
                 {
                     continue;
                 }
-                // The reset: a first `if` of the body (tested in the walk not
-                // to be a test of the variable).
-                let first = match &proc_body.kind {
-                    StatementKind::SeqBlock { stmts, .. } => stmts.first(),
-                    _ => Some(proc_body),
+                // The reset (tested in the walk not to be a test of the
+                // variable): with an asynchronous control, the `if` of the
+                // body that tests it (`if (rst)` of `always @(posedge clk or
+                // posedge rst)`); otherwise the first statement past the
+                // block's declarations, when it is an `if`.
+                let stmts = match &proc_body.kind {
+                    StatementKind::SeqBlock { stmts, .. } => stmts.as_slice(),
+                    _ => std::slice::from_ref(proc_body),
                 };
-                let reset_at = first
-                    .filter(|f| matches!(f.kind, StatementKind::If { .. }))
-                    .map_or(0, |f| f as *const Statement as usize);
-                // For `--no-fsm-reset-transitions`, that `if` is a reset only
-                // when it has an `else` and its own branch does not test the
-                // variable: a clock enable (`if (en) case (st) ...`) guards
-                // the state logic itself and has neither.
-                let reset_branch = first.is_some_and(|f| match &f.kind {
-                    StatementKind::If {
-                        then_stmt,
-                        else_stmt: Some(_),
-                        ..
-                    } => {
-                        let mut t = HashSet::default();
-                        stmt_tests(then_stmt, &mut t);
-                        let leaf = var.rsplit('.').next().unwrap_or(var);
-                        !t.contains(var) && !t.contains(leaf)
+                let arm = stmts.iter().find(|s| match &s.kind {
+                    StatementKind::If { condition, .. } => {
+                        let mut n = Vec::new();
+                        idents(condition, &mut n);
+                        n.iter().any(|x| asyncs.contains(x))
                     }
                     _ => false,
                 });
+                let first = arm.or_else(|| {
+                    stmts.iter().find(|s| {
+                        !matches!(
+                            s.kind,
+                            StatementKind::VarDecl { .. } | StatementKind::Typedef(_)
+                        )
+                    })
+                });
+                let reset_at = first
+                    .filter(|f| matches!(f.kind, StatementKind::If { .. }))
+                    .map_or(0, |f| f as *const Statement as usize);
+                // For `--no-fsm-reset-transitions`, an asynchronous control's
+                // `if` is a reset; another first `if` only when it has an
+                // `else` and its own branch does not test the variable: a
+                // clock enable (`if (en) case (st) ...`) guards the state
+                // logic itself and has neither.
+                let reset_branch = arm.is_some()
+                    || first.is_some_and(|f| match &f.kind {
+                        StatementKind::If {
+                            then_stmt,
+                            else_stmt: Some(_),
+                            ..
+                        } => {
+                            let mut t = HashSet::default();
+                            stmt_tests(then_stmt, &mut t);
+                            let leaf = var.rsplit('.').next().unwrap_or(var);
+                            !t.contains(var) && !t.contains(leaf)
+                        }
+                        _ => false,
+                    });
                 let mut w = Walk {
                     sim: self,
                     var,

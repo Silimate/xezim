@@ -447,10 +447,38 @@ module m(input logic clk, input logic rst, input logic go, output logic busy);
     endcase
   assign busy = st != IDLE;
 endmodule
+module a(input logic clk, input logic reset, input logic go);
+  localparam [1:0] IDLE = 2'd0, RUN = 2'd1, DONE = 2'd2;
+  logic [1:0] st;
+  always @(posedge clk or posedge reset) begin
+    logic [1:0] prev;
+    if (reset) st <= IDLE;
+    else case (st)
+      IDLE: if (go) st <= RUN;
+      RUN: st <= DONE;
+      DONE: if (!go) st <= RUN;
+    endcase
+  end
+endmodule
+module b(input logic clk, input logic rst_n, input logic go, output logic seen);
+  typedef enum logic [1:0] {IDLE, RUN, DONE} st_t;
+  st_t st;
+  always @(posedge clk or negedge rst_n) begin
+    seen <= go;
+    if (!rst_n) st <= IDLE;
+    else case (st)
+      IDLE: if (go) st <= RUN;
+      RUN: st <= DONE;
+      DONE: if (!go) st <= RUN;
+    endcase
+  end
+endmodule
 module tb;
   logic clk = 0, rst = 1, go = 0; wire busy;
   m u(.clk, .rst, .go, .busy);
   e g(.clk, .en(go), .go);
+  a ua(.clk, .reset(rst), .go);
+  b ub(.clk, .rst_n(!rst), .go, .seen());
   always #5 clk = ~clk;
   initial begin #12 rst = 0; go = 1; #30 go = 0; #20 rst = 1; #10 rst = 0; #20 $finish; end
 endmodule
@@ -458,8 +486,10 @@ endmodule
 
 /// `--no-fsm-reset-transitions` leaves out the transitions that only the
 /// state process's reset branch makes (`RUN -> IDLE`, `DONE -> IDLE`); the
-/// others stay. A clock enable (`if (en) case (st)`) is no reset: its FSM
-/// keeps every transition. A state that stays put is never a transition.
+/// others stay. With an asynchronous reset, the `if` testing it is the reset
+/// branch, past a declaration (`a`) or another statement (`b`) in front of
+/// it. A clock enable (`if (en) case (st)`) is no reset: its FSM keeps every
+/// transition. A state that stays put is never a transition.
 #[test]
 fn fsm_reset_transitions_left_out() {
     let d = scratch("fsm");
@@ -491,6 +521,14 @@ fn fsm_reset_transitions_left_out() {
         pairs(&logic, "tb.u"),
         ["IDLE->RUN", "RUN->DONE", "DONE->RUN"]
     );
+    for inst in ["tb.ua", "tb.ub"] {
+        assert_eq!(pairs(&all, inst), pairs(&all, "tb.u"), "{inst}");
+        assert_eq!(
+            pairs(&logic, inst),
+            ["IDLE->RUN", "RUN->DONE", "DONE->RUN"],
+            "{inst}"
+        );
+    }
     let enabled = ["IDLE->RUN", "RUN->DONE", "DONE->IDLE"];
     assert_eq!(pairs(&all, "tb.g"), enabled);
     assert_eq!(pairs(&logic, "tb.g"), enabled);

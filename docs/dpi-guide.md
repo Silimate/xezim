@@ -592,6 +592,15 @@ hook.
   whose limits differ from its delay is refused). `append_flag` adds to the
   current delays. A module path's `vpiFullName` is its output net's; a timing
   check's is its scope plus the check's name.
+- An input or inout port connected to a whole net of its own shape is one
+  object with it (§23.3.3.7), an unpacked-array port connected to a whole
+  array included: a value written through VPI to `top.u.a[3]` is what
+  instance `u` reads, and the actual's name `top.a[3]` reads it too, through
+  any number of port levels; one written to `top.a[3]` reaches `top.u.a[3]`.
+  A port on a bit- or part-select, an array slice, a concatenation or an
+  expression keeps a net of its own. xezim also shares the storage when the
+  actual is a variable, which the standard does not merge with a net port: a
+  write to the port's name then changes the variable too.
 - `vpiInterModPath` delays live where SDF `INTERCONNECT` delays do, on the
   input port's net. When elaboration collapsed the two ports into one net
   there is no interconnect between them, and `vpi_handle_multi` returns NULL.

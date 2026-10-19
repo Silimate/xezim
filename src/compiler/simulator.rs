@@ -30301,6 +30301,7 @@ impl Simulator {
                 return;
             }
         }
+        let arrays_settled = self.collapse_array_port_nets();
         let mut collapsed = 0usize;
         // A net the connect CA drives may have OTHER continuous drivers (a
         // hierarchical TB assign, a shorted second output). Dropping the
@@ -30477,7 +30478,7 @@ impl Simulator {
         // Settled when every pass that ran reached its fixed point and the
         // buffer pass re-pointed no name a port link reads (which would give
         // the port pass new work).
-        let mut settled = port_settled;
+        let mut settled = port_settled && arrays_settled;
         if buf_collapse_on {
             // Same rule as the port pass above: never alias onto a source a
             // process WRITES. A reader parked on the same edge that writes
@@ -30632,6 +30633,224 @@ impl Simulator {
                 total_ca, identity, identity_single
             );
         }
+    }
+
+    /// §23.3.3.7: an unpacked-array port connected to a whole array is one
+    /// object with it, as `collapse_identity_port_nets` makes a scalar port and
+    /// its actual one net. The elaborator connects such a port element by
+    /// element (`u.a[i] = a[i]`), so the port kept elements of its own: a value
+    /// a VPI client wrote to `u.a[i]` reached the instance but not `a[i]`, nor
+    /// the port of an outer instance that `a` passes through, and one written
+    /// to `a[i]` reached `u.a[i]` only through the connect assign. Here every
+    /// element name of the port, and its `array_first_id` entry, is pointed at
+    /// the actual's cells, and the connects become self-copies that
+    /// `build_comb_entries` drops. A port collapses whole or not at all: every
+    /// element driven by its connect alone, onto cells of the same width,
+    /// realness and two-state-ness laid out in the same order. A chain through
+    /// several port levels resolves over a few passes. Returns whether the
+    /// passes reached a fixed point.
+    fn collapse_array_port_nets(&mut self) -> bool {
+        // The array an assignment target selects from.
+        fn base_of<'a>(
+            mut e: &'a Expression,
+            module: &ElaboratedModule,
+        ) -> Option<std::borrow::Cow<'a, str>> {
+            while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &e.kind {
+                e = expr;
+            }
+            match &e.kind {
+                ExprKind::Ident(h) => Some(Simulator::flat_ident_name(h, module)),
+                _ => None,
+            }
+        }
+        // Element connects (port base, port indices, actual base, actual
+        // indices), grouped by port array.
+        let mut conns: Vec<(String, Vec<i64>, String, Vec<i64>)> = self
+            .module
+            .continuous_assigns
+            .iter()
+            .filter(|ca| {
+                ca.rhs_parent_scoped
+                    && ca.delay == 0
+                    && ca.delay_fall.is_none()
+                    && ca.delay_off.is_none()
+                    && matches!(ca.lhs.kind, ExprKind::Index { .. })
+            })
+            .filter_map(|ca| {
+                let (port, pi) = Self::const_elem_ref(&ca.lhs, &self.module)?;
+                let (actual, ai) = Self::const_elem_ref(&ca.rhs, &self.module)?;
+                Some((port, pi, actual, ai))
+            })
+            .collect();
+        if conns.is_empty() {
+            return true;
+        }
+        conns.sort_by(|a, b| a.0.cmp(&b.0));
+        let ports: Vec<(&str, &[(String, Vec<i64>, String, Vec<i64>)])> = conns
+            .chunk_by(|a, b| a.0 == b.0)
+            .map(|g| (g[0].0.as_str(), g))
+            .collect();
+        // Continuous drivers of each port array, its connects included.
+        let mut drivers = vec![0usize; ports.len()];
+        for ca in &self.module.continuous_assigns {
+            if let Some(b) = base_of(&ca.lhs, &self.module) {
+                if let Ok(k) = ports.binary_search_by(|(p, _)| (*p).cmp(b.as_ref())) {
+                    drivers[k] += 1;
+                }
+            }
+        }
+        let len = |(l, r): (i64, i64)| (r - l).unsigned_abs() as usize + 1;
+        let m = &self.module;
+        let ports: Vec<_> = ports
+            .into_iter()
+            .zip(drivers)
+            .filter(|((port, elems), drivers)| {
+                let count = if let Some(&(lo, hi, _)) = m.arrays.get(*port) {
+                    len((lo, hi))
+                } else if let Some(&(a, b, _)) = m.arrays_2d.get(*port) {
+                    len(a) * len(b)
+                } else if let Some((shape, _)) = m.arrays_nd.get(*port) {
+                    shape.iter().map(|&d| len(d)).product()
+                } else {
+                    return false;
+                };
+                elems.len() == count
+                    && *drivers == count
+                    && !m.events.contains(*port)
+                    && !elems
+                        .iter()
+                        .any(|(_, _, a, _)| m.events.contains(a.as_str()))
+            })
+            .map(|(p, _)| p)
+            .collect();
+        let mut settled = false;
+        let mut collapsed = vec![false; ports.len()];
+        for _ in 0..8 {
+            let mut changed = false;
+            for (k, &(port, elems)) in ports.iter().enumerate() {
+                // The actual's cells sit at one fixed offset from the port's
+                // own, which are consecutive.
+                let mut delta = None;
+                let mut cells = Vec::with_capacity(elems.len());
+                for (_, pi, actual, ai) in elems {
+                    let (Some(c), Some(a)) = (self.elem_cell(port, pi), self.elem_cell(actual, ai))
+                    else {
+                        break;
+                    };
+                    let d = a.wrapping_sub(c);
+                    if *delta.get_or_insert(d) != d
+                        || self.cell_storage(c).is_none()
+                        || self.cell_storage(c) != self.cell_storage(a)
+                    {
+                        break;
+                    }
+                    cells.push(c);
+                }
+                let Some(delta) = delta.filter(|&d| d != 0 && cells.len() == elems.len()) else {
+                    continue;
+                };
+                cells.sort_unstable();
+                cells.dedup();
+                if cells.len() != elems.len()
+                    || cells[cells.len() - 1] - cells[0] + 1 != cells.len()
+                {
+                    continue;
+                }
+                for (_, pi, _, _) in elems {
+                    let name = Self::elem_name(port, pi);
+                    if let Some(&c) = self.signal_name_to_id.get(name.as_str()) {
+                        self.signal_name_to_id
+                            .insert(name.into(), c.wrapping_add(delta));
+                    }
+                }
+                if let Some(e) = self.array_first_id.get_mut(port) {
+                    e.0 = e.0.wrapping_add(delta);
+                }
+                // Typed as a wire in a dump, as a collapsed scalar port is.
+                self.collapsed_port_children.insert(port.to_string());
+                collapsed[k] = true;
+                changed = true;
+            }
+            if !changed {
+                settled = true;
+                break;
+            }
+        }
+        let n = collapsed.iter().filter(|&&c| c).count();
+        if n > 0 && std::env::var_os("XEZIM_DEBUG").is_some() {
+            eprintln!("[ARRAY-PORT-COLLAPSE] {} unpacked-array ports collapsed", n);
+        }
+        settled
+    }
+
+    /// The flat base and constant indices of an element connect operand
+    /// `base[i]..[k]`, as the elaborator spells an element of an
+    /// unpacked-array port and of its actual.
+    fn const_elem_ref(e: &Expression, module: &ElaboratedModule) -> Option<(String, Vec<i64>)> {
+        let mut idx = Vec::new();
+        let mut cur = e;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            idx.push(super::elaborate::const_eval_i64_with_params(index, None)?);
+            cur = expr;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        if idx.is_empty() || !h.path.iter().all(|s| s.selects.is_empty()) {
+            return None;
+        }
+        idx.reverse();
+        Some((Self::flat_ident_name(h, module).into_owned(), idx))
+    }
+
+    /// The flat name `resolve_hier_name_static` gives, borrowed for a single
+    /// segment.
+    fn flat_ident_name<'a>(
+        h: &'a HierarchicalIdentifier,
+        module: &ElaboratedModule,
+    ) -> std::borrow::Cow<'a, str> {
+        let skip_root = usize::from(h.path.len() > 1 && h.path[0].name.name == "$root");
+        if h.path.len() == skip_root + 1 {
+            std::borrow::Cow::Borrowed(h.path[skip_root].name.name.as_str())
+        } else {
+            std::borrow::Cow::Owned(Self::resolve_hier_name_static(h, module))
+        }
+    }
+
+    /// `base[i]..[k]`, written the way array element names are registered.
+    fn elem_name(base: &str, idx: &[i64]) -> String {
+        let mut name = String::with_capacity(base.len() + 8 * idx.len());
+        name.push_str(base);
+        for &i in idx {
+            name.push('[');
+            Self::push_i64(&mut name, i);
+            name.push(']');
+        }
+        name
+    }
+
+    /// The cell of element `base[i]..[k]`: by name, else through
+    /// `array_first_id` for a 1-D array without element names.
+    fn elem_cell(&self, base: &str, idx: &[i64]) -> Option<usize> {
+        let name = Self::elem_name(base, idx);
+        self.signal_name_to_id
+            .get(name.as_str())
+            .copied()
+            .or_else(|| resolve_array_elem_id(&name, &self.array_first_id))
+    }
+
+    /// Width, realness and two-state-ness of a cell, in the signal table or
+    /// the packed arena.
+    fn cell_storage(&self, id: usize) -> Option<(u32, bool, bool)> {
+        if is_packed_id(id) {
+            let (seg, _) = self.packed.locate(id)?;
+            return Some((seg.width as u32, false, seg.xmask == 0));
+        }
+        Some((
+            *self.signal_widths.get(id)?,
+            self.signal_real.get(id).copied().unwrap_or(false),
+            self.signal_two_state.get(id).copied().unwrap_or(false),
+        ))
     }
 
     /// Does a compiled edge block still need its source statement after
@@ -37426,6 +37645,23 @@ impl Simulator {
                 };
             if ident_copy_ids.is_some_and(|(dst_id, src_id)| dst_id == src_id) {
                 continue;
+            }
+            // So is an element connect of an unpacked-array port collapsed
+            // onto its actual (see `collapse_array_port_nets`).
+            if ca.rhs_parent_scoped
+                && explicit_delay == 0
+                && cov_counter.is_none()
+                && matches!(ca.lhs.kind, ExprKind::Index { .. })
+            {
+                let cell = |e: &Expression| {
+                    let (base, idx) = Self::const_elem_ref(e, &self.module)?;
+                    self.elem_cell(&base, &idx)
+                };
+                if let (Some(dst), Some(src)) = (cell(&ca.lhs), cell(&ca.rhs)) {
+                    if dst == src {
+                        continue;
+                    }
+                }
             }
             reads.clear();
             writes.clear();

@@ -640,3 +640,29 @@ fn sites_registered_after_the_time_0_settle_keep_their_instance() {
     assert!(!json.contains("\"instance\": \"top.u\""), "{json}");
     assert!(out.contains("hits=12"), "{out}");
 }
+
+const FINISH_DISABLED: &str = r#"module top;
+  logic clk = 0, rst = 0, a = 1, b = 0;
+  a_pend : assert property (@(posedge clk) disable iff (rst) a |=> b);
+  a_live : assert property (@(posedge clk) a |=> b);
+  a_now : assert property (@(posedge clk) a);
+  initial begin
+    #5 clk = 1;
+    #5 clk = 0;
+    rst = 1;
+    $finish;
+  end
+endmodule
+"#;
+
+/// §16.12: an attempt still in flight when the simulation ends with its
+/// `disable iff` guard true is cancelled, not failed, and counts as
+/// disabled, as one cancelled between clock ticks does. Without the guard
+/// the weak consequent is just left pending (§16.12.2).
+#[test]
+fn attempts_disabled_at_the_end_count_as_disabled() {
+    let (json, _) = run("finish_disabled", &[("f.sv", FINISH_DISABLED)]);
+    assert_eq!(counts(&json, "top", "a_pend"), [1, 0, 0, 0, 1], "{json}");
+    assert_eq!(counts(&json, "top", "a_live"), [1, 0, 0, 0, 0], "{json}");
+    assert_eq!(counts(&json, "top", "a_now"), [1, 1, 0, 0, 0], "{json}");
+}

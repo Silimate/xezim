@@ -48677,8 +48677,12 @@ impl Simulator {
                 }
             }
         }
-        // The last slot ends too.
-        self.dump_slot_end();
+        // The last slot ends too, unless `$finish` ended it: §20.2 stops the
+        // run inside that slot, and the reference simulator counts no toggle
+        // there (`no_slot_end_flush_after_finish`).
+        if !self.finished {
+            self.dump_slot_end();
+        }
         if verify_inline_bits && !self.signal_inline_bits.is_empty() {
             let mismatches = self.verify_inline_bits_invariant(iters);
             if mismatches == 0 {

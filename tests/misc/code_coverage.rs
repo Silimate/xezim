@@ -864,6 +864,38 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// §20.2: `$finish` ends the run inside its time slot, so the flush at the
+/// end of the last slot is skipped when `$finish` ended it: `d` rises and
+/// `clk` rises a second time only in the finishing slot at 15, and neither
+/// counts. The reference simulator reports `d` untoggled and 4 of 6 bins.
+#[test]
+fn no_slot_end_flush_after_finish() {
+    let d = scratch("finish_slot");
+    let src = "\
+module tb;
+  logic clk = 0;
+  logic d = 0, e = 0;
+  always #5 clk = ~clk;
+  initial begin
+    #12 e = 1; #1 e = 0;
+    #2 d = 1;
+    $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    toggle_rows(&json, &[("clk", 1, 1), ("d", 0, 0), ("e", 1, 1)], "finish");
+    let total = toggle_total(4, 6, "66.67");
+    assert!(json.contains(&total), "{total}: {json}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The two-state executors take back a count when they hand a block to the
 /// four-state VM, so both give the same counts (the flop reads x before
 /// `d` is driven).

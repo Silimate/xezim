@@ -1476,9 +1476,13 @@ impl Simulator {
         }
     }
 
-    // silimate: keep run_one_tick out of line, as the inliner left it before the assertion tick moved into sva_observed
-    // Inlined into the event loop, it pushed the loop's other callees out of
-    // line (about 1.8% more instructions on a design without assertions).
+    // Kept out of line: inlined into the event loop, it pushed the loop's
+    // other callees out of line, which cost instructions on designs without
+    // assertions.
+    // Out of line. Once the sampled array cells made the assertion code it
+    // used to inline longer, it was inlined into `event_loop_singlethread`
+    // instead, which cost a design without assertions 1.1% more
+    // instructions.
     #[inline(never)]
     pub(super) fn run_one_tick(
         &mut self,
@@ -1504,7 +1508,6 @@ impl Simulator {
         // §14.4: #1step samples precede every callback/active-region write
         // at this time, and remain fixed across this slot's later deltas.
         self.refresh_clocking_preponed();
-        // silimate: assertions sample once per time slot, before its VPI callbacks
         // LRM §16.5.1: the same holds for the Preponed samples of every
         // SVA-referenced signal: taken before the slot's Pre-Active VPI
         // callbacks (cbAtStartOfSimTime, cbAfterDelay; §4.4.3.2) and its
@@ -1513,7 +1516,6 @@ impl Simulator {
         // cbReadWriteSynch, or one a later delta raises) samples pre-edge
         // values rather than values written earlier in the slot.
         self.refresh_sva_preponed();
-        // /silimate
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot
@@ -1769,7 +1771,8 @@ impl Simulator {
         }
         // LRM §16.5 SVA clocked property evaluation. Detects edges on
         // each registered clock signal and ticks pending consequents.
-        // silimate: a cbReadWriteSynch due at an assertion clock edge runs before the assertions (sva_post_nba)
+        // A cbNBASynch or cbReadWriteSynch due at a clock edge runs first
+        // (`sva_post_nba`).
         self.sva_observed();
         if self.finished {
             return;

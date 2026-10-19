@@ -491,15 +491,15 @@ const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 /// control (`@prop` on a non-event class property) was armed. Never
 /// user-visible.
 const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
+/// Ends a deferred declaration initializer: `(<target>, ...)` records the
+/// values it gave as their default sampled values (see `sampled_defaults`).
+const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
 /// Ticks of history a concurrent assertion keeps per `$past` operand
 /// (`SvaClockedSite::past_snapshots`).
 const SVA_PAST_DEPTH: usize = 16;
-/// Ends a deferred declaration initializer: `(<target>, ...)` records the
-/// values it gave as their default sampled values (see `sampled_defaults`).
-const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
 /// §16.3: the message of the `$error` a failed assertion with no `else`
 /// clause reports (the reference simulator's wording).
 const ASSERT_DEFAULT_ERROR: &str = "Assertion error.";
@@ -1588,7 +1588,7 @@ struct CombEntryCold {
     cov: Option<u32>,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB019";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB020";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -3533,11 +3533,9 @@ struct SvaClockedSite {
     /// LSB of the most recent clock value: 0, 1, X (2), or Z (3).
     /// Declarative sites start with the value before Active processes run.
     prev_clock: u8,
-    // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
     /// The clock event happened and the attempts it starts have not been
     /// evaluated yet (`sva_note_edges`).
     fired: bool,
-    // /silimate
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
@@ -6554,17 +6552,14 @@ pub struct Simulator {
     /// being one clock cycle early. Only populated when `sva_sites` is
     /// non-empty; the referenced ids are those collected per site.
     sva_preponed: HashMap<usize, Value>,
-    // silimate: assertions sample once per time slot, before its VPI callbacks
     /// The time slot `sva_preponed` was captured for. The Preponed region
     /// runs once per slot (§4.4.2.1), so the later deltas of a slot (a VPI
     /// write from cbReadWriteSynch reopening the Active region) keep it.
     sva_preponed_slot: Option<u64>,
-    // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
     /// A site's clock event is recorded (`fired`) and not evaluated yet.
     sva_owed: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
-    // /silimate
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -6590,6 +6585,10 @@ pub struct Simulator {
     /// Buffer-collapse exclusions (override-target leaves, procedural write
     /// names), collected once while the process bodies are still present.
     buf_collapse_write_sets: Option<(HashSet<String>, HashSet<String>)>,
+    /// Last source value of constant packed-memory element connections.
+    /// Unresolved dependency polling must not overwrite a VPI deposit when
+    /// the connection's source has not changed (§23.3.3.3, §38.34).
+    packed_array_copy_values: HashMap<(usize, usize), Value>,
     /// LRM §14.3: each clocking block's clock EDGE (`@(posedge/negedge clk)`).
     /// `tick_clocking_blocks` and `@(cb)` resolution consult this so a
     /// `@(negedge clk)` block samples/advances on the negedge, not the posedge.

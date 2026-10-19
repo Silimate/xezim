@@ -76,6 +76,8 @@ impl Simulator {
     /// dirty right away; inside one (entry table taken out, dirty marks
     /// dropped with the pass) the id is queued for `settle_combinatorial`.
     pub(super) fn redrive_released_signal(&mut self, id: usize) {
+        self.packed_array_copy_values
+            .retain(|&(dst, _), _| dst != id);
         if self.settling || self.comb_entries.is_empty() {
             self.pending_release_ids.push(id);
             self.dirty_any = true;
@@ -678,6 +680,30 @@ impl Simulator {
                         .and_then(|id| self.sdf_delays.get(id).copied())
                         .unwrap_or(0)
                 };
+                // A packed-array read is polled on every settle because its
+                // cell has no dependency epoch. An implicit array-port
+                // connection still drives only when its source changes;
+                // otherwise polling erases a deposited net value (§38.34).
+                let copy_ids = if delay == 0 && matches!(rhs.kind, ExprKind::Index { .. }) {
+                    let cell = |e: &Expression| {
+                        let (base, idx) = Self::const_elem_ref(e, &self.module)?;
+                        self.elem_cell(&base, &idx)
+                    };
+                    cell(lhs)
+                        .zip(cell(rhs))
+                        .filter(|&(_, src)| is_packed_id(src))
+                } else {
+                    None
+                };
+                if let Some(ids) = copy_ids {
+                    if self.packed_array_copy_values.get(&ids) == Some(&val) {
+                        *self.name_resolve_hint.borrow_mut() = saved_hint;
+                        self.prof_settle_ca_ns += t_entry.elapsed().as_nanos() as u64;
+                        self.prof_settle_ca_count += 1;
+                        return;
+                    }
+                    self.packed_array_copy_values.insert(ids, val.clone());
+                }
                 if delay > 0 {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {

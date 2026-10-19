@@ -7,8 +7,8 @@
 //! `s <= -a` negated `a` before extending it. Compiled bytecode was right; the
 //! interpreter runs a statement the compiler can't take, such as a `for` or
 //! `repeat` loop bounded by `$clog2(...)` whose body also writes a part-select
-//! (the pipelined adder of a CVDP matrix multiplier). The reference simulator
-//! prints 1fffe for every sum here and 30001 for `-a`.
+//! (a pipelined adder tree). Verilator 5.038 prints 1fffe for every sum here
+//! and 30001 for `-a`.
 //!
 //! A side-effecting index in a nonblocking target (`v[(k++)*18 +: 18]`) is
 //! evaluated once (§11.4.1), as in a blocking assignment; it advanced `k` twice
@@ -61,10 +61,8 @@ module tb;
       s_plus <= +(a + b);
       v4[(k++)*18 +: 18] <= a + b;
     end
-  initial begin
-    s_ev <= @(posedge clk) a + b;
-    s_bev = @(posedge clk) a + b;
-  end
+  initial s_ev <= @(posedge clk) a + b;
+  initial s_bev = @(posedge clk) a + b;
   initial v5[(j++)*18 +: 18] = @(posedge clk) a + b;
   initial begin
     #1 clk = 1;

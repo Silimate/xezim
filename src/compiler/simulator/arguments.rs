@@ -2606,12 +2606,16 @@ impl Simulator {
     }
 
     /// §6.21/§11.5.1: the `static` local of the current subroutine that a
-    /// select or member write changes in place: `a` in `a[i]`, `a[7:0]`,
-    /// `a[i*8 +: 8]`, `a.f` or `a.f[1:0]`. None for a write to the whole
+    /// select or member write changes in place, and the key of its shared
+    /// cell: `a` in `a[i]`, `a[7:0]`, `a[i*8 +: 8]`, `a.f` or `a.f[1:0]`.
+    /// None for a write to the whole
     /// variable, which reaches its shared cell by itself, and for any other
     /// target, including a variable named like another subroutine's static
     /// or a block variable that hides one.
-    pub(super) fn static_select_target<'a>(&self, lhs: &'a Expression) -> Option<&'a str> {
+    pub(super) fn static_select_target<'a>(
+        &self,
+        lhs: &'a Expression,
+    ) -> Option<(&'a str, String)> {
         let mut e = lhs;
         let mut sel = false;
         loop {
@@ -2634,16 +2638,14 @@ impl Simulator {
             return None;
         }
         let n = seg.name.name.as_str();
-        let hit = n
+        if !n
             .as_bytes()
             .first()
             .is_some_and(|&b| self.static_local_first[b as usize])
-            && self.static_local_names.contains(n)
-            && self.static_local_syncs.last().is_some_and(|(_, s)| {
-                s.iter()
-                    .any(|(m, k)| m == n && self.static_local_keys.contains(k))
-            });
-        hit.then_some(n)
+        {
+            return None;
+        }
+        Some((n, self.packed_local_static_key(n)?))
     }
 
     /// Are the indices of the select target `e` literals and variable reads
@@ -2720,23 +2722,12 @@ impl Simulator {
     }
 
     /// §6.21: copy the `static` local `name` of the current subroutine
-    /// between its frame copy and its live shared cell: into the cell after
+    /// between its frame copy and its live shared cell `key`: into the cell after
     /// a write in place (`store`), out of it before one (an NBA or another
     /// activation may have written the cell since the copy was taken). A
     /// fallback frame's copy comes from a compiled method's register, which
     /// is newer than the cell, so it is never overwritten.
-    pub(super) fn static_cell_sync(&mut self, name: &str, store: bool) {
-        let Some(key) = self
-            .static_local_syncs
-            .last()
-            .and_then(|(_, s)| s.iter().find(|(n, _)| n == name))
-            .map(|(_, k)| k)
-        else {
-            return;
-        };
-        if !self.static_local_keys.contains(key) {
-            return;
-        }
+    pub(super) fn static_cell_sync(&mut self, name: &str, key: &str, store: bool) {
         let depth = self.local_stack.len();
         if !store && depth > 0 && self.fb_frame_depths.last() == Some(&(depth - 1)) {
             return;
@@ -2753,7 +2744,7 @@ impl Simulator {
         match self.static_local_vars.get_mut(key) {
             Some(v) => *v = copy.clone(),
             None => {
-                self.static_local_vars.insert(key.clone(), copy.clone());
+                self.static_local_vars.insert(key.to_string(), copy.clone());
             }
         }
     }

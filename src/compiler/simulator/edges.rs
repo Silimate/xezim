@@ -816,11 +816,12 @@ impl Simulator {
 
     /// Fill `sampled_defaults` before the time-0 settle, while every variable
     /// still holds its declaration value or its type's default (§16.5.1). A
-    /// concurrent assertion registers only when its process first runs, so
-    /// its operands are found here by name: every signal whose last name
-    /// segment a concurrent assertion (its action blocks included) or a
-    /// named property or sequence spells. That needs no scope resolution,
-    /// and an extra match only costs its entry.
+    /// concurrent assertion registers after the settle, and one in a
+    /// procedure only when the procedure reaches it, so its operands are
+    /// found here by name: every signal whose last name segment a concurrent
+    /// assertion (its action blocks included) or a named property or
+    /// sequence spells. That needs no scope resolution, and an extra match
+    /// only costs its entry.
     pub(super) fn capture_sampled_defaults(&mut self) {
         let mut names: HashSet<String> = HashSet::default();
         for b in &self.module.initial_blocks {
@@ -1390,9 +1391,10 @@ impl Simulator {
         } else {
             match sig_id {
                 // §16.5.1: the value from before time 0, which
-                // `capture_sampled_defaults` kept; a concurrent assertion
-                // registers its watches only after time-0 writes and the
-                // settle (a net reads its driver's value by then).
+                // `capture_sampled_defaults` kept. A concurrent assertion
+                // registers its watches after the time-0 settle (a net reads
+                // its driver's value by then), and one in a procedure after
+                // the procedure's earlier writes.
                 Some(sid) => self
                     .sampled_defaults
                     .get(&sid)

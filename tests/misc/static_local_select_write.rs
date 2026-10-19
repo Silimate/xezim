@@ -22,11 +22,20 @@
 //! runs once, in order, even after an x index that discards the write
 //! (§11.4.1, §11.5.1).
 //!
-//! The design checks itself. Every expected value follows the LRM and
-//! matches the reference simulator. It runs with the default method tiering,
-//! with every method and function compiled on its first call, and with none
-//! compiled, so the interpreted and compiled bodies and the switch from one
-//! to the other are all covered.
+//! The design checks itself. Verilator 5.038 (`--binary --timing`) passes
+//! 30 of its 36 checks. The other six follow the LRM text and say so at the
+//! check:
+//! - two `$sscanf` checks: Verilator cannot build a `$sscanf` output that
+//!   is a select with a function call in its index;
+//! - two x-index checks: Verilator is two-state and writes bit 0 for an
+//!   x index, where §11.5.1 discards the write (one of them also uses the
+//!   `$sscanf` form);
+//! - two nonblocking checks: Verilator commits a nonblocking write to a
+//!   task's local at once, where §10.4.2 schedules it in the NBA region.
+//!
+//! It runs with the default method tiering, with every method and function
+//! compiled on its first call, and with none compiled, so the interpreted
+//! and compiled bodies and the switch from one to the other are all covered.
 
 use std::process::Command;
 
@@ -40,7 +49,7 @@ const SRC: &str = r##"module top;
   endtask
 
   // A static function whose bit-select writes build a carry chain into a
-  // local that starts all X (the counter increment of a DRAM controller).
+  // local that starts all X.
   function [3:0] incr(input [3:0] s);
     reg [3:0] v, tb;
     integer i;
@@ -228,7 +237,7 @@ const SRC: &str = r##"module top;
     return a;
   endfunction
   // The same through `$sscanf`, which takes its output target as written,
-  // on a static with no initializer.
+  // on a static with no initializer (LRM only: Verilator cannot build it).
   function automatic logic [7:0] rec_scan(input int n);
     static reg [7:0] a;
     if (n == 1) begin
@@ -241,7 +250,8 @@ const SRC: &str = r##"module top;
   endfunction
 
   // A side-effecting index runs once, and an x index discards the write
-  // (§11.4.1, §11.5.1).
+  // (§11.4.1, §11.5.1; LRM only: Verilator writes bit 0 for an x index and
+  // cannot build the `$sscanf` form).
   int idx_calls = 0;
   logic [7:0] r_pick;
   function automatic logic [31:0] pick(input bit unknown);
@@ -279,7 +289,8 @@ const SRC: &str = r##"module top;
   endtask
 
   // Nonblocking writes to locals of a static task that the task writes
-  // whole first commit in the NBA region, not at once (§10.4.2).
+  // whole first commit in the NBA region, not at once (§10.4.2; LRM only:
+  // Verilator commits them at once).
   logic [7:0] r_early_b, r_late_b, r_early_c, r_late_c;
   task nba_frame;
     reg [7:0] b, c;
@@ -318,7 +329,9 @@ const SRC: &str = r##"module top;
   endtask
 
   // A nonblocking member select of a static packed struct, read in the
-  // same time slot, after it, and after a delayed write to a whole member.
+  // same time slot, after it, and after a delayed write to a whole member
+  // (§10.4.2; LRM only for the first read: Verilator commits the
+  // nonblocking write at once).
   logic [7:0] r_m_now, r_m_next, r_m_late;
   task automatic member_nba;
     static pair_t s;
@@ -382,7 +395,8 @@ const SRC: &str = r##"module top;
       void'($sscanf("7", "%d", q[$]));
       return q[2];
     endfunction
-    // An x index discards the write, but the index after it still runs.
+    // An x index discards the write, but the index after it still runs
+    // (§11.4.1, §11.5.1; LRM only: Verilator cannot build it).
     function logic [15:0] pair();
       static logic [1:0][7:0] p;
       p = 16'h1234;
@@ -467,42 +481,34 @@ const SRC: &str = r##"module top;
 endmodule
 "##;
 
-fn run(env: &[(&str, &str)]) -> String {
+fn check(env: &[(&str, &str)]) {
     // Unique per call: tests run as parallel threads of one process.
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "xezim_static_psel_{}_{}",
+        "xezim_static_select_{}_{}",
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("top.sv");
     std::fs::write(&path, SRC).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args([
-            "--simulate",
-            "-s",
-            "top",
-            path.to_str().unwrap(),
-            "--no-cache",
-        ])
+        .args(["--no-cache", "-s", "top"])
+        .arg(&path)
+        .env_remove("XEZIM_METHOD_TIER")
+        .env_remove("XEZIM_COMPILE_METHODS")
         .envs(env.iter().copied())
         .output()
         .expect("run xezim");
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    let _ = std::fs::remove_dir_all(&dir);
-    text
-}
-
-fn check(env: &[(&str, &str)]) {
-    let text = run(env);
+    std::fs::remove_dir_all(&dir).unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        text.contains("ALL PASS") && !text.contains("FAIL"),
-        "select writes to static locals ({:?}):\n{}",
-        env,
-        text
+        out.status.success() && text.contains("ALL PASS") && !text.contains("FAIL"),
+        "select writes to static locals ({env:?}):\n{text}"
     );
 }
 

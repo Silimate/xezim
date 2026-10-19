@@ -29,10 +29,12 @@ impl Simulator {
     /// those of an assertion written inline. The parser spells `u.st` as a
     /// member access, which the elaborator folds into a hierarchical name in
     /// the top-level process bodies and in every declaration of an inlined
-    /// instance, but not in a top-level or package declaration. Unfolded, the
-    /// reference is not among the signals a concurrent assertion samples, so
-    /// it read the value the clock edge's nonblocking assignments had just
-    /// written. Fold those bodies the same way. A body without a member
+    /// instance, but not in a top-level or package declaration. Unfolded, a
+    /// reference rooted at the top module (`t.u.st`) is not among the signals
+    /// a concurrent assertion samples, so it read the value the clock edge's
+    /// nonblocking assignments had just written, and a hierarchical clock
+    /// (`@(posedge u.clk)`) named no signal, so the property never ticked.
+    /// Fold those bodies the same way. A body without a member
     /// access is left alone: rebuilding it changes nothing but where it lives
     /// in memory, which cost 0.6% more instructions on a design with 288
     /// named properties.
@@ -175,8 +177,7 @@ impl Simulator {
             .collect::<Vec<_>>()
             .join(".");
         // §23.8: the name is looked up in the assertion's scope, then in each
-        // enclosing one (`comb[0].delay_reg` in instance `dut` is
-        // `dut.comb[0].delay_reg`).
+        // enclosing one (`cg[1].y` in instance `c` is `c.cg[1].y`).
         let scope = self.active_instance_scope();
         let mut up = scope.as_str();
         loop {
@@ -1415,13 +1416,11 @@ impl Simulator {
                 }
             }
         }
-        // silimate: assertions sample once per time slot, before its VPI callbacks
         // For the first site these are the slot's only samples: a later delta
         // of the slot must not retake them (`refresh_sva_preponed`).
         if self.sva_sites.is_empty() {
             self.sva_preponed_slot = Some(self.time);
         }
-        // /silimate
         let mut past_names = Vec::new();
         self.collect_past_arg_names(&body_expanded, &mut past_names);
         // A signal is sampled once per property clock, however many
@@ -1812,18 +1811,28 @@ impl Simulator {
                 // A slice of an unpacked array (an array port's connection,
                 // `a[1:2]`) reads the cells in it; no single name follows.
                 let (l, r) = (self.eval_expr(left), self.eval_expr(right));
+                if l.has_xz() || r.has_xz() {
+                    return None;
+                }
                 let (Some(l), Some(r)) = (l.to_i64(), r.to_i64()) else {
                     return None;
                 };
+                // §11.5.1 permits out-of-range selects. Form the bounds in
+                // wider arithmetic before clipping so even an unused
+                // assertion with an extreme index cannot overflow here.
+                let (l, r) = (i128::from(l), i128::from(r));
                 let (lo, hi) = match kind {
                     RangeKind::Constant => (l.min(r), l.max(r)),
-                    RangeKind::IndexedUp => (l, l + r - 1),
-                    RangeKind::IndexedDown => (l - r + 1, l),
+                    RangeKind::IndexedUp if r > 0 => (l, l + r - 1),
+                    RangeKind::IndexedDown if r > 0 => (l - r + 1, l),
+                    _ => return None,
                 };
                 // Only the indices the array has.
                 let (alo, ahi) = self.sva_slice_bounds(&base)?;
-                for i in lo.max(alo)..=hi.min(ahi) {
-                    if let Some(id) = self.resolve_signal_id(&Self::name_with_index(&base, i)) {
+                for i in lo.max(i128::from(alo))..=hi.min(i128::from(ahi)) {
+                    if let Some(id) =
+                        self.resolve_signal_id(&Self::name_with_index(&base, i as i64))
+                    {
                         out.push(id);
                     }
                 }
@@ -2057,13 +2066,11 @@ impl Simulator {
     }
 
     pub(super) fn refresh_sva_preponed(&mut self) {
-        // silimate: assertions sample once per time slot, before its VPI callbacks
         // Once per slot (§4.4.2.1): a later delta of the slot keeps them.
         if self.sva_sites.is_empty() || self.sva_preponed_slot == Some(self.time) {
             return;
         }
         self.sva_preponed_slot = Some(self.time);
-        // /silimate
         self.sva_preponed.clear();
         for i in 0..self.sva_sites.len() {
             if !self.sva_sites[i].sels.is_empty() {
@@ -2165,6 +2172,9 @@ impl Simulator {
         }
     }
 
+    // Inlined, so a time slot of a design without assertions pays only the
+    // two tests below.
+    #[inline(always)]
     pub(super) fn tick_sva_sites(&mut self) {
         if self.finished {
             return;
@@ -2184,7 +2194,6 @@ impl Simulator {
         self.class_context_stack = saved_cls;
     }
 
-    // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
     /// §4.4.2: the Observed region of a delta. It follows the whole active
     /// region set, the Post-NBA cbReadWriteSynch routines included, so with
     /// a cbNBASynch or cbReadWriteSynch due in this slot `sva_post_nba`
@@ -2253,7 +2262,6 @@ impl Simulator {
             self.sva_owed = true;
         }
     }
-    // /silimate
 
     pub(super) fn tick_sva_sites_inner(&mut self) {
         // §16.14.6.2: the procedural instances queued so far mature (no
@@ -2266,23 +2274,20 @@ impl Simulator {
                 }
             }
         }
-        // silimate: assertion clock events are recorded when they happen and evaluated once the slot's VPI synch routines have run
         // The clock events since the last call, and those a deferred tick
         // recorded (`note_sva_edges`).
         self.sva_note_edges();
         self.sva_owed = false;
-        // /silimate
         // Use indices so we can call &mut self methods inside the loop
         // without holding a borrow on self.sva_sites.
         for i in 0..self.sva_sites.len() {
             if self.finished {
                 break;
             }
-            // silimate: only the sites whose clock event was recorded tick
+            // Only the sites whose clock event was recorded tick.
             if !std::mem::take(&mut self.sva_sites[i].fired) {
                 continue;
             }
-            // /silimate
             let span_key = self.sva_sites[i].stat_key;
             let site_loc = self.sva_sites[i].stat_loc;
             let site_kind = self.sva_sites[i].kind;

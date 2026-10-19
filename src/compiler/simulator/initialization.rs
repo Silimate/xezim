@@ -3759,6 +3759,7 @@ impl Simulator {
             clocking_prev_clock: HashMap::default(),
             clocking_tick_cache: Vec::new(),
             buf_collapse_write_sets: None,
+            packed_array_copy_values: HashMap::default(),
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
             clocking_cycle_pending: HashMap::default(),

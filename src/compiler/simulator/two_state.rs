@@ -4582,19 +4582,19 @@ impl Simulator {
     }
 
     /// §23.3.3.7: an unpacked-array port connected to a whole array is one
-    /// object with it, as `collapse_identity_port_nets` makes a scalar port
-    /// and its actual one net. The elaborator connects such a port element
-    /// by element (`u.a[i] = a[i]`) and hands the instance's reads the
-    /// actual, so the port's own elements were read by name only: a value a
-    /// VPI client wrote to `u.a[i]` never reached the instance, and one
-    /// written to `a[i]` reached the name `u.a[i]` a delta later. Here every
-    /// element name of the port, and its `array_first_id` entry, is pointed
-    /// at the actual's cells, and the connects become self-copies that
-    /// `build_comb_entries` drops. A port collapses whole or not at all:
-    /// every element driven by its connect alone, onto cells of the same
-    /// width, realness and two-state-ness laid out in the same order. A
-    /// chain through several port levels resolves over a few passes. Returns
-    /// whether the passes reached a fixed point.
+    /// object with it, as `collapse_identity_port_nets` makes a scalar port and
+    /// its actual one net. The elaborator connects such a port element by
+    /// element (`u.a[i] = a[i]`), so the port kept elements of its own: a value
+    /// a VPI client wrote to `u.a[i]` reached the instance but not `a[i]`, nor
+    /// the port of an outer instance that `a` passes through, and one written
+    /// to `a[i]` reached `u.a[i]` only through the connect assign. Here every
+    /// element name of the port, and its `array_first_id` entry, is pointed at
+    /// the actual's cells, and the connects become self-copies that
+    /// `build_comb_entries` drops. A port collapses whole or not at all: every
+    /// element driven by its connect alone, onto cells of the same width,
+    /// realness and two-state-ness laid out in the same order. A chain through
+    /// several port levels resolves over a few passes. Returns whether the
+    /// passes reached a fixed point.
     pub(super) fn collapse_array_port_nets(&mut self) -> bool {
         // The array an assignment target selects from.
         fn base_of<'a>(
@@ -4625,6 +4625,12 @@ impl Simulator {
             .filter_map(|ca| {
                 let (port, pi) = Self::const_elem_ref(&ca.lhs, &self.module)?;
                 let (actual, ai) = Self::const_elem_ref(&ca.rhs, &self.module)?;
+                // §23.3.3.7 merges nets. A variable formal or actual keeps
+                // its implicit continuous assignment (§23.3.3.3): aliasing
+                // it would expose a blocking write before propagation.
+                if !self.module.nets.contains(&port) || !self.module.nets.contains(&actual) {
+                    return None;
+                }
                 Some((port, pi, actual, ai))
             })
             .collect();
@@ -4732,7 +4738,10 @@ impl Simulator {
     /// The flat base and constant indices of an element connect operand
     /// `base[i]..[k]`, as the elaborator spells an element of an
     /// unpacked-array port and of its actual.
-    pub(super) fn const_elem_ref(e: &Expression, module: &ElaboratedModule) -> Option<(String, Vec<i64>)> {
+    pub(super) fn const_elem_ref(
+        e: &Expression,
+        module: &ElaboratedModule,
+    ) -> Option<(String, Vec<i64>)> {
         let mut idx = Vec::new();
         let mut cur = e;
         while let ExprKind::Index { expr, index } = &cur.kind {

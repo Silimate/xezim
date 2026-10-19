@@ -196,6 +196,7 @@ impl Simulator {
     pub(super) fn build_comb_entries(&mut self) {
         // Entry indices are about to change — drop stale two-state bodies.
         self.ts_comb.clear();
+        self.packed_array_copy_values.clear();
         if self.try_load_prepared_comb_cache() {
             return;
         }
@@ -628,7 +629,14 @@ impl Simulator {
                     }
                 }
             }
-            let item = if explicit_delay > 0 {
+            // Packed cells have no per-element dependency epochs. Retain
+            // these port copies as AST entries so their evaluator can poll
+            // the source without redriving an unchanged value (§38.34).
+            let packed_array_copy = ca.rhs_parent_scoped
+                && Self::const_elem_ref(&ca.rhs, &self.module)
+                    .and_then(|(base, idx)| self.elem_cell(&base, &idx))
+                    .is_some_and(is_packed_id);
+            let item = if explicit_delay > 0 || packed_array_copy {
                 CombItem::ContAssign {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),

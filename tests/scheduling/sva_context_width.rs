@@ -16,8 +16,11 @@
 //! (`W'(r)`) lost its width: its parameter was resolved like a signal read.
 //!
 //! Every expression below holds under those rules and fails at a narrower
-//! width or with the other signedness. The reference simulator prints `PASS`
-//! for each design.
+//! width or with the other signedness. Verilator 5.038 holds each of them as
+//! an assertion and as a `disable iff` guard, and holds the `$past` and
+//! select checks of the second test and every check of the third. It can't
+//! run property local variables or `##1` in a sequence; those forms rest on
+//! §16.10 and §11.6.1.
 
 use std::path::PathBuf;
 use std::process::Command;

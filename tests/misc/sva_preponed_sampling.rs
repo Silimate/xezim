@@ -81,8 +81,9 @@ endmodule
 /// region. Here the property's clock rises two deltas into the slot, from the
 /// process that the NBA update of `d` wakes, and `d` is still sampled with
 /// its value from the start of the slot. The samples used to be retaken in
-/// every delta the scheduler re-entered, which saw the new `d`. The
-/// reference simulator: 10 ticks, no failure.
+/// every delta the scheduler re-entered, which saw the new `d`. Verilator
+/// 5.038 passes all 10 ticks (with `$display` action blocks; it stops with
+/// an internal error on the counters).
 #[test]
 fn clock_in_a_later_delta_samples_slot_entry_values() {
     let o = out(r#"

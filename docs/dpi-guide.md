@@ -549,6 +549,11 @@ The time of `cbAfterDelay`, `cbNBASynch`, `cbReadWriteSynch` and
 is refused. `vpiScaledRealTime` is in the time unit of `obj` when that is a
 module, else in simulation ticks.
 
+A value written from `cbStartOfSimulation` is evaluated in the time-0 step,
+even when nothing else happens at time 0. Waveform dumps and toggle coverage
+record each write in the step it was made in, the end-of-step callbacks'
+included.
+
 xezim has no statement objects, so `cbStmt` takes a scope and reports that
 scope as `obj`, and `cbForce`/`cbRelease`/`cbAssign`/`cbDeassign` registered
 with a NULL `obj` report the affected net or variable (a handle valid only

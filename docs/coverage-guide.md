@@ -565,6 +565,12 @@ counts its toggles. By default each instance counts its own ports; see
 [Toggles](#toggles). `--toggle-input-ports` restores the default when the
 variable is set.
 
+Code that a constant condition rules out in an instance is left out of the
+totals, as in other simulators: see [Constant conditions](#constant-conditions).
+`--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`) counts
+it like any other code; `--code-coverage-constant=exclude` is the default, and
+the flag wins over the variable.
+
 Code coverage is off by default, and then costs nothing: the design compiles and
 runs exactly as it does without the feature. When it is on, statements and
 branches are instrumented as the design is compiled, before xezim lowers it to
@@ -688,6 +694,75 @@ testbench signals' counts: `clk` rose and fell four times, `rst` only fell and
 - An arm is covered once its count is at least 1; branch coverage is the
   covered arms over all arms.
 
+#### Constant conditions
+
+A parameter's value is fixed when the design is elaborated (IEEE 1800 §11.2.1),
+so in each instance a condition built from parameters always goes the same way,
+and the code it rules out can never run there. As in other simulators, that code
+is left out of the instance's totals (*excluded*):
+
+- `if` / `else if`: an arm whose condition is constantly false is excluded, and
+  so is every arm after one whose condition is constantly true, the implicit
+  `else` included. When every condition of the chain is a constant, the chain is
+  no decision at all: the whole branch is excluded, and only the statements of
+  the arm it takes count.
+- `case`, `casez` and `casex` whose selector and every item expression are
+  constants: the whole branch is excluded, and so is every item but the one
+  that matches (the `default`, written or implicit, when none does). Wildcard
+  items match as they do at run time. A `case` with any item that is not a
+  constant, such as `case (1'b1)` over signals, keeps all of its arms, and so
+  does a `case inside`, as in other simulators.
+- `?:` whose condition is a constant: the branch is excluded, and so is any
+  `?:` in the operand it never yields, or in the right operand of an `&&`
+  whose left operand is constantly false (an `||`, constantly true), which
+  is never evaluated.
+- The statements of an excluded arm are excluded, and so are the branches
+  inside it, and the `?:`s in the conditions of the `else if`s after a
+  constantly true one.
+
+Constants are literals (strings included), parameters and `localparam`s, enum
+constants, package parameters (`pkg::P`), the genvar of a generate loop, and an
+input port that the instantiation ties to a literal (`.en(1'b1)`), combined with
+operators, `?:`, concatenation, replication, bit and part selects of a
+parameter, and `$bits`, `$clog2`, `$signed`, `$unsigned`, `$countones`,
+`$onehot` and `$onehot0`. An `&&` with a constantly false operand, or an `&`
+with an all-zero one, is constantly false whatever its other operand is; an
+`||` with a constantly true operand, or an `|` with a nonzero one, is constantly
+true. Each constant is evaluated once the design is compiled, by the same
+evaluator as the run, so an excluded statement or arm is one the run can never
+reach. A condition with x or z bits and no 1 bit is not decided. The methods of
+classes and the subroutines of packages are never excluded.
+
+Generate constructs (`if`, `case` and `for` generate) are decided by
+elaboration: the blocks a generate condition leaves out are not part of the
+design, so they have no entries at all.
+
+For example, a reduction module that one instance uses as an OR:
+
+```systemverilog
+module reduce #(parameter [1:0] OP = 0) (input logic [3:0] a, output logic y);
+  always_comb
+    case (OP)
+      0: y = &a;
+      1: y = |a;
+      default: y = ^a;
+    endcase
+endmodule
+```
+
+`reduce #(.OP(1)) u_or` counts the `always_comb` and `y = |a;`; the other two
+statements and the `case`, a constant decision, are excluded:
+
+```json
+        "statement": {"covered": 2, "total": 2, "percent": 100.00, "excluded": 2},
+        "branch": {"covered": 0, "total": 0, "percent": null, "excluded": 3},
+        "statements": [{"file": "red.sv", "line": 3, "kind": "always_comb", "count": 3}, {"file": "red.sv", "line": 4, "kind": "statement", "count": 0, "excluded": "constant"}, {"file": "red.sv", "line": 5, "kind": "statement", "count": 3}, {"file": "red.sv", "line": 6, "kind": "statement", "count": 0, "excluded": "constant"}],
+        "branches": [{"file": "red.sv", "line": 3, "kind": "case", "excluded": "constant", "arms": [{"line": 4, "arm": "item", "count": 0, "excluded": "constant"}, {"line": 5, "arm": "item", "count": 3}, {"line": 6, "arm": "default", "count": 0, "excluded": "constant"}]}]
+```
+
+With `--code-coverage-constant=keep` the same instance has statement 2/4 and
+branch 1/3, and no `excluded` members.
+
 #### Toggles
 
 - Each bit has two bins: a rise (0 to 1) and a fall (1 to 0). Transitions to or
@@ -759,9 +834,18 @@ differences:
 - An `always` that starts with a delay counts when the delay has passed, not
   when it starts, which can make its count one lower.
 - A continuous assignment that another simulator optimizes into a gate
-  (`assign y = r;`, `wire w = a ? b : c;`) is still a statement here, and its
-  `?:` still a branch. So is the code of an instance whose inputs are
-  constant, which another simulator may fold away.
+  (`assign y = r;`, `wire w = a ? b : c;`, or `assign y = P ? a : b;` once
+  its constant `?:` is gone) is still a statement here, and a `?:` in it that
+  is not decided by a constant still a branch.
+- An input port tied to a parameter or to an expression (`.en(P == 1)`) is
+  not a [constant](#constant-conditions) here, as one tied to a literal is.
+  Other simulators can propagate those constants into the instance and leave
+  out the code they rule out, as well as the code of conditions on real
+  parameters.
+- A design unit counts each arm of an `if` chain that any of its instances
+  counts. Where constant conditions leave instances different arms of one
+  chain, another simulator's design-unit view can line those arms up by
+  position instead, and count fewer.
 - Enum variables toggle as bit vectors, not by value, and unused variables stay
   in the toggle list.
 - Variables of an integer type (`int`, `integer`, `shortint`, `longint`,
@@ -783,16 +867,16 @@ The results file gains a `code_coverage` member:
 | Field | Meaning |
 |---|---|
 | `code_coverage.kinds` | The kinds collected: `statement`, `branch`, `toggle` |
-| `code_coverage.statement`, `.branch`, `.toggle` | Totals over the design: `covered`, `total` and `percent` (two decimals; `null` when `total` is 0). Toggle totals count bins, two per bit |
+| `code_coverage.statement`, `.branch`, `.toggle` | Totals over the design: `covered`, `total` and `percent` (two decimals; `null` when `total` is 0). Toggle totals count bins, two per bit. `excluded`, present when it is not 0, counts the statements or arms left out of `covered` and `total` (see [Constant conditions](#constant-conditions)) |
 | `code_coverage.scopes[]` | One entry per scope that has code: the instances by path, then the packages, `$unit` and the modules that declare classes |
 | `scopes[].scope` | The instance path from the top (`tb.u_cnt`), or the package, `$unit` or module name |
 | `scopes[].design_unit` | The module or interface of the instance; the scope's own name otherwise |
 | `scopes[].kind` | `instance`, `package`, `unit` or `module` (see [Scopes](#scopes)) |
 | `scopes[].statement`, `.branch`, `.toggle` | The scope's totals, like the design totals |
-| `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait` |
-| `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count` |
+| `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait`. An excluded statement has `"excluded": "constant"` and is not in the totals |
+| `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count`. `"excluded": "constant"` after `kind` marks a branch whose decision is a constant or that is in an excluded arm: none of its arms is in the totals. On an arm, it marks one that can never run |
 | `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, `type`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first. `type` is the data type the signal was declared with, after any typedef: `logic` (also a net declared without a data type), `bit`, `reg`, `byte`, `shortint`, `int`, `longint`, `integer`, `enum`, `struct` or `union`. A member of an unpacked struct or union has the type of the variable it belongs to, `struct` or `union`. `--no-toggle-integers` leaves out the entries of type `byte`, `shortint`, `int`, `longint` and `integer` |
-| `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches` and `toggles` with the counts of all its instances added up. A statement, arm or bin is covered when any instance covered it |
+| `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches` and `toggles` with the counts of all its instances added up. A statement, arm or bin is covered when any instance covered it. A statement or arm is excluded only when every instance excludes it; otherwise its count adds up only the instances that count it (the arm a constant decision takes runs, but it is no arm in an instance where the decision is made at run time) |
 
 Only the kinds collected appear. Several statements on one line are separate
 entries with the same `line`.
@@ -839,6 +923,7 @@ position, the statements of all three runs add up with `jq`:
 
 ```text
 $ jq -s '[.[] | .code_coverage.scopes[] | .scope as $s | .statements | to_entries[]
+          | select(.value.excluded | not)
           | {key: "\($s)#\(.key)", count: .value.count}]
          | group_by(.key) | map(map(.count) | add)
          | {covered: map(select(. > 0)) | length, total: length}' cov/seed*.json
@@ -852,7 +937,8 @@ and the branch arms the same way:
 
 ```text
 $ jq -s '[.[] | .code_coverage.scopes[] | .scope as $s | .branches | to_entries[]
-          | .key as $b | .value.arms | to_entries[]
+          | .key as $b | select(.value.excluded | not) | .value.arms | to_entries[]
+          | select(.value.excluded | not)
           | {key: "\($s)#\($b)#\(.key)", count: .value.count}]
          | group_by(.key) | map(map(.count) | add)
          | {covered: map(select(. > 0)) | length, total: length}' cov/seed*.json
@@ -862,12 +948,15 @@ $ jq -s '[.[] | .code_coverage.scopes[] | .scope as $s | .branches | to_entries[
 }
 ```
 
-Only `1: acc = 2;` never ran. Toggles add up per bit in the same way, from
+Only `1: acc = 2;` never ran. The `select`s leave out the
+[excluded](#constant-conditions) statements and arms, which are the same in
+every run of a design. Toggles add up per bit in the same way, from
 `.toggles[] | .rise` and `.fall`.
 
 ### Code coverage limits
 
-- No condition, expression or FSM coverage, and no exclusions: every statement,
+- No condition, expression or FSM coverage, and no exclusions besides code that
+  [constant conditions](#constant-conditions) rule out: every other statement,
   arm and tracked bit counts.
 - Instrumented code leaves some of xezim's fast paths: the optional native code
   generators, gate fusion for instrumented continuous assignments, table
@@ -946,6 +1035,7 @@ it.
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees and packages |
 | `--no-toggle-input-ports`, `XEZIM_TOGGLE_INPUT_PORTS=0` | Leave input and inout ports out of toggle coverage; by default each instance counts its own (`--toggle-input-ports`). See [Toggles](#toggles) |
 | `--no-toggle-integers`, `XEZIM_TOGGLE_INTEGERS=0` | Leave variables of an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of toggle coverage. `--toggle-integers` keeps them (the default) |
+| `--code-coverage-constant=<exclude\|keep>`, `XEZIM_CODE_COVERAGE_CONSTANT` | Leave out (`exclude`, the default) or count (`keep`) the code that [constant conditions](#constant-conditions) rule out |
 | `+cover`, `+cover=<letters>`, `-coverage` | Other simulators' spellings of `--code-coverage`: `s`, `b` and `t` select the kinds; other letters are ignored with a warning |
 | `+fcover` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |

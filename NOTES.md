@@ -49,6 +49,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `+seed=`. A `+seed=` you write is still a plusarg, and still seeds the RNG
   (§21.6, §38.17). (Silimate/xezim#2)
 
+* Code coverage leaves out what a constant condition rules out in an
+  instance, as the reference simulator does: a `case` whose selector and
+  items are constants, an `if` chain or `?:` on parameters, genvars or ports
+  tied to literals is no branch, and the arms that cannot run and their
+  statements are not counted. `xezim_cov.json` marks those rows
+  `"excluded": "constant"` and counts them in an `excluded` member of the
+  totals; a design unit counts an item that any of its instances counts.
+  `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`)
+  counts them as before (§11.2.1, §12.4, §12.5). (Silimate/xezim#25)
+
 * Integer `inside` constraints evaluate size-cast bounds in the joint
   comparison context and sample uniformly over distinct legal values,
   including overlapping ranges and repeated items. Explicit `dist` weights

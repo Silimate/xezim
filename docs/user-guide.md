@@ -53,6 +53,13 @@ The exit status is 1 for parse and elaboration errors, `$fatal`, a
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.
 
+A run stops at 100 ms of simulated time unless the design calls `$finish`
+first or runs out of events; `--max-time <time>` sets another limit and
+`--max-time none` removes it. For a flow written for a commercial simulator,
+`--compat` lifts the limit and turns on `--relax-implicit-static`,
+`--relax-driver-conflicts` and `--error-exit` (see the
+[command-line reference](command-line.md#commercial-simulators-defaults---compat)).
+
 ## Waveforms
 
 Waveform support is compiled into the model only on request, because it is

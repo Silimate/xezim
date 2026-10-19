@@ -10,6 +10,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* The results file lists every assertion statement per instance in
+  `assertion_instances`: the instance path, the label (or the reference
+  simulator's name for an unlabeled statement), kind, file and line, and the
+  attempts, nonvacuous passes, vacuous passes, failures, disabled attempts and
+  cover matches (§16.14.3). The summed `assertions` list is unchanged.
+* Vacuity follows §16.14.8 through nested properties: `a |-> (c |-> b)`
+  succeeds vacuously while `c` is false, so it runs no pass action and a
+  `cover` of it does not match, and `p or q` with a sequence operand is never
+  vacuous.
+* An assertion in a task or function declared in another module or in a
+  package reports that module's or package's file and line in the results
+  file; it had the calling process's file and a wrong line.
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
@@ -31,6 +43,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   functions is now sampled in the Preponed region like the others; it was
   read after the tick's NBAs, so `$rose(q)` of a flop fired one tick early
   and `$past(q)` returned the current tick's value (§16.5.1, §16.9.3).
+* Bit-, part- and indexed part-select writes to a variable of a static task
+  or function, or to a `static` local of any subroutine or class method,
+  update the one variable all calls share. They were lost, so a static
+  function that built a value bit by bit returned its input and
+  `a[15:8] = v` left `a` all X. Member writes, increments and output
+  arguments are fixed too (§6.21, §11.5.1). A nonblocking write to a whole
+  member of a static packed struct (`s.f <= v`) is no longer dropped
+  (§10.4.2), and a block variable that hides a static of the same name no
+  longer reads or writes the static. (#4)
 * A value a VPI client writes at time 0 is the toggle-coverage baseline.
   Values written from the end-of-slot callbacks (`cbReadWriteSynch`,
   `cbAtEndOfSimTime`) reach toggle coverage and the waveform dumps in their
@@ -79,6 +100,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   toggle scores and design totals change accordingly;
   `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
   previous counting, where only the driving signal counts.
+* Toggle coverage leaves out a variable whose value is fixed before the run
+  starts, as the reference simulator does: one only its declaration
+  initializer sets (`reg [4:0] poly = 5'b10011;`), and one only a single
+  constant assignment sets in an `initial` block without timing controls.
+  Such a variable never changes, so its bins could never be covered and
+  held instance scores down (§6.8). Any other write keeps a variable, even
+  one that never runs; writes through VPI don't count. (Silimate/xezim#46)
 * Named blocking `case` branches retain their `%m` scope and `disable`
   targets across suspension (§9.3, §9.6.2).
 
@@ -208,6 +236,28 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * `--tee <file>` copies stdout/stderr and DPI/VPI output to a transcript while
   retaining console output. `-vcd` and `-vcd dumpon` enable source-driven VCD
   dumping like `--wave`. (#347, reported by akashlevy)
+
+**Usability**
+
+* `--compat` (or `XEZIM_COMPAT=1`) runs a flow written for commercial
+  simulators with one flag: no time cap, `--relax-implicit-static`,
+  `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
+  or `-do` run time still sets the run length.
+* `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
+  `$finish` or no events remain, as with `-do "run -all"`. The default is
+  unchanged: a design that never finishes still stops.
+* `--version` and `-version` print the version and git revision, as `-V`
+  does, and exit 0.
+* More of other simulators' options run as-is: `-define`, `-incdir` and
+  `-top` (same as `-D`, `-I`, `-s`), `-coverage <types>` (`all`, or `B`,
+  `T`, `U`, `E`, `F` joined by `:`), `-covworkdir`/`-covscope`/`-covtest`
+  (the results file goes in `<dir>/<scope>/<test>/`), and, with no effect,
+  `-covoverwrite`, `-licqueue`, `-R`, `-access`, `+access+`, `-nowarn`,
+  `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
+  to be read as source files or top names, and `-licqueue` as `-l icqueue`,
+  which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
+  (same as `+seed=`) now work on the command line too, where they were read
+  as `-s vseed` and `-s eed`.
 
 **Maintenance**
 

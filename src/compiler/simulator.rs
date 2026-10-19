@@ -60943,7 +60943,15 @@ impl Simulator {
             None
         } else {
             match sig_id {
-                Some(sid) => self.signal_table.get(sid).cloned(),
+                // §16.5.1: the value from before time 0, which
+                // `capture_sampled_defaults` kept; a concurrent assertion
+                // registers its watches only after time-0 writes and the
+                // settle (a net reads its driver's value by then).
+                Some(sid) => self
+                    .sampled_defaults
+                    .get(&sid)
+                    .or(self.signal_table.get(sid))
+                    .cloned(),
                 None => Some(self.eval_expr(operand)),
             }
         };

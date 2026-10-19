@@ -52762,6 +52762,7 @@ impl Simulator {
                         | "$clog2"
                         | "$__xz_named_cast"
                         | "$__xz_size_cast"
+                        | SVA_SIG_MARKER
                 ) && args.iter().all(pure)
             }
             ExprKind::Call { func, args } => {
@@ -97452,7 +97453,12 @@ impl Simulator {
         for it in items {
             match it.slot {
                 Some((k, w, signed)) => {
-                    let v = self.sva_eval_env(&it.expr, &mut env);
+                    // §11.6.1: the right-hand side of an assignment is sized
+                    // with its target, so `x = a + b` keeps the carry when
+                    // `x` is wider than `a` and `b`.
+                    std::mem::swap(&mut self.sva_lv, &mut env);
+                    let v = self.eval_expr_ctx(&it.expr, w);
+                    std::mem::swap(&mut self.sva_lv, &mut env);
                     let mut v = v.resize_for_assign(w);
                     v.is_signed = signed;
                     if let Some(slot) = env.get_mut(k) {
@@ -98648,7 +98654,12 @@ impl Simulator {
                 ) {
                     return;
                 }
-                for a in args {
+                // The width or type of a cast (`W'(x)`) is read by name.
+                let skip = usize::from(matches!(
+                    name.as_str(),
+                    "$__xz_size_cast" | "$__xz_named_cast" | "$__xz_type_cast"
+                ));
+                for a in args.iter_mut().skip(skip) {
                     self.sva_resolve_signals(a);
                 }
             }
@@ -98701,6 +98712,21 @@ impl Simulator {
             v.is_real = true;
         }
         v
+    }
+
+    /// The width of an `SVA_SIG_MARKER` read: its signal's declared width, or
+    /// for a local variable (§16.10) its slot's.
+    fn sva_sig_width(&self, args: &[Expression]) -> Option<u32> {
+        let k = match &args.first()?.kind {
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                value.parse::<usize>().ok()?
+            }
+            _ => return None,
+        };
+        if args.len() == 2 {
+            return self.sva_lv.get(k).map(|v| v.width);
+        }
+        self.signal_widths.get(k).copied()
     }
 
     /// §16.10: a local variable read (a two-argument `SVA_SIG_MARKER`: the
@@ -104599,7 +104625,10 @@ impl Simulator {
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
-                if let Some(w) = self.lookup_signal_width(&n) {
+                if let Some(w) = self
+                    .lookup_signal_width(&n)
+                    .or_else(|| self.packed_field_width(&n))
+                {
                     return Some(w);
                 }
                 // A CLASS-FIELD operand (e.g. a `time` / `longint` member of
@@ -104666,8 +104695,159 @@ impl Simulator {
                 self.lrm_self_width(then_expr)?
                     .max(self.lrm_self_width(else_expr)?),
             ),
+            // A signal read in a concurrent assertion (`sva_resolve_signals`):
+            // the signal's width, kept on the node, or a local variable's
+            // (§16.10).
+            ExprKind::SystemCall { name, args } if name == SVA_SIG_MARKER => {
+                if let Some(w) = expr.cached_width.get() {
+                    return Some(w);
+                }
+                let w = self.sva_sig_width(args)?;
+                if args.len() == 1 {
+                    expr.cached_width.set(Some(w));
+                }
+                Some(w)
+            }
+            // A select or a member of an aggregate: from the declaration when
+            // that says. Else, in a concurrent assertion, the width of its
+            // value: evaluating it for that runs once a tick, and is safe
+            // when nothing in it has an effect (a call would run again).
+            ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::MemberAccess { .. } => {
+                if let Some(w) = self.select_width(expr) {
+                    return Some(w);
+                }
+                (self.active_sva_site.is_some() && Self::cond_expr_is_effect_free(expr, false))
+                    .then(|| self.eval_expr(expr).width)
+            }
+            // §6.24.1: a size cast `N'(x)` is N bits wide.
+            ExprKind::SystemCall { name, args }
+                if name == "$__xz_size_cast" || name == "$__xz_named_cast" =>
+            {
+                self.size_cast_width(name, args)
+            }
+            // §11.4.12: the operands of a concatenation side by side, `count`
+            // times over for a replication.
+            ExprKind::Concatenation(parts) => parts
+                .iter()
+                .try_fold(0, |w, p| Some(w + self.lrm_self_width(p)?)),
+            ExprKind::Replication { count, exprs }
+                if Self::cond_expr_is_effect_free(count, false) =>
+            {
+                let n = u32::try_from(self.eval_expr(count).to_u64()?).ok()?;
+                let w = exprs
+                    .iter()
+                    .try_fold(0u32, |w, p| Some(w + self.lrm_self_width(p)?))?;
+                n.checked_mul(w)
+            }
             _ => None,
         }
+    }
+
+    /// The width of a select of a signal or a one-dimensional array, from the
+    /// declaration alone: a bit of a vector, an element of an array, `|l - r|
+    /// + 1` bits for a part-select `[l:r]` and `w` for `[i +: w]`. None for
+    /// any other base (a packed array of vectors, a local variable) and for
+    /// bounds that are not unsized decimal literals. A select of a vector is
+    /// as wide as its value always is, so the answer is kept on the node, as
+    /// `infer_width` keeps its own.
+    fn select_width(&mut self, expr: &Expression) -> Option<u32> {
+        if let Some(w) = expr.cached_width.get() {
+            return Some(w);
+        }
+        // An unsized decimal literal is its digits. A sized one can be
+        // truncated (`3'd15` is 7), so it is left to the caller.
+        let lit = |e: &Expression| match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                base: NumberBase::Decimal,
+                value,
+                ..
+            }) => value.replace('_', "").parse::<i64>().ok(),
+            _ => None,
+        };
+        let (base, bits) = match &expr.kind {
+            ExprKind::Index { expr: base, .. } => (base, None),
+            ExprKind::RangeSelect {
+                expr: base,
+                kind,
+                left,
+                right,
+            } => {
+                let w = match kind {
+                    RangeKind::Constant => lit(left)?.abs_diff(lit(right)?) + 1,
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => lit(right)?.unsigned_abs(),
+                };
+                (base, Some(u32::try_from(w).ok()?))
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        if let [seg] = h.path.as_slice()
+            && self
+                .local_stack
+                .last()
+                .is_some_and(|m| m.contains_key(&seg.name.name))
+        {
+            return None;
+        }
+        let n = self.resolve_hier_name(h);
+        let n = n.as_ref();
+        if let Some(t) = self.module.arrays.get(n) {
+            return bits.is_none().then_some(t.2);
+        }
+        let id = *self.signal_name_to_id.get(n)?;
+        let vector = !self.signal_real[id]
+            && !self.module.packed_signal_elem_widths.contains_key(n)
+            && !self.module.packed_full_dims.contains_key(n)
+            && !self.module.arrays_2d.contains_key(n)
+            && !self.module.arrays_nd.contains_key(n)
+            && !self.module.dynamic_arrays.contains(n)
+            && !self.module.associative_arrays.contains_key(n)
+            && !self.string_signals.contains(n);
+        if !vector {
+            return None;
+        }
+        let w = bits.unwrap_or(1);
+        expr.cached_width.set(Some(w));
+        Some(w)
+    }
+
+    /// The width of a size cast `N'(x)` (§6.24.1): N, a literal or a name
+    /// that is a constant (a parameter), as the cast's evaluation reads it.
+    /// None for a cast to a type.
+    fn size_cast_width(&mut self, name: &str, args: &[Expression]) -> Option<u32> {
+        let n = args.first()?;
+        if name == "$__xz_named_cast" {
+            let key = self.named_cast_key(n)?;
+            let constant = !self.module.typedef_types.contains_key(&key)
+                && !self.module.typedefs.contains_key(&key)
+                && (self.module.parameters.contains_key(&key)
+                    || self.get_signal_value_by_name(&key).is_some()
+                    || self.class_value_param_in_scope(&key));
+            if !constant {
+                return None;
+            }
+        }
+        let v = self.eval_expr(n);
+        if v.has_xz() {
+            return None;
+        }
+        u32::try_from(v.to_u64()?).ok().filter(|&w| w > 0)
+    }
+
+    /// The width of a packed struct or union member (`s.f`), which has no
+    /// signal of its own: from its parent's field layout.
+    fn packed_field_width(&self, name: &str) -> Option<u32> {
+        let (parent, field) = name.rsplit_once('.')?;
+        let fields = self.module.packed_struct_fields.get(parent)?;
+        fields.iter().find(|(m, _, _)| m == field).map(|f| f.2)
     }
 
     /// §11.4.13: `expr inside {items}` compares like `==`, so every operand
@@ -104893,13 +105073,8 @@ impl Simulator {
                 // signal; its width comes from the parent's field layout. Needed
                 // so a concatenation LHS (`{word3.high, word3.low} = ...`) splits
                 // the rvalue at the right bit boundaries.
-                if let Some(dot) = n.rfind('.') {
-                    let (parent, field) = (&n[..dot], &n[dot + 1..]);
-                    if let Some(fields) = self.module.packed_struct_fields.get(parent) {
-                        if let Some((_, _, w)) = fields.iter().find(|(m, _, _)| m == field) {
-                            return (*w, stable);
-                        }
-                    }
+                if let Some(w) = self.packed_field_width(&n) {
+                    return (w, stable);
                 }
                 (1, false)
             }

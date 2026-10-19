@@ -37,12 +37,31 @@ const LIBRARY_PACKAGES: [&str; 2] = ["std", "uvm_pkg"];
 /// the whole design). `exclude_input_ports` leaves input and inout ports out
 /// of toggle coverage, so the net that drives one carries its toggles
 /// (`--no-toggle-input-ports`); by default each instance counts its own.
-#[derive(Clone, Debug, Default)]
+/// `integers` keeps the signals declared with an integer atom type
+/// (`TOGGLE_INTEGER_TYPES`) in toggle coverage; on by default,
+/// `--no-toggle-integers` turns it off.
+#[derive(Clone, Debug)]
 pub struct CodeCoverage {
     pub kinds: u8,
     pub scopes: Vec<String>,
     pub exclude_input_ports: bool,
+    pub integers: bool,
 }
+
+impl Default for CodeCoverage {
+    fn default() -> Self {
+        CodeCoverage {
+            kinds: 0,
+            scopes: Vec::new(),
+            exclude_input_ports: false,
+            integers: true,
+        }
+    }
+}
+
+/// The integer atom types of §6.11 (Table 6-8) whose signals toggle
+/// coverage leaves out without `integers`; `time` is never tracked.
+const TOGGLE_INTEGER_TYPES: [&str; 5] = ["byte", "shortint", "int", "longint", "integer"];
 
 static CONFIG: Mutex<Option<CodeCoverage>> = Mutex::new(None);
 
@@ -178,9 +197,9 @@ pub(crate) struct Toggle {
     prev_x: Vec<u64>,
     rise: Vec<u32>,
     fall: Vec<u32>,
-    /// (scope, name within the scope, tracked index); aliases of one signal
-    /// share the tracked index.
-    names: Vec<(u32, String, u32)>,
+    /// (scope, name within the scope, tracked index, data type); aliases of
+    /// one signal share the tracked index.
+    names: Vec<(u32, String, u32, &'static str)>,
 }
 
 impl Toggle {
@@ -837,6 +856,7 @@ struct BranchRow {
 #[derive(Clone)]
 struct ToggleRow {
     name: String,
+    ty: &'static str,
     rise: Vec<u32>,
     fall: Vec<u32>,
 }
@@ -1031,10 +1051,11 @@ impl Report {
             };
             for (i, r) in self.toggles.iter().enumerate() {
                 out.push_str(&format!(
-                    "{}{{\"signal\": \"{}\", \"width\": {}, \"rise\": [{}], \"fall\": [{}]}}",
+                    "{}{{\"signal\": \"{}\", \"width\": {}, \"type\": \"{}\", \"rise\": [{}], \"fall\": [{}]}}",
                     if i == 0 { "" } else { ", " },
                     json_escape(&r.name),
                     r.rise.len(),
+                    r.ty,
                     list(&r.rise),
                     list(&r.fall)
                 ));
@@ -1046,6 +1067,143 @@ impl Report {
             out.truncate(out.len() - 2);
             out.push('\n');
         }
+    }
+}
+
+/// The data types tracked signals were declared with, for the `type` of
+/// their toggle rows: the keyword of an integer type (§6.11: `logic`, `bit`,
+/// `reg`, `byte`, `shortint`, `int`, `longint`, `integer`), or `enum`,
+/// `struct` or `union`.
+struct ToggleTypes<'a> {
+    module: &'a ElaboratedModule,
+    /// Instance path -> the definition it instantiates.
+    defs: HashMap<&'a str, &'a str>,
+    /// (definition, port) -> the data type of each ANSI port, read from the
+    /// sources the first time one is needed (see `ansi_ports`).
+    ports: std::cell::OnceCell<HashMap<(String, String), DataType>>,
+}
+
+impl ToggleTypes<'_> {
+    /// The type of signal `name`. A typedef is followed to the type it
+    /// names. A member of an unpacked struct or union takes the aggregate's
+    /// kind, since the variable is the aggregate; a net declared without a
+    /// data type is `logic` (§6.7.1), as is a type that does not resolve.
+    fn of(&self, name: &str, type_name: Option<&str>) -> &'static str {
+        let aggregate = name.match_indices('.').find_map(|(i, _)| {
+            self.declared(&name[..i])
+                .filter(|k| matches!(*k, "struct" | "union"))
+        });
+        aggregate
+            .or_else(|| self.declared(name))
+            .or_else(|| {
+                type_name
+                    .and_then(|t| self.module.typedef_types.get(t))
+                    .and_then(|dt| self.kind(dt))
+            })
+            .unwrap_or("logic")
+    }
+
+    /// The type of the variable, net or port `name` as declared.
+    /// Elaboration records it in `var_decl_types`, except for the ANSI
+    /// ports of an instance below the top, which come from the sources.
+    fn declared(&self, name: &str) -> Option<&'static str> {
+        if let Some(dt) = self.module.var_decl_types.get(name) {
+            return self.kind(dt);
+        }
+        let (inst, port) = name.rsplit_once('.')?;
+        let def = self.defs.get(inst)?;
+        self.ports
+            .get_or_init(|| self.ansi_ports())
+            .get(&(def.to_string(), port.to_string()))
+            .and_then(|dt| self.kind(dt))
+    }
+
+    /// The keyword or kind of the type `dt` names.
+    fn kind(&self, dt: &DataType) -> Option<&'static str> {
+        use crate::ast::types::{IntegerVectorType, StructUnionKind};
+        match crate::compiler::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types) {
+            DataType::IntegerAtom { kind, .. } => Some(match kind {
+                IntegerAtomType::Byte => "byte",
+                IntegerAtomType::ShortInt => "shortint",
+                IntegerAtomType::Int => "int",
+                IntegerAtomType::LongInt => "longint",
+                IntegerAtomType::Integer => "integer",
+                IntegerAtomType::Time => "time",
+            }),
+            DataType::IntegerVector { kind, .. } => Some(match kind {
+                IntegerVectorType::Bit => "bit",
+                IntegerVectorType::Logic => "logic",
+                IntegerVectorType::Reg => "reg",
+            }),
+            DataType::Enum(_) => Some("enum"),
+            DataType::Struct(su) if su.kind == StructUnionKind::Union => Some("union"),
+            DataType::Struct(_) => Some("struct"),
+            DataType::Implicit { .. } => Some("logic"),
+            _ => None,
+        }
+    }
+
+    /// The data types of the ANSI ports of every module, interface and
+    /// program, parsed again from the preprocessed sources the way the VPI
+    /// model is (a design loaded from a compiled artifact has none). A port
+    /// with no direction, port kind or data type takes the previous one's
+    /// (§23.2.2.3).
+    fn ansi_ports(&self) -> HashMap<(String, String), DataType> {
+        use crate::ast::Description;
+        use crate::ast::decl::ModuleItem;
+        use crate::ast::module::PortList;
+        fn add(
+            def: &str,
+            ports: &PortList,
+            items: &[ModuleItem],
+            out: &mut HashMap<(String, String), DataType>,
+        ) {
+            if let PortList::Ansi(ps) = ports {
+                let mut prev: Option<&DataType> = None;
+                for p in ps {
+                    let dt = match &p.data_type {
+                        Some(dt) => Some(dt),
+                        None if p.direction.is_none() && p.net_type.is_none() && !p.var_kw => prev,
+                        None => None,
+                    };
+                    if let Some(dt) = dt {
+                        out.entry((def.to_string(), p.name.name.clone()))
+                            .or_insert_with(|| dt.clone());
+                    }
+                    prev = dt;
+                }
+            }
+            for it in items {
+                if let ModuleItem::NestedModule(m) = it {
+                    add(&m.name.name, &m.ports, &m.items, out);
+                }
+            }
+        }
+        let mut out = HashMap::default();
+        let mut scan = |text: &str| {
+            let tokens = xezim_core::lexer::Lexer::new(text).tokenize();
+            for d in &xezim_core::parse::Parser::new(tokens)
+                .parse_source_text()
+                .descriptions
+            {
+                match d {
+                    Description::Module(m) => add(&m.name.name, &m.ports, &m.items, &mut out),
+                    Description::Interface(i) => add(&i.name.name, &i.ports, &i.items, &mut out),
+                    Description::Program(p) => add(&p.name.name, &p.ports, &p.items, &mut out),
+                    _ => {}
+                }
+            }
+        };
+        for text in &self.module.source_texts {
+            scan(text);
+        }
+        // `-v`/`-y` library files the elaboration adopted definitions from.
+        for (path, _) in xezim_core::adopted_lib_files() {
+            if let Some(text) = xezim_core::preprocess_adopted_lib(&path) {
+                scan(&text);
+            }
+        }
+        out
     }
 }
 
@@ -1546,15 +1704,19 @@ impl Simulator {
     /// shares the actual's counts, an expression or select toggles as its
     /// value, and a constant or open port never toggles.
     /// `exclude_input_ports` leaves input and inout ports to the signal that
-    /// drives them.
+    /// drives them. When the run leaves integers out, the signals declared
+    /// with an integer atom type are left out too. Each comes with its data
+    /// type (`ToggleTypes::of`).
     ///
-    /// Each name carries what `cov_drop_fixed` needs: `None` for a port, a net
-    /// and a variable of a struct, enum or named type, which always stay
-    /// tracked; for any other variable, whether a constant declaration
+    /// Each name also carries what `cov_drop_fixed` needs: `None` for a port,
+    /// a net and a variable of a struct, enum or named type, which always
+    /// stay tracked; for any other variable, whether a constant declaration
     /// initializer gave it its elaborated value (a bit that is not x, or is
     /// set in a 2-state variable). One declared in a generate block counts
     /// as not initialized: the reference simulator keeps those.
-    pub(super) fn cov_toggle_candidates(module: &ElaboratedModule) -> Vec<(String, Option<bool>)> {
+    pub(super) fn cov_toggle_candidates(
+        module: &ElaboratedModule,
+    ) -> Vec<(String, &'static str, Option<bool>)> {
         let Some(cfg) = code_coverage().filter(|c| c.kinds & KIND_TOGGLE != 0) else {
             return Vec::new();
         };
@@ -1587,7 +1749,18 @@ impl Simulator {
             }
             n.contains('.')
         };
-        let mut out: Vec<(String, Option<bool>)> = module
+        let types = ToggleTypes {
+            module,
+            // A path-specific bind runs a specialized copy of its target
+            // ("target__bind0"); its ports are declared under the source name.
+            defs: module
+                .instances
+                .iter()
+                .map(|i| (i.path.as_str(), xezim_core::bind_spec_base(&i.def_name)))
+                .collect(),
+            ports: std::cell::OnceCell::new(),
+        };
+        let mut out: Vec<(String, &'static str, Option<bool>)> = module
             .signals
             .iter()
             .filter(|(name, sig)| {
@@ -1677,8 +1850,13 @@ impl Simulator {
                     let (v, x) = sig.value.slice_bits_swar(lo, w);
                     (if two { v } else { v | !x }) & mask != 0
                 });
-                (name.clone(), var.then(|| init && !nested(n)))
+                (
+                    name.clone(),
+                    types.of(name, sig.type_name.as_deref()),
+                    var.then(|| init && !nested(n)),
+                )
             })
+            .filter(|(_, ty, _)| cfg.integers || !TOGGLE_INTEGER_TYPES.contains(ty))
             .collect();
         out.sort();
         out
@@ -1696,15 +1874,18 @@ impl Simulator {
     /// variable of its name. Values a VPI client writes don't count, as on
     /// the reference simulator; a variable nothing writes that has no
     /// initializer (one a VPI client drives) stays tracked.
-    fn cov_drop_fixed(&self, names: Vec<(String, Option<bool>)>) -> Vec<String> {
+    fn cov_drop_fixed(
+        &self,
+        names: Vec<(String, &'static str, Option<bool>)>,
+    ) -> Vec<(String, &'static str)> {
         let index: HashMap<String, usize> = names
             .iter()
             .enumerate()
-            .filter(|(_, (_, f))| f.is_some())
-            .map(|(i, (n, _))| (n.clone(), i))
+            .filter(|(_, (_, _, f))| f.is_some())
+            .map(|(i, (n, _, _))| (n.clone(), i))
             .collect();
         if index.is_empty() {
-            return names.into_iter().map(|(n, _)| n).collect();
+            return names.into_iter().map(|(n, t, _)| (n, t)).collect();
         }
         let mut leaves: HashMap<String, Vec<usize>> = HashMap::default();
         for (n, &i) in &index {
@@ -1769,11 +1950,11 @@ impl Simulator {
         names
             .into_iter()
             .enumerate()
-            .filter(|(i, (_, f))| match f {
+            .filter(|(i, (_, _, f))| match f {
                 Some(init) => c.more[*i] || c.once[*i] != u32::from(!*init),
                 None => true,
             })
-            .map(|(_, (n, _))| n)
+            .map(|(_, (n, t, _))| (n, t))
             .collect()
     }
 
@@ -1781,7 +1962,7 @@ impl Simulator {
         &mut self,
         cov: &mut CodeCov,
         inst_paths: &HashSet<String>,
-        names: Vec<String>,
+        names: Vec<(String, &'static str)>,
     ) -> Toggle {
         let mut t = Toggle {
             slot: vec![u32::MAX; self.signal_table.len()],
@@ -1796,7 +1977,7 @@ impl Simulator {
             names: Vec::new(),
         };
         let top_prefix = format!("{}.", self.module.name);
-        for name in names {
+        for (name, ty) in names {
             let Some(&id) = self.signal_name_to_id.get(name.as_str()).or_else(|| {
                 self.signal_name_to_id
                     .get(format!("{}{}", top_prefix, name).as_str())
@@ -1844,7 +2025,7 @@ impl Simulator {
                 t.fall.resize(t.fall.len() + width as usize, 0);
                 k
             };
-            t.names.push((sc, rest.to_string(), k));
+            t.names.push((sc, rest.to_string(), k, ty));
         }
         t
     }
@@ -1939,11 +2120,12 @@ impl Simulator {
             });
         }
         if let Some(t) = &cov.toggle {
-            for (sc, name, k) in &t.names {
+            for (sc, name, k, ty) in &t.names {
                 let k = *k as usize;
                 let (b, w) = (t.bit0[k] as usize, t.width[k] as usize);
                 reports[*sc as usize].toggles.push(ToggleRow {
                     name: name.clone(),
+                    ty,
                     rise: t.rise[b..b + w].to_vec(),
                     fall: t.fall[b..b + w].to_vec(),
                 });

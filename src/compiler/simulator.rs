@@ -2529,6 +2529,7 @@ pub(crate) use code_cov::{
 };
 pub use code_cov::{
     CodeCoverage, KIND_BRANCH, KIND_STATEMENT, KIND_TOGGLE,
+    parse_constant_mode as parse_code_coverage_constant_mode,
     parse_kinds as parse_code_coverage_kinds, set_code_coverage,
 };
 use event_stamps::{EventId, EventStampStore, NamedEventPlan, NamedEventTarget};
@@ -19749,6 +19750,8 @@ impl Simulator {
         self.auto_partition_by_clock();
         self.auto_partition_by_scope();
         mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
+        // Every block is instrumented now.
+        self.cov_resolve_constants();
         self.init_value_trace();
         self.rebuild_signal_commit_plans();
         self.compiled = true;

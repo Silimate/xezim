@@ -31,6 +31,7 @@ fn run(dir: &Path, src: &str, args: &[&str]) -> Output {
         .env_remove("XEZIM_CODE_COVERAGE")
         .env_remove("XEZIM_TOGGLE_INPUT_PORTS")
         .env_remove("XEZIM_TOGGLE_INTEGERS")
+        .env_remove("XEZIM_CODE_COVERAGE_CONSTANT")
         .env_remove("XEZIM_VERBOSE")
         .args(args)
         .arg("t.sv")
@@ -1368,5 +1369,469 @@ fn scope_limit_and_summary() {
         err.contains("[COV]   tb.u0 (sub): statement 5/5 (100.00%)"),
         "{err}"
     );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The entry of scope `name` in the results file.
+fn scope_entry<'a>(json: &'a str, name: &str) -> &'a str {
+    let start = json
+        .find(&format!("\"scope\": \"{}\",", name))
+        .unwrap_or_else(|| panic!("no scope {name}: {json}"));
+    let rest = &json[start..];
+    &rest[..rest.find("\n      }").unwrap_or(rest.len())]
+}
+
+/// The design-unit entry of module `name` in the results file.
+fn unit_entry<'a>(json: &'a str, name: &str) -> &'a str {
+    let start = json
+        .find(&format!(
+            "\"design_unit\": \"{}\",\n        \"instances\"",
+            name
+        ))
+        .unwrap_or_else(|| panic!("no design unit {name}: {json}"));
+    let rest = &json[start..];
+    &rest[..rest.find("\n      }").unwrap_or(rest.len())]
+}
+
+/// Whether the row starting with `key` in a results entry is marked
+/// excluded; panics when there is no such row.
+fn row_excluded(entry: &str, key: &str) -> bool {
+    let start = entry
+        .find(key)
+        .unwrap_or_else(|| panic!("no {key}: {entry}"));
+    let rest = &entry[start..];
+    rest[..rest.find('}').unwrap()].contains("\"excluded\": \"constant\"")
+}
+
+fn stmt_excluded(entry: &str, line: u32) -> bool {
+    row_excluded(
+        entry,
+        &format!("\"line\": {line}, \"kind\": \"statement\", \"count\": "),
+    )
+}
+
+fn arm_excluded(entry: &str, line: u32) -> bool {
+    row_excluded(entry, &format!("{{\"line\": {line}, \"arm\": "))
+}
+
+fn tally(kind: &str, covered: u64, total: u64, excluded: u64) -> String {
+    format!(
+        "\"{}\": {{\"covered\": {}, \"total\": {}, \"percent\": {:.2}, \"excluded\": {}}}",
+        kind,
+        covered,
+        total,
+        100.0 * covered as f64 / total as f64,
+        excluded
+    )
+}
+
+/// Two instances of a module whose `case` selector, `if` conditions and `?:`
+/// condition read its parameters.
+const CONSTANT_DESIGN: &str = "\
+module red #(parameter [1:0] OP = 0, parameter W = 4) (
+  input  logic [3:0] a,
+  input  logic       s,
+  output logic       y,
+  output logic       z,
+  output logic       m,
+  output logic       t
+);
+  always @(*) begin
+    case (OP)
+      0, 3: y = &a;
+      1: y = |a;
+      default: y = ^a;
+    endcase
+  end
+  always @(*) begin
+    if (W > 4)
+      z = a[0];
+    else
+      z = a[1];
+    if (s && W == 8)
+      z = ~z;
+  end
+  always @(*) begin
+    if (a[0])
+      m = 1;
+    else if (OP == 1)
+      m = s;
+    else
+      m = 0;
+  end
+  always @(*) t = (OP == 2) ? a[2] : (s ? a[3] : a[1]);
+endmodule
+
+module tb;
+  logic [3:0] a;
+  logic s;
+  logic y0, z0, m0, t0, y1, z1, m1, t1;
+  red #(.OP(0), .W(4)) u0 (.a, .s, .y(y0), .z(z0), .m(m0), .t(t0));
+  red #(.OP(1), .W(8)) u1 (.a, .s, .y(y1), .z(z1), .m(m1), .t(t1));
+  initial begin
+    a = 0; s = 0;
+    #1 a = 4'hf; s = 1;
+    #1 a = 4'h5;
+    #1 a = 4'ha; s = 0;
+    #1 $finish;
+  end
+endmodule
+";
+
+/// Parameters are elaboration-time constants (IEEE 1800 §11.2.1), so in
+/// each instance the code a condition on them rules out (§12.4 `if`, §12.5
+/// `case`, §11.4.11 `?:`) can never run. Like the reference simulator,
+/// xezim leaves it out of the instance's totals: the arms that cannot be
+/// taken and their statements, and the whole branch when its decision is a
+/// constant (`s && W == 8` is one where `W` is 4). An `else if` chain with
+/// a constant condition after a run-time one keeps its other arms. The
+/// instances' totals are the reference simulator's. A design unit counts an
+/// item that any instance counts.
+#[test]
+fn constant_conditions_leave_code_out() {
+    let d = scratch("constant");
+    let out = run(
+        &d,
+        CONSTANT_DESIGN,
+        &["--code-coverage=stmt,branch", "--verbose"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let u0 = scope_entry(&json, "tb.u0");
+    assert!(u0.contains(&tally("statement", 9, 9, 5)), "{u0}");
+    assert!(u0.contains(&tally("branch", 4, 4, 10)), "{u0}");
+    for (line, out) in [(11, false), (12, true), (13, true), (18, true), (20, false)] {
+        assert_eq!(stmt_excluded(u0, line), out, "line {line}: {u0}");
+    }
+    for (line, out) in [(22, true), (26, false), (28, true), (30, false)] {
+        assert_eq!(stmt_excluded(u0, line), out, "line {line}: {u0}");
+    }
+    for (line, kind) in [(10, "case"), (17, "if"), (21, "if")] {
+        assert!(
+            u0.contains(&format!(
+                "\"line\": {line}, \"kind\": \"{kind}\", \"excluded\": \"constant\", \"arms\""
+            )),
+            "{kind} at {line}: {u0}"
+        );
+    }
+    // The chain at line 25 keeps its `if` and `else` arms.
+    assert!(
+        u0.contains("\"line\": 25, \"kind\": \"if\", \"arms\""),
+        "{u0}"
+    );
+    for (line, out) in [(26, false), (28, true), (30, false)] {
+        assert_eq!(arm_excluded(u0, line), out, "arm at {line}: {u0}");
+    }
+    let u1 = scope_entry(&json, "tb.u1");
+    assert!(u1.contains(&tally("statement", 10, 10, 4)), "{u1}");
+    assert!(u1.contains(&tally("branch", 6, 6, 8)), "{u1}");
+    assert!(
+        u1.contains("\"line\": 21, \"kind\": \"if\", \"arms\""),
+        "{u1}"
+    );
+    for (line, out) in [(26, false), (28, false), (30, true)] {
+        assert_eq!(arm_excluded(u1, line), out, "arm at {line}: {u1}");
+    }
+    let unit = unit_entry(&json, "red");
+    assert!(unit.contains(&tally("statement", 13, 13, 1)), "{unit}");
+    assert!(unit.contains(&tally("branch", 7, 7, 7)), "{unit}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(
+            "[COV]   tb.u0 (red): statement 9/9 (100.00%; 5 excluded), \
+             branch 4/4 (100.00%; 10 excluded)"
+        ),
+        "{err}"
+    );
+    // Statement coverage alone leaves out the same statements.
+    run(&d, CONSTANT_DESIGN, &["--code-coverage=stmt"]);
+    let json = results(&d);
+    assert!(
+        scope_entry(&json, "tb.u0").contains(&tally("statement", 9, 9, 5)),
+        "{json}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `--code-coverage-constant=keep` (or XEZIM_CODE_COVERAGE_CONSTANT=keep)
+/// counts constant-folded code like any other; the flag wins over the
+/// variable, and an unknown mode is an error.
+#[test]
+fn constant_code_kept_on_request() {
+    let d = scratch("keep");
+    let keep = |args: &[&str], env: Option<&str>| {
+        std::fs::write(d.join("t.sv"), CONSTANT_DESIGN).unwrap();
+        let mut cmd = Command::new(xezim());
+        cmd.current_dir(&d)
+            .env("XEZIM_COV_DB", d.join("cov.json"))
+            .env_remove("XEZIM_CODE_COVERAGE")
+            .env_remove("XEZIM_CODE_COVERAGE_CONSTANT")
+            .args(args)
+            .arg("t.sv");
+        if let Some(v) = env {
+            cmd.env("XEZIM_CODE_COVERAGE_CONSTANT", v);
+        }
+        let out = cmd.output().expect("run xezim");
+        assert!(out.status.success());
+        results(&d)
+    };
+    let kept = keep(
+        &[
+            "--code-coverage=stmt,branch",
+            "--code-coverage-constant=keep",
+        ],
+        None,
+    );
+    assert!(!kept.contains("excluded"), "{kept}");
+    assert!(
+        scope_entry(&kept, "tb.u0")
+            .contains("\"statement\": {\"covered\": 9, \"total\": 14, \"percent\": 64.29}"),
+        "{kept}"
+    );
+    assert_eq!(keep(&["--code-coverage=stmt,branch"], Some("keep")), kept);
+    let excluded = keep(
+        &[
+            "--code-coverage=stmt,branch",
+            "--code-coverage-constant=exclude",
+        ],
+        Some("keep"),
+    );
+    assert!(
+        scope_entry(&excluded, "tb.u0").contains(&tally("statement", 9, 9, 5)),
+        "{excluded}"
+    );
+    let bad = run(
+        &d,
+        CONSTANT_DESIGN,
+        &["--code-coverage", "--code-coverage-constant=maybe"],
+    );
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("unknown constant-code mode 'maybe'"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Which constant decisions leave code out, each as in the reference
+/// simulator (§12.5, §12.5.1, §11.4.7, §27.5):
+/// - a `case` with a constant selector is decided only when every item is
+///   a constant too: `case (P)` with an item `a[1:0]` keeps all its arms;
+/// - an `&&` with a constant-false operand and an `|` with a constant-true
+///   one are constants whatever the other operand is;
+/// - `casez` items match the constant selector with their wildcards;
+/// - a `unique case` that no item matches leaves out every item;
+/// - a genvar is a constant in each generate-loop iteration.
+#[test]
+fn constant_decision_rules() {
+    let d = scratch("rules");
+    let src = "\
+module sub #(parameter P = 1, parameter [2:0] K = 3'b010) (
+  input  logic [3:0] a,
+  output logic       v,
+  output logic       c,
+  output logic       x,
+  output logic       e
+);
+  always @(*) begin
+    case (P)
+      a[1:0]: v = 1;
+      1: v = 0;
+      default: v = a[3];
+    endcase
+  end
+  always @(*) begin
+    c = a[0];
+    if (a[2] && P == 1)
+      c = 1;
+    if ((P == 2) | a[3])
+      c = 0;
+  end
+  always @(*) begin
+    casez (K)
+      3'b1??: x = a[0];
+      3'b0?1: x = a[1];
+      default: x = a[2];
+    endcase
+  end
+  always @(*) begin
+    e = 0;
+    unique case (K)
+      3'b000: e = a[0];
+      3'b010: e = a[1];
+      3'b011: e = a[2];
+    endcase
+  end
+endmodule
+
+module tb;
+  logic [3:0] a;
+  logic [1:0] g;
+  logic v0, c0, x0, e0, v1, c1, x1, e1;
+  sub #(.P(1), .K(3'b011)) u0 (.a, .v(v0), .c(c0), .x(x0), .e(e0));
+  sub #(.P(2), .K(3'b110)) u1 (.a, .v(v1), .c(c1), .x(x1), .e(e1));
+  for (genvar i = 0; i < 2; i++) begin : gl
+    always @(*) begin
+      if (i == 0)
+        g[i] = a[0];
+      else
+        g[i] = a[1];
+    end
+  end
+  initial begin
+    a = 0;
+    #1 a = 4'hf;
+    #1 a = 4'h5;
+    #1 a = 4'ha;
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=stmt,branch"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let u0 = scope_entry(&json, "tb.u0");
+    assert!(u0.contains(&tally("statement", 12, 13, 4)), "{u0}");
+    assert!(u0.contains(&tally("branch", 6, 7, 6)), "{u0}");
+    let u1 = scope_entry(&json, "tb.u1");
+    assert!(u1.contains(&tally("statement", 10, 11, 6)), "{u1}");
+    assert!(u1.contains(&tally("branch", 2, 3, 10)), "{u1}");
+    for entry in [u0, u1] {
+        assert!(
+            entry.contains("\"line\": 9, \"kind\": \"case\", \"arms\""),
+            "{entry}"
+        );
+        assert!(
+            entry.contains("\"line\": 23, \"kind\": \"casez\", \"excluded\": \"constant\""),
+            "{entry}"
+        );
+    }
+    for (line, out) in [(10, false), (11, false), (12, false)] {
+        assert_eq!(arm_excluded(u0, line), out, "arm at {line}: {u0}");
+        assert_eq!(arm_excluded(u1, line), out, "arm at {line}: {u1}");
+    }
+    // `a[2] && 1` and `0 | a[3]` in u0; `a[2] && 0` and `1 | a[3]` in u1.
+    for line in [17, 19] {
+        let key = format!("\"line\": {line}, \"kind\": \"if\", ");
+        assert!(u0.contains(&format!("{key}\"arms\"")), "{u0}");
+        assert!(
+            u1.contains(&format!("{key}\"excluded\": \"constant\"")),
+            "{u1}"
+        );
+    }
+    assert!(stmt_excluded(u1, 18) && !stmt_excluded(u1, 20), "{u1}");
+    // `casez` K = 3'b011 takes `3'b0?1`; K = 3'b110 takes `3'b1??`.
+    for (line, out) in [(24, true), (25, false), (26, true)] {
+        assert_eq!(arm_excluded(u0, line), out, "arm at {line}: {u0}");
+    }
+    for (line, out) in [(24, false), (25, true), (26, true)] {
+        assert_eq!(arm_excluded(u1, line), out, "arm at {line}: {u1}");
+    }
+    // No item of the `unique case` matches K = 3'b110.
+    for line in [32, 33, 34] {
+        assert!(arm_excluded(u1, line) && stmt_excluded(u1, line), "{u1}");
+    }
+    // Each generate-loop iteration takes one arm: both statements count.
+    let tb = scope_entry(&json, "tb");
+    assert!(
+        tb.contains("\"line\": 47, \"kind\": \"if\", \"excluded\": \"constant\""),
+        "{tb}"
+    );
+    assert!(!stmt_excluded(tb, 48) && !stmt_excluded(tb, 50), "{tb}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A constant condition is decided the way the run evaluates it, so no
+/// excluded statement or arm ever runs: operands sized by their context
+/// (§11.6.1: `4'hf + 4'h1 == 8'h10` adds in 8 bits and is true, `2'b11 +
+/// 2'b01 > 2'b11` in 2 bits and is false), signed arithmetic (§11.8.1) and
+/// string literals. A constant operand of `&` takes the other operand's
+/// width, so `{a, a} & (4'hf + 4'h1)` is not decided by `4'hf + 4'h1`
+/// alone. The right operand of an `&&` whose left operand is constantly
+/// false never runs (§11.4.7), so a `?:` in it is excluded.
+#[test]
+fn constant_decisions_follow_the_run() {
+    let d = scratch("sizing");
+    let src = "\
+module leaf #(parameter [1:0] P = 2'b11, parameter int S = 0);
+  logic [3:0] a = 0;
+  logic [6:0] r;
+  always @(*) begin
+    if ((4'hf + 4'h1) == 8'h10) r[0] = a[0]; else r[0] = a[1];
+    if ((4'hf + 4'h1) == 4'h0) r[1] = a[0]; else r[1] = a[1];
+    if (2'b11 + 2'b01 > 2'b11) r[2] = a[0]; else r[2] = a[1];
+    if (~P == 0) r[3] = a[0]; else r[3] = a[1];
+    if (S - 1 < 0) r[4] = a[0]; else r[4] = a[1];
+    if (\"z\" < \"aa\") r[5] = a[0]; else r[5] = a[1];
+    if ({a, a} & (4'hf + 4'h1)) r[6] = a[0]; else r[6] = a[1];
+  end
+  wire y = (1'b1 ? 1'b0 : 1'b1) && (a[0] ? a[1] : a[2]);
+  initial begin
+    #1 a = 4'h3;
+    #1 a = 4'hc;
+  end
+endmodule
+module tb;
+  leaf #(.P(2'b11), .S(0)) u0 ();
+  leaf #(.P(2'b01), .S(5)) u1 ();
+  initial #5 $finish;
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=stmt,branch"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    for scope in ["tb.u0", "tb.u1"] {
+        let e = scope_entry(&json, scope);
+        assert_eq!(
+            e.matches("\"kind\": \"if\", \"excluded\": \"constant\"")
+                .count(),
+            6,
+            "{e}"
+        );
+        assert_eq!(
+            e.matches("\"kind\": \"ternary\", \"excluded\": \"constant\"")
+                .count(),
+            2,
+            "{e}"
+        );
+        assert!(
+            e.contains("\"line\": 11, \"kind\": \"if\", \"arms\""),
+            "{e}"
+        );
+        let arms = e.find("\"branches\"").unwrap();
+        for (line, taken_if) in [(5, true), (6, true), (7, false)] {
+            let key = format!("\"line\": {line}, \"arm\": \"if\", \"count\": ");
+            assert_eq!(
+                row_excluded(&e[arms..], &key),
+                !taken_if,
+                "line {line}: {e}"
+            );
+        }
+    }
+    // Whatever the run does, an excluded row never counts.
+    let mut rest = json.as_str();
+    let mut rows = 0;
+    while let Some(i) = rest.find(", \"excluded\": \"constant\"}") {
+        let row = &rest[rest[..i].rfind('{').unwrap()..i];
+        if let Some(c) = row.find("\"count\": ") {
+            assert_eq!(&row[c + "\"count\": ".len()..], "0", "{row}");
+            rows += 1;
+        }
+        rest = &rest[i + 1..];
+    }
+    assert!(rows > 0, "{json}");
     let _ = std::fs::remove_dir_all(&d);
 }

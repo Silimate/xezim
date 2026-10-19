@@ -30,6 +30,7 @@
 //! masked. An item of a continuous assignment or at the top level of a
 //! combinational block also counts the transient states its inputs went
 //! through since its last evaluation (`Simulator::cov_replay`).
+use super::fsm_cov::{FSM_MARK, FsmCov, FsmRow};
 use super::*;
 use crate::ast::Span;
 use crate::compiler::elaborate::InitialBlock;
@@ -39,12 +40,21 @@ pub const KIND_BRANCH: u8 = 2;
 pub const KIND_TOGGLE: u8 = 4;
 pub const KIND_CONDITION: u8 = 8;
 pub const KIND_EXPRESSION: u8 = 16;
+pub const KIND_FSM: u8 = 32;
 /// Every kind: what `--code-coverage` and `+cover` collect by default.
-pub const KIND_ALL: u8 = 31;
-/// The kinds instrumented in the code (toggles watch the signals instead).
+pub const KIND_ALL: u8 = 63;
+/// The kinds instrumented in the code (toggles watch the signals instead;
+/// FSMs mark their state processes after these).
 const KIND_CODE: u8 = KIND_STATEMENT | KIND_BRANCH | KIND_CONDITION | KIND_EXPRESSION;
 /// Result names of the kinds, bit `i` of a kind mask naming entry `i`.
-const KIND_NAMES: [&str; 5] = ["statement", "branch", "toggle", "condition", "expression"];
+const KIND_NAMES: [&str; 6] = [
+    "statement",
+    "branch",
+    "toggle",
+    "condition",
+    "expression",
+    "fsm",
+];
 type Tallies = [Tally; KIND_NAMES.len()];
 
 /// `$__xz_cov(<n>)`: counts counter `n` (a statement or a branch arm).
@@ -145,7 +155,7 @@ pub(crate) fn code_coverage() -> Option<CodeCoverage> {
 
 /// The kinds a `--code-coverage` list names: `stmt` (or `statement`, `s`),
 /// `branch` (`b`), `cond` (`condition`, `c`), `expr` (`expression`, `e`),
-/// `toggle` (`t`) or `all`, separated by commas.
+/// `toggle` (`t`), `fsm` (`f`) or `all`, separated by commas.
 pub fn parse_kinds(spec: &str) -> Result<u8, String> {
     let mut kinds = 0u8;
     for k in spec.split(',').map(str::trim).filter(|k| !k.is_empty()) {
@@ -155,10 +165,11 @@ pub fn parse_kinds(spec: &str) -> Result<u8, String> {
             "cond" | "condition" | "c" => KIND_CONDITION,
             "expr" | "expression" | "e" => KIND_EXPRESSION,
             "toggle" | "t" => KIND_TOGGLE,
+            "fsm" | "f" => KIND_FSM,
             "all" => KIND_ALL,
             _ => {
                 return Err(format!(
-                    "unknown code coverage kind '{}' (want stmt, branch, cond, expr, toggle or all)",
+                    "unknown code coverage kind '{}' (want stmt, branch, cond, expr, toggle, fsm or all)",
                     k
                 ));
             }
@@ -1416,6 +1427,7 @@ pub(crate) struct CodeCov {
     /// Decisions constants may make, until `cov_resolve_constants`.
     decisions: Vec<Decision>,
     pub(crate) toggle: Option<Toggle>,
+    pub(crate) fsm: Option<FsmCov>,
     /// Signal id -> the earliest and latest step it settles at, and the
     /// scope and source offset of the combinational `always` block that
     /// writes it (see `Simulator::cov_steps`).
@@ -3138,6 +3150,7 @@ struct Report {
     toggles: Vec<ToggleRow>,
     conds: Vec<ItemRow>,
     exprs: Vec<ItemRow>,
+    fsms: Vec<FsmRow>,
 }
 
 /// Sort items and add up the copies of one (a parameterized class's, the
@@ -3265,6 +3278,18 @@ impl Tally {
             format!("{}/{} ({})", self.covered, self.total, notes.join("; "))
         }
     }
+
+    /// The `fsm` member: states and transitions together, then apart.
+    fn fsm_json(&self, split: &[Tally; 2]) -> String {
+        let mut j = self.json();
+        j.pop();
+        format!(
+            "{}, \"states\": {}, \"transitions\": {}}}",
+            j,
+            split[0].json(),
+            split[1].json()
+        )
+    }
 }
 
 impl Report {
@@ -3299,6 +3324,31 @@ impl Report {
                 t[k].total += it.terms.len() as u64;
                 t[k].covered += (0..it.terms.len()).filter(|&j| it.covered(j)).count() as u64;
             }
+        }
+        let [s, x] = self.fsm_split();
+        t[KIND_FSM.trailing_zeros() as usize] = Tally {
+            covered: s.covered + x.covered,
+            total: s.total + x.total,
+            excluded: 0,
+        };
+        t
+    }
+
+    /// FSM states and FSM transitions, the reference simulator's two bins.
+    fn fsm_split(&self) -> [Tally; 2] {
+        let mut t = [Tally::default(); 2];
+        for f in &self.fsms {
+            let [sc, st, tc, tt] = f.tally();
+            t[0].add(Tally {
+                covered: sc,
+                total: st,
+                excluded: 0,
+            });
+            t[1].add(Tally {
+                covered: tc,
+                total: tt,
+                excluded: 0,
+            });
         }
         t
     }
@@ -3350,6 +3400,7 @@ impl Report {
         self.toggles.sort_by(|a, b| a.name.cmp(&b.name));
         merge_items(&mut self.conds);
         merge_items(&mut self.exprs);
+        self.fsms.sort_by(|a, b| a.key().cmp(&b.key()));
     }
 
     /// Add another instance of the same design unit (rows keyed by source
@@ -3382,14 +3433,32 @@ impl Report {
                 }
             }
         }
+        // Instances of one FSM in different parameterizations can differ in
+        // their states: add to the row of the same shape, if any.
+        for f in &o.fsms {
+            let added = self
+                .fsms
+                .iter_mut()
+                .filter(|m| m.key() == f.key())
+                .any(|m| m.add(f));
+            if !added {
+                self.fsms.push(f.clone());
+            }
+        }
         self.normalize();
     }
 
     fn json(&self, kinds: u8, indent: &str, out: &mut String) {
         let t = self.tallies();
+        let split = self.fsm_split();
         for (i, name) in KIND_NAMES.iter().enumerate() {
             if kinds & (1 << i) != 0 {
-                out.push_str(&format!("{}\"{}\": {},\n", indent, name, t[i].json()));
+                let j = if 1 << i == KIND_FSM {
+                    t[i].fsm_json(&split)
+                } else {
+                    t[i].json()
+                };
+                out.push_str(&format!("{}\"{}\": {},\n", indent, name, j));
             }
         }
         if kinds & KIND_STATEMENT != 0 {
@@ -3461,6 +3530,16 @@ impl Report {
         if kinds & KIND_EXPRESSION != 0 {
             out.push_str(&format!("{}\"expressions\": [", indent));
             items_json(&self.exprs, out);
+            out.push_str("],\n");
+        }
+        if kinds & KIND_FSM != 0 {
+            out.push_str(&format!("{}\"fsms\": [", indent));
+            for (i, f) in self.fsms.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                f.json(out);
+            }
             out.push_str("],\n");
         }
         // Drop the trailing comma of the last member.
@@ -3640,6 +3719,7 @@ impl Simulator {
             inst_paths: inst_paths.clone(),
             decisions: Vec::new(),
             toggle: None,
+            fsm: None,
             steps: Vec::new(),
             writers: HashMap::default(),
             clocked: Vec::new(),
@@ -3652,10 +3732,15 @@ impl Simulator {
         // `compile` and `build_comb_entries` take them (`cov_initial`,
         // `cov_contassign`): most of them are still lazy here, and building
         // them early would change the order and the passes they go through.
+        let mut always = std::mem::take(&mut self.module.always_blocks);
+        // FSMs are found on the blocks as elaborated; their markers go in
+        // after the other kinds have instrumented the blocks.
+        if kinds & KIND_FSM != 0 {
+            cov.fsm = Some(self.fsm_extract(&mut cov, &inst_paths, &always));
+        }
         if kinds & KIND_CODE != 0 {
             let mut program = std::mem::take(&mut self.module.program_initial_blocks);
             let mut fin = std::mem::take(&mut self.module.final_blocks);
-            let mut always = std::mem::take(&mut self.module.always_blocks);
             let mut functions = std::mem::take(&mut self.module.functions).into_map();
             let mut tasks = std::mem::take(&mut self.module.tasks);
             {
@@ -3762,15 +3847,22 @@ impl Simulator {
             }
             self.module.program_initial_blocks = program;
             self.module.final_blocks = fin;
-            self.module.always_blocks = always;
             self.module.functions = xezim_core::elaborate::FuncTable::from_map(functions);
             self.module.tasks = tasks;
             self.cov_instrument_classes(&mut cov);
         }
+        if let Some(f) = &cov.fsm {
+            Self::fsm_instrument(f, &mut always);
+        }
+        self.module.always_blocks = always;
         if kinds & KIND_TOGGLE != 0 {
             let names = std::mem::take(&mut self.code_cov_toggle_names);
             let names = self.cov_drop_fixed(names);
             cov.toggle = Some(self.cov_build_toggle(&mut cov, &inst_paths, names));
+            self.enable_dump_dirty_tracking();
+        }
+        // FSM state processes watch their inputs off the same dirty set.
+        if cov.fsm.as_ref().is_some_and(|f| !f.fsms.is_empty()) {
             self.enable_dump_dirty_tracking();
         }
         self.code_cov_hits = vec![0; cov.counters as usize];
@@ -3960,7 +4052,7 @@ impl Simulator {
     /// The instance a block scope (`u0.u1.genblk2`) belongs to: its longest
     /// prefix that names an instance, else the top. `None` when the command
     /// line's scope limit leaves it out.
-    fn cov_instance_scope(
+    pub(super) fn cov_instance_scope(
         module: &ElaboratedModule,
         cov: &mut CodeCov,
         inst_paths: &HashSet<String>,
@@ -4275,6 +4367,9 @@ impl Simulator {
     /// hot loops compile as they do without code coverage.
     #[inline(never)]
     pub(super) fn cov_count(&mut self, c: u32) {
+        if c >= FSM_MARK {
+            return self.fsm_mark(c - FSM_MARK);
+        }
         if let Some(h) = self.code_cov_hits.get_mut(c as usize) {
             *h += 1;
         }
@@ -4282,19 +4377,19 @@ impl Simulator {
 
     /// `TsInsn::CovHit`: count, and note the count on the save list so a
     /// bail takes it back (`ts_restore_saved`) before the block runs again.
+    /// FSM markers need no undoing: they repeat the same marks on the rerun.
     #[inline(never)]
     pub(super) fn ts_cov_hit(&mut self, c: u32) {
         self.cov_count(c);
-        self.ts_save_list.push((c | TS_SAVE_COV, 0, 0));
+        if c < FSM_MARK {
+            self.ts_save_list.push((c | TS_SAVE_COV, 0, 0));
+        }
     }
 
     /// Count a coverage marker's counter (interpreter side).
     pub(super) fn cov_hit(&mut self, arg: Option<&Expression>) {
-        if let Some(c) = arg
-            .and_then(marker_id)
-            .and_then(|id| self.code_cov_hits.get_mut(id as usize))
-        {
-            *c += 1;
+        if let Some(c) = arg.and_then(marker_id) {
+            self.cov_count(c);
         }
     }
 
@@ -5419,6 +5514,19 @@ impl Simulator {
                 });
             }
         }
+        if let Some(f) = &cov.fsm {
+            let mut locate = |span: Span, sc: u32| {
+                lines
+                    .locate(span, cov.scopes[sc as usize].src)
+                    .unwrap_or_default()
+            };
+            for (r, rows) in reports
+                .iter_mut()
+                .zip(self.fsm_rows(f, cov.scopes.len(), &mut locate))
+            {
+                r.fsms = rows;
+            }
+        }
         for r in reports.iter_mut() {
             r.normalize();
         }
@@ -5437,8 +5545,12 @@ impl Simulator {
                 .cmp(&(cov.scopes[b].kind, &cov.scopes[b].name))
         });
         let mut total = Tallies::default();
+        let mut split = [Tally::default(); 2];
         for r in &reports {
             for (t, x) in total.iter_mut().zip(r.tallies()) {
+                t.add(x);
+            }
+            for (t, x) in split.iter_mut().zip(r.fsm_split()) {
                 t.add(x);
             }
         }
@@ -5486,7 +5598,12 @@ impl Simulator {
         ));
         for (i, n) in KIND_NAMES.iter().enumerate() {
             if kinds & (1 << i) != 0 {
-                json.push_str(&format!("    \"{}\": {},\n", n, total[i].json()));
+                let j = if 1 << i == KIND_FSM {
+                    total[i].fsm_json(&split)
+                } else {
+                    total[i].json()
+                };
+                json.push_str(&format!("    \"{}\": {},\n", n, j));
             }
         }
         json.push_str("    \"scopes\": [\n");

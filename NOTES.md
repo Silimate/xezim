@@ -192,6 +192,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   designs, the items and terms match the reference simulator's report on 22
   and the covered terms on 18. Off by default; a run without it compiles and
   runs as before. (#48)
+**Usability**
+
+* FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
+  `--code-coverage`) and `+cover=f` find the design's state machines (one- and
+  two-process, enum, parameter and `` `define `` encodings, `case` or `if`
+  next-state logic, a continuous-assignment next state) and count each
+  state's visits and each transition, reset and `default` transitions
+  included. `xezim_cov.json` gets `fsm` totals (states and transitions,
+  together and apart) and the details of each FSM per scope. Recognition,
+  state sets, transitions, lines and counts follow the reference simulator;
+  on the CVDP agentic designs both find the same 16 FSMs with the same bins.
+  It costs nothing when off. See docs/coverage-guide.md, "FSMs".
 
 **Performance**
 

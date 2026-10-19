@@ -40,13 +40,14 @@ pub(crate) struct CompatArgs {
 
 /// The code coverage `+cover[=<letters>]` and `-coverage` ask for, as
 /// `(kinds, letters xezim does not collect)`. The letters are other
-/// simulators': `s` statement, `b` branch, `c` condition, `e` expression and
-/// `t` toggle map onto xezim's kinds; `f` (FSM) and `x` (extended toggle)
-/// have no xezim counterpart. The bare forms ask for the default set,
-/// `sbceft`: all of xezim's kinds.
+/// simulators': `s` statement, `b` branch, `c` condition, `e` expression,
+/// `t` toggle and `f` FSM map onto xezim's kinds; `x` (extended toggle) has
+/// no xezim counterpart. The bare forms ask for the default set, `sbceft`:
+/// all of xezim's kinds.
 pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String)> {
     use xezim::compiler::simulator::{
-        KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_STATEMENT, KIND_TOGGLE,
+        KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_FSM, KIND_STATEMENT,
+        KIND_TOGGLE,
     };
     let spec = match cx.cover.as_deref() {
         None if !cx.coverage => return None,
@@ -64,6 +65,7 @@ pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String)> {
             'c' => kinds |= KIND_CONDITION,
             'e' => kinds |= KIND_EXPRESSION,
             't' => kinds |= KIND_TOGGLE,
+            'f' => kinds |= KIND_FSM,
             _ if !unsupported.contains(c) => unsupported.push(c),
             _ => {}
         }

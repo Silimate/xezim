@@ -1518,8 +1518,8 @@ fn off_by_default_output_unchanged() {
 }
 
 /// Other simulators' spellings: `+cover=<letters>` picks the kinds (`c`
-/// condition and `e` expression included) and warns once about the ones
-/// xezim lacks; bare `+cover` and `-coverage` collect all five;
+/// condition, `e` expression and `f` FSM included) and warns once about the ones
+/// xezim lacks; bare `+cover` and `-coverage` collect all six;
 /// XEZIM_CODE_COVERAGE does what the flag does.
 #[test]
 fn compatible_spellings() {
@@ -1536,13 +1536,14 @@ fn compatible_spellings() {
         let k = json[start..start + json[start..].find(']').unwrap()].to_string();
         (k, String::from_utf8_lossy(&out.stderr).into_owned())
     };
-    let all = "\"statement\", \"branch\", \"toggle\", \"condition\", \"expression\"";
+    let all =
+        "\"statement\", \"branch\", \"toggle\", \"condition\", \"expression\", \"fsm\"";
     let (k, err) = kinds(&["+cover=sbcfx"]);
-    assert_eq!(k, "\"statement\", \"branch\", \"condition\"");
+    assert_eq!(k, "\"statement\", \"branch\", \"condition\", \"fsm\"");
     assert_eq!(
         err.matches(
-            "Warning: +cover=sbcfx: xezim has no FSM (f), extended toggle (x) coverage; \
-                     collecting statement, branch, condition coverage"
+            "Warning: +cover=sbcfx: xezim has no extended toggle (x) coverage; \
+                     collecting statement, branch, condition, FSM coverage"
         )
         .count(),
         1,

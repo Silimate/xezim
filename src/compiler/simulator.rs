@@ -3396,6 +3396,8 @@ struct ObservedProbe {
     /// Optional `this` handle so a property declared in a class context can
     /// resolve member references at evaluation time.
     this_handle: Option<usize>,
+    /// Index of the statement's per-instance tally in `assert_insts`.
+    inst: usize,
 }
 
 /// LRM §16.5 SVA clocked property site. Registered once when an
@@ -3411,8 +3413,10 @@ struct SvaClockedSite {
     /// Key of the site's `assertion_stats` tally, and its location.
     stat_key: usize,
     stat_loc: (Option<u32>, usize),
-    /// Instance scope of the registering process: every instance of a
-    /// module or interface shares the assertion's span.
+    /// Index of the site's per-instance tally in `assert_insts`.
+    inst: usize,
+    /// Instance scope the statement executed in (`running_instance_scope`):
+    /// every instance of a module or interface shares the assertion's span.
     dedup_scope: String,
     /// 0 assert, 1 assume, 2 cover (§16.5): a cover miss is not a failure
     /// and fires no else-action; a cover match fires the pass action.
@@ -3648,10 +3652,31 @@ enum SvaNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SvaOutcome {
     Pass,
-    /// An implication whose antecedent never matched: holds, but fires no
-    /// pass action (§16.12.1).
+    /// Holds, but the evaluation was vacuous (§16.14.8): an implication
+    /// whose antecedent never matched, or whose every consequent evaluation
+    /// was itself vacuous. Fires no pass action (§16.12.1).
     Vacuous,
+    /// A failure, never vacuous: the reference simulator counts `not p` of a
+    /// failing `p` as a nonvacuous success, whatever made `p` fail.
     Fail,
+}
+
+impl SvaOutcome {
+    fn holds(self) -> bool {
+        self != SvaOutcome::Fail
+    }
+
+    fn nonvacuous(self) -> bool {
+        self != SvaOutcome::Vacuous
+    }
+
+    fn of(holds: bool, nonvacuous: bool) -> Self {
+        match (holds, nonvacuous) {
+            (true, true) => SvaOutcome::Pass,
+            (true, false) => SvaOutcome::Vacuous,
+            (false, _) => SvaOutcome::Fail,
+        }
+    }
 }
 
 /// Per-attempt evaluation state mirroring `SvaNode`.
@@ -3662,7 +3687,9 @@ enum SvaState {
     Impl {
         ante: SvaRun,
         ante_alive: bool,
-        matched_any: bool,
+        /// A consequent evaluation has succeeded nonvacuously, which makes
+        /// the attempt nonvacuous (§16.14.8).
+        nonvacuous: bool,
         /// Consequent evaluations `(ticks until they start, state)`.
         cons: Vec<(u32, SvaState)>,
     },
@@ -4022,6 +4049,36 @@ struct AssertionStat {
     pass_count: u64,
     /// Times the predicate evaluated false (`cover` ignores).
     fail_count: u64,
+}
+
+/// One `assert` / `assume` / `cover` statement in one instance, with the
+/// results §16.14.3 asks for: the results file's `assertion_instances`.
+#[derive(Debug, Clone, Default)]
+struct AssertInst {
+    /// The statement's `assertion_stats` key.
+    key: usize,
+    /// 0 assert, 1 assume, 2 cover.
+    kind: u8,
+    loc: (Option<u32>, usize),
+    /// Hierarchical path of the module or interface instance.
+    instance: String,
+    /// The module or interface it instantiates: unlabeled concurrent
+    /// statements are numbered within it.
+    unit: String,
+    /// The scopes between the instance and the statement (generate and
+    /// named blocks), dot-separated, ending in the label when it has one.
+    path: String,
+    labeled: bool,
+    concurrent: bool,
+    /// Evaluations of an immediate assertion; clock ticks that started (or,
+    /// disabled, would have started) an attempt of a concurrent one.
+    attempts: u64,
+    /// Nonvacuous successes (§16.14.8); a cover's matches.
+    pass: u64,
+    vacuous: u64,
+    fail: u64,
+    /// Attempts a `disable iff` cancelled (§16.12).
+    disabled: u64,
 }
 
 /// Roadmap steps 11-12: a process compiled to bytecode WITH wait points.
@@ -6925,6 +6982,17 @@ pub struct Simulator {
     /// Emitted at end-of-sim under `[COV] assertion summary` + (when
     /// `XEZIM_COV_DB` is set) the JSON coverage database file.
     assertion_stats: HashMap<usize, AssertionStat>,
+    /// The same statements counted per instance, with vacuous successes
+    /// apart (§16.14.3, §16.14.8).
+    assert_insts: Vec<AssertInst>,
+    /// `assert_insts` index by statement key, instance and path.
+    assert_inst_ix: HashMap<(usize, String, String), usize>,
+    /// Immediate and deferred assertions: `assert_insts` index by statement
+    /// span, the id of the scope `%m` names it after and, in a class method,
+    /// the id of the class (`assert_scope_ids`), so an evaluation finds its
+    /// entry without building the `%m` path.
+    assert_imm_ix: HashMap<(usize, usize, u8, u32, u32), usize>,
+    assert_scope_ids: HashMap<String, u32>,
     /// Code coverage sites and toggle state (`--code-coverage`); `None` when
     /// the run collects none. See `code_cov`.
     code_cov: Option<Box<code_cov::CodeCov>>,
@@ -13279,6 +13347,10 @@ impl Simulator {
             semaphores: HashMap::default(),
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
+            assert_insts: Vec::new(),
+            assert_inst_ix: HashMap::default(),
+            assert_imm_ix: HashMap::default(),
+            assert_scope_ids: HashMap::default(),
             code_cov: None,
             code_cov_hits: Vec::new(),
             code_cov_toggle_names,
@@ -47144,6 +47216,186 @@ impl Simulator {
         f
     }
 
+    /// The `assert_insts` entry of the assertion `a` executing now: an
+    /// immediate or deferred one, or a concurrent one without a clock.
+    /// Looked up by the statement and what `%m` (`m_path`) names its scope
+    /// after: the declaring path of a subroutine of another instance or of a
+    /// package, the creating scope of a class method's object, or the
+    /// running instance. The `%m` path is built only the first time.
+    fn imm_assert_inst(&mut self, a: &crate::ast::stmt::AssertionStatement, kind: u8) -> usize {
+        let first = self.m_scope_stack.first().map(String::as_str);
+        let (tag, scope) = match first.and_then(|f| f.strip_prefix(M_ROOT_MARK)) {
+            Some(root) => (1u8, root),
+            None if !first.is_some_and(|f| f.starts_with(M_SUBR_MARK))
+                && matches!(self.class_context_stack.last(), Some(Some(_))) =>
+            {
+                let obj = self.this_stack.last().copied().flatten();
+                let obj = obj.and_then(|h| self.heap.get(h)).and_then(|o| o.as_ref());
+                (2, obj.map_or("", |o| o.creation_scope.as_str()))
+            }
+            None => (0, self.running_instance_scope()),
+        };
+        let sid = match self.assert_scope_ids.get(scope) {
+            Some(&s) => s,
+            None => {
+                let owned = scope.to_string();
+                let s = self.assert_scope_ids.len() as u32;
+                self.assert_scope_ids.insert(owned, s);
+                s
+            }
+        };
+        // The objects of two classes can share a creating scope, and their
+        // statements a span (in different files): the class tells them apart.
+        let class = match (tag, self.class_context_stack.last()) {
+            (2, Some(Some(c))) => match self.assert_scope_ids.get(c.as_str()) {
+                Some(&s) => s,
+                None => {
+                    let s = self.assert_scope_ids.len() as u32;
+                    self.assert_scope_ids.insert(c.clone(), s);
+                    s
+                }
+            },
+            _ => u32::MAX,
+        };
+        let ix = (a.span.start, a.span.end, tag, sid, class);
+        if let Some(&i) = self.assert_imm_ix.get(&ix) {
+            return i;
+        }
+        let src = self.current_src_file();
+        let m = self.m_path();
+        let label = a.label.as_ref().map(|l| l.name.as_str());
+        let i = self.assert_inst(kind, (src, a.span.start), &m, label, a.is_property);
+        self.assert_imm_ix.insert(ix, i);
+        i
+    }
+
+    /// The `assert_insts` entry of the statement at `loc` in the scope whose
+    /// `%m` path is `scope`, created on first use. `label` is the label of a
+    /// module-level statement, which `scope` does not include. The file is
+    /// that of the module, package or class holding the statement; `loc`'s
+    /// is the fallback.
+    fn assert_inst(
+        &mut self,
+        kind: u8,
+        loc: (Option<u32>, usize),
+        scope: &str,
+        label: Option<&str>,
+        concurrent: bool,
+    ) -> usize {
+        let (instance, unit, mut path) = match self.assert_scope_split(scope) {
+            Some((rel, rest)) => (
+                self.hier_path(rel),
+                self.scope_def_module(Some(rel)).unwrap_or_default(),
+                rest.to_string(),
+            ),
+            // A package or class: no instance holds it.
+            None => {
+                let (head, rest) = scope.split_once('.').unwrap_or((scope, ""));
+                (head.to_string(), head.to_string(), rest.to_string())
+            }
+        };
+        let loc = (
+            self.module.src_file_of_module.get(&unit).copied().or(loc.0),
+            loc.1,
+        );
+        let key = Self::assert_stat_key(loc.1, loc.0);
+        let labeled = match label {
+            Some(l) => {
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(l);
+                true
+            }
+            None => self.assert_label_precedes(loc, &path),
+        };
+        let ix = (key, instance, path);
+        if let Some(&i) = self.assert_inst_ix.get(&ix) {
+            return i;
+        }
+        let i = self.assert_insts.len();
+        self.assert_insts.push(AssertInst {
+            key,
+            kind,
+            loc,
+            instance: ix.1.clone(),
+            unit,
+            path: ix.2.clone(),
+            labeled,
+            concurrent,
+            ..Default::default()
+        });
+        self.assert_inst_ix.insert(ix, i);
+        i
+    }
+
+    /// Split the `%m` path of an assertion's scope into the path (below the
+    /// top) of the module or interface instance holding it and the scopes
+    /// below that: generate and named blocks. `None` outside the instance
+    /// tree (a package or class).
+    fn assert_scope_split<'a>(&self, scope: &'a str) -> Option<(&'a str, &'a str)> {
+        let top = self.module.name.as_str();
+        let rel = if self.root_is_multi_top() {
+            scope
+        } else if scope == top {
+            ""
+        } else {
+            scope.strip_prefix(top)?.strip_prefix('.')?
+        };
+        let mut cut = rel.len();
+        while cut > 0 && !self.module.instances.iter().any(|i| i.path == rel[..cut]) {
+            cut = rel[..cut].rfind('.').unwrap_or(0);
+        }
+        Some((&rel[..cut], rel[cut..].trim_start_matches('.')))
+    }
+
+    /// Is the statement at `loc` written `<label> : assert ...`, `label`
+    /// being the last scope of `path`? The parser hands a labeled procedural
+    /// assertion over unlabeled, inside a block named by the label (§9.3.5).
+    fn assert_label_precedes(&self, loc: (Option<u32>, usize), path: &str) -> bool {
+        let name = path.rsplit('.').next().unwrap_or("");
+        let Some(t) = self
+            .src_text_index(loc.1, loc.0)
+            .map(|i| self.module.source_texts[i].as_bytes())
+        else {
+            return false;
+        };
+        let mut j = loc.1;
+        while j > 0 && t[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        if name.is_empty() || j == 0 || t[j - 1] != b':' {
+            return false;
+        }
+        j -= 1;
+        while j > 0 && t[j - 1].is_ascii_whitespace() {
+            j -= 1;
+        }
+        let end = j;
+        while j > 0 && (t[j - 1].is_ascii_alphanumeric() || matches!(t[j - 1], b'_' | b'$')) {
+            j -= 1;
+        }
+        &t[j..end] == name.as_bytes()
+    }
+
+    /// Index in `source_texts` of the text holding offset `start`: `src`
+    /// when it is long enough, else the only text that is.
+    fn src_text_index(&self, start: usize, src: Option<u32>) -> Option<usize> {
+        let texts = &self.module.source_texts;
+        if let Some(i) = src
+            .map(|s| s as usize)
+            .filter(|&s| texts.get(s).is_some_and(|t| start < t.len()))
+        {
+            return Some(i);
+        }
+        let mut fits = texts.iter().enumerate().filter(|(_, t)| start < t.len());
+        let (i, _) = fits.next()?;
+        if fits.next().is_some() {
+            return None;
+        }
+        Some(i)
+    }
+
     /// File and line of a span, resolved like `span_file_line_in`.
     fn span_file_and_line(
         &self,
@@ -47151,23 +47403,7 @@ impl Simulator {
         src_file: Option<u32>,
     ) -> Option<(String, usize)> {
         let texts = &self.module.source_texts;
-        let i = match src_file
-            .map(|s| s as usize)
-            .filter(|&s| texts.get(s).is_some_and(|t| span.start < t.len()))
-        {
-            Some(i) => i,
-            None => {
-                let mut fits = texts
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| span.start < t.len());
-                let (i, _) = fits.next()?;
-                if fits.next().is_some() {
-                    return None;
-                }
-                i
-            }
-        };
+        let i = self.src_text_index(span.start, src_file)?;
         if let Some(loc) = self
             .module
             .source_line_maps
@@ -49593,6 +49829,312 @@ impl Simulator {
         }
     }
 
+    /// The results file's `assertion_instances`: one entry per statement and
+    /// instance, sorted by instance, then by file and position. A statement
+    /// without a label is named the way the reference simulator names it: a
+    /// concurrent one `<kind>__<n>`, numbered by kind in source order among
+    /// those its module declares (run or not), an immediate one
+    /// `immed__<line>` (`i_cover__<line>` for a cover).
+    fn write_assertion_instances(&self, json: &mut String) {
+        let mut order: BTreeMap<(&str, u8), Vec<usize>> = BTreeMap::new();
+        for ai in self
+            .assert_insts
+            .iter()
+            .filter(|a| a.concurrent && !a.labeled)
+        {
+            order
+                .entry((ai.unit.as_str(), ai.kind))
+                .or_default()
+                .push(ai.key);
+        }
+        let units: std::collections::BTreeSet<&str> = order.keys().map(|k| k.0).collect();
+        for unit in units {
+            let Some(&src) = self.module.src_file_of_module.get(unit) else {
+                continue;
+            };
+            let labeled: HashSet<usize> = self
+                .assert_insts
+                .iter()
+                .filter(|a| a.unit == unit && a.labeled)
+                .map(|a| a.key)
+                .collect();
+            for (kind, off) in self.unlabeled_concurrent_decls(unit, src) {
+                let key = Self::assert_stat_key(off, Some(src));
+                if !labeled.contains(&key) {
+                    order.entry((unit, kind)).or_default().push(key);
+                }
+            }
+        }
+        for keys in order.values_mut() {
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        let mut insts: Vec<&AssertInst> = self.assert_insts.iter().collect();
+        insts.sort_by(|a, b| (&a.instance, a.key, &a.path).cmp(&(&b.instance, b.key, &b.path)));
+        json.push_str("  \"assertion_instances\": [\n");
+        for (i, ai) in insts.iter().enumerate() {
+            let kind = ["assert", "assume", "cover"][ai.kind.min(2) as usize];
+            let (src, off) = ai.loc;
+            let place = self.span_file_and_line(crate::ast::Span::new(off, off + 1), src);
+            let leaf = match (ai.labeled, ai.concurrent) {
+                (true, _) => String::new(),
+                (false, true) => {
+                    let keys = &order[&(ai.unit.as_str(), ai.kind)];
+                    format!("{}__{}", kind, keys.binary_search(&ai.key).unwrap_or(0))
+                }
+                (false, false) => format!(
+                    "{}__{}",
+                    if ai.kind == 2 { "i_cover" } else { "immed" },
+                    place.as_ref().map_or(0, |p| p.1)
+                ),
+            };
+            let name = match (ai.path.is_empty(), leaf.is_empty()) {
+                (_, true) => ai.path.clone(),
+                (true, false) => leaf,
+                (false, false) => format!("{}.{}", ai.path, leaf),
+            };
+            json.push_str(&format!(
+                "    {{\"instance\": \"{}\", \"name\": \"{}\", \"kind\": \"{}\", \"concurrent\": {}, {}\"span_start\": {}, \"attempts\": {}, \"pass\": {}, \"vacuous\": {}, \"fail\": {}, \"disabled\": {}{}}}{}\n",
+                json_escape(&ai.instance),
+                json_escape(&name),
+                kind,
+                ai.concurrent,
+                place
+                    .map(|(f, l)| format!("\"file\": \"{}\", \"line\": {}, ", json_escape(&f), l))
+                    .unwrap_or_default(),
+                off,
+                ai.attempts,
+                ai.pass,
+                ai.vacuous,
+                ai.fail,
+                ai.disabled,
+                if ai.kind == 2 {
+                    format!(", \"matches\": {}", ai.pass)
+                } else {
+                    String::new()
+                },
+                if i + 1 < insts.len() { "," } else { "" }
+            ));
+        }
+        json.push_str("  ],\n");
+    }
+
+    /// The concurrent `assert`, `assume` and `cover` statements without a
+    /// label in the declaration of module `unit` in source text `src`, as
+    /// (kind, offset of the keyword), in source order. Read from the
+    /// preprocessed text, which has no comments left; string literals are
+    /// skipped. A statement is labeled when `<label> :` precedes the keyword,
+    /// and the colon is not a case item's (`2'd1 : assert ...`): a case body
+    /// alternates items and statements, and an item's statement ends at its
+    /// `;` or at the `end` of its block.
+    fn unlabeled_concurrent_decls(&self, unit: &str, src: u32) -> Vec<(u8, usize)> {
+        let Some(t) = self.module.source_texts.get(src as usize) else {
+            return Vec::new();
+        };
+        let t = t.as_bytes();
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+        // The words of the text, and the brackets, semicolons, colons (not
+        // `::`) and conditional operators around them, with their offsets;
+        // strings and based literals (whose `?` is a digit: `2'b1?`) left
+        // out, and the `?` of the wildcard equalities `==?` and `!=?`.
+        let mut toks: Vec<(usize, &[u8])> = Vec::new();
+        let mut i = 0;
+        while i < t.len() {
+            match t[i] {
+                b'"' => {
+                    i += 1;
+                    while i < t.len() && t[i] != b'"' {
+                        i += if t[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                }
+                c if c.is_ascii_alphabetic() || c == b'_' => {
+                    let start = i;
+                    while i < t.len() && word(t[i]) {
+                        i += 1;
+                    }
+                    toks.push((start, &t[start..i]));
+                }
+                c if word(c) => {
+                    while i < t.len() && word(t[i]) {
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    let mut j = i + 1;
+                    if t.get(j).is_some_and(|c| c.eq_ignore_ascii_case(&b's')) {
+                        j += 1;
+                    }
+                    if t.get(j).is_some_and(|c| {
+                        matches!(c.to_ascii_lowercase(), b'b' | b'o' | b'd' | b'h')
+                    }) {
+                        j += 1;
+                        while j < t.len() && t[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        while j < t.len()
+                            && (t[j].is_ascii_alphanumeric() || matches!(t[j], b'_' | b'?'))
+                        {
+                            j += 1;
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+                b':' if t.get(i + 1) == Some(&b':') => i += 2,
+                b'?' if i >= 2 && t[i - 1] == b'=' && matches!(t[i - 2], b'=' | b'!') => i += 1,
+                b'(' | b'[' | b'{' | b')' | b']' | b'}' | b';' | b':' | b'?' => {
+                    toks.push((i, &t[i..i + 1]));
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        let opens = |w: &[u8]| matches!(w, b"module" | b"macromodule" | b"interface" | b"program");
+        let closes = |w: &[u8]| matches!(w, b"endmodule" | b"endinterface" | b"endprogram");
+        let ends = |w: &[u8]| {
+            matches!(
+                w,
+                b"end" | b"endcase" | b"join" | b"join_any" | b"join_none"
+            )
+        };
+        // An open case body: the bracket depth of its keyword, whether its
+        // `(...)` header is still open, whether an item (not the item's
+        // statement) comes next, and the conditional operators of that item
+        // still waiting for their `:`. `None` is a begin-end or fork-join
+        // block.
+        struct Case {
+            at: usize,
+            header: bool,
+            item: bool,
+            ternary: usize,
+        }
+        let mut blocks: Vec<Option<Case>> = Vec::new();
+        let mut brackets = 0usize;
+        // The last colon that is not a label's: a case item's, or one
+        // naming a block.
+        let mut plain = usize::MAX;
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        for (n, &(off, w)) in toks.iter().enumerate() {
+            if depth == 0 {
+                let name = || {
+                    toks[n + 1..]
+                        .iter()
+                        .map(|w| w.1)
+                        .find(|w| word(w[0]) && !matches!(*w, b"automatic" | b"static"))
+                };
+                if opens(w) && name() == Some(unit.as_bytes()) {
+                    depth = 1;
+                }
+                continue;
+            }
+            let case = blocks.last_mut().and_then(Option::as_mut);
+            let kind = match w {
+                b"(" | b"[" | b"{" => {
+                    brackets += 1;
+                    continue;
+                }
+                b")" | b"]" | b"}" => {
+                    brackets = brackets.saturating_sub(1);
+                    if let Some(c) = case.filter(|c| c.header && c.at == brackets) {
+                        c.header = false;
+                        c.item = true;
+                    }
+                    continue;
+                }
+                b";" => {
+                    if let Some(c) = case.filter(|c| !c.header && c.at == brackets) {
+                        c.item = true;
+                        c.ternary = 0;
+                    }
+                    continue;
+                }
+                b"?" => {
+                    if let Some(c) = case.filter(|c| c.item && c.at == brackets) {
+                        c.ternary += 1;
+                    }
+                    continue;
+                }
+                b":" => {
+                    if n > 0 && (ends(toks[n - 1].1) || matches!(toks[n - 1].1, b"begin" | b"fork"))
+                    {
+                        plain = n;
+                    } else if let Some(c) = case.filter(|c| c.item && c.at == brackets) {
+                        if c.ternary > 0 {
+                            c.ternary -= 1;
+                        } else {
+                            c.item = false;
+                            plain = n;
+                        }
+                    }
+                    continue;
+                }
+                b"case" | b"casex" | b"casez" | b"randcase" => {
+                    let header = w != b"randcase";
+                    blocks.push(Some(Case {
+                        at: brackets,
+                        header,
+                        item: !header,
+                        ternary: 0,
+                    }));
+                    continue;
+                }
+                b"begin" | b"fork" => {
+                    blocks.push(None);
+                    continue;
+                }
+                _ if ends(w) => {
+                    blocks.pop();
+                    if let Some(c) = blocks
+                        .last_mut()
+                        .and_then(Option::as_mut)
+                        .filter(|c| c.at == brackets)
+                    {
+                        c.item = true;
+                        c.ternary = 0;
+                    }
+                    continue;
+                }
+                b"else" => {
+                    if let Some(c) = case.filter(|c| c.at == brackets) {
+                        c.item = false;
+                    }
+                    continue;
+                }
+                _ if opens(w) => {
+                    depth += 1;
+                    continue;
+                }
+                _ if closes(w) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                b"assert" => 0,
+                b"assume" => 1,
+                b"cover" => 2,
+                _ => continue,
+            };
+            if !matches!(toks.get(n + 1), Some((_, b"property" | b"sequence"))) {
+                continue;
+            }
+            // `<label> :` before the keyword (not `default :`).
+            let labeled = n >= 2
+                && toks[n - 1].1 == b":"
+                && plain != n - 1
+                && word(toks[n - 2].1[0])
+                && toks[n - 2].1 != b"default";
+            if !labeled {
+                out.push((kind, off));
+            }
+        }
+        out
+    }
+
     /// End-of-sim assertion + functional coverage report.
     ///
     /// Always emits a one-line `[COV]` summary when at least one assertion
@@ -49699,6 +50241,7 @@ impl Simulator {
             ));
         }
         json.push_str("  ],\n");
+        self.write_assertion_instances(&mut json);
         json.push_str("  \"covergroups\": [\n");
         let mut cg_items: Vec<&CovergroupInstance> = self.cg_heap.iter().flatten().collect();
         // Keep input order; the cg_heap index IS the instance handle.
@@ -91179,9 +91722,11 @@ impl Simulator {
                         };
                     if let Some((clock_signal, edge, iff, body)) = clocked {
                         let span_key = a.span.start;
-                        let existing = self.sva_sites.iter().position(|s| {
-                            s.span_key == span_key && s.dedup_scope == self.current_scope
-                        });
+                        let here = self.running_instance_scope();
+                        let existing = self
+                            .sva_sites
+                            .iter()
+                            .position(|s| s.span_key == span_key && s.dedup_scope == here);
                         let idx = match existing {
                             Some(i) => i,
                             None => {
@@ -91212,10 +91757,17 @@ impl Simulator {
                     }
                     let probe_name = format!("prop@{}", a.span.start);
                     let this_handle = self.this_stack.last().and_then(|t| *t);
+                    let kind = match a.kind {
+                        AssertionKind::Assert => 0,
+                        AssertionKind::Assume => 1,
+                        AssertionKind::Cover => 2,
+                    };
+                    let inst = self.imm_assert_inst(a, kind);
                     self.pending_observed.push(ObservedProbe {
                         name: probe_name,
                         predicate: resolved_expr,
                         this_handle,
+                        inst,
                     });
                     return;
                 }
@@ -91240,21 +91792,7 @@ impl Simulator {
                     AssertionKind::Assume => 1,
                     AssertionKind::Cover => 2,
                 };
-                let src = self.current_src_file();
-                let entry = self
-                    .assertion_stats
-                    .entry(Self::assert_stat_key(a.span.start, src))
-                    .or_insert(AssertionStat {
-                        kind: kind_tag,
-                        loc: Some((src, a.span.start)),
-                        pass_count: 0,
-                        fail_count: 0,
-                    });
-                if true_branch {
-                    entry.pass_count += 1;
-                } else {
-                    entry.fail_count += 1;
-                }
+                self.imm_assert_tally(a, kind_tag, true_branch);
                 if !true_branch {
                     if !ctl.fail_action() {
                     } else if let Some(ea) = &a.else_action {
@@ -96987,6 +97525,32 @@ impl Simulator {
         }
     }
 
+    /// Is the evaluation `st` of `node`, still running, already known to be
+    /// nonvacuous (§16.14.8)? A sequence's always is; an implication's once a
+    /// consequent evaluation that is has started.
+    fn sva_known_nonvacuous(node: &SvaNode, st: &SvaState) -> bool {
+        match (node, st) {
+            (SvaNode::Not(n), SvaState::Not(s)) => Self::sva_known_nonvacuous(n, s),
+            (
+                SvaNode::Impl { cons: cn, .. },
+                SvaState::Impl {
+                    nonvacuous, cons, ..
+                },
+            ) => {
+                *nonvacuous
+                    || cons
+                        .iter()
+                        .any(|(_, cs)| Self::sva_known_nonvacuous(cn, cs))
+            }
+            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb })
+            | (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                ra.map_or_else(|| Self::sva_known_nonvacuous(na, a), |r| r.nonvacuous())
+                    || rb.map_or_else(|| Self::sva_known_nonvacuous(nb, b), |r| r.nonvacuous())
+            }
+            _ => true,
+        }
+    }
+
     /// End of simulation (§16.12.2): every attempt still waiting on a strong
     /// obligation fails now.
     fn sva_end_of_sim(&mut self) {
@@ -97064,7 +97628,7 @@ impl Simulator {
             SvaNode::Impl { .. } => SvaState::Impl {
                 ante: SvaRun::with_env(env.clone()),
                 ante_alive: true,
-                matched_any: false,
+                nonvacuous: false,
                 cons: Vec::new(),
             },
             SvaNode::Followed { .. } => SvaState::Followed {
@@ -97372,11 +97936,11 @@ impl Simulator {
                     None
                 }
             }
-            (SvaNode::Not(inner), SvaState::Not(ist)) => match self.sva_advance(inner, ist) {
-                Some(SvaOutcome::Fail) => Some(SvaOutcome::Pass),
-                Some(_) => Some(SvaOutcome::Fail),
-                None => None,
-            },
+            // §16.14.8: `not p` succeeds when `p` fails, which is never
+            // vacuous; it fails when `p` holds, vacuously or not.
+            (SvaNode::Not(inner), SvaState::Not(ist)) => self
+                .sva_advance(inner, ist)
+                .map(|r| SvaOutcome::of(!r.holds(), r.nonvacuous())),
             (
                 SvaNode::Impl {
                     ante,
@@ -97386,7 +97950,7 @@ impl Simulator {
                 SvaState::Impl {
                     ante: arun,
                     ante_alive,
-                    matched_any,
+                    nonvacuous,
                     cons,
                 },
             ) => {
@@ -97396,13 +97960,12 @@ impl Simulator {
                 if *ante_alive {
                     let (m, alive) = self.sva_run_advance(ante, arun, false);
                     *ante_alive = alive;
-                    if !m.is_empty() {
-                        *matched_any = true;
-                        for env in &m {
-                            fresh.push(Self::sva_new_state(cons_node, env));
-                        }
+                    for env in &m {
+                        fresh.push(Self::sva_new_state(cons_node, env));
                     }
                 }
+                // §16.14.8: the attempt is nonvacuous iff a consequent
+                // evaluation is; a failed one fails it.
                 let mut failed = false;
                 let mut keep: Vec<(u32, SvaState)> = Vec::new();
                 for (mut delay, mut cst) in cons.drain(..) {
@@ -97414,16 +97977,16 @@ impl Simulator {
                         continue;
                     }
                     match self.sva_advance(cons_node, &mut cst) {
-                        Some(SvaOutcome::Fail) => failed = true,
-                        Some(_) => {}
+                        Some(r) if !r.holds() => failed = true,
+                        Some(r) => *nonvacuous |= r.nonvacuous(),
                         None => keep.push((0, cst)),
                     }
                 }
                 for mut cst in fresh {
                     if *overlap {
                         match self.sva_advance(cons_node, &mut cst) {
-                            Some(SvaOutcome::Fail) => failed = true,
-                            Some(_) => {}
+                            Some(r) if !r.holds() => failed = true,
+                            Some(r) => *nonvacuous |= r.nonvacuous(),
                             None => keep.push((0, cst)),
                         }
                     } else {
@@ -97437,11 +98000,7 @@ impl Simulator {
                     return Some(SvaOutcome::Fail);
                 }
                 if !*ante_alive && cons.is_empty() {
-                    Some(if *matched_any {
-                        SvaOutcome::Pass
-                    } else {
-                        SvaOutcome::Vacuous
-                    })
+                    Some(SvaOutcome::of(true, *nonvacuous))
                 } else {
                     None
                 }
@@ -97506,6 +98065,8 @@ impl Simulator {
                     None
                 }
             }
+            // §16.14.8: `p and q` / `p or q` is nonvacuous iff `p` or `q`
+            // is.
             (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb }) => {
                 if ra.is_none() {
                     *ra = self.sva_advance(na, a);
@@ -97513,17 +98074,12 @@ impl Simulator {
                 if rb.is_none() {
                     *rb = self.sva_advance(nb, b);
                 }
-                if *ra == Some(SvaOutcome::Fail) || *rb == Some(SvaOutcome::Fail) {
-                    return Some(SvaOutcome::Fail);
-                }
                 match (*ra, *rb) {
-                    (Some(x), Some(y)) => {
-                        Some(if x == SvaOutcome::Vacuous && y == SvaOutcome::Vacuous {
-                            SvaOutcome::Vacuous
-                        } else {
-                            SvaOutcome::Pass
-                        })
-                    }
+                    (Some(x), Some(y)) => Some(SvaOutcome::of(
+                        x.holds() && y.holds(),
+                        x.nonvacuous() || y.nonvacuous(),
+                    )),
+                    (Some(x), None) | (None, Some(x)) if !x.holds() => Some(SvaOutcome::Fail),
                     _ => None,
                 }
             }
@@ -97534,14 +98090,22 @@ impl Simulator {
                 if rb.is_none() {
                     *rb = self.sva_advance(nb, b);
                 }
-                if *ra == Some(SvaOutcome::Pass) || *rb == Some(SvaOutcome::Pass) {
-                    return Some(SvaOutcome::Pass);
-                }
-                if *ra == Some(SvaOutcome::Vacuous) || *rb == Some(SvaOutcome::Vacuous) {
-                    return Some(SvaOutcome::Vacuous);
-                }
+                // Settled when an operand holds, as on the reference
+                // simulator: nonvacuous if that operand's success is, or if
+                // the other operand's evaluation is already known to be.
                 match (*ra, *rb) {
-                    (Some(_), Some(_)) => Some(SvaOutcome::Fail),
+                    (Some(x), Some(y)) => Some(SvaOutcome::of(
+                        x.holds() || y.holds(),
+                        x.nonvacuous() || y.nonvacuous(),
+                    )),
+                    (Some(x), None) if x.holds() => Some(SvaOutcome::of(
+                        true,
+                        x.nonvacuous() || Self::sva_known_nonvacuous(nb, b),
+                    )),
+                    (None, Some(y)) if y.holds() => Some(SvaOutcome::of(
+                        true,
+                        y.nonvacuous() || Self::sva_known_nonvacuous(na, a),
+                    )),
                     _ => None,
                 }
             }
@@ -97666,11 +98230,19 @@ impl Simulator {
         } else {
             2 // sentinel
         };
+        let inst = self.assert_inst(
+            kind,
+            (src, span_key),
+            &disable_scope,
+            a.label.as_ref().map(|l| l.name.as_str()),
+            true,
+        );
         self.sva_sites.push(SvaClockedSite {
             span_key,
-            stat_key: Self::assert_stat_key(span_key, src),
-            stat_loc: (src, span_key),
-            dedup_scope: self.current_scope.clone(),
+            stat_key: self.assert_insts[inst].key,
+            stat_loc: self.assert_insts[inst].loc,
+            inst,
+            dedup_scope: self.running_instance_scope().to_string(),
             kind,
             all_matches: a.is_sequence,
             clock_signal,
@@ -97747,11 +98319,14 @@ impl Simulator {
                 fail_count: 0,
             });
         stat.kind = kind;
+        let ai = &mut self.assert_insts[self.sva_sites[site_idx].inst];
         if outcome {
             stat.pass_count += 1;
+            ai.pass += 1;
             self.fire_sva_action(site_idx, true);
         } else if kind != 2 {
             stat.fail_count += 1;
+            ai.fail += 1;
             self.fire_sva_action(site_idx, false);
         }
     }
@@ -98126,7 +98701,19 @@ impl Simulator {
                 .as_ref()
                 .is_some_and(|g| self.eval_expr(g).is_true());
             self.sva_sites[i].disable = disable;
+            // §20.12 Off/Kill: no new attempt; those in flight go on.
+            let starts = !self.assert_ctl_on || self.sva_site_ctl(i).enabled();
+            // The attempts this tick starts: one, or for a procedural
+            // assertion one per matured instance (§16.14.6).
+            let fresh = match (starts, self.sva_sites[i].procedural) {
+                (false, _) => 0,
+                (true, true) => self.sva_sites[i].matured.len() as u64,
+                (true, false) => 1,
+            };
+            let inst = self.sva_sites[i].inst;
+            self.assert_insts[inst].attempts += fresh;
             if disabled {
+                self.assert_insts[inst].disabled += fresh + self.sva_sites[i].attempts.len() as u64;
                 self.sva_sites[i].attempts.clear();
                 self.sva_sites[i].matured.clear();
                 self.sva_sites[i].sampled_ids = sampled_ids;
@@ -98136,8 +98723,6 @@ impl Simulator {
             }
             let saved = self.install_preponed(&sampled_ids);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
-            // §20.12 Off/Kill: no new attempt; those in flight go on.
-            let starts = !self.assert_ctl_on || self.sva_site_ctl(i).enabled();
             if self.sva_sites[i].procedural {
                 // §16.14.6: one attempt per matured instance, none otherwise.
                 for env in std::mem::take(&mut self.sva_sites[i].matured) {
@@ -98184,6 +98769,7 @@ impl Simulator {
                     SvaOutcome::Pass => self.sva_tally(i, span_key, true),
                     SvaOutcome::Fail => self.sva_tally(i, span_key, false),
                     SvaOutcome::Vacuous => {
+                        self.assert_insts[inst].vacuous += 1;
                         let stat =
                             self.assertion_stats
                                 .entry(span_key)
@@ -99106,6 +99692,37 @@ impl Simulator {
         }
     }
 
+    /// Count one evaluation of an immediate or deferred assertion in its
+    /// statement's `assertion_stats` entry and its instance's `assert_insts`
+    /// entry. A cover's false evaluation is no failure in the latter
+    /// (§16.14.3: a cover counts its matches).
+    fn imm_assert_tally(
+        &mut self,
+        a: &crate::ast::stmt::AssertionStatement,
+        kind: u8,
+        passed: bool,
+    ) {
+        let i = self.imm_assert_inst(a, kind);
+        let ai = &mut self.assert_insts[i];
+        let entry = self.assertion_stats.entry(ai.key).or_insert(AssertionStat {
+            kind,
+            loc: Some(ai.loc),
+            pass_count: 0,
+            fail_count: 0,
+        });
+        if passed {
+            entry.pass_count += 1;
+        } else {
+            entry.fail_count += 1;
+        }
+        ai.attempts += 1;
+        if passed {
+            ai.pass += 1;
+        } else if kind != 2 {
+            ai.fail += 1;
+        }
+    }
+
     /// §16.4: record a deferred assertion's outcome; its action block runs
     /// when the report matures. Arguments of a subroutine-call action are
     /// evaluated now, as §16.4 requires.
@@ -99120,21 +99737,7 @@ impl Simulator {
             crate::ast::stmt::AssertionKind::Assume => 1,
             crate::ast::stmt::AssertionKind::Cover => 2,
         };
-        let src = self.current_src_file();
-        let entry = self
-            .assertion_stats
-            .entry(Self::assert_stat_key(a.span.start, src))
-            .or_insert(AssertionStat {
-                kind: kind_tag,
-                loc: Some((src, a.span.start)),
-                pass_count: 0,
-                fail_count: 0,
-            });
-        if passed {
-            entry.pass_count += 1;
-        } else {
-            entry.fail_count += 1;
-        }
+        self.imm_assert_tally(a, kind_tag, passed);
         // An `always_comb` / `always @*` the settle runs as a comb entry is
         // not the process that happens to be current (whose resumption, a
         // §16.4.2 flush point, would drop the report): its reports belong to
@@ -99304,6 +99907,13 @@ impl Simulator {
                 stat.pass_count += 1;
             } else {
                 stat.fail_count += 1;
+            }
+            let ai = &mut self.assert_insts[probe.inst];
+            ai.attempts += 1;
+            if outcome {
+                ai.pass += 1;
+            } else if ai.kind != 2 {
+                ai.fail += 1;
             }
         }
     }
@@ -99591,6 +100201,17 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         None
+    }
+
+    /// The instance scope `%m` names the running statement after: a
+    /// sensitivity-driven block's, else the process's. `current_scope` alone
+    /// is the last process's while an edge block runs.
+    fn running_instance_scope(&self) -> &str {
+        if self.m_block_active || self.current_scope.is_empty() {
+            &self.m_block_scope
+        } else {
+            &self.current_scope
+        }
     }
 
     fn active_instance_scope(&self) -> String {

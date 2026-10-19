@@ -306,10 +306,10 @@ pub(crate) struct ExprSite {
     /// An item at the top level of a combinational `always` block (it runs
     /// each time the block does): the block's scope and source offset.
     proc: Option<(String, usize)>,
-    /// An item anywhere in a combinational `always` block: the block's scope
-    /// and source offset, as `proc`. A run of the block that skips the item
-    /// drops its deferred evaluations (`Simulator::cov_block_ran`).
-    comb: Option<(String, usize)>,
+    /// An item anywhere in a combinational `always` block: the block, in
+    /// `CodeCov::blocks`. A run of the block that skips the item drops its
+    /// deferred evaluations (`Simulator::cov_block_ran`).
+    comb: Option<u32>,
     /// A continuous assignment's, or a `proc` item's: the term values of
     /// its last evaluation (empty before the first), and the earliest and
     /// latest step each term can settle at (`None` until first needed,
@@ -1381,20 +1381,25 @@ pub(crate) struct CodeCov {
     assigned: Vec<(String, String)>,
     /// Item evaluations not counted yet, by item (see `Simulator::cov_expr`).
     pending: HashMap<u32, Pending>,
+    /// The combinational `always` blocks with items, by source offset and
+    /// scope (`ExprSite::comb`), and the runs of each a process's writes
+    /// made while evaluations were pending (`Simulator::cov_block_ran`).
+    blocks: HashMap<usize, HashMap<String, u32>>,
+    ran: Vec<u64>,
     /// Inside a read that only coverage makes (`Simulator::cov_quietly`):
     /// count nothing.
     quiet: u32,
 }
 
 /// An item's evaluations not counted yet: the process whose write ran its
-/// block and the settle that did, and each evaluation's node values and
-/// term and constant values. `fresh`: made by the block's current run
-/// (`Simulator::cov_block_ran` clears it when the run ends).
+/// block and the settle that did, the runs of the item's combinational
+/// block that had ended by then (`CodeCov::ran`), and each evaluation's
+/// node values and term and constant values.
 #[allow(clippy::type_complexity)]
 struct Pending {
     pid: usize,
     run: u64,
-    fresh: bool,
+    ended: u64,
     evals: Vec<(Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)>,
 }
 
@@ -2926,6 +2931,20 @@ impl Instr<'_> {
             .iter()
             .any(|n| matches!(n.op, Op::BitXor | Op::BitXnor | Op::Mux));
         self.cov.counters += (2 + 2 * bimodal as u32) * p.terms.len() as u32;
+        let comb = self.comb.map(|s| {
+            let next = self.cov.ran.len() as u32;
+            let b = *self
+                .cov
+                .blocks
+                .entry(s)
+                .or_default()
+                .entry(self.here.path.clone())
+                .or_insert(next);
+            if b == next {
+                self.cov.ran.push(0);
+            }
+            b
+        });
         self.cov.exprs.push(ExprSite {
             scope: self.scope,
             span: e.span,
@@ -2949,7 +2968,7 @@ impl Instr<'_> {
                 .top
                 .filter(|_| matches!(kind, "if" | "statement"))
                 .map(|s| (self.here.path.clone(), s)),
-            comb: self.comb.map(|s| (self.here.path.clone(), s)),
+            comb,
             last: Vec::new(),
             steps: None,
             excluded: false,
@@ -3631,6 +3650,8 @@ impl Simulator {
             inverters: Vec::new(),
             assigned: Vec::new(),
             pending: HashMap::default(),
+            blocks: HashMap::default(),
+            ran: Vec::new(),
             quiet: 0,
         };
         // Initial blocks and continuous assignments are instrumented where
@@ -4363,15 +4384,15 @@ impl Simulator {
             if let Some(c) = self.code_cov.as_mut() {
                 // A later run of the block replaces an earlier one; a loop in
                 // it evaluates the item more than once in one run.
+                let ended = c.exprs[id as usize].comb.map_or(0, |b| c.ran[b as usize]);
                 let p = c.pending.entry(id).or_insert(Pending {
                     pid,
                     run,
-                    fresh: false,
+                    ended,
                     evals: Vec::new(),
                 });
-                if p.run != run || !p.fresh {
-                    p.run = run;
-                    p.fresh = true;
+                if p.run != run || p.ended != ended {
+                    (p.run, p.ended) = (run, ended);
                     p.evals.clear();
                 }
                 p.evals.push((vals, terms));
@@ -4422,35 +4443,36 @@ impl Simulator {
             return;
         };
         let s = &c.exprs[id as usize];
+        // A later run of its block skipped the item (`cov_block_ran`).
+        if s.comb.is_some_and(|b| p.ended + 1 < c.ran[b as usize]) {
+            return;
+        }
         let (nodes, row0) = (s.nodes.clone(), (s.row0, s.bimodal));
         for (vals, terms) in p.evals {
             self.cov_count_item(id, &nodes, row0, &vals, terms);
         }
     }
 
-    /// A run of combinational block `entry` inside a process ended: only
-    /// the evaluations of the block's last run count once the process waits
-    /// (`cov_expr`), so an item of the block this run skipped drops the
-    /// deferred evaluations of an earlier run (the reference simulator runs
-    /// the block once then, and does not evaluate it).
+    /// A run of combinational block `entry` inside a process ended. Only the
+    /// evaluations of the block's last run count once the process waits
+    /// (`cov_expr`), so an item of the block that this run skipped drops
+    /// those of an earlier run (the reference simulator runs the block once
+    /// then, and does not evaluate it): `cov_flush_item` drops evaluations
+    /// made before the block's last run. Counting the runs is enough, and
+    /// only while evaluations are pending.
     #[inline]
     pub(super) fn cov_block_ran(&mut self, entry: &CombEntry) {
         let Some(c) = self.code_cov.as_deref_mut().filter(|c| !c.pending.is_empty()) else {
             return;
         };
-        let (scope, start) = (
-            entry.cold.scope_hint.as_deref().unwrap_or(""),
-            entry.cold.span.start,
-        );
-        let (pid, exprs) = (self.current_pid, &c.exprs);
-        c.pending.retain(|&id, p| {
-            let mine = p.pid == pid
-                && exprs[id as usize]
-                    .comb
-                    .as_ref()
-                    .is_some_and(|(s, o)| *o == start && s == scope);
-            !mine || std::mem::replace(&mut p.fresh, false)
-        });
+        let scope = entry.cold.scope_hint.as_deref().unwrap_or("");
+        if let Some(&b) = c
+            .blocks
+            .get(&entry.cold.span.start)
+            .and_then(|m| m.get(scope))
+        {
+            c.ran[b as usize] += 1;
+        }
     }
 
     /// Inside a read that only coverage makes.

@@ -373,7 +373,10 @@ xezim writes `xezim_cov.json` to the current directory, replacing any earlier on
   assertion that was evaluated, or when the run collects code coverage. A run
   with none of them leaves an old `xezim_cov.json` as it was.
 - `XEZIM_COV_DB=<path>` writes it to `<path>` instead. The directory must exist.
-  When the file can't be written, xezim prints
+- Other simulators' `-covworkdir <dir>`, `-covscope <name>` and `-covtest <name>`
+  write it to `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`,
+  `scope`, `test`), creating the directory. `XEZIM_COV_DB` wins over them.
+- When the file can't be written, xezim prints
   `[COV] warning: could not write <path>: <reason>` and the run's result is
   unchanged.
 
@@ -637,6 +640,7 @@ branch went and which bits of each signal toggled, and writes the counts to
 | `+cover` | All three |
 | `+cover=<letters>` | `s` statement, `b` branch, `t` toggle. Other simulators' other letters (`c` condition, `e` expression, `f` FSM, `x` extended toggle) are ignored with one warning, for example `Warning: +cover=sbcf: xezim has no condition (c), FSM (f) coverage; collecting statement, branch coverage` |
 | `-coverage` | All three, unless a `+cover=<letters>` names fewer |
+| `-coverage <types>` | `all` (or `A`): all three. Otherwise types joined by `:`, in either case: `B` block (statement and branch), `T` toggle, `U` functional (always collected). `E` expression and `F` FSM are ignored with one warning, for example `Warning: -coverage B:E: xezim has no expression (e) coverage; collecting statement, branch coverage`. A `+cover=<letters>` wins |
 
 `--code-coverage-scope=<path>[,<path>...]` (repeatable) limits every kind to the
 instances at or below the given paths (`tb.dut`, or `dut` for the instance of that
@@ -804,6 +808,19 @@ testbench signals' counts: `clk` rose and fell four times, `rst` only fell and
   variables, parameters, interface ports and modports (the interface instance
   counts its signals), variables declared in tasks, functions and procedural
   blocks, and class properties.
+- Also left out: a variable whose value is fixed before the run starts, so it
+  has no toggle to count (§6.8). That is one only its declaration initializer
+  sets, from literals and parameters, and one only a single blocking
+  assignment of such a constant sets, in an `initial` block with no delay,
+  event control, `wait` or task call. Any other write in the design keeps a
+  variable, even one that never runs: a procedural or continuous assignment,
+  a port connection, `force`, a clocking block drive, `++`, or an argument a
+  task, function or system task can write. A write xezim can't trace to its
+  variable, such as one through a virtual interface, keeps every variable of
+  that name. Writes through VPI don't count, so a variable a cocotb test
+  drives stays only if it has no initializer. Ports,
+  nets, structs, enums, variables of a named type and an initialized variable
+  declared in a generate block are always tracked.
 - Counts are exact: they do not stop at 1.
 
 #### Scopes
@@ -841,6 +858,13 @@ differences:
   constant, which another simulator may fold away.
 - Enum variables toggle as bit vectors, not by value, and unused variables stay
   in the toggle list.
+- A variable stays tracked, where the reference simulator leaves it out as
+  fixed, when its only other write is under a constant condition that never
+  holds (`if (0)`), from another module through a hierarchical name, or to a
+  part of it (`v[3:0] = 0`), or when it is a 2-state variable initialized to
+  0 or one initialized to all x, which xezim can't tell from one nothing
+  writes. So does one that only a class writes through a virtual interface.
+  A net whose only driver is a constant stays tracked too.
 - An input port is always its own entry in its instance. A simulator that
   optimizes for speed can merge a port connected straight to a parent's net
   into that net, and then lists it under the parent only; with full signal
@@ -1014,6 +1038,8 @@ it.
 | `--code-coverage[=<kinds>]`, `XEZIM_CODE_COVERAGE=<kinds>` | Collect code coverage: `stmt`, `branch`, `toggle` or `all` (the default). See [Code coverage](#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees and packages |
 | `--no-toggle-input-ports`, `XEZIM_TOGGLE_INPUT_PORTS=0` | Leave input and inout ports out of toggle coverage; by default each instance counts its own (`--toggle-input-ports`). See [Toggles](#toggles) |
-| `+cover`, `+cover=<letters>`, `-coverage` | Other simulators' spellings of `--code-coverage`: `s`, `b` and `t` select the kinds; other letters are ignored with a warning |
+| `+cover`, `+cover=<letters>`, `-coverage [<types>]` | Other simulators' spellings of `--code-coverage`: `s`, `b` and `t` (or `B` and `T`) select the kinds; other letters are ignored with a warning |
+| `-covworkdir <dir>`, `-covscope <name>`, `-covtest <name>` | Write the results file to `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`, `scope`, `test`) |
+| `-covoverwrite` | Accepted for compatibility with other simulators; no effect (the file is always replaced) |
 | `+fcover` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |

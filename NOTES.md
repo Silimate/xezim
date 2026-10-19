@@ -80,6 +80,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   toggle scores and design totals change accordingly;
   `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
   previous counting, where only the driving signal counts.
+* Toggle coverage leaves out a variable whose value is fixed before the run
+  starts, as the reference simulator does: one only its declaration
+  initializer sets (`reg [4:0] poly = 5'b10011;`), and one only a single
+  constant assignment sets in an `initial` block without timing controls.
+  Such a variable never changes, so its bins could never be covered and
+  held instance scores down (§6.8). Any other write keeps a variable, even
+  one that never runs; writes through VPI don't count. (Silimate/xezim#46)
 * Named blocking `case` branches retain their `%m` scope and `disable`
   targets across suspension (§9.3, §9.6.2).
 
@@ -209,6 +216,28 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * `--tee <file>` copies stdout/stderr and DPI/VPI output to a transcript while
   retaining console output. `-vcd` and `-vcd dumpon` enable source-driven VCD
   dumping like `--wave`. (#347, reported by akashlevy)
+
+**Usability**
+
+* `--compat` (or `XEZIM_COMPAT=1`) runs a flow written for commercial
+  simulators with one flag: no time cap, `--relax-implicit-static`,
+  `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
+  or `-do` run time still sets the run length.
+* `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
+  `$finish` or no events remain, as with `-do "run -all"`. The default is
+  unchanged: a design that never finishes still stops.
+* `--version` and `-version` print the version and git revision, as `-V`
+  does, and exit 0.
+* More of other simulators' options run as-is: `-define`, `-incdir` and
+  `-top` (same as `-D`, `-I`, `-s`), `-coverage <types>` (`all`, or `B`,
+  `T`, `U`, `E`, `F` joined by `:`), `-covworkdir`/`-covscope`/`-covtest`
+  (the results file goes in `<dir>/<scope>/<test>/`), and, with no effect,
+  `-covoverwrite`, `-licqueue`, `-R`, `-access`, `+access+`, `-nowarn`,
+  `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
+  to be read as source files or top names, and `-licqueue` as `-l icqueue`,
+  which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
+  (same as `+seed=`) now work on the command line too, where they were read
+  as `-s vseed` and `-s eed`.
 
 **Maintenance**
 

@@ -413,6 +413,8 @@ mod class_collection_storage;
 mod class_queue_locators;
 #[path = "misc/cli_compat_args.rs"]
 mod cli_compat_args;
+#[path = "misc/compat_defaults.rs"]
+mod compat_defaults;
 #[path = "misc/cross_checked_constructs.rs"]
 mod cross_checked_constructs;
 #[path = "misc/dead_giant_declaration_elision.rs"]

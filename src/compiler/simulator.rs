@@ -2529,7 +2529,9 @@ pub(crate) use code_cov::{
 pub use code_cov::{
     CodeCoverage, KIND_ALL, KIND_BRANCH, KIND_CONDITION, KIND_EXPRESSION, KIND_FSM,
     KIND_STATEMENT, KIND_TOGGLE, parse_constant_mode as parse_code_coverage_constant_mode,
-    parse_kinds as parse_code_coverage_kinds, set_code_coverage,
+    parse_expression_mode as parse_code_coverage_expression_mode,
+    parse_granularity as parse_code_coverage_granularity, parse_kinds as parse_code_coverage_kinds,
+    set_code_coverage,
 };
 use event_stamps::{EventId, EventStampStore, NamedEventPlan, NamedEventTarget};
 pub(crate) use names::{IdNames, NameMap};

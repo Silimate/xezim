@@ -1442,6 +1442,7 @@ impl Simulator {
             ran: Vec::new(),
             scratch: Vec::new(),
         };
+        let reset_transitions = super::code_cov::code_coverage().is_none_or(|c| c.fsm_reset);
         // Who assigns what: variable -> blocks assigning it whole, and the
         // variables some block assigns in part.
         let mut writers: HashMap<&str, Vec<usize>> = HashMap::default();
@@ -1504,6 +1505,23 @@ impl Simulator {
                 let reset_at = first
                     .filter(|f| matches!(f.kind, StatementKind::If { .. }))
                     .map_or(0, |f| f as *const Statement as usize);
+                // For `--no-fsm-reset-transitions`, that `if` is a reset only
+                // when it has an `else` and its own branch does not test the
+                // variable: a clock enable (`if (en) case (st) ...`) guards
+                // the state logic itself and has neither.
+                let reset_branch = first.is_some_and(|f| match &f.kind {
+                    StatementKind::If {
+                        then_stmt,
+                        else_stmt: Some(_),
+                        ..
+                    } => {
+                        let mut t = HashSet::default();
+                        stmt_tests(then_stmt, &mut t);
+                        let leaf = var.rsplit('.').next().unwrap_or(var);
+                        !t.contains(var) && !t.contains(leaf)
+                    }
+                    _ => false,
+                });
                 let mut w = Walk {
                     sim: self,
                     var,
@@ -1657,6 +1675,9 @@ impl Simulator {
                 // the last in the source.
                 let mut best: BTreeMap<(u32, u32), ((bool, bool, usize), Span, Span)> =
                     BTreeMap::new();
+                // The transitions some assignment outside a reset branch
+                // makes (see `reset_branch`).
+                let mut logic: HashSet<(u32, u32)> = HashSet::default();
                 for r in &recs {
                     let Some(&to) = index.get(&r.value) else {
                         continue;
@@ -1666,11 +1687,19 @@ impl Simulator {
                         if v == r.value || !r.ctx.holds(v) {
                             continue;
                         }
+                        if !r.reset || !reset_branch {
+                            logic.insert((from, to));
+                        }
                         let e = best.entry((from, to)).or_insert((rank, r.span, r.from));
                         if rank >= e.0 {
                             *e = (rank, r.span, r.from);
                         }
                     }
+                }
+                // `--no-fsm-reset-transitions`: a transition only the reset
+                // branch makes is no transition.
+                if !reset_transitions {
+                    best.retain(|k, _| logic.contains(k));
                 }
                 if best.is_empty() {
                     continue;

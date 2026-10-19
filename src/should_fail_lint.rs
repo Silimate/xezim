@@ -122,6 +122,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
         errs.extend(crate::type_lint::check(defs, elab));
+        // §23.8: a hierarchical name that does not resolve is an error.
+        errs.extend(crate::hier_ref_lint::check(defs, elab));
     }
     errs
 }

@@ -10,6 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A hierarchical name that does not resolve is an elaboration error (§23.8),
+  wherever it is written: a read or a write, a continuous assignment, an
+  event control, an assertion, a system task argument, or a task or function
+  that is never called. The message gives the file and line, the name, the
+  scope that does not declare it and the scope the search started from. Such
+  a name was accepted silently: a testbench that wrote to a guessed internal
+  name (`dut.mem_data[3] = ...`) ran as if the write had happened, and a read
+  returned x. A name inside a generate block a constant rules out is not
+  elaborated, so it is not checked. `--no-strict` turns the check off.
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the

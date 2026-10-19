@@ -9262,6 +9262,9 @@ pub struct Simulator {
     /// initializer, else its type's default). §16.9.3 reads it for a clock
     /// tick before the first one. Filled by `capture_sampled_defaults`.
     sampled_defaults: HashMap<usize, Value>,
+    /// The pre-process time-0 settle has run: a value read now is no longer
+    /// a default sampled value.
+    time0_settled: bool,
     /// §9.2.2.2 timing: `-> ev` fired from a comb block during the PRE-process
     /// time-0 settle (compile) happens before any `always @(ev)` process has
     /// registered its waiter — the trigger would be lost. Queue them and

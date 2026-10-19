@@ -791,7 +791,7 @@ impl Simulator {
                 Some(_) if w.slot_time == Some(self.time) && w.slot_val.is_some() => {
                     w.slot_val.clone().unwrap()
                 }
-                Some(sid) => self.preponed_value_of(sid),
+                Some(sid) => self.slot_preponed(sid),
                 None => {
                     let op = operand.clone();
                     self.eval_expr(&op)
@@ -843,7 +843,13 @@ impl Simulator {
             return;
         }
         for (name, &id) in self.signal_name_to_id.iter() {
-            if !names.contains(name.rsplit(['.', ':']).next().unwrap_or_default()) {
+            // An array cell is named `mem[3]`; an assertion spells `mem`. The
+            // cells of a memory too large for per-element names (the packed
+            // arena) are not in this map and keep their current value: only
+            // an `always_comb` or continuous assignment writing one at time
+            // 0 tells the two apart, and copying such a memory is not free.
+            let leaf = name.rsplit(['.', ':']).next().unwrap_or_default();
+            if !names.contains(leaf.split('[').next().unwrap_or_default()) {
                 continue;
             }
             if let Some(v) = self.signal_table.get(id) {
@@ -1004,6 +1010,7 @@ impl Simulator {
     /// so its targets now hold their default sampled values (§16.5.1).
     /// Update the ones a concurrent assertion or a procedural watch keeps.
     pub(super) fn record_sampled_defaults(&mut self, targets: &[Expression]) {
+        let mut ids = Vec::new();
         for t in targets {
             let Some(id) = self.get_lhs_signal_id(t) else {
                 continue;
@@ -1011,15 +1018,76 @@ impl Simulator {
             let Some(v) = self.signal_table.get(id).cloned() else {
                 continue;
             };
-            for w in &mut self.sampled_watches {
-                if w.sig_id == Some(id) && w.default.is_some() {
-                    w.default = Some(v.clone());
-                }
-            }
-            if let Some(d) = self.sampled_defaults.get_mut(&id) {
-                *d = v;
+            self.set_sampled_default(id, v);
+            ids.push(id);
+        }
+        self.refresh_expr_defaults(&ids);
+    }
+
+    /// Make `v` the default sampled value of signal `id` (§16.5.1): for the
+    /// watches that read it before their first tick, and as its time-0
+    /// sample for the concurrent assertions.
+    pub(super) fn set_sampled_default(&mut self, id: usize, v: Value) {
+        for w in &mut self.sampled_watches {
+            if w.sig_id == Some(id) && w.default.is_some() {
+                w.default = Some(v.clone());
             }
         }
+        if self.time == 0
+            && self.sva_preponed_slot == Some(0)
+            && let Some(p) = self.sva_preponed.get_mut(&id)
+        {
+            *p = v.clone();
+        }
+        if let Some(d) = self.sampled_defaults.get_mut(&id) {
+            *d = v;
+        }
+    }
+
+    /// Re-evaluate the default of each expression watch (`$past(a | b)`)
+    /// that reads one of `ids`, whose default sampled values changed, from
+    /// the default sampled values of its operands.
+    pub(super) fn refresh_expr_defaults(&mut self, ids: &[usize]) {
+        if ids.is_empty() {
+            return;
+        }
+        for i in 0..self.sampled_watches.len() {
+            let w = &self.sampled_watches[i];
+            // Every operand needs its default: a live one would mix values
+            // from after the time-0 settle into a default.
+            if w.sig_id.is_some()
+                || w.default.is_none()
+                || !w.sample_ids.iter().any(|id| ids.contains(id))
+                || !w
+                    .sample_ids
+                    .iter()
+                    .all(|id| self.sampled_defaults.contains_key(id))
+            {
+                continue;
+            }
+            let e = self.sampled_watches[i].expr.clone();
+            let ops = self.sampled_watches[i].sample_ids.clone();
+            let v = self.eval_with_defaults(&e, &ops);
+            self.sampled_watches[i].default = Some(v);
+        }
+    }
+
+    /// `e` evaluated with each signal of `ids` that has a default sampled
+    /// value holding it.
+    pub(super) fn eval_with_defaults(&mut self, e: &Expression, ids: &[usize]) -> Value {
+        let mut saved: Vec<(usize, Value)> = ids
+            .iter()
+            .filter(|&&id| id < self.signal_table.len())
+            .filter_map(|&id| Some((id, self.sampled_defaults.get(&id)?.clone())))
+            .collect();
+        for (id, v) in &mut saved {
+            std::mem::swap(&mut self.signal_table[*id], v);
+        }
+        let v = self.eval_expr(e);
+        for (id, v) in saved.into_iter().rev() {
+            self.signal_table[id] = v;
+        }
+        v
     }
 
     /// Pre-register sampled-value watches for every `$rose/$fell/$stable/
@@ -1300,6 +1368,29 @@ impl Simulator {
         }
     }
 
+    /// §16.5.1: the sampled value of signal `id` in this slot's Preponed
+    /// region. In time slot 0 that is its default sampled value: the
+    /// preponed snapshot is taken after the time-0 settle has run the
+    /// continuous assignments, so it would read what they drive.
+    #[inline]
+    pub(super) fn slot_preponed(&self, id: usize) -> Value {
+        if self.time == 0
+            && let Some(v) = self.sampled_defaults.get(&id)
+        {
+            return v.clone();
+        }
+        self.preponed_value_of(id)
+    }
+
+    /// §16.5.1: in time slot 0, the default sampled value of signal `id`
+    /// (`sampled_defaults`), when it has one.
+    pub(super) fn slot0_default(&self, id: usize) -> Option<Value> {
+        if self.time != 0 {
+            return None;
+        }
+        self.sampled_defaults.get(&id).cloned()
+    }
+
     pub(super) fn preponed_value_of(&self, id: usize) -> Value {
         if let Some(w) = self.prev_wide.get(&id) {
             return w.clone();
@@ -1393,7 +1484,23 @@ impl Simulator {
                     .get(&sid)
                     .or(self.signal_table.get(sid))
                     .cloned(),
-                None => Some(self.eval_expr(operand)),
+                // An expression's default is computed from its operands'
+                // defaults, kept for every operand so a later change to one
+                // (`refresh_expr_defaults`) can recompute it.
+                None => {
+                    let mut ids = Vec::new();
+                    self.collect_sva_signal_ids(operand, &mut ids);
+                    if !self.time0_settled {
+                        for &id in &ids {
+                            if !self.sampled_defaults.contains_key(&id)
+                                && let Some(v) = self.signal_table.get(id)
+                            {
+                                self.sampled_defaults.insert(id, v.clone());
+                            }
+                        }
+                    }
+                    Some(self.eval_with_defaults(operand, &ids))
+                }
             }
         };
         let i = self.sampled_watches.len();
@@ -1433,11 +1540,11 @@ impl Simulator {
                 let ids = self.sampled_watches[i].sample_ids.clone();
                 let vals = ids
                     .into_iter()
-                    .map(|sid| (sid, self.preponed_value_of(sid)))
+                    .map(|sid| (sid, self.slot_preponed(sid)))
                     .collect();
                 let slot_val = self.sampled_watches[i]
                     .sig_id
-                    .map(|sid| self.preponed_value_of(sid));
+                    .map(|sid| self.slot_preponed(sid));
                 let w = &mut self.sampled_watches[i];
                 w.slot_values = vals;
                 w.slot_val = slot_val;

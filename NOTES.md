@@ -10,6 +10,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An assertion attempt at time 0 reads default sampled values (§16.5.1): a
+  variable's declaration initializer, else its type's default. It read the
+  values the time-0 continuous assignments and `always_comb` blocks had
+  already driven, so under a clock that rises at time 0 (an HDL clock, or
+  cocotb's Python `Clock`) such an attempt passed. `$past` at the next tick
+  reads the same samples (§16.9.3).
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).

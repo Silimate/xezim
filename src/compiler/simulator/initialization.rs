@@ -4625,6 +4625,7 @@ impl Simulator {
             assoc_static_keys_cache: RefCell::new(HashMap::default()),
             sampled_watches: Vec::new(),
             sampled_defaults: HashMap::default(),
+            time0_settled: false,
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),

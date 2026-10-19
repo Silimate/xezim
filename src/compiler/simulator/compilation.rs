@@ -1314,6 +1314,7 @@ impl Simulator {
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();
         self.in_pre_process_settle = false;
+        self.time0_settled = true;
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
         if dt.as_millis() > 100 {

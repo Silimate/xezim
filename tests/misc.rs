@@ -157,6 +157,8 @@ mod ivtest_tail2_cluster;
 mod ivtest_tail_cluster;
 #[path = "misc/library_flags.rs"]
 mod library_flags;
+#[path = "misc/local_shadow_select.rs"]
+mod local_shadow_select;
 #[path = "misc/log_redirect.rs"]
 mod log_redirect;
 #[path = "misc/lrm_audit2_runner.rs"]
@@ -354,8 +356,6 @@ mod spec_canonical_keying;
 mod static_collection_per_spec;
 #[path = "misc/static_init_sysfuncs.rs"]
 mod static_init_sysfuncs;
-#[path = "misc/static_local_partial_write.rs"]
-mod static_local_partial_write;
 #[path = "misc/static_local_per_spec.rs"]
 mod static_local_per_spec;
 #[path = "misc/static_method_via_handle.rs"]
@@ -507,3 +507,6 @@ mod let_declaration_scopes;
 mod constraint_inside_wrap;
 #[path = "misc/loop_var_scope_lint.rs"]
 mod loop_var_scope_lint;
+
+#[path = "misc/cli_transcript_347.rs"]
+mod cli_transcript_347;

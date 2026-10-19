@@ -458,12 +458,7 @@ Each library's `vlog_startup_routines` entries run before simulation.
   `vpi_handle_by_index`, `vpi_get`, `vpi_get_str`,
   `vpi_get_value`/`vpi_put_value`.
 - `vpi_control`: `vpiStop`/`vpiFinish` end the run once the calling routine
-  returns, as `$finish` does: no always block or waiting process that the
-  routine's writes woke runs afterwards, so `final` blocks see the values from
-  before them. When the routine is a cbAfterDelay, cbNextSimTime or
-  cbAtStartOfSimTime callback, or a value change it caused (the way cocotb
-  ends a test), that time slot's NBAs, assertions and monitors do not run
-  either; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
+  returns; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
   refused (xezim cannot rewind a run).
 - `vpi_chk_error`, `vpi_printf`, `vpi_flush`, `vpi_compare_objects`,
   `vpi_get64`.
@@ -522,7 +517,7 @@ before a callback runs appears before the routine's `vpi_printf` output.
 | `cbDisable` | after a `disable` terminates the named block, fork or task around a `$systf` call | obj = that call's `vpiSysTfCall` handle |
 | `cbStmt` | before each interpreted statement a process of the given module instance runs | obj = a module handle |
 | `cbEndOfCompile`, `cbStartOfSimulation` | before time 0, in that order | |
-| `cbEndOfSimulation` | after the last time step, before `final` blocks | |
+| `cbEndOfSimulation` | after the last time step and all `final` blocks | |
 | `cbError` | after each run-time error: `$error`, `$fatal`, a reported timing violation, an illegal bin | `vpi_chk_error` reports it inside the routine |
 | `cbPLIError` | after each VPI routine error | `vpi_chk_error` reports it inside the routine, and still to the caller after |
 | `cbTchkViolation` | on each timing-check violation | obj NULL; `value` = the violation text (`vpiStringVal`) |

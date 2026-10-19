@@ -115,8 +115,6 @@ mod expect_statement_blocks;
 mod explicit_level_suspend;
 #[path = "scheduling/explicit_sensitivity_and_delay_task.rs"]
 mod explicit_sensitivity_and_delay_task;
-#[path = "scheduling/for_decl_signed_across_wait.rs"]
-mod for_decl_signed_across_wait;
 #[path = "scheduling/forever_break_and_disable_fork_label.rs"]
 mod forever_break_and_disable_fork_label;
 #[path = "scheduling/fork_automatic_capture.rs"]
@@ -271,8 +269,6 @@ mod delay_always_compound_body;
 mod delayed_write_pending_semantics;
 #[path = "scheduling/edge_skip_shared_output.rs"]
 mod edge_skip_shared_output;
-#[path = "scheduling/finish_stops_woken_blocks.rs"]
-mod finish_stops_woken_blocks;
 #[path = "scheduling/finish_with_live_fork_child.rs"]
 mod finish_with_live_fork_child;
 #[path = "scheduling/hierarchical_event_wait.rs"]
@@ -315,3 +311,24 @@ mod sva_local_diagnostics;
 mod sva_semantics_reference;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]
 mod waiter_cont_anyedge_wake;
+
+#[path = "scheduling/clocking_delivery_356.rs"]
+mod clocking_delivery_356;
+
+#[path = "scheduling/sampled_history_363.rs"]
+mod next_twelve_sampled_history_363;
+
+#[path = "scheduling/sequence_counts_367.rs"]
+mod next_twelve_sequence_counts_367;
+
+#[path = "scheduling/finish_barrier_371.rs"]
+mod next_twelve_finish_barrier_371;
+
+#[path = "scheduling/generated_assertions_374.rs"]
+mod next_rest_generated_assertions_374;
+
+#[path = "scheduling/followed_by_375.rs"]
+mod next_rest_followed_by_375;
+
+#[path = "scheduling/loop_scope_379.rs"]
+mod next_rest_loop_scope_379;

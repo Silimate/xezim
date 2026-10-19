@@ -707,7 +707,8 @@ module top;
     $dumpvars(0, top);
     src = 8'h10;
     #20 src = 8'h20;
-    #20 $finish;
+    // Finish after the eighth clock edge has settled.
+    #21 $finish;
   end
 endmodule
 "#;

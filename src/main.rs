@@ -349,6 +349,8 @@ fn print_usage() {
     eprintln!("  --xtrace-profile <name>  @profile header value (default: minimal).");
     eprintln!("  --xtrace-compress <none|zstd>  Compress the XTrace stream (declared in");
     eprintln!("                   the @compression header; forces a '.zst' file name).");
+    eprintln!("  --tee <file>     Copy stdout/stderr to <file> and retain console output");
+    eprintln!("  -vcd [dumpon]    Enable source-driven VCD dumping (same as --wave)");
     eprintln!("  --wave           Compile the model WITH waveform support, enabling the");
     eprintln!("                   `$dumpfile`/`$dumpvars` VCD tasks. Off by default: an");
     eprintln!("                   active dump forces loops onto the slower AST path and");
@@ -1153,6 +1155,182 @@ fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
     ))
 }
 
+/// Mirror both descriptors through a helper process. The helper survives
+/// simulator exit/abort and drains C stdio written during exit handlers.
+#[cfg(unix)]
+static LOG_TEE_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn finish_log_tee() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe {
+        libc::fflush(std::ptr::null_mut());
+        libc::close(libc::STDOUT_FILENO);
+        libc::close(libc::STDERR_FILENO);
+        let pid = LOG_TEE_PID.load(std::sync::atomic::Ordering::Relaxed);
+        // An inherited descriptor in a background child must not hang exit.
+        for _ in 0..100 {
+            if libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) != 0 {
+                break;
+            }
+            let delay = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 10_000_000,
+            };
+            libc::nanosleep(&delay, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn tee_stdio_to_log(path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    fn pair() -> std::io::Result<[OwnedFd; 2]> {
+        let mut fds = [-1; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = unsafe { [OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])] };
+        for fd in &result {
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(result)
+    }
+    unsafe fn copy_bytes(fd: libc::c_int, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if n > 0 {
+                bytes = &bytes[n as usize..];
+            } else if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+    }
+    let log = std::fs::File::create(path)?;
+    let stdout_pipe = pair()?;
+    let stderr_pipe = pair()?;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe {
+        libc::fflush(std::ptr::null_mut());
+    }
+    let parent = unsafe { libc::getpid() };
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // Only descriptor syscalls after fork: do not touch inherited Rust
+        // locks or run destructors in the helper.
+        unsafe {
+            libc::close(stdout_pipe[1].as_raw_fd());
+            libc::close(stderr_pipe[1].as_raw_fd());
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            // Terminal/group termination belongs to the simulator. Keep the
+            // helper alive long enough to drain the simulator's final output.
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            let mut polls = [
+                libc::pollfd {
+                    fd: stdout_pipe[0].as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stderr_pipe[0].as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let mut buf = [0u8; 8192];
+            let mut open = 2;
+            while open != 0 {
+                let ready = libc::poll(polls.as_mut_ptr(), 2, 250);
+                if ready < 0 {
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if ready == 0 && libc::getppid() != parent {
+                    break;
+                }
+                for (i, p) in polls.iter_mut().enumerate() {
+                    if p.fd < 0 || p.revents == 0 {
+                        continue;
+                    }
+                    let n = libc::read(p.fd, buf.as_mut_ptr().cast(), buf.len());
+                    if n > 0 {
+                        copy_bytes(log.as_raw_fd(), &buf[..n as usize]);
+                        copy_bytes(
+                            if i == 0 {
+                                libc::STDOUT_FILENO
+                            } else {
+                                libc::STDERR_FILENO
+                            },
+                            &buf[..n as usize],
+                        );
+                    } else if n == 0 {
+                        libc::close(p.fd);
+                        p.fd = -1;
+                        open -= 1;
+                    } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        libc::close(p.fd);
+                        p.fd = -1;
+                        open -= 1;
+                    }
+                }
+            }
+            libc::_exit(0);
+        }
+    }
+    if unsafe { libc::dup2(stdout_pipe[1].as_raw_fd(), libc::STDOUT_FILENO) } < 0
+        || unsafe { libc::dup2(stderr_pipe[1].as_raw_fd(), libc::STDERR_FILENO) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // C output must already be in the pipe when a fatal signal bypasses exit.
+    unsafe {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            unsafe extern "C" {
+                static mut stdout: *mut libc::FILE;
+                static mut stderr: *mut libc::FILE;
+            }
+            libc::setvbuf(stdout, std::ptr::null_mut(), libc::_IONBF, 0);
+            libc::setvbuf(stderr, std::ptr::null_mut(), libc::_IONBF, 0);
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            unsafe extern "C" {
+                static mut __stdoutp: *mut libc::FILE;
+                static mut __stderrp: *mut libc::FILE;
+            }
+            libc::setvbuf(__stdoutp, std::ptr::null_mut(), libc::_IONBF, 0);
+            libc::setvbuf(__stderrp, std::ptr::null_mut(), libc::_IONBF, 0);
+        }
+        LOG_TEE_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+        libc::atexit(finish_log_tee);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tee_stdio_to_log(_path: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "--tee is only supported on unix",
+    ))
+}
+
 /// Post-elaboration design summary (vendor-elaborator style). xezim inlines
 /// the hierarchy into one flat module, so the left column counts FLATTENED
 /// runtime objects and the right column counts unique parsed definitions —
@@ -1843,6 +2021,7 @@ fn run_main() -> i32 {
     let mut primitive_verbose = false;
     let mut nospecify = false;
     let mut log_file: Option<String> = None;
+    let mut log_tee = false;
     let mut settle_limit: Option<u32> = None;
     let mut activity_mon = false;
     let mut dump_timescales = false;
@@ -1961,6 +2140,20 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("-o") && arg.len() > 2 => {
                 _output_file = Some(arg[2..].to_string());
+            }
+            "--tee" => {
+                i += 1;
+                if let Some(path) = args.get(i) {
+                    log_file = Some(path.clone());
+                    log_tee = true;
+                } else {
+                    eprintln!("Error: --tee requires <file>");
+                    std::process::exit(1);
+                }
+            }
+            _ if arg.starts_with("--tee=") => {
+                log_file = Some(arg["--tee=".len()..].to_string());
+                log_tee = true;
             }
             "-l" | "--log" | "-logfile" => {
                 i += 1;
@@ -2432,6 +2625,12 @@ fn run_main() -> i32 {
             }
             "--wave" => {
                 wave = true;
+            }
+            "-vcd" => {
+                wave = true;
+                if args.get(i + 1).is_some_and(|a| a == "dumpon") {
+                    i += 1;
+                }
             }
             "--code-coverage" => {
                 code_cov_kinds = Some(
@@ -3028,7 +3227,12 @@ suppressed but the explicit SDF annotation still applies."
     }
 
     if let Some(ref path) = log_file {
-        if let Err(e) = redirect_stdio_to_log(path) {
+        let result = if log_tee {
+            tee_stdio_to_log(path)
+        } else {
+            redirect_stdio_to_log(path)
+        };
+        if let Err(e) = result {
             eprintln!("Error: cannot open log file '{}': {}", path, e);
             std::process::exit(1);
         }

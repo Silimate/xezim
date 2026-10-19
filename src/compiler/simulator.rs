@@ -8175,6 +8175,10 @@ pub struct Simulator {
     vcd_id_to_trace: Vec<Vec<u32>>,
     vcd_event_indices: Vec<usize>,
     dump_dirty_active: bool,
+    /// A dump writer or toggle coverage is open under a forced full scan
+    /// (`XEZIM_VCD_FULL=1` / `XEZIM_DUMP_FULL=1`), so `dump_dirty_active` is
+    /// off with something still to flush.
+    dump_full: bool,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.
@@ -13597,6 +13601,7 @@ impl Simulator {
             vcd_id_to_trace: Vec::new(),
             vcd_event_indices: Vec::new(),
             dump_dirty_active: false,
+            dump_full: false,
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
@@ -20916,13 +20921,16 @@ impl Simulator {
         // model was built before the VPI startup routines ran, so both come
         // here, before the time-0 slot. (cbStartOfReset/cbEndOfReset never
         // fire: xezim has no `$reset`.)
+        let mut start = false;
         if self.vpi_cb_mask != 0 {
             self.vpi_start_of_simulation();
+            // A value a routine wrote there left work for the time-0 slot.
+            start = self.dirty_any;
         }
         if !self.wake_rank_built {
             self.build_sig_wake_rank();
         }
-        self.event_loop();
+        self.event_loop(start);
         if self.ended_waiting_in_c {
             // Stopped, not finished: no `$finish` was called.
             self.finished = false;
@@ -48047,8 +48055,10 @@ impl Simulator {
         self.loop_iters += 1;
     }
 
-    fn event_loop(&mut self) {
-        self.event_loop_singlethread();
+    /// `start`: a `cbStartOfSimulation` routine wrote a value, so the time-0
+    /// slot runs even with nothing else due in it.
+    fn event_loop(&mut self, start: bool) {
+        self.event_loop_singlethread(start);
     }
 
     /// Ask the event loop to stop at the next slot boundary and finalize.
@@ -48090,7 +48100,7 @@ impl Simulator {
         self.finished = true;
     }
 
-    fn event_loop_singlethread(&mut self) {
+    fn event_loop_singlethread(&mut self, mut start: bool) {
         Self::install_interrupt_handler();
         let sim_start = std::time::Instant::now();
         // Realtime twin for the human-facing report (see crate::WallTimer).
@@ -48254,6 +48264,13 @@ impl Simulator {
                 self.clock_generators.len()
             );
         }
+        // §38.36.3: a value a VPI client writes before time 0 (from
+        // cbStartOfSimulation; cocotb drives its first values and starts its
+        // clocks there) is processed in the time-0 slot, like one written at
+        // time 0. With nothing else due at time 0 the loop used to skip that
+        // slot, so the combinational logic read the old value until the next
+        // one and toggle coverage never saw the written value as a baseline.
+        // `start` holds the loop at time 0 until that slot has run.
         while !self.finished && iters < max_iters {
             iters += 1;
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
@@ -48482,6 +48499,7 @@ impl Simulator {
                 // without this the run ends at time 0 and every `Timer`
                 // reports as never set up.
                 && !self.vpi_timed_future()
+                && !start
             {
                 // The slot still ends: its cbAtEndOfSimTime/cbReadOnlySynch
                 // run, and may schedule more.
@@ -48500,6 +48518,7 @@ impl Simulator {
                 && self.delayed_nba.is_empty()
                 && self.delayed_nba_queue.is_empty()
                 && !self.vpi_timed_future()
+                && !start
             {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
                     continue;
@@ -48544,6 +48563,7 @@ impl Simulator {
                     u64::MAX
                 }
             });
+            let next_time = if start { self.time } else { next_time };
 
             if next_time > self.max_time {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
@@ -48574,6 +48594,7 @@ impl Simulator {
                 continue;
             }
             if next_time > self.time {
+                self.dump_slot_end();
                 self.time = next_time;
                 publish_sim_time(next_time);
                 // Lines printed near the end of a burst stay buffered until the
@@ -48637,6 +48658,7 @@ impl Simulator {
             // catches NBA feedback loops.)
             let cond_prog_before = self.cond_progress;
             self.run_one_tick(&mut accum, cascade_limit, iters, trace_loop);
+            start = false;
             if self.cond_progress != cond_prog_before {
                 self.stall_iters = 0;
             }
@@ -48654,6 +48676,12 @@ impl Simulator {
                     break;
                 }
             }
+        }
+        // The last slot ends too, unless `$finish` ended it: §20.2 stops the
+        // run inside that slot, and the reference simulator counts no toggle
+        // there (`no_slot_end_flush_after_finish`).
+        if !self.finished {
+            self.dump_slot_end();
         }
         if verify_inline_bits && !self.signal_inline_bits.is_empty() {
             let mismatches = self.verify_inline_bits_invariant(iters);
@@ -50877,6 +50905,8 @@ impl Simulator {
                 if slot_pending {
                     slot_pending = false;
                     self.run_postponed_region();
+                } else {
+                    self.dump_slot_end();
                 }
                 self.time = nt;
                 publish_sim_time(nt);
@@ -106011,6 +106041,7 @@ impl Simulator {
         let force_full = std::env::var("XEZIM_VCD_FULL").ok().as_deref() == Some("1");
         if force_full {
             self.dump_dirty_active = false;
+            self.dump_full = true;
         } else {
             let nsig = self.signal_table.len();
             let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
@@ -106041,6 +106072,7 @@ impl Simulator {
     fn enable_dump_dirty_tracking(&mut self) {
         if std::env::var("XEZIM_DUMP_FULL").ok().as_deref() == Some("1") {
             self.dump_dirty_active = false;
+            self.dump_full = true;
             return;
         }
         if self.dump_dirty_active {
@@ -106104,6 +106136,27 @@ impl Simulator {
         if self.dump_dirty_active {
             self.dump_dirty.clear();
             self.dump_dirty_epoch = self.dump_dirty_epoch.wrapping_add(1);
+        }
+    }
+
+    /// End of a time slot, before time moves: flush what was written after
+    /// the slot's last tick. The end-of-slot VPI callbacks (§38.36.2: a
+    /// leftover cbReadWriteSynch, cbAtEndOfSimTime) run after that tick's
+    /// flush, and cocotb applies its writes from cbReadWriteSynch, so without
+    /// this a value written there reached the dumps and toggle coverage only
+    /// at the next slot, merged with that slot's changes: a reset cocotb
+    /// wrote at time 0 was never a toggle baseline, so its release did not
+    /// count. Under a forced full scan there is no dirty set to tell, so
+    /// every slot flushes.
+    #[inline]
+    fn dump_slot_end(&mut self) {
+        let due = if self.dump_dirty_active {
+            !self.dump_dirty.is_empty()
+        } else {
+            self.dump_full
+        };
+        if due {
+            self.dump_write_changes();
         }
     }
 

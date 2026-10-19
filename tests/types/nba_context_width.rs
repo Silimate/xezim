@@ -33,7 +33,8 @@ module tb;
   logic [35:0] v;
   logic [127:0] v2, v3;
   logic [35:0] v4;
-  int k = 0;
+  logic [17:0] v5;
+  int k = 0, j = 0;
   always_ff @(posedge clk)
     for (int l = 0; l < $clog2(4); l++) begin
       s_for <= a + b;
@@ -64,6 +65,7 @@ module tb;
     s_ev <= @(posedge clk) a + b;
     s_bev = @(posedge clk) a + b;
   end
+  initial v5[(j++)*18 +: 18] = @(posedge clk) a + b;
   initial begin
     #1 clk = 1;
     #1 clk = 0;
@@ -97,6 +99,12 @@ fn nonblocking_right_hand_sides_take_the_target_width() {
         hex(&sim, "v4"),
         (0x1FFFE << 18) | 0x1FFFE,
         "each write lands in its own slice and keeps the carry"
+    );
+    assert_eq!(hex(&sim, "j"), 1, "v5[(j++)*18 +: 18] advances j once");
+    assert_eq!(
+        hex(&sim, "v5"),
+        0x1FFFE,
+        "an event-controlled sum into a side-effecting target keeps the carry"
     );
     assert_eq!(
         hex(&sim, "s_narrow"),

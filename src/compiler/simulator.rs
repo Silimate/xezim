@@ -89329,20 +89329,20 @@ impl Simulator {
                 // literal it evaluates to now, as the blocking path does, so
                 // the target's width and the captured target below read the
                 // same index. Before, `i` advanced more than once per
-                // assignment and the value landed in the wrong slice.
-                if Self::lvalue_has_incdec_index(lvalue)
-                    && let Some(folded) = self.rewrite_lvalue_index_side_effects(lvalue)
+                // assignment and the value landed in the wrong slice. The
+                // statement carries on with the folded target, so its
+                // statement callbacks fire once.
+                let lvalue_folded;
+                let lvalue: &Expression = match Self::lvalue_has_incdec_index(lvalue)
+                    .then(|| self.rewrite_lvalue_index_side_effects(lvalue))
+                    .flatten()
                 {
-                    self.exec_statement(&Statement::new(
-                        StatementKind::NonblockingAssign {
-                            lvalue: folded,
-                            delay: delay.clone(),
-                            rvalue: rvalue.clone(),
-                        },
-                        stmt.span,
-                    ));
-                    return;
-                }
+                    Some(f) => {
+                        lvalue_folded = f;
+                        &lvalue_folded
+                    }
+                    None => lvalue,
+                };
                 // §14.4: normalize a plain dotted-chain lvalue (`vif.cb.data`
                 // inside a method) to the flat Ident the clocking-drive check
                 // below expects — the chain shape skipped the check and the
@@ -105063,11 +105063,16 @@ impl Simulator {
                 // -1 became 0xFFFF_FFFF, `l >= r` picked the wrong branch and
                 // the width came out 0 — which then resized the RHS to nothing,
                 // so a partially out-of-range NBA wrote no bits at all.
-                let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                // An indexed select's width is its constant width alone: its
+                // start is not evaluated here, so one with a side effect
+                // (`v[i++ +: 8]`) runs only where the target is captured.
                 let r = self.eval_expr(right).to_i64().unwrap_or(0);
                 let count = match kind {
                     RangeKind::IndexedUp | RangeKind::IndexedDown => r.max(0) as u32,
-                    RangeKind::Constant => (l - r).unsigned_abs() as u32 + 1,
+                    RangeKind::Constant => {
+                        let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                        (l - r).unsigned_abs() as u32 + 1
+                    }
                 };
                 // §7.4.1: an element range on a packed multi-D lvalue is
                 // count × elem_w bits wide, not count bits — the RHS was
@@ -125226,12 +125231,15 @@ impl Simulator {
     /// it whenever the statement ran here instead of as bytecode, for
     /// example in a `for` loop bounded by `$clog2(...)`.
     ///
-    /// The target's width is not looked up when an lvalue index has a side
-    /// effect (`v[i++ +: 18] <= ...`): `infer_lhs_width` evaluates part-select
-    /// bounds, and §11.4.1 has the index evaluated once, when the assignment
-    /// captures its target. Such a right-hand side stays self-determined.
+    /// §11.4.1 has a side-effecting lvalue index (`v[i++ +: 18] = @(e) ...`)
+    /// evaluated once, when the assignment captures its target.
+    /// `infer_lhs_width` doesn't evaluate an indexed select's start, but its
+    /// class-aggregate lookup may evaluate indices, so with class objects
+    /// live such a right-hand side stays self-determined.
     fn eval_target_rhs(&mut self, lvalue: &Expression, rvalue: &Expression) -> Value {
-        if !Self::rhs_takes_context(rvalue) || Self::lvalue_has_incdec_index(lvalue) {
+        if !Self::rhs_takes_context(rvalue)
+            || (!self.no_class_objects() && Self::lvalue_has_incdec_index(lvalue))
+        {
             return self.eval_expr(rvalue);
         }
         match self.infer_lhs_width(lvalue) {

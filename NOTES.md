@@ -265,6 +265,65 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§6.19, §6.21, §7.4.1, §11.5.1).
   (#369, contributed by akashlevy)
 
+* Initializers accepted with `--relax-implicit-static` run once before initial
+  processes and retain their values across calls and activations. Design caches
+  distinguish this lifetime mode from the default policy (§6.21).
+  (#351, reported by akashlevy)
+* Static class calls retain lexical scope and specialization through module
+  type parameters, typedef chains, nested classes and instance handles.
+  Suspended static tasks retain their bindings, and class event OR waits wake
+  once on the selected event (§8.23, §8.25, §9.4.2, §13.4.1, §15.5).
+  Recompile saved designs to refresh scoped class metadata.
+  (#382, reported by Ganesh-TNL)
+* Randomization callbacks reject tasks, non-void returns and argument lists
+  before execution, preserving legal inherited and overridden callbacks
+  (§18.11). (#383, reported by rpjayaraman)
+* Unsigned expression context reaches a shift's left operand before extension
+  and evaluation in compiled and interpreted execution. Self-determined
+  boundaries and function side effects are preserved (§11.8.2, §11.4.10).
+  (#384, reported by akashlevy)
+
+* Concurrent assertions and covers observe clock edges at time zero and
+  four-state clock transitions, using Preponed samples (§16.5, §9.4.2).
+  (#385, reported by akashlevy)
+* Assertion action blocks preserve generated scope and keep their local
+  declarations separate from module variables (§16.14.1, §23.9, §27.4).
+  (#386, reported by akashlevy)
+* Returning an unpacked function-name variable no longer recurses. Dynamic
+  arrays, queues and fixed arrays retain their elements across return,
+  including descending fixed ranges (§13.4.1, §7.6).
+  (#387, reported by Dragon-Git)
+
+
+* Queue elements created from struct-returning expressions retain their
+  string and other members when passed to functions or copied. Arguments
+  run once even when a struct's leaf layout is unavailable
+  (§7.10.2.2, §13.4.1, §13.5.1).
+  (#390, #392, contributed by Ganesh-TNL)
+* Variables declared in `for` headers retain their declared signedness
+  across synchronous and suspended loops, including typedefs and unsigned
+  initializers (§6.11.1, §11.8.1, §12.7.1).
+  (#394, contributed by akashlevy)
+
+* Full-word concatenations preserve value and X/Z bits without overflowing
+  a native shift in debug execution, including nested and wide-block
+  forms (§11.4.12).
+
+* Negated weak sequences fail when the clock stops with an attempt still
+  pending. Nested negation preserves sequence strength, and `disable iff`
+  cancels attempts even without another clock edge (§16.12.2–3).
+  (#393, reported by akashlevy)
+* Followed-by properties settle at the first successful consequent tick,
+  including vacuous successes, so later matches cannot add pass actions,
+  cover hits or end-of-simulation failures (§16.12.9, §16.14.8).
+  (#395, reported by akashlevy)
+
+* Tiered string casts convert bytes without padding concatenations, including
+  casts through typedefs. NUL removal and byte values agree with interpreted
+  calls, and persistent methods recompile for the new conversion
+  (§6.16, §6.18, §6.24.3, §11.4.12).
+  (#391, reported by urbanij; #396, contributed by Ganesh-TNL)
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and
@@ -288,17 +347,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   An explicit `XEZIM_METHOD_TIER` also attempts compilation on a later call
   after enough interpreted loop iterations, including `foreach`; default
   admission continues to use call counts. (#326, contributed by Thomasb81)
-
-**Usability**
-
-* `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
-  an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
-  toggle coverage, as some simulators do by default, so a module-level loop
-  counter no longer adds 64 bins that rarely toggle. By default they are
-  still tracked, as in the reference simulator. Each toggle entry in
-  `xezim_cov.json` gains a `type`, the data type the signal was declared with
-  (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
-  See docs/coverage-guide.md.
 
 **cocotb**
 
@@ -340,6 +388,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
   (same as `+seed=`) now work on the command line too, where they were read
   as `-s vseed` and `-s eed`.
+* `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
+  an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
+  toggle coverage, as some simulators do by default, so a module-level loop
+  counter no longer adds 64 bins that rarely toggle. By default they are
+  still tracked, as in the reference simulator. Each toggle entry in
+  `xezim_cov.json` gains a `type`, the data type the signal was declared with
+  (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
+  See docs/coverage-guide.md.
 
 **Maintenance**
 

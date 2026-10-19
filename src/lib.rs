@@ -193,6 +193,8 @@ fn design_cache_key(
     // A run that downgraded driver conflicts to warnings must not serve one
     // that reports them as errors.
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
+    // §6.21: the accepted initializer's lifetime changes elaboration.
+    hash.bytes(&[xezim_core::elaborate::relax_implicit_static() as u8]);
 
     // Invalidate after a local rebuild even when the package version did not
     // change, since the executable may contain elaboration fixes.

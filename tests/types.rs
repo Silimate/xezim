@@ -502,3 +502,6 @@ mod next_rest_input_formals_376;
 
 #[path = "types/typedef_casts_377.rs"]
 mod next_rest_typedef_casts_377;
+
+#[path = "types/unsigned_shift_context_384.rs"]
+mod unsigned_shift_context_384;

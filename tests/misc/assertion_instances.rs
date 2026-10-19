@@ -601,3 +601,42 @@ fn class_methods_and_case_items_keep_their_own_entries() {
         );
     }
 }
+
+const SETTLED: &str = r#"module unit(output logic o);
+  for (genvar k = 0; k < 2; k++) begin : gb
+    logic [3:0] datum = k;
+  end
+  assign o = gb[1].datum == 1;
+endmodule
+
+module top;
+  logic clk = 0, o;
+  int hits = 0;
+  unit u (.o(o));
+  always #5 clk = ~clk;
+  for (genvar i = 0; i < 3; i++) begin : g
+    a_gen : assert property (@(posedge clk) i < 3) hits += i + 1;
+  end
+  a_top : assert property (@(posedge clk) o);
+  initial begin
+    #22 $display("hits=%0d", hits);
+    $finish;
+  end
+endmodule
+"#;
+
+/// §16.5, §16.14: declarative concurrent assertions register before time
+/// 0's processes run, after the time-0 settle has evaluated `u`'s
+/// continuous assignment. They still belong to `top`, one per generate
+/// block, each running its action at both edges (5 and 15). The settle's
+/// last block scope named them after `top.u` instead, so the three generate
+/// blocks shared one site and `hits` was 2.
+#[test]
+fn sites_registered_after_the_time_0_settle_keep_their_instance() {
+    let (json, out) = run("settled", &[("s.sv", SETTLED)]);
+    for name in ["g[0].a_gen", "g[1].a_gen", "g[2].a_gen", "a_top"] {
+        assert_eq!(counts(&json, "top", name), [2, 2, 0, 0, 0], "{name}:\n{json}");
+    }
+    assert!(!json.contains("\"instance\": \"top.u\""), "{json}");
+    assert!(out.contains("hits=12"), "{out}");
+}

@@ -23,6 +23,7 @@ module top;
   logic c; assign c = ~rn;         // continuous assignment
   logic g; always_comb g = ri;     // always_comb
   logic f; initial f = 1'b1;       // initial block
+  logic m [2]; always_comb m[0] = ri;  // an array cell
   initial begin clk = 1; forever #5 clk = ~clk; end
   a_r:  assert property (@(posedge clk) r === 1'bx) $display("T|r|pass|%0t", $time); else $display("T|r|fail|%0t", $time);
   a_ri: assert property (@(posedge clk) ri === 1'b1) $display("T|ri|pass|%0t", $time); else $display("T|ri|fail|%0t", $time);
@@ -31,6 +32,7 @@ module top;
   a_c:  assert property (@(posedge clk) c === 1'b1) $display("T|c|pass|%0t", $time); else $display("T|c|fail|%0t", $time);
   a_g:  assert property (@(posedge clk) g === 1'b1) $display("T|g|pass|%0t", $time); else $display("T|g|fail|%0t", $time);
   a_f:  assert property (@(posedge clk) f === 1'b1) $display("T|f|pass|%0t", $time); else $display("T|f|fail|%0t", $time);
+  a_m:  assert property (@(posedge clk) m[0] === 1'b1) $display("T|m|pass|%0t", $time); else $display("T|m|fail|%0t", $time);
   // At 10 ns, $past reads the time-0 samples.
   a_p:  assert property (@(posedge clk) $time != 10 || 0)
           else $display("T|past|%0t|%b%b%b", $time, $past(c), $past(w), $past(ri));
@@ -55,6 +57,8 @@ fn time0_attempt_reads_default_sampled_values() {
         "T|f|pass|10",
         "T|g|fail|0",
         "T|g|pass|10",
+        "T|m|fail|0",
+        "T|m|pass|10",
         "T|n|pass|0",
         "T|n|pass|10",
         "T|past|10|xx1",

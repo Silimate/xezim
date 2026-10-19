@@ -18,13 +18,15 @@ use std::process::Command;
 /// `top.a_in` to 1 at time 0. `T0_CLK` and `T0_IN` pick the routine that
 /// makes each time-0 write: `start` (cbStartOfSimulation, the way cocotb
 /// writes with `Immediate`) or `rw` (a cbReadWriteSynch at time 0, the way
-/// cocotb applies an ordinary write and its Python `Clock`).
+/// cocotb applies an ordinary write and its Python `Clock`). With
+/// `T0_G=start`, cbStartOfSimulation also writes `top.g` the value its
+/// `always_comb` gives it.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
 #include "vpi_user.h"
 
-static vpiHandle clk, in;
+static vpiHandle clk, in, g;
 static int level = 1;
 
 static const char *env(const char *n, const char *dflt) {
@@ -71,6 +73,9 @@ static PLI_INT32 start(p_cb_data cb) {
     (void)cb;
     clk = vpi_handle_by_name("top.clk", NULL);
     in = vpi_handle_by_name("top.a_in", NULL);
+    g = vpi_handle_by_name("top.g", NULL);
+    if (!strcmp(env("T0_G", "none"), "start"))
+        put(g, 1);
     if (!strcmp(env("T0_IN", "rw"), "start"))
         put(in, 1);
     if (!strcmp(env("T0_CLK", "rw"), "start"))
@@ -98,6 +103,7 @@ module top;
   logic c; assign c = ri;          // continuous assignment
   logic g; always_comb g = ri;     // always_comb
   logic f; initial f = 1'b1;       // initial block
+  logic m [2]; always_comb m[0] = ri;  // an array cell
   a_r:  assert property (@(posedge clk) r === 1'bx) $display("T|r|pass|%0t", $time); else $display("T|r|fail|%0t", $time);
   a_ri: assert property (@(posedge clk) ri === 1'b1) $display("T|ri|pass|%0t", $time); else $display("T|ri|fail|%0t", $time);
   a_n:  assert property (@(posedge clk) n === 0) $display("T|n|pass|%0t", $time); else $display("T|n|fail|%0t", $time);
@@ -106,8 +112,13 @@ module top;
   a_g:  assert property (@(posedge clk) g === 1'b1) $display("T|g|pass|%0t", $time); else $display("T|g|fail|%0t", $time);
   a_f:  assert property (@(posedge clk) f === 1'b1) $display("T|f|pass|%0t", $time); else $display("T|f|fail|%0t", $time);
   a_in_a: assert property (@(posedge clk) a_in === 1'b1) $display("T|in|pass|%0t", $time); else $display("T|in|fail|%0t", $time);
+  a_m:  assert property (@(posedge clk) m[0] === 1'b1) $display("T|m|pass|%0t", $time); else $display("T|m|fail|%0t", $time);
   a_p:  assert property (@(posedge clk) $time != 10 || 0)
           else $display("T|past|%0t|%b%b%b%b", $time, $past(a_in), $past(c), $past(w), $past(ri));
+  // At the first tick, $past reads default sampled values, of an
+  // expression's operands too.
+  a_p0: assert property (@(posedge clk) $time != 0 || 0)
+          else $display("T|past0|%b%b", $past(a_in), $past(a_in | 1'b0));
   initial #12 $finish;
 endmodule
 "#;
@@ -136,13 +147,14 @@ fn setup() -> (PathBuf, PathBuf) {
 }
 
 /// The `T|` lines of one run, sorted.
-fn run(dir: &Path, so: &Path, clk: &str, input: &str) -> Vec<String> {
+fn run(dir: &Path, so: &Path, clk: &str, input: &str, g: &str) -> Vec<String> {
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--vpi-lib")
         .arg(so)
         .args(["--no-cache", "-s", "top", "top.sv"])
         .env("T0_CLK", clk)
         .env("T0_IN", input)
+        .env("T0_G", g)
         .current_dir(dir)
         .output()
         .expect("failed to run xezim");
@@ -159,34 +171,44 @@ fn run(dir: &Path, so: &Path, clk: &str, input: &str) -> Vec<String> {
 fn time0_attempt_reads_default_sampled_values() {
     let (dir, so) = setup();
     let mut bad = Vec::new();
-    for clk in ["rw", "start"] {
-        for input in ["rw", "start"] {
-            // Only a write from cbStartOfSimulation precedes the slot.
-            let early = input == "start";
-            let mut want = vec![
-                "T|c|fail|0".to_string(),
-                "T|c|pass|10".to_string(),
-                "T|f|fail|0".to_string(),
-                "T|f|pass|10".to_string(),
-                "T|g|fail|0".to_string(),
-                "T|g|pass|10".to_string(),
-                format!("T|in|{}|0", if early { "pass" } else { "fail" }),
-                "T|in|pass|10".to_string(),
-                "T|n|pass|0".to_string(),
-                "T|n|pass|10".to_string(),
-                format!("T|past|10|{}xx1", if early { "1" } else { "x" }),
-                "T|r|pass|0".to_string(),
-                "T|r|pass|10".to_string(),
-                "T|ri|pass|0".to_string(),
-                "T|ri|pass|10".to_string(),
-                "T|w|fail|0".to_string(),
-                "T|w|pass|10".to_string(),
-            ];
-            want.sort();
-            let got = run(&dir, &so, clk, input);
-            if got != want {
-                bad.push(format!("T0_CLK={clk} T0_IN={input}:\n got {got:?}\nwant {want:?}"));
-            }
+    let runs = [
+        ("rw", "rw", "none"),
+        ("rw", "start", "none"),
+        ("start", "rw", "start"),
+        ("start", "start", "start"),
+    ];
+    for (clk, input, g) in runs {
+        // Only a write from cbStartOfSimulation precedes the slot, even one
+        // of the value the slot's `always_comb` writes again.
+        let early = input == "start";
+        let mut want = vec![
+            "T|c|fail|0".to_string(),
+            "T|c|pass|10".to_string(),
+            "T|f|fail|0".to_string(),
+            "T|f|pass|10".to_string(),
+            format!("T|g|{}|0", if g == "start" { "pass" } else { "fail" }),
+            "T|g|pass|10".to_string(),
+            format!("T|in|{}|0", if early { "pass" } else { "fail" }),
+            "T|in|pass|10".to_string(),
+            "T|m|fail|0".to_string(),
+            "T|m|pass|10".to_string(),
+            "T|n|pass|0".to_string(),
+            "T|n|pass|10".to_string(),
+            format!("T|past0|{}", if early { "11" } else { "xx" }),
+            format!("T|past|10|{}xx1", if early { "1" } else { "x" }),
+            "T|r|pass|0".to_string(),
+            "T|r|pass|10".to_string(),
+            "T|ri|pass|0".to_string(),
+            "T|ri|pass|10".to_string(),
+            "T|w|fail|0".to_string(),
+            "T|w|pass|10".to_string(),
+        ];
+        want.sort();
+        let got = run(&dir, &so, clk, input, g);
+        if got != want {
+            bad.push(format!(
+                "T0_CLK={clk} T0_IN={input} T0_G={g}:\n got {got:?}\nwant {want:?}"
+            ));
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

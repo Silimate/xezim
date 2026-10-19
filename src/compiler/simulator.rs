@@ -9295,6 +9295,10 @@ pub struct Simulator {
     /// initializer, else its type's default). §16.9.3 reads it for a clock
     /// tick before the first one. Filled by `capture_sampled_defaults`.
     sampled_defaults: HashMap<usize, Value>,
+    /// The cells VPI clients write while the cbStartOfSimulation routines
+    /// run (`Some` only then): their values are default sampled values
+    /// (`adopt_start_of_simulation_writes`).
+    start_of_simulation_writes: Option<Vec<usize>>,
     /// §9.2.2.2 timing: `-> ev` fired from a comb block during the PRE-process
     /// time-0 settle (compile) happens before any `always @(ev)` process has
     /// registered its waiter — the trigger would be lost. Queue them and
@@ -14106,6 +14110,7 @@ impl Simulator {
             assoc_static_keys_cache: RefCell::new(HashMap::default()),
             sampled_watches: Vec::new(),
             sampled_defaults: HashMap::default(),
+            start_of_simulation_writes: None,
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),
@@ -21159,11 +21164,13 @@ impl Simulator {
                 .keys()
                 .filter_map(|&id| Some((id, self.signal_table.get(id)?.clone())))
                 .collect();
+            self.start_of_simulation_writes = Some(Vec::new());
             self.vpi_start_of_simulation();
+            let wrote = self.start_of_simulation_writes.take().unwrap_or_default();
             // A value a routine wrote there left work for the time-0 slot.
             start = self.dirty_any;
             if !before.is_empty() {
-                self.adopt_start_of_simulation_writes(before);
+                self.adopt_start_of_simulation_writes(before, &wrote);
             }
         }
         if !self.wake_rank_built {
@@ -61471,7 +61478,9 @@ impl Simulator {
             return;
         }
         for (name, &id) in self.signal_name_to_id.iter() {
-            if !names.contains(name.rsplit(['.', ':']).next().unwrap_or_default()) {
+            // An array cell is named `mem[3]`; an assertion spells `mem`.
+            let leaf = name.rsplit(['.', ':']).next().unwrap_or_default();
+            if !names.contains(leaf.split('[').next().unwrap_or_default()) {
                 continue;
             }
             if let Some(v) = self.signal_table.get(id) {
@@ -61639,6 +61648,7 @@ impl Simulator {
     /// so its targets now hold their default sampled values (§16.5.1).
     /// Update the ones a concurrent assertion or a procedural watch keeps.
     fn record_sampled_defaults(&mut self, targets: &[Expression]) {
+        let mut ids = Vec::new();
         for t in targets {
             let Some(id) = self.get_lhs_signal_id(t) else {
                 continue;
@@ -61647,7 +61657,9 @@ impl Simulator {
                 continue;
             };
             self.set_sampled_default(id, v);
+            ids.push(id);
         }
+        self.refresh_expr_defaults(&ids);
     }
 
     /// Make `v` the default sampled value of signal `id` (§16.5.1): for the
@@ -61675,15 +61687,54 @@ impl Simulator {
     /// value, as on the reference simulator (cocotb writes its first values
     /// there with `Immediate`). `before` holds the values of the signals with
     /// a default sampled value from before the routines ran.
-    fn adopt_start_of_simulation_writes(&mut self, before: Vec<(usize, Value)>) {
+    fn adopt_start_of_simulation_writes(&mut self, before: Vec<(usize, Value)>, wrote: &[usize]) {
+        let wrote: HashSet<usize> = wrote.iter().copied().collect();
+        let mut adopted = Vec::new();
         for (id, old) in before {
             let Some(v) = self.signal_table.get(id) else {
                 continue;
             };
-            if *v != old {
+            // Written (the routine may write the value the settle left), or
+            // changed through any other VPI routine.
+            if wrote.contains(&id) || *v != old {
                 let v = v.clone();
                 self.set_sampled_default(id, v);
+                adopted.push(id);
             }
+        }
+        self.refresh_expr_defaults(&adopted);
+    }
+
+    /// Re-evaluate the default of each expression watch (`$past(a | b)`)
+    /// that reads one of `ids`, whose default sampled values changed, from
+    /// the default sampled values of its operands.
+    fn refresh_expr_defaults(&mut self, ids: &[usize]) {
+        if ids.is_empty() {
+            return;
+        }
+        for i in 0..self.sampled_watches.len() {
+            let w = &self.sampled_watches[i];
+            if w.sig_id.is_some()
+                || w.default.is_none()
+                || !w.sample_ids.iter().any(|id| ids.contains(id))
+            {
+                continue;
+            }
+            let mut saved: Vec<(usize, Value)> = w
+                .sample_ids
+                .iter()
+                .filter(|&&id| id < self.signal_table.len())
+                .filter_map(|&id| Some((id, self.sampled_defaults.get(&id)?.clone())))
+                .collect();
+            for (id, v) in &mut saved {
+                std::mem::swap(&mut self.signal_table[*id], v);
+            }
+            let e = self.sampled_watches[i].expr.clone();
+            let v = self.eval_expr(&e);
+            for (id, v) in saved.into_iter().rev() {
+                self.signal_table[id] = v;
+            }
+            self.sampled_watches[i].default = Some(v);
         }
     }
 
@@ -180384,6 +180435,9 @@ pub extern "C" fn vpi_put_value(
                 "vpi_put_value: null value_p with a write flag; ignored".into(),
             );
             return std::ptr::null_mut();
+        }
+        if let Some(w) = sim.start_of_simulation_writes.as_mut() {
+            w.push(sig_id);
         }
 
         // A slice decodes at its own width, then splices back into its parent.

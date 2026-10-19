@@ -3036,3 +3036,105 @@ endmodule
     assert!(rows > 0, "{json}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The condition and expression items of code that a parameter rules out
+/// (IEEE 1800 §11.2.1, §12.4) are left out too, like its statements and
+/// arms: in `u0` (`EN` 0) the `y = a & b;` of the dead `if` arm and the
+/// `a && b` inside it, in `u1` (`EN` 1) the `y = a | b;` of the dead `else`
+/// and the `else if` condition after the constantly true `if`. They are not
+/// listed and not in the totals, as in the reference simulator. A design
+/// unit lists an item any instance counts; `--code-coverage-constant=keep`
+/// counts them all.
+#[test]
+fn constant_conditions_leave_items_out() {
+    let d = scratch("constant-items");
+    let src = "\
+module sub #(parameter bit EN = 0) (
+  input  logic a,
+  input  logic b,
+  output logic y,
+  output logic z
+);
+  always_comb begin
+    if (EN)
+      y = a & b;
+    else
+      y = a | b;
+  end
+  always_comb begin
+    if (EN) begin
+      if (a && b) z = 1;
+      else z = 0;
+    end else if (a || b)
+      z = 1;
+    else
+      z = 0;
+  end
+endmodule
+
+module tb;
+  logic a, b, y0, z0, y1, z1;
+  sub #(.EN(0)) u0 (.a, .b, .y(y0), .z(z0));
+  sub #(.EN(1)) u1 (.a, .b, .y(y1), .z(z1));
+  initial begin
+    a = 0; b = 0;
+    #1 a = 1;
+    #1 b = 1;
+    #1 a = 0;
+    #1 $finish;
+  end
+endmodule
+";
+    // The `total` of tally `kind` in a results entry.
+    let total = |e: &str, kind: &str| -> u64 {
+        let key = format!("\"{kind}\": {{\"covered\": ");
+        let rest = &e[e.find(&key).unwrap_or_else(|| panic!("no {kind}: {e}")) + key.len()..];
+        let rest = &rest[rest.find("\"total\": ").unwrap() + "\"total\": ".len()..];
+        rest[..rest.find(|c: char| !c.is_ascii_digit()).unwrap()]
+            .parse()
+            .unwrap()
+    };
+    let out = run(&d, src, &["--code-coverage=cond,expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let u0 = scope_entry(&json, "tb.u0");
+    for (line, listed) in [(9, false), (11, true), (15, false), (17, true)] {
+        assert_eq!(has_item(u0, line), listed, "line {line}: {u0}");
+    }
+    let u1 = scope_entry(&json, "tb.u1");
+    for (line, listed) in [(9, true), (11, false), (15, true), (17, false)] {
+        assert_eq!(has_item(u1, line), listed, "line {line}: {u1}");
+    }
+    for e in [u0, u1] {
+        assert_eq!(total(e, "condition"), 2, "{e}");
+        assert_eq!(total(e, "expression"), 2, "{e}");
+    }
+    let unit = unit_entry(&json, "sub");
+    for line in [9, 11, 15, 17] {
+        assert!(has_item(unit, line), "line {line}: {unit}");
+    }
+    let out = run(
+        &d,
+        src,
+        &["--code-coverage=cond,expr", "--code-coverage-constant=keep"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    for scope in ["tb.u0", "tb.u1"] {
+        let e = scope_entry(&json, scope);
+        for line in [9, 11, 15, 17] {
+            assert!(has_item(e, line), "line {line}: {e}");
+        }
+        assert_eq!(total(e, "condition"), 4, "{e}");
+        assert_eq!(total(e, "expression"), 4, "{e}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

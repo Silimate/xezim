@@ -313,6 +313,9 @@ pub(crate) struct ExprSite {
     /// `Simulator::cov_replay`.
     last: Vec<u8>,
     steps: Option<Vec<(u32, u32)>>,
+    /// In code a constant condition rules out (`cov_resolve_constants`): not
+    /// reported, like that code's statements and branches.
+    excluded: bool,
 }
 
 /// An item's logic tree while it is built.
@@ -1258,9 +1261,14 @@ enum Cond {
     Unknown,
 }
 
-/// The statement sites and branch sites one arm or condition holds, as
-/// ranges of `CodeCov::stmts` and `CodeCov::branches`.
-type Region = (std::ops::Range<usize>, std::ops::Range<usize>);
+/// The statement sites, branch sites and condition and expression items one
+/// arm or condition holds, as ranges of `CodeCov::stmts`, `CodeCov::branches`
+/// and `CodeCov::exprs`.
+type Region = (
+    std::ops::Range<usize>,
+    std::ops::Range<usize>,
+    std::ops::Range<usize>,
+);
 
 /// What a decision is made of.
 enum Choice {
@@ -1287,8 +1295,9 @@ struct Decision {
     /// What each arm holds, in arm order (the implicit `else` / `default`
     /// last, empty).
     arms: Vec<Region>,
-    /// The `?:` branches inside each condition.
-    conds: Vec<std::ops::Range<usize>>,
+    /// What each condition holds: its condition item and the `?:` branches
+    /// inside it.
+    conds: Vec<Region>,
 }
 
 /// Per-bit rise/fall counts of the tracked signals.
@@ -1389,7 +1398,7 @@ struct Pending {
 struct Chain {
     arms: Vec<Arm>,
     regions: Vec<Region>,
-    conds: Vec<std::ops::Range<usize>>,
+    conds: Vec<Region>,
 }
 
 /// The instance a block scope (`u0.u1.genblk2`) belongs to, its longest
@@ -1527,11 +1536,23 @@ impl Instr<'_> {
         out.push(hit(counter, span));
     }
 
-    /// Run `f`, and return the statement and branch sites it created.
+    /// Run `f`, and return the statement sites, branch sites and items it
+    /// created.
     fn region<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, Region) {
-        let (s0, b0) = (self.cov.stmts.len(), self.cov.branches.len());
+        let (s0, b0, x0) = (
+            self.cov.stmts.len(),
+            self.cov.branches.len(),
+            self.cov.exprs.len(),
+        );
         let r = f(self);
-        (r, (s0..self.cov.stmts.len(), b0..self.cov.branches.len()))
+        (
+            r,
+            (
+                s0..self.cov.stmts.len(),
+                b0..self.cov.branches.len(),
+                x0..self.cov.exprs.len(),
+            ),
+        )
     }
 
     fn decide(
@@ -1539,7 +1560,7 @@ impl Instr<'_> {
         choice: Choice,
         site: Option<usize>,
         arms: Vec<Region>,
-        conds: Vec<std::ops::Range<usize>>,
+        conds: Vec<Region>,
     ) {
         self.cov.decisions.push(Decision {
             choice,
@@ -2169,7 +2190,7 @@ impl Instr<'_> {
             excluded: false,
         });
         let mut chain = Chain::default();
-        let ((), (_, c)) = self.region(|me| me.cond(&mut condition, "if", true));
+        let ((), c) = self.region(|me| me.cond(&mut condition, "if", true));
         chain.conds.push(c);
         // (An `else if` condition does not run each time the `if` does.)
         let top = self.top.take();
@@ -2192,7 +2213,7 @@ impl Instr<'_> {
             });
         }
         if !has_else {
-            chain.regions.push((0..0, 0..0));
+            chain.regions.push((0..0, 0..0, 0..0));
         }
         self.cov.branches[site].arms = chain.arms;
         if conds.iter().any(|c| !matches!(c, Cond::Unknown)) {
@@ -2235,7 +2256,7 @@ impl Instr<'_> {
                     then_stmt: t,
                     else_stmt: el,
                 } => {
-                    let ((), (_, c)) = self.region(|me| me.cond(&mut cond, "if", true));
+                    let ((), c) = self.region(|me| me.cond(&mut cond, "if", true));
                     chain.conds.push(c);
                     self.if_arms(up, cond, t, el, espan, false, chain)
                 }
@@ -2333,7 +2354,7 @@ impl Instr<'_> {
             }
         }
         // The implicit `default` holds nothing.
-        regions.push((0..0, 0..0));
+        regions.push((0..0, 0..0, 0..0));
         if let Some(choice) = choice {
             self.decide(choice, site, regions, Vec::new());
         }
@@ -2842,7 +2863,7 @@ impl Instr<'_> {
                 }
             }
             Op::Mux => {
-                let mut parts = (Cond::Unknown, (0..0, 0..0), (0..0, 0..0));
+                let mut parts = (Cond::Unknown, (0..0, 0..0, 0..0), (0..0, 0..0, 0..0));
                 if let ExprKind::Conditional {
                     condition,
                     then_expr,
@@ -2906,6 +2927,7 @@ impl Instr<'_> {
                 .map(|s| (self.here.path.clone(), s)),
             last: Vec::new(),
             steps: None,
+            excluded: false,
         });
         let span = e.span;
         let inner = std::mem::replace(e, Expression::new(ExprKind::Empty, span));
@@ -4057,11 +4079,15 @@ impl Simulator {
                     _ => continue,
                 },
             };
-            let mut dead = |(s, b): &Region| {
+            let mut dead = |(s, b, e): &Region| {
                 for x in &mut cov.stmts[s.clone()] {
                     x.excluded = true;
                 }
                 for x in &mut cov.branches[b.clone()] {
+                    x.excluded = true;
+                }
+                // The condition and expression items of code that cannot run.
+                for x in &mut cov.exprs[e.clone()] {
                     x.excluded = true;
                 }
             };
@@ -4070,9 +4096,9 @@ impl Simulator {
                     dead(r);
                 }
             }
-            for (out, b) in conds.iter().zip(&d.conds) {
+            for (out, c) in conds.iter().zip(&d.conds) {
                 if *out {
-                    dead(&(0..0, b.clone()));
+                    dead(c);
                 }
             }
             if let Some(site) = d.site.and_then(|i| cov.branches.get_mut(i)) {
@@ -5303,7 +5329,7 @@ impl Simulator {
                 excluded: b.excluded,
             });
         }
-        for x in &cov.exprs {
+        for x in cov.exprs.iter().filter(|x| !x.excluded) {
             let src = cov.scopes[x.scope as usize].src;
             let (file, line) = lines.locate(x.span, src).unwrap_or_default();
             let outs: Vec<[u64; 4]> = if x.bimodal {

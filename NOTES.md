@@ -167,8 +167,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   by the item's value (bimodal), and a negated `&&`/`||` decides as
   `~&`/`~|`, as in the reference simulator. On the design instances of 23 CVDP
   designs, the items and terms match the reference simulator's report on 22
-  and the covered terms on 18. Off by default; a run without it compiles and
-  runs as before. (#48)
+  and the covered terms on 18. The items in code that a constant condition
+  rules out are left out, like its statements and arms. Off by default; a run
+  without it compiles and runs as before. (#48)
 
 **Performance**
 

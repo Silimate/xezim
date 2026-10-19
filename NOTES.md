@@ -16,6 +16,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* Concurrent assertions sample a reference into a generate block or an
+  instance-array element (`blk[1].sig`, `ra[0].sig`), inline, in a named
+  property and through a bound checker's port connected to it, and `$past`
+  of it keeps a history as for any other variable. It was read after the
+  clock edge's NBAs, so an antecedent on a state that changes at that edge
+  never matched and a consequent on such a state failed. In a named
+  property or sequence declared in the top-level module or a package, a
+  reference rooted at the top module (`t.u.st`) is sampled too, and a
+  hierarchical clock (`@(posedge u.clk)`) ticks; it named no signal, so the
+  property never ran (§16.5.1).
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

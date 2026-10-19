@@ -47716,6 +47716,11 @@ impl Simulator {
         }
     }
 
+    // Out of line. Once the sampled array cells made the assertion code it
+    // used to inline longer, it was inlined into `event_loop_singlethread`
+    // instead, which cost a design without assertions 1.1% more
+    // instructions.
+    #[inline(never)]
     fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -98758,6 +98763,9 @@ impl Simulator {
         }
     }
 
+    // Inlined, so a time slot of a design without assertions pays only the
+    // two tests below.
+    #[inline(always)]
     fn tick_sva_sites(&mut self) {
         if self.finished {
             return;

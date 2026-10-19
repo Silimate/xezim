@@ -643,7 +643,7 @@ The counter's entry in `xezim_cov.json`:
         "fsm": {"covered": 0, "total": 0, "percent": null, "states": {"covered": 0, "total": 0, "percent": null}, "transitions": {"covered": 0, "total": 0, "percent": null}},
         "statements": [{"file": "cnt_cov.sv", "line": 2, "kind": "always_ff", "count": 4}, {"file": "cnt_cov.sv", "line": 4, "kind": "statement", "count": 1}, {"file": "cnt_cov.sv", "line": 6, "kind": "statement", "count": 3}],
         "branches": [{"file": "cnt_cov.sv", "line": 3, "kind": "if", "arms": [{"line": 4, "arm": "if", "count": 1}, {"line": 6, "arm": "else if", "count": 3}, {"line": 3, "arm": "else (implicit)", "count": 0}]}],
-        "toggles": [{"signal": "clk", "width": 1, "rise": [4], "fall": [4]}, {"signal": "en", "width": 1, "rise": [1], "fall": [0]}, {"signal": "q", "width": 3, "rise": [2, 1, 0], "fall": [1, 0, 0]}, {"signal": "rst", "width": 1, "rise": [0], "fall": [1]}],
+        "toggles": [{"signal": "clk", "width": 1, "type": "logic", "rise": [4], "fall": [4]}, {"signal": "en", "width": 1, "type": "logic", "rise": [1], "fall": [0]}, {"signal": "q", "width": 3, "type": "logic", "rise": [2, 1, 0], "fall": [1, 0, 0]}, {"signal": "rst", "width": 1, "type": "logic", "rise": [0], "fall": [1]}],
         "fsms": []
       }
 ```
@@ -741,6 +741,14 @@ state machine: nothing tests it (see [FSMs](#fsms)).
   drives stays only if it has no initializer. Ports,
   nets, structs, enums, variables of a named type and an initialized variable
   declared in a generate block are always tracked.
+- With `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`), the variables
+  of an integer atom type are not tracked either: `int`, `integer`,
+  `shortint`, `longint` and `byte` (§6.11), signed or unsigned, declared
+  directly or through a typedef, ports included. Vectors such as
+  `logic [31:0]`, enums whatever their base type, packed structs and the
+  members of unpacked structs are still tracked. Each toggle entry's `type`
+  says which entries the option leaves out (see
+  [the results](#the-code-coverage-results)).
 - Counts are exact: they do not stop at 1.
 
 #### FSMs
@@ -942,6 +950,12 @@ differences:
   0 or one initialized to all x, which xezim can't tell from one nothing
   writes. So does one that only a class writes through a virtual interface.
   A net whose only driver is a constant stays tracked too.
+- Variables of an integer type (`int`, `integer`, `shortint`, `longint`,
+  `byte`) are tracked, as some simulators do by default; others leave them
+  out. `--no-toggle-integers` leaves them out. It matters most for a loop
+  counter declared in a module (`integer i;` for a `for` loop): its 64 bins
+  rarely toggle, since its high bits stay 0 and it ends each time slot at the
+  same value.
 - An input port is always its own entry in its instance. A simulator that
   optimizes for speed can merge a port connected straight to a parent's net
   into that net, and then lists it under the parent only; with full signal
@@ -976,7 +990,7 @@ The results file gains a `code_coverage` member:
 | `scopes[].statement`, `.branch`, `.toggle`, `.fsm` | The scope's totals, like the design totals |
 | `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait` |
 | `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count` |
-| `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first |
+| `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, `type`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first. `type` is the data type the signal was declared with, after any typedef: `logic` (also a net declared without a data type), `bit`, `reg`, `byte`, `shortint`, `int`, `longint`, `integer`, `enum`, `struct` or `union`. A member of an unpacked struct or union has the type of the variable it belongs to, `struct` or `union`. `--no-toggle-integers` leaves out the entries of type `byte`, `shortint`, `int`, `longint` and `integer` |
 | `scopes[].fsms[]` | Every FSM (see [FSMs](#fsms)): `variable` (the state variable's name within the scope, `gen[0].state` in a generate block), `next` (the next-state variable, or `null` for a one-process FSM), `file` and `line` of the state process, `reset` (the states it is reset to), `states[]` (`name`, `value`, `line`, `count`) in value order, `transitions[]` (`from`, `to`, `line`, `count`) by source state and then target, `unreachable` (state names) and `illegal` |
 | `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches`, `toggles` and `fsms` with the counts of all its instances added up (FSMs of different parameterizations stay apart). A statement, arm, bin, state or transition is covered when any instance covered it |
 
@@ -1078,7 +1092,9 @@ Only `1: acc = 2;` never ran. Toggles add up per bit in the same way, from
   (in a system task's arguments, a loop condition or a `case` selector) is not
   a branch.
 - A run from a precompiled artifact (`-o`) has no source text, so its entries
-  have an empty `file` and line 0.
+  have an empty `file` and line 0. The ANSI ports of the instances below the
+  top then have type `logic` unless declared through a typedef, and
+  `--no-toggle-integers` keeps them.
 - The file lists every statement and tracked bit of the covered scopes. For a
   large design, cover the design under test only (`--code-coverage-scope`), or
   leave toggles out (`--code-coverage=stmt,branch`).
@@ -1143,5 +1159,6 @@ it.
 | `+cover`, `+cover=<letters>`, `-coverage [<types>]` | Other simulators' spellings of `--code-coverage`: `s`, `b`, `t` and `f` (or `B`, `T` and `F`) select the kinds; other letters are ignored with a warning |
 | `-covworkdir <dir>`, `-covscope <name>`, `-covtest <name>` | Write the results file to `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`, `scope`, `test`) |
 | `-covoverwrite` | Accepted for compatibility with other simulators; no effect (the file is always replaced) |
+| `--no-toggle-integers`, `XEZIM_TOGGLE_INTEGERS=0` | Leave variables of an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of toggle coverage. `--toggle-integers` keeps them (the default) |
 | `+fcover` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |

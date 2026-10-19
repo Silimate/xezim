@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A value a VPI client writes to an element of an instance's unpacked-array
+  input port reaches the instance, through any number of port levels, and
+  the actual's name reads it too; a value written to the actual reaches the
+  port's name in the same delta. The port and a whole-array actual are one
+  object (§23.3.3.7), as a scalar port and its actual already were. They had
+  storage of their own, connected element by element, while the instance
+  read the actual, so a cocotb test driving `dut.inst.port[i]` left the
+  instance reading z. (#66)
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
@@ -45,6 +53,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   of a static task or function, whole or select, commit in the NBA region;
   select writes were dropped and whole writes to a local the task wrote
   first took effect at once (§10.4.2). (#4)
+* Concurrent assertions sample the elements of unpacked arrays in the
+  Preponed region like other variables. They read the value an element took
+  in the NBA region of the edge being evaluated, so `a[0] == $past(s)` with
+  `a[0] <= s` failed at every edge. This covers multidimensional arrays,
+  unpacked arrays of packed vectors, arrays of structs, arrays in interfaces,
+  array ports, and dynamic arrays and queues up to index 63. A select with
+  constant indices samples its element. One whose indices read variables
+  samples the element their sampled values name, found again in each time
+  slot, so a large memory is never copied. An index read from a sequence
+  local variable, a procedure's loop variable, a sampled-value function or a
+  call samples the whole array (§16.5.1). (#27)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -129,6 +148,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   An explicit `XEZIM_METHOD_TIER` also attempts compilation on a later call
   after enough interpreted loop iterations, including `foreach`; default
   admission continues to use call counts. (#326, contributed by Thomasb81)
+
+**Usability**
+
+* `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
+  an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
+  toggle coverage, as some simulators do by default, so a module-level loop
+  counter no longer adds 64 bins that rarely toggle. By default they are
+  still tracked, as in the reference simulator. Each toggle entry in
+  `xezim_cov.json` gains a `type`, the data type the signal was declared with
+  (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
+  See docs/coverage-guide.md.
 
 **cocotb**
 

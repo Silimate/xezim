@@ -20,13 +20,14 @@ use std::process::Command;
 /// writes with `Immediate`) or `rw` (a cbReadWriteSynch at time 0, the way
 /// cocotb applies an ordinary write and its Python `Clock`). With
 /// `T0_G=start`, cbStartOfSimulation also writes `top.g` the value its
-/// `always_comb` gives it.
+/// `always_comb` gives it, 1 to `top.pd`, which only a procedural `$past`
+/// reads, and 1 to bit 0 of `top.v2`, whose `always_comb` drives both bits.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
 #include "vpi_user.h"
 
-static vpiHandle clk, in, g;
+static vpiHandle clk, in, g, pd, v2;
 static int level = 1;
 
 static const char *env(const char *n, const char *dflt) {
@@ -74,8 +75,13 @@ static PLI_INT32 start(p_cb_data cb) {
     clk = vpi_handle_by_name("top.clk", NULL);
     in = vpi_handle_by_name("top.a_in", NULL);
     g = vpi_handle_by_name("top.g", NULL);
-    if (!strcmp(env("T0_G", "none"), "start"))
+    pd = vpi_handle_by_name("top.pd", NULL);
+    v2 = vpi_handle_by_index(vpi_handle_by_name("top.v2", NULL), 0);
+    if (!strcmp(env("T0_G", "none"), "start")) {
         put(g, 1);
+        put(pd, 1);
+        put(v2, 1);
+    }
     if (!strcmp(env("T0_IN", "rw"), "start"))
         put(in, 1);
     if (!strcmp(env("T0_CLK", "rw"), "start"))
@@ -108,6 +114,9 @@ module top;
   // both operands' defaults (pb is x before the time-0 settle drives it).
   logic pb; always_comb pb = ri;
   always @(posedge clk) if ($time == 0) $display("T|ppast0|%b", $past(a_in & pb));
+  logic pd;                        // written only by the driver
+  always @(posedge clk) if ($time == 0) $display("T|pdpast0|%b", $past(pd));
+  logic [1:0] v2; always_comb v2 = {ri, ri};  // the driver writes bit 0
   a_r:  assert property (@(posedge clk) r === 1'bx) $display("T|r|pass|%0t", $time); else $display("T|r|fail|%0t", $time);
   a_ri: assert property (@(posedge clk) ri === 1'b1) $display("T|ri|pass|%0t", $time); else $display("T|ri|fail|%0t", $time);
   a_n:  assert property (@(posedge clk) n === 0) $display("T|n|pass|%0t", $time); else $display("T|n|fail|%0t", $time);
@@ -123,6 +132,9 @@ module top;
   // expression's operands too.
   a_p0: assert property (@(posedge clk) $time != 0 || 0)
           else $display("T|past0|%b%b", $past(a_in), $past(a_in | 1'b0));
+  a_v2: assert property (@(posedge clk) $time != 0 || v2 === 2'bx1)
+          begin if ($time == 0) $display("T|v2|pass|0"); end
+          else $display("T|v2|fail|%0t", $time);
   initial #12 $finish;
 endmodule
 "#;
@@ -200,6 +212,8 @@ fn time0_attempt_reads_default_sampled_values() {
             "T|n|pass|10".to_string(),
             format!("T|past0|{}", if early { "11" } else { "xx" }),
             "T|ppast0|x".to_string(),
+            format!("T|pdpast0|{}", if g == "start" { "1" } else { "x" }),
+            format!("T|v2|{}|0", if g == "start" { "pass" } else { "fail" }),
             format!("T|past|10|{}xx1", if early { "1" } else { "x" }),
             "T|r|pass|0".to_string(),
             "T|r|pass|10".to_string(),

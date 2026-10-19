@@ -9361,9 +9361,10 @@ pub struct Simulator {
     /// tick before the first one. Filled by `capture_sampled_defaults`.
     sampled_defaults: HashMap<usize, Value>,
     /// The cells VPI clients write while the cbStartOfSimulation routines
-    /// run (`Some` only then): their values are default sampled values
-    /// (`adopt_start_of_simulation_writes`).
-    start_of_simulation_writes: Option<Vec<usize>>,
+    /// run (`Some` only then), each with the bits written (`(lsb, width)`
+    /// for a part, `None` for the whole cell): their values are default
+    /// sampled values (`adopt_start_of_simulation_writes`).
+    start_of_simulation_writes: Option<Vec<(usize, Option<(usize, usize)>)>>,
     /// The pre-process time-0 settle has run: a value read now is no longer
     /// a default sampled value.
     time0_settled: bool,
@@ -12132,7 +12133,8 @@ pub extern "C" fn vpi_put_value(
             sim.dirty_any = true;
         }
         if let Some(w) = sim.start_of_simulation_writes.as_mut() {
-            w.push(sig_id);
+            let part = (h.kind == VpiKind::Slice).then_some((h.lsb as usize, h.width as usize));
+            w.push((sig_id, part));
         }
 
         std::ptr::null_mut()

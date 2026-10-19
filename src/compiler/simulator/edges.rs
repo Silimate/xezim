@@ -1049,22 +1049,44 @@ impl Simulator {
     /// value, as on the reference simulator (cocotb writes its first values
     /// there with `Immediate`). `before` holds the values of the signals with
     /// a default sampled value from before the routines ran; `wrote`, the
-    /// cells the routines wrote.
+    /// cells the routines wrote, with the bits written (`None`: all).
     pub(super) fn adopt_start_of_simulation_writes(
         &mut self,
         before: Vec<(usize, Value)>,
-        wrote: &[usize],
+        wrote: &[(usize, Option<(usize, usize)>)],
     ) {
-        let wrote: HashSet<usize> = wrote.iter().copied().collect();
+        // Per cell, the parts written, or `None` once the whole cell was.
+        let mut parts: HashMap<usize, Option<Vec<(usize, usize)>>> = HashMap::default();
+        for &(id, part) in wrote {
+            let e = parts.entry(id).or_insert_with(|| Some(Vec::new()));
+            match (e.as_mut(), part) {
+                (Some(v), Some(p)) => v.push(p),
+                _ => *e = None,
+            }
+        }
         let mut adopted = Vec::new();
         for (id, old) in before {
-            let Some(v) = self.signal_table.get(id) else {
+            let Some(live) = self.signal_table.get(id) else {
                 continue;
             };
-            // Written (the routine may write the value the settle left), or
-            // changed through any other VPI routine.
-            if wrote.contains(&id) || *v != old {
-                let v = v.clone();
+            let new = match parts.get(&id) {
+                Some(None) => Some(live.clone()),
+                // A write to some bits leaves the others' defaults alone: the
+                // settle may have driven them since.
+                Some(Some(ps)) => {
+                    let mut d = self.sampled_defaults.get(&id).cloned().unwrap_or(old);
+                    for &(lsb, width) in ps {
+                        for i in lsb..lsb + width {
+                            d.set_bit_code(i, live.get_bit_code(i));
+                        }
+                    }
+                    Some(d)
+                }
+                // Changed through another VPI routine.
+                None if *live != old => Some(live.clone()),
+                None => None,
+            };
+            if let Some(v) = new {
                 self.set_sampled_default(id, v);
                 adopted.push(id);
             }
@@ -1507,11 +1529,21 @@ impl Simulator {
                 // registers its watches after the time-0 settle (a net reads
                 // its driver's value by then), and one in a procedure after
                 // the procedure's earlier writes.
-                Some(sid) => self
-                    .sampled_defaults
-                    .get(&sid)
-                    .or(self.signal_table.get(sid))
-                    .cloned(),
+                // Kept in `sampled_defaults` too when registered before the
+                // time-0 settle, so its time-0 sample and a startup write to
+                // it (`adopt_start_of_simulation_writes`) reach this watch.
+                Some(sid) => {
+                    if !self.time0_settled
+                        && !self.sampled_defaults.contains_key(&sid)
+                        && let Some(v) = self.signal_table.get(sid)
+                    {
+                        self.sampled_defaults.insert(sid, v.clone());
+                    }
+                    self.sampled_defaults
+                        .get(&sid)
+                        .or(self.signal_table.get(sid))
+                        .cloned()
+                }
                 // An expression's default is computed from its operands'
                 // defaults, kept for every operand so a later change to one
                 // (`refresh_expr_defaults`) can recompute it.

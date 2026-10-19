@@ -181,7 +181,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_CODE_COVERAGE",
-        "Coverage: collect code coverage, like --code-coverage=<kinds> (stmt,branch,toggle,all); the flag wins",
+        "Coverage: collect code coverage, like --code-coverage=<kinds> (stmt,branch,cond,expr,toggle,all); the flag wins",
     ),
     (
         "XEZIM_CODE_COVERAGE_CONSTANT",

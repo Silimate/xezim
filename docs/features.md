@@ -20,6 +20,17 @@ per release are in the [release notes](../NOTES.md).
   matures at the end of the time slot; a report is dropped if its process
   resumes first, and one still pending at `$finish` prints a note instead of
   running its action.
+* **Sampled values in concurrent assertions** (§16.5.1) — a property reads
+  every variable as sampled in the Preponed region, elements of unpacked
+  arrays included: multidimensional arrays, arrays of structs, arrays in
+  interfaces and array ports. A select samples only the element it names; one
+  whose index reads variables finds that element from the index's sampled
+  value in each time slot, so a large memory is never copied. An index known
+  only when the property is evaluated (a sequence local variable, a
+  procedure's loop variable, a sampled-value function or a call) samples the
+  whole array. The `disable iff` condition reads current values (§16.12).
+  Dynamic-array and queue elements past index 63 and associative-array
+  entries are still read unsampled.
 * **Assertion control** (§20.11, §20.12) — `$asserton`, `$assertoff`,
   `$assertkill`, the pass/fail/vacuous action-control tasks and
   `$assertcontrol` with Lock/Unlock, the assertion-type and directive-type

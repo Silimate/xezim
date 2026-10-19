@@ -3,9 +3,9 @@
 //! writes to an element of an instance's array port is what the instance
 //! reads, and the actual's name reads it too; a value written to the actual
 //! reaches the port's name. xezim gave the port's elements storage of their
-//! own, which the instance never read (it reads the actual), so writes to
-//! `u.a[i]` were lost: a cocotb test driving `dut.inst.port[i]` left the
-//! instance reading z.
+//! own, so a value written to `u.a[i]` reached the instance but not `a[i]`
+//! or an outer port: a cocotb test that wrote `dut.inst.port[i]` read z back
+//! from the parent's array.
 //!
 //! tests/dpi/vpi_array_ports.c writes through one, two and three port
 //! levels, to wide, one-bit, two-dimensional and descending arrays, to a

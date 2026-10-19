@@ -183,6 +183,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   calls, and persistent methods recompile for the new conversion
   (§6.16, §6.18, §6.24.3, §11.4.12).
   (#391, reported by urbanij; #396, contributed by Ganesh-TNL)
+* Sampled-value functions use the value from before time 0 as the default
+  sampled value at a tick before the first one, wherever their watch
+  registers: a net reads its type's default instead of its driver's value,
+  a declaration initializer run as a time-0 process (`logic [7:0] v = f(3);`)
+  counts, and an assertion inside a procedure ignores the procedure's own
+  time-0 writes. Procedural calls take the same defaults (§16.5.1, §16.9.3).
+  (#403, reported by akashlevy)
 
 **Performance**
 

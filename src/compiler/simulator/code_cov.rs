@@ -2043,6 +2043,25 @@ impl Instr<'_> {
         }
     }
 
+    /// In block granularity without branch coverage, the counter of an
+    /// implicit `else` or `default` (`kind`), as a statement to put in it.
+    /// With branch coverage the arm's count comes from the branch instead
+    /// (see `cov_report`).
+    fn implicit_block(&mut self, span: Span, kind: &'static str) -> Option<Statement> {
+        if !self.blocks || self.kinds & KIND_STATEMENT == 0 {
+            return None;
+        }
+        let counter = self.counter();
+        self.cov.stmts.push(StmtSite {
+            scope: self.scope,
+            span,
+            kind,
+            counter,
+            excluded: false,
+        });
+        Some(hit(counter, span))
+    }
+
     /// An `always` construct's own count, each time its body starts; in
     /// block granularity the body's first block counts that instead.
     fn process(&mut self, span: Span, kind: &'static str, out: &mut Vec<Statement>) {
@@ -2366,7 +2385,14 @@ impl Instr<'_> {
             let cond = self.skeleton(&condition);
             self.cond(&mut condition, "if", true);
             let (then_stmt, t) = self.region(|me| Box::new(me.wrap(*then_stmt)));
-            let (else_stmt, e) = self.region(|me| else_stmt.map(|e| Box::new(me.wrap(*e))));
+            let implicit = else_stmt.is_none() && unique_priority.is_none();
+            let (else_stmt, e) = self.region(|me| match else_stmt {
+                Some(e) => Some(Box::new(me.wrap(*e))),
+                // Block granularity counts the implicit `else` without
+                // branch coverage too: an `else` holding only its counter.
+                None if implicit => me.implicit_block(span, "else (implicit)").map(Box::new),
+                None => None,
+            });
             if !matches!(cond, Cond::Unknown) {
                 self.decide(Choice::If(vec![cond]), None, vec![t, e], Vec::new());
             }
@@ -2522,12 +2548,32 @@ impl Instr<'_> {
         let choice = self.case_choice(kind, &expr, &items);
         let mut regions = Vec::with_capacity(items.len() + 1);
         let mut site = None;
+        // What the implicit `default` holds: nothing, or its block.
+        let mut fallback: Region = (0..0, 0..0, 0..0);
         if self.kinds & KIND_BRANCH == 0 {
             for it in items.iter_mut() {
                 let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
                 let (s, r) = self.region(|me| me.wrap(st));
                 it.stmt = s;
                 regions.push(r);
+            }
+            // Block granularity counts the implicit `default` without branch
+            // coverage too: a `default` item holding only its counter (an
+            // ordinary `case`; not a `case matches`).
+            let implicit = !items.iter().any(|it| it.is_default)
+                && unique_priority.is_none()
+                && items.first().is_some_and(|it| it.pattern.is_none());
+            if implicit {
+                let (stmt, r) = self.region(|me| me.implicit_block(span, "default (implicit)"));
+                fallback = r;
+                if let Some(stmt) = stmt {
+                    let mut d = items[0].clone();
+                    d.patterns.clear();
+                    d.is_default = true;
+                    d.stmt = stmt;
+                    d.span = span;
+                    items.push(d);
+                }
             }
         } else {
             let implicit = !items.iter().any(|it| it.is_default) && unique_priority.is_none();
@@ -2575,8 +2621,7 @@ impl Instr<'_> {
                 out.push(hit(e, span));
             }
         }
-        // The implicit `default` holds nothing.
-        regions.push((0..0, 0..0, 0..0));
+        regions.push(fallback);
         if let Some(choice) = choice {
             self.decide(choice, site, regions, Vec::new());
         }
@@ -2878,7 +2923,9 @@ impl Instr<'_> {
         // on two non-constant operands; a relation alone is none.
         if self.logical {
             let logical = p.nodes.iter().any(|n| {
-                matches!(n.op, Op::And | Op::Or) && !constant(n.kids[0]) && !constant(n.kids[1])
+                matches!(n.op, Op::And | Op::Or | Op::AndFull | Op::OrFull)
+                    && !constant(n.kids[0])
+                    && !constant(n.kids[1])
             });
             return logical.then_some(p);
         }
@@ -2966,6 +3013,24 @@ impl Instr<'_> {
                 op: BinaryOp::LogAnd | BinaryOp::LogOr,
                 ..
             } if self.logical => self.split_logical(e, t),
+            // A `!` over a `&&` or `||` keeps the tree below it.
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } if self.logical
+                && matches!(
+                    &unparen(operand).kind,
+                    ExprKind::Binary {
+                        op: BinaryOp::LogAnd | BinaryOp::LogOr,
+                        ..
+                    }
+                ) =>
+            {
+                (
+                    Op::Not,
+                    vec![(operand, t.and_then(|t| unary_operand(t, '!')))],
+                )
+            }
             _ if self.logical => (self.term(e, t, p, i), Vec::new()),
             ExprKind::Unary {
                 op: UnaryOp::LogNot,
@@ -5523,6 +5588,7 @@ impl Simulator {
             // branch's stay bare in its instance, so they are found in the
             // source.
             let decls = generate_decls(module);
+            let none = (HashSet::default(), HashSet::default());
             let top = xezim_core::bind_spec_base(&module.name).to_string();
             out.retain(|(n, _, _)| {
                 // The instance the signal belongs to: the longest instance
@@ -5535,16 +5601,12 @@ impl Simulator {
                     .unwrap_or("");
                 let rel = n[inst.len()..].trim_start_matches('.');
                 let def = types.defs.get(inst).copied().unwrap_or(top.as_str());
-                let Some((bare, blocks)) = decls.get(def) else {
-                    return true;
-                };
-                match rel.split_once('.') {
-                    Some((first, _)) => {
-                        let first = first.split('[').next().unwrap_or(first);
-                        !blocks.contains(first) && !first.starts_with("genblk")
-                    }
-                    None => !bare.contains(rel),
-                }
+                let (bare, blocks) = decls.get(def).unwrap_or(&none);
+                // A member (`s.m`) goes with its variable; an unnamed loop's
+                // block is `genblk<n>`.
+                let first = rel.split(['.', '[']).next().unwrap_or(rel);
+                !(bare.contains(first)
+                    || (rel.contains('.') && (blocks.contains(first) || first.starts_with("genblk"))))
             });
         }
         out.sort();

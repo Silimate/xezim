@@ -232,7 +232,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 **Usability**
 
 * Five code coverage counting rules, each its own option and off by
-  default, follow the defaults another simulator documents:
+  default, follow the code coverage defaults the reference simulator
+  documents:
   `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
   signals declared in generate blocks out of toggle coverage;
   `--code-coverage-expressions=logical` scores only the conditions with a

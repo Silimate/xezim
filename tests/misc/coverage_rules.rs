@@ -79,7 +79,8 @@ module sub #(parameter N = 2) (input logic clk, output logic [1:0] o);
   logic [1:0] r;
   if (N > 1) begin
     logic [1:0] ub;
-    always @(posedge clk) ub <= ub + 1;
+    struct { logic m; } gs;
+    always @(posedge clk) begin ub <= ub + 1; gs.m <= ~gs.m; end
   end
   if (N > 1) begin : lb
     logic [1:0] lab;
@@ -92,12 +93,21 @@ module sub #(parameter N = 2) (input logic clk, output logic [1:0] o);
   always @(posedge clk) r <= r + 1;
   assign o = r;
 endmodule
+module leaf(input logic clk);
+  for (genvar i = 0; i < 2; i++) begin
+    logic g2;
+    always @(posedge clk) g2 <= ~g2;
+  end
+  logic keep;
+  always @(posedge clk) keep <= ~keep;
+endmodule
 module tb;
   logic clk = 0;
   st_t st;
   struct { logic m; logic [1:0] k; } us;
   wire [1:0] o;
   sub u(.clk, .o);
+  leaf w(.clk);
   always #5 clk = ~clk;
   initial begin st = A; us.m = 0; us.k = 0; #12 st = C; us.m = 1; us.k = 3; #20 $finish; end
 endmodule
@@ -105,9 +115,11 @@ endmodule
 
 /// `--no-toggle-enums` leaves enum variables out of toggle coverage;
 /// `--no-toggle-generate` leaves out the signals declared in a generate
-/// block: an unlabeled branch's (`ub`, bare in its instance), a labeled
-/// one's (`lb.lab`) and a loop's (`fl[0].f`). Module-scope signals, ports
-/// and the members of an unpacked struct stay. By default both are counted.
+/// block: an unlabeled branch's (`ub`, bare in its instance, and the
+/// members of its struct `gs`), a labeled one's (`lb.lab`), a named loop's
+/// (`fl[0].f`) and an unnamed loop's (`genblk1[0].g2`, in a module with no
+/// other generate block). Module-scope signals, ports and the members of a
+/// module-scope unpacked struct stay. By default both are counted.
 #[test]
 fn toggle_enums_and_generate_blocks_left_out() {
     let d = scratch("toggles");
@@ -118,7 +130,13 @@ fn toggle_enums_and_generate_blocks_left_out() {
     );
     assert_eq!(
         strings(scope(&all, "tb.u"), "signal"),
-        ["clk", "fl[0].f", "fl[1].f", "lb.lab", "o", "r", "ub"]
+        [
+            "clk", "fl[0].f", "fl[1].f", "gs.m", "lb.lab", "o", "r", "ub"
+        ]
+    );
+    assert_eq!(
+        strings(scope(&all, "tb.w"), "signal"),
+        ["clk", "genblk1[0].g2", "genblk1[1].g2", "keep"]
     );
     let enums = run(
         &d,
@@ -142,6 +160,7 @@ fn toggle_enums_and_generate_blocks_left_out() {
         strings(scope(&generate, "tb.u"), "signal"),
         ["clk", "o", "r"]
     );
+    assert_eq!(strings(scope(&generate, "tb.w"), "signal"), ["clk", "keep"]);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -154,6 +173,7 @@ module m(input logic clk, input logic a, b, c, input logic [1:0] v, output logic
     if (v == 2'd1) z <= 1;
     if ((a & b) || c) z <= 0;
     if (!a && v) z <= 1;
+    if (!(a && b)) z <= 0;
   end
 endmodule
 module tb;
@@ -166,7 +186,8 @@ endmodule
 
 /// `--code-coverage-expressions=logical` scores only the conditions that
 /// hold a `&&` or `||`, with their operands as terms: `(a & b) || c` has
-/// the terms `a & b` and `c`, `!a && v` has `!a` and `v`. A condition
+/// the terms `a & b` and `c`, `!a && v` has `!a` and `v`, and `!(a && b)`
+/// keeps `a` and `b` under its `!`. A condition
 /// without one (`if (a)`, `if (v == 2'd1)`) and an assignment's value
 /// (`assign y = a && b`) are no items. A term is covered once it has been
 /// 0 and 1, whether or not it decided the value: `a` of `a && b` is 1 only
@@ -179,7 +200,14 @@ fn logical_conditions_scored_by_term_values() {
     let u = scope(&all, "tb.u");
     assert_eq!(
         strings(u, "text"),
-        ["a && b", "v == 2'd1", "(a & b) || c", "!a && v", "a && b"]
+        [
+            "a && b",
+            "v == 2'd1",
+            "(a & b) || c",
+            "!a && v",
+            "!(a && b)",
+            "a && b"
+        ]
     );
     assert!(u.contains("{\"term\": \"a\", \"hits\": [2, 0]}"), "{u}");
     let logical = run(
@@ -191,11 +219,17 @@ fn logical_conditions_scored_by_term_values() {
         ],
     );
     let u = scope(&logical, "tb.u");
-    assert_eq!(strings(u, "text"), ["a && b", "(a & b) || c", "!a && v"]);
-    assert_eq!(strings(u, "term"), ["a", "b", "a & b", "c", "!a", "v"]);
+    assert_eq!(
+        strings(u, "text"),
+        ["a && b", "(a & b) || c", "!a && v", "!(a && b)"]
+    );
+    assert_eq!(
+        strings(u, "term"),
+        ["a", "b", "a & b", "c", "!a", "v", "a", "b"]
+    );
     assert!(u.contains("{\"term\": \"a\", \"hits\": [2, 2]}"), "{u}");
     assert!(
-        u.contains("\"condition\": {\"covered\": 3, \"total\": 6, \"percent\": 50.00}"),
+        u.contains("\"condition\": {\"covered\": 4, \"total\": 8, \"percent\": 50.00}"),
         "{u}"
     );
     assert!(
@@ -245,10 +279,21 @@ endmodule
 /// (20) and the code after a delay (22, with 23). An implicit `else` or
 /// `default` is a block of its own (9, 17), run when no written arm is. A
 /// continuous assignment (3) and the `always` construct itself are no
-/// blocks.
+/// blocks. Branch coverage or not, the blocks are the same.
 #[test]
 fn block_granularity() {
     let d = scratch("blocks");
+    let rows = |json: &str| -> Vec<(u32, String)> {
+        scope(json, "tb.u")
+            .split("{\"file\": \"t.sv\", \"line\": ")
+            .skip(1)
+            .take_while(|r| r.contains("\"count\"") && !r.contains("\"arms\""))
+            .map(|r| {
+                let line = r[..r.find(',').unwrap()].parse().unwrap();
+                (line, strings(r, "kind")[0].to_string())
+            })
+            .collect()
+    };
     let json = run(
         &d,
         BLOCKS,
@@ -258,43 +303,50 @@ fn block_granularity() {
         ],
     );
     let u = scope(&json, "tb.u");
-    let rows: Vec<(u32, &str)> = u
-        .split("{\"file\": \"t.sv\", \"line\": ")
-        .skip(1)
-        .take_while(|r| r.contains("\"count\"") && !r.contains("\"arms\""))
-        .map(|r| {
-            let line = r[..r.find(',').unwrap()].parse().unwrap();
-            let kind = strings(r, "kind")[0];
-            (line, kind)
-        })
-        .collect();
-    assert_eq!(
-        rows,
-        [
-            (5, "block"),
-            (6, "block"),
-            (8, "block"),
-            (9, "default (implicit)"),
-            (10, "block"),
-            (11, "block"),
-            (14, "block"),
-            (17, "block"),
-            (17, "else (implicit)"),
-            (17, "block"),
-            (19, "block"),
-            (20, "block"),
-            (22, "block"),
-        ],
-        "{u}"
-    );
+    let expected: Vec<(u32, String)> = [
+        (5, "block"),
+        (6, "block"),
+        (8, "block"),
+        (9, "default (implicit)"),
+        (10, "block"),
+        (11, "block"),
+        (14, "block"),
+        (17, "block"),
+        (17, "else (implicit)"),
+        (17, "block"),
+        (19, "block"),
+        (20, "block"),
+        (22, "block"),
+    ]
+    .into_iter()
+    .map(|(l, k)| (l, k.to_string()))
+    .collect();
+    assert_eq!(rows(&json), expected, "{u}");
     assert!(
         u.contains("\"statement\": {\"covered\": 12, \"total\": 13, \"percent\": 92.31}"),
         "{u}"
     );
+    let stmts = run(
+        &d,
+        BLOCKS,
+        &["--code-coverage=stmt", "--code-coverage-granularity=block"],
+    );
+    assert_eq!(rows(&stmts), expected, "{stmts}");
     let _ = std::fs::remove_dir_all(&d);
 }
 
 const FSM: &str = "\
+module e(input logic clk, input logic en, input logic go);
+  typedef enum logic [1:0] {IDLE, RUN, DONE} st_t;
+  st_t st = IDLE;
+  always @(posedge clk)
+    if (en)
+      case (st)
+        IDLE: if (go) st <= RUN;
+        RUN: st <= DONE;
+        DONE: st <= IDLE;
+      endcase
+endmodule
 module m(input logic clk, input logic rst, input logic go, output logic busy);
   typedef enum logic [1:0] {IDLE, RUN, DONE} st_t;
   st_t st;
@@ -310,6 +362,7 @@ endmodule
 module tb;
   logic clk = 0, rst = 1, go = 0; wire busy;
   m u(.clk, .rst, .go, .busy);
+  e g(.clk, .en(go), .go);
   always #5 clk = ~clk;
   initial begin #12 rst = 0; go = 1; #30 go = 0; #20 rst = 1; #10 rst = 0; #20 $finish; end
 endmodule
@@ -317,13 +370,14 @@ endmodule
 
 /// `--no-fsm-reset-transitions` leaves out the transitions that only the
 /// state process's reset branch makes (`RUN -> IDLE`, `DONE -> IDLE`); the
-/// others stay. A state that stays put is never a transition.
+/// others stay. A clock enable (`if (en) case (st)`) is no reset: its FSM
+/// keeps every transition. A state that stays put is never a transition.
 #[test]
 fn fsm_reset_transitions_left_out() {
     let d = scratch("fsm");
     let all = run(&d, FSM, &["--code-coverage=fsm"]);
-    let pairs = |json: &str| {
-        let u = scope(json, "tb.u");
+    let pairs = |json: &str, inst: &str| {
+        let u = scope(json, inst);
         strings(u, "from")
             .into_iter()
             .zip(strings(u, "to"))
@@ -331,7 +385,7 @@ fn fsm_reset_transitions_left_out() {
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        pairs(&all),
+        pairs(&all, "tb.u"),
         [
             "IDLE->RUN",
             "RUN->IDLE",
@@ -345,7 +399,13 @@ fn fsm_reset_transitions_left_out() {
         FSM,
         &["--code-coverage=fsm", "--no-fsm-reset-transitions"],
     );
-    assert_eq!(pairs(&logic), ["IDLE->RUN", "RUN->DONE", "DONE->RUN"]);
+    assert_eq!(
+        pairs(&logic, "tb.u"),
+        ["IDLE->RUN", "RUN->DONE", "DONE->RUN"]
+    );
+    let enabled = ["IDLE->RUN", "RUN->DONE", "DONE->IDLE"];
+    assert_eq!(pairs(&all, "tb.g"), enabled);
+    assert_eq!(pairs(&logic, "tb.g"), enabled);
     let _ = std::fs::remove_dir_all(&d);
 }
 

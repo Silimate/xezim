@@ -1085,16 +1085,15 @@ reference simulator's "FSM States" and "FSM Transitions".
 #### Counting rules
 
 Five options change what is counted. Each is off by default; together they
-follow the defaults another simulator documents for its code coverage, and
-the CVDP `xrun` stand-in turns all of them on.
+follow the code coverage defaults the reference simulator documents.
 
 | Option | What it counts |
 |---|---|
 | `--no-toggle-enums`, `XEZIM_TOGGLE_ENUMS=0` | Enum variables are not tracked for toggles (entries of `type` `enum`). |
-| `--no-toggle-generate`, `XEZIM_TOGGLE_GENERATE=0` | Signals declared in a generate block are not tracked for toggles: a labeled block's (`g.x`), a generate loop's (`g[1].x`) and an unlabeled `if` or `case` branch's, which keep their bare name in the instance. Signals declared directly in a `generate` region are module items and stay. |
+| `--no-toggle-generate`, `XEZIM_TOGGLE_GENERATE=0` | Signals declared in a generate block are not tracked for toggles: a labeled block's (`g.x`), a generate loop's, named or not (`g[1].x`, `genblk1[1].x`), and an unlabeled `if` or `case` branch's, which keep their bare name in the instance (the members of a struct declared there too). Signals declared directly in a `generate` region are module items and stay. |
 | `--code-coverage-expressions=logical`, `XEZIM_CODE_COVERAGE_EXPRESSIONS=logical` | Only conditions (`if`, `while`, `do`, `?:`) that hold a `&&` or `||` are items, and only those operators split one into terms: `(a & b) \|\| c` has the terms `a & b` and `c`, `!a && v` has `!a` and `v`, and a vector term counts as nonzero or zero. An assignment's value is no item. A term is covered once the item has read it at 0 and at 1, whether or not it decided the value (sum-of-products scoring); a term a short circuit skips is not read. |
 | `--code-coverage-granularity=block`, `XEZIM_CODE_COVERAGE_GRANULARITY=block` | `statement` counts straight-line blocks instead of statements (below). |
-| `--no-fsm-reset-transitions`, `XEZIM_FSM_RESET_TRANSITIONS=0` | A transition that only the state process's reset branch makes is no transition. |
+| `--no-fsm-reset-transitions`, `XEZIM_FSM_RESET_TRANSITIONS=0` | A transition that only the state process's reset branch makes is no transition. The reset branch is the first `if` of the state process when it has an `else` and does not test the state variable itself; a clock enable around the state logic (`if (en) case (st) ...`) is none. |
 
 A state that stays put is never a transition, with or without these.
 
@@ -1109,7 +1108,8 @@ block starts:
   without an `else`, or a `case` without a `default`, has an implicit arm
   that is a block of its own (`kind` `else (implicit)` or `default
   (implicit)`, counted when no written arm runs), except in a `unique` or
-  `priority` decision;
+  `priority` decision. Its count comes from branch coverage when that is
+  collected, and from a counter of its own otherwise;
 - after an `if`, `case` or loop, where the paths meet again;
 - at a loop body, and at the statement an event control, delay or `wait`
   controls;

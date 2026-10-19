@@ -3138,3 +3138,97 @@ endmodule
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A `?:` whose condition is a parameter (§11.2.1, §11.4.11) never yields
+/// its other operand, so the condition items there are left out whether or
+/// not branch coverage is on: the condition totals do not depend on the
+/// other kinds collected. `a && b` is in the operand `P` rules out; `a || b`
+/// stays.
+#[test]
+fn constant_ternary_items_whatever_the_kinds() {
+    let d = scratch("constant-ternary");
+    let src = "\
+module tb;
+  parameter bit P = 0;
+  logic a, b;
+  logic [7:0] y;
+  always_comb y = P ? ((a && b) ? 8'd1 : 8'd2) : ((a || b) ? 8'd3 : 8'd0);
+  initial begin
+    a = 0; b = 0;
+    #1 a = 1;
+    #1 b = 1;
+    #1 a = 0;
+    #1 $finish;
+  end
+endmodule
+";
+    for kinds in [
+        "--code-coverage=cond",
+        "--code-coverage=cond,branch",
+        "--code-coverage=all",
+    ] {
+        let out = run(&d, src, &[kinds]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json = results(&d);
+        let tb = scope_entry(&json, "tb");
+        assert!(!tb.contains("\"text\": \"a && b\""), "{kinds}: {tb}");
+        assert!(tb.contains("\"text\": \"a || b\""), "{kinds}: {tb}");
+        assert!(
+            tb.contains("\"condition\": {\"covered\": 2, \"total\": 2, \"percent\": 100.00}"),
+            "{kinds}: {tb}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Only a combinational block's last run before a process waits counts
+/// (the reference simulator runs it once then, §4.5, §9.2.2.2): when that
+/// run skips an item, the item counts nothing from the process's earlier
+/// writes. `a = 1;` runs the block with `en` at 1 and `a & b` at (1, 1),
+/// then `en = 0;` takes the `else`: `a` and `b` never decide at 1. The same
+/// in an instance whose variables the process writes by name.
+#[test]
+fn skipped_item_drops_deferred_runs() {
+    let d = scratch("skipped-deferred");
+    let src = "\
+module sub;
+  logic en, a, b, y;
+  always_comb
+    if (en) y = a & b;
+    else y = 0;
+endmodule
+module tb;
+  logic en, a, b, y;
+  always_comb
+    if (en) y = a & b;
+    else y = 0;
+  sub u0 ();
+  initial begin
+    en = 1; a = 0; b = 1;
+    u0.en = 1; u0.a = 0; u0.b = 1;
+    #1 a = 1; en = 0;
+    u0.a = 1; u0.en = 0;
+    #1 $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=expr"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    for (scope, line) in [("tb", 10), ("tb.u0", 4)] {
+        let e = scope_entry(&json, scope);
+        let t = terms(e, line, "statement");
+        assert_eq!(t.len(), 2, "{scope}: {e}");
+        assert!(t[0].1[0] > 0, "{scope}: {e}");
+        assert_eq!((t[0].1[1], t[1].1[1]), (0, 0), "{scope}: {e}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

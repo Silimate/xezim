@@ -51148,6 +51148,9 @@ impl Simulator {
     }
 
     fn note_comb_ran_in_process(&mut self, eidx: usize, entry: &CombEntry) {
+        // Code coverage: the items this run skipped count nothing from
+        // earlier runs.
+        self.cov_block_ran(entry);
         if entry.cold.write_signal_ids.is_empty() {
             return;
         }

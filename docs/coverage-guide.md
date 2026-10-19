@@ -746,6 +746,10 @@ is left out of the instance's totals (*excluded*):
 - The statements of an excluded arm are excluded, and so are the branches
   inside it, and the `?:`s in the conditions of the `else if`s after a
   constantly true one.
+- FSM coverage reads only the code that can run: an assignment in an
+  excluded arm or `?:` operand makes no state and no transition, and a
+  state machine whose state logic is all excluded is none (with `EN` 0,
+  `if (EN && go) st <= HALT;` adds neither `HALT` nor a transition to it).
 
 Constants are literals (strings included), parameters and `localparam`s, enum
 constants, package parameters (`pkg::P`), the genvar of a generate loop, and an

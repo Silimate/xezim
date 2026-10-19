@@ -537,6 +537,103 @@ fn fsm_reset_transitions_left_out() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+const DEAD_FSM: &str = "\
+module p #(parameter bit ON = 1'b0) (input logic clk, input logic rst, input logic go);
+  typedef enum logic [1:0] {IDLE, RUN, DONE, HALT} st_t;
+  st_t st;
+  always @(posedge clk or posedge rst)
+    if (rst) st <= IDLE;
+    else case (st)
+      IDLE: if (go) st <= RUN;
+      RUN: if (ON && go) st <= HALT;
+           else st <= DONE;
+      DONE: st <= IDLE;
+      default: ;
+    endcase
+endmodule
+module t #(parameter bit ON = 1'b0) (input logic clk, input logic rst, input logic go);
+  typedef enum logic [1:0] {IDLE, RUN, DONE, HALT} st_t;
+  st_t st;
+  always @(posedge clk or posedge rst)
+    if (rst) st <= IDLE;
+    else case (st)
+      IDLE: if (go) st <= RUN;
+      RUN: st <= (go & ON) ? HALT : DONE;
+      DONE: st <= IDLE;
+      default: ;
+    endcase
+endmodule
+module q #(parameter bit ON = 1'b0) (input logic clk, input logic rst, input logic go);
+  typedef enum logic [1:0] {IDLE, RUN, DONE} st_t;
+  st_t st;
+  always @(posedge clk)
+    if (!ON || rst) st <= IDLE;
+    else case (st)
+      IDLE: if (go) st <= RUN;
+      RUN: st <= DONE;
+      DONE: st <= IDLE;
+    endcase
+endmodule
+module tb;
+  logic clk = 0, rst = 1, go = 0;
+  p #(.ON(1'b0)) u0(.clk, .rst, .go);
+  p #(.ON(1'b1)) u1(.clk, .rst, .go);
+  t #(.ON(1'b0)) t0(.clk, .rst, .go);
+  q #(.ON(1'b0)) v(.clk, .rst, .go);
+  always #5 clk = ~clk;
+  initial begin #12 rst = 0; go = 1; #60 go = 0; #30 $finish; end
+endmodule
+";
+
+/// Code a constant rules out (see Constant conditions) holds no FSM states
+/// or transitions, also where the rest of a condition can't change its
+/// value: with `ON` 0, `if (ON && go)` and `(go & ON) ? HALT : DONE` never
+/// make `HALT`, and `if (!ON || rst)` leaves `q`'s state logic out, so `q`
+/// has no FSM at all. With `ON` 1 the same code counts.
+#[test]
+fn fsm_in_constant_dead_code_left_out() {
+    let d = scratch("deadfsm");
+    let json = run(&d, DEAD_FSM, &["--code-coverage=fsm,stmt"]);
+    let fsm = |inst: &str| {
+        let u = scope(&json, inst);
+        let states = u
+            .find("\"states\": [")
+            .map(|a| &u[a..a + u[a..].find(']').unwrap()])
+            .unwrap_or("");
+        let pairs: Vec<String> = strings(u, "from")
+            .into_iter()
+            .zip(strings(u, "to"))
+            .map(|(f, t)| format!("{f}->{t}"))
+            .collect();
+        (strings(states, "name"), pairs)
+    };
+    for inst in ["tb.u0", "tb.t0"] {
+        let (states, pairs) = fsm(inst);
+        assert_eq!(states, ["IDLE", "RUN", "DONE"], "{inst}: {json}");
+        assert_eq!(
+            pairs,
+            ["IDLE->RUN", "RUN->IDLE", "RUN->DONE", "DONE->IDLE"],
+            "{inst}: {json}"
+        );
+    }
+    let (states, pairs) = fsm("tb.u1");
+    assert_eq!(states, ["IDLE", "RUN", "DONE", "HALT"], "{json}");
+    assert_eq!(
+        pairs,
+        [
+            "IDLE->RUN",
+            "RUN->IDLE",
+            "RUN->DONE",
+            "RUN->HALT",
+            "DONE->IDLE",
+            "HALT->IDLE"
+        ],
+        "{json}"
+    );
+    assert!(!scope(&json, "tb.v").contains("\"variable\""), "{json}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 const TIED: &str = "\
 module fa(input logic a, input logic b, input logic cin, output logic s, output logic co);
   assign s = a ^ b ^ cin;

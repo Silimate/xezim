@@ -240,7 +240,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `--code-coverage-granularity=block` counts straight-line blocks, implicit
   `else` and `default` arms included and continuous assignments not; and
   `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
-  makes, an asynchronous reset's included. A sixth, `--no-toggle-tied`,
+  makes, an asynchronous reset's included. FSM coverage skips the code a
+  constant condition rules out, as statement and branch coverage do, also
+  where the rest of the condition can't change it (`if (EN && go)` with `EN`
+  0). A sixth, `--no-toggle-tied`,
   leaves out the toggle bins of bits whose only drivers are constants
   (`{4'b0, x}`, a port tied to `1'b0` and the ports wired to it). Each has an
   `XEZIM_*` variable. See docs/coverage-guide.md, "Counting rules".

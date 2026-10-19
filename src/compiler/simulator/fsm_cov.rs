@@ -629,6 +629,45 @@ impl Walk<'_> {
         self.sim.eval_expr(cond).is_nonzero()
     }
 
+    /// The value of a condition its constant parts decide, as constant
+    /// condition exclusion takes it (code_cov's `Cond`): a `&&` or `&` with
+    /// a constantly false operand is false, a `||` or `|` with a constantly
+    /// true one true, whatever the other operand is; `!` turns it around. A
+    /// bitwise operand counts only when its value does not depend on the
+    /// other's width.
+    fn decide(&mut self, cond: &Expression) -> Option<bool> {
+        if let Some(t) = self.fold(cond) {
+            return Some(t);
+        }
+        match &cond.kind {
+            ExprKind::Paren(x) => self.decide(x),
+            ExprKind::Unary {
+                op: UnaryOp::LogNot,
+                operand,
+            } => self.decide(operand).map(|t| !t),
+            ExprKind::Binary { op, left, right } => {
+                let bitwise = matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr);
+                let mut side = |x: &Expression| {
+                    if bitwise && !super::code_cov::context_free(x) {
+                        return None;
+                    }
+                    self.decide(x)
+                };
+                let (l, r) = (side(left), side(right));
+                match op {
+                    BinaryOp::LogAnd | BinaryOp::BitAnd => {
+                        (l == Some(false) || r == Some(false)).then_some(false)
+                    }
+                    BinaryOp::LogOr | BinaryOp::BitOr => {
+                        (l == Some(true) || r == Some(true)).then_some(true)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The item a `case` on parameters selects (`Some(None)`: none does),
     /// when its selector and labels are all constants. The items are tried
     /// in order and matched as simulation matches them: the selector sized
@@ -876,7 +915,7 @@ impl Walk<'_> {
                 then_expr,
                 else_expr,
             } => {
-                if let Some(taken) = self.fold(condition) {
+                if let Some(taken) = self.decide(condition) {
                     return self.eval(if taken { then_expr } else { else_expr }, ctx);
                 }
                 let (t, f) = match (self.pure(condition), self.then(condition)) {
@@ -942,8 +981,10 @@ impl Walk<'_> {
                 else_stmt,
                 ..
             } => {
-                // A branch on parameters: only the branch they select is code.
-                if let Some(taken) = self.fold(condition) {
+                // A branch on parameters: only the branch they select is
+                // code, also when the rest of the condition can't change it
+                // (`if (EN && go)` with `EN` 0).
+                if let Some(taken) = self.decide(condition) {
                     match (taken, else_stmt) {
                         (true, _) => self.stmt(then_stmt, ctx),
                         (false, Some(e)) => self.stmt(e, ctx),

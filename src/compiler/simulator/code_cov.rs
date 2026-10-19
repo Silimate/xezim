@@ -2798,7 +2798,7 @@ impl Instr<'_> {
 /// reduction operator), so that whether it is zero, or has a 1 bit, does
 /// not depend on the operator it is an operand of. `4'hf + 4'h1` is 0 on
 /// its own but 8'h10 beside an 8-bit operand.
-fn context_free(e: &Expression) -> bool {
+pub(super) fn context_free(e: &Expression) -> bool {
     match &e.kind {
         ExprKind::Paren(x) => context_free(x),
         ExprKind::Number(_)

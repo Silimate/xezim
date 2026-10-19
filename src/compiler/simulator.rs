@@ -10999,6 +10999,7 @@ impl Simulator {
         Self::classify_typedef_collection_properties(&mut module);
         let contested_pkg_vars = Self::split_contested_package_vars(&mut module);
         Self::register_struct_member_packed_dims(&mut module);
+        Self::fold_named_sva_members(&mut module);
         // §9.2.2.2: give every dynamic array / queue a REAL `<q>.size` signal.
         // It doubles as the queue's change proxy in the comb dependency graph:
         // sensitivity registration resolves it to an id, and every mutation
@@ -15995,18 +15996,7 @@ impl Simulator {
         // Ident. Resolve it as the hierarchical name it spells; without this
         // `$readmemh("f", r.mem)` in a task loaded nothing.
         if matches!(expr.kind, ExprKind::MemberAccess { .. }) {
-            if let Some(mut flat) = Self::member_chain_as_hier_ident(expr) {
-                // An instance-array select names one element instance, whose
-                // scope is `ra[1]`: fold the (constant) index into the
-                // segment name, the spelling the element's storage uses.
-                if let ExprKind::Ident(h) = &mut flat.kind {
-                    for seg in h.path.iter_mut() {
-                        for sel in std::mem::take(&mut seg.selects) {
-                            let i = self.eval_scalar_self(&sel)?;
-                            seg.name.name = format!("{}[{}]", seg.name.name, i);
-                        }
-                    }
-                }
+            if let Some(flat) = self.member_chain_ident(expr) {
                 return self.resolve_array_name_from_expr(&flat);
             }
         }
@@ -16086,6 +16076,23 @@ impl Simulator {
         self.record_output(m.clone());
         self.stdout_writeln(&m);
         None
+    }
+
+    /// [`member_chain_as_hier_ident`] with each select folded into its
+    /// segment's name: an instance-array element or a generate block scope
+    /// is `ra[1]` / `blk[1]`, the spelling its storage uses. `None` when a
+    /// select is not constant.
+    fn member_chain_ident(&self, e: &Expression) -> Option<Expression> {
+        let mut flat = Self::member_chain_as_hier_ident(e)?;
+        if let ExprKind::Ident(h) = &mut flat.kind {
+            for seg in h.path.iter_mut() {
+                for sel in std::mem::take(&mut seg.selects) {
+                    let i = self.eval_scalar_self(&sel)?;
+                    seg.name.name = format!("{}[{}]", seg.name.name, i);
+                }
+            }
+        }
+        Some(flat)
     }
 
     /// A dotted chain of names and constant-indexed instance-array elements
@@ -94850,6 +94857,180 @@ impl Simulator {
         }
     }
 
+    /// §16.5.1: the operands of a named property or sequence are sampled like
+    /// those of an assertion written inline. The parser spells `u.st` as a
+    /// member access, which the elaborator folds into a hierarchical name in
+    /// the top-level process bodies and in every declaration of an inlined
+    /// instance, but not in a top-level or package declaration. Unfolded, the
+    /// reference is not among the signals a concurrent assertion samples, so
+    /// it read the value the clock edge's nonblocking assignments had just
+    /// written. Fold those bodies the same way. A body without a member
+    /// access is left alone: rebuilding it changes nothing but where it lives
+    /// in memory, which cost 0.6% more instructions on a design with 288
+    /// named properties.
+    fn fold_named_sva_members(module: &mut ElaboratedModule) {
+        if !module.property_decls.values().any(Self::has_member_access) {
+            return;
+        }
+        // §3.12.1: keep `$unit::x` where the scope shadows `x`, as the
+        // elaborator's pass over the process bodies does.
+        let unit: std::collections::HashSet<String> = module
+            .signals
+            .keys()
+            .filter(|k| k.starts_with("$unit::"))
+            .cloned()
+            .collect();
+        for body in module.property_decls.values_mut() {
+            if Self::has_member_access(body) {
+                *body = super::elaborate::rewrite_expr(
+                    body,
+                    "",
+                    &HashMap::default(),
+                    &unit,
+                    &HashMap::default(),
+                );
+            }
+        }
+    }
+
+    /// Does `e` hold a member access (`u.st`), clocked bodies included?
+    fn has_member_access(e: &Expression) -> bool {
+        let mut hit = false;
+        Self::walk_operands(e, &mut |x| match &x.kind {
+            ExprKind::MemberAccess { .. } => hit = true,
+            ExprKind::SvaClocked {
+                clock, iff, body, ..
+            } => {
+                hit |= Self::has_member_access(clock)
+                    || Self::has_member_access(body)
+                    || iff.as_deref().is_some_and(Self::has_member_access)
+            }
+            ExprKind::NamedArg { expr, .. } => {
+                hit |= expr.as_deref().is_some_and(Self::has_member_access)
+            }
+            _ => {}
+        });
+        hit
+    }
+
+    /// §16.5.1: a reference into a generate block or an instance-array
+    /// element (`blk[1].sig`, `blk[1].mem[2]`) parses as a member access over
+    /// a select, which the elaborator leaves alone even in a process body.
+    /// Unfolded, the assertion neither sampled it nor kept a `$past` history
+    /// of it. Fold each one with constant selects that names a signal or an
+    /// unpacked array into the flat name the scope's own code uses
+    /// (`blk[1].sig`).
+    fn sva_fold_scopes(&self, e: &mut Expression) {
+        if matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            if let Some(name) = self.sva_scope_name(e) {
+                let span = e.span;
+                let seg = crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier { name, span },
+                    selects: Vec::new(),
+                };
+                *e = Self::hier_ident_expr(vec![seg], span);
+                return;
+            }
+        }
+        let mut sub = |x: &mut Expression| self.sva_fold_scopes(x);
+        match &mut e.kind {
+            ExprKind::Unary { operand: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::SvaClocked { body: x, .. } => sub(x),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Index {
+                expr: left,
+                index: right,
+            }
+            | ExprKind::Range(left, right) => {
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Conditional {
+                condition: a,
+                then_expr: b,
+                else_expr: c,
+            }
+            | ExprKind::RangeSelect {
+                expr: a,
+                left: b,
+                right: c,
+                ..
+            } => {
+                sub(a);
+                sub(b);
+                sub(c);
+            }
+            ExprKind::Concatenation(xs)
+            | ExprKind::SystemCall { args: xs, .. }
+            | ExprKind::Call { args: xs, .. } => xs.iter_mut().for_each(&mut sub),
+            ExprKind::Replication {
+                count: x,
+                exprs: xs,
+            }
+            | ExprKind::Inside {
+                expr: x,
+                ranges: xs,
+            } => {
+                sub(x);
+                xs.iter_mut().for_each(&mut sub);
+            }
+            _ => {}
+        }
+    }
+
+    /// The storage `blk[1].sig` names (see `sva_fold_scopes`): `None` unless
+    /// the chain has a select, every select is a constant (a generate-block
+    /// or instance-array index fixed at elaboration), and it names a signal
+    /// or an unpacked array. A variable index (`a[i].f`) is evaluated at
+    /// every tick, so folding it would freeze the element it picked.
+    fn sva_scope_name(&self, e: &Expression) -> Option<String> {
+        let chain = Self::member_chain_as_hier_ident(e)?;
+        let ExprKind::Ident(h) = &chain.kind else {
+            return None;
+        };
+        let mut sels = h.path.iter().flat_map(|s| &s.selects).peekable();
+        if sels.peek().is_none()
+            || !sels.all(|x| super::elaborate::const_eval_i64_with_params(x, None).is_some())
+        {
+            return None;
+        }
+        let flat = self.member_chain_ident(e)?;
+        let ExprKind::Ident(h) = &flat.kind else {
+            return None;
+        };
+        let path = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        // §23.8: the name is looked up in the assertion's scope, then in each
+        // enclosing one (`comb[0].delay_reg` in instance `dut` is
+        // `dut.comb[0].delay_reg`).
+        let scope = self.active_instance_scope();
+        let mut up = scope.as_str();
+        loop {
+            let name = match up {
+                "" => path.clone(),
+                _ => format!("{up}.{path}"),
+            };
+            if self.signal_name_to_id.contains_key(name.as_str())
+                || self.array_first_id.contains_key(name.as_str())
+                || self.module.arrays.contains_key(&name)
+                || self.module.arrays_2d.contains_key(&name)
+                || self.module.arrays_nd.contains_key(&name)
+            {
+                return Some(name);
+            }
+            if up.is_empty() {
+                return None;
+            }
+            up = up.rsplit_once('.').map_or("", |(p, _)| p);
+        }
+    }
+
     fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
@@ -95790,6 +95971,7 @@ impl Simulator {
         // Named sequence / property instances INSIDE the body (`a |=> s`)
         // expand here, once.
         let mut body_expanded = self.sva_expand_named(&body, 0);
+        self.sva_fold_scopes(&mut body_expanded);
         let mut lv_init: Vec<Value> = Vec::new();
         let mut lv_types =
             self.sva_bind_locals(&mut body_expanded, &HashMap::default(), &mut lv_init);

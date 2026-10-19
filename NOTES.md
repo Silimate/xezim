@@ -64,6 +64,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   slot, so a large memory is never copied. An index read from a sequence
   local variable, a procedure's loop variable, a sampled-value function or a
   call samples the whole array (§16.5.1). (#27)
+* A hierarchical reference (`u.st`) in a named property or sequence declared
+  in the top-level module is sampled in the Preponed region, as it is when
+  written inline in `assert property`. It was read after the clock edge's
+  NBAs, so an antecedent on a state that changes at that edge never matched
+  and the assertion passed only vacuously, and a consequent on such a state
+  failed. `$past` and `$rose` of such a reference also behave as they do
+  inline, and a hierarchical clock (`@(posedge u.clk)`) there ticks; it
+  named no signal, so the property never ran. A reference into a generate
+  block or an instance-array element (`blk[1].sig`, `ra[0].sig`) is now
+  sampled too, inline, in a named property and through a bound checker's
+  port connected to it, and `$past` of it keeps a history as for any other
+  variable (§16.5.1). (Silimate/xezim#52, Silimate/xezim#68)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

@@ -98783,6 +98783,9 @@ impl Simulator {
             let span_key = self.sva_sites[i].stat_key;
             let attempts = std::mem::take(&mut self.sva_sites[i].attempts);
             if disabled {
+                // Cancelled by the guard, as `sva_cancel_disabled` counts them.
+                let inst = self.sva_sites[i].inst;
+                self.assert_insts[inst].disabled += attempts.len() as u64;
                 self.finished = was_finished;
                 continue;
             }

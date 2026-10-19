@@ -22,6 +22,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
+* Concurrent assertions size their expressions as the rest of the language
+  does. A context-determined operand (of `+ - * / % **`, of a bitwise or
+  conditional operator, or a shift's left operand) is extended to the width
+  of the whole expression before the operation: over 16-bit `a` and `b`,
+  `a * b == 32'sh0001_0000` multiplies at 32 bits, where it multiplied at 16
+  and failed. This holds in properties, sequences, `disable iff`, clocking
+  event guards and cover properties, for the results of `$past`, and for
+  property local variables, whose match item assignments (`x = a + b`) are
+  now sized with `x`. A size cast to a parameter width (`W'(r)`) keeps its
+  width in an assertion; its parameter was read like a signal and the cast
+  lost its width. The evaluator now also sizes a size cast, a select, an array
+  element, a struct member and a concatenation in a comparison, which
+  corrects them in procedural code it runs, such as an `initial` block
+  (§6.24.1, §11.6.1, §11.8.2, §16.10). (Silimate/xezim#55)
 * A value a VPI client writes to an element of an instance's unpacked-array
   input port reaches the instance, through any number of port levels, and
   the actual's name reads it too; a value written to the actual reaches the
@@ -97,6 +111,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   slot, so a large memory is never copied. An index read from a sequence
   local variable, a procedure's loop variable, a sampled-value function or a
   call samples the whole array (§16.5.1). (#27)
+* A hierarchical reference (`u.st`) in a named property or sequence declared
+  in the top-level module is sampled in the Preponed region, as it is when
+  written inline in `assert property`. It was read after the clock edge's
+  NBAs, so an antecedent on a state that changes at that edge never matched
+  and the assertion passed only vacuously, and a consequent on such a state
+  failed. `$past` and `$rose` of such a reference also behave as they do
+  inline, and a hierarchical clock (`@(posedge u.clk)`) there ticks; it
+  named no signal, so the property never ran. A reference into a generate
+  block or an instance-array element (`blk[1].sig`, `ra[0].sig`) is now
+  sampled too, inline, in a named property and through a bound checker's
+  port connected to it, and `$past` of it keeps a history as for any other
+  variable (§16.5.1). (Silimate/xezim#52, Silimate/xezim#68)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).
@@ -115,6 +141,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `+seed=random` as its seed. If both are given, `-sv_seed` wins over
   `+seed=`. A `+seed=` you write is still a plusarg, and still seeds the RNG
   (§21.6, §38.17). (Silimate/xezim#2)
+
+* Code coverage leaves out what a constant condition rules out in an
+  instance, as the reference simulator does: a `case` whose selector and
+  items are constants, an `if` chain or `?:` on parameters, genvars or ports
+  tied to literals is no branch, and the arms that cannot run and their
+  statements are not counted. `xezim_cov.json` marks those rows
+  `"excluded": "constant"` and counts them in an `excluded` member of the
+  totals; a design unit counts an item that any of its instances counts.
+  `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`)
+  counts them as before (§11.2.1, §12.4, §12.5). (Silimate/xezim#25)
 
 * Integer `inside` constraints evaluate size-cast bounds in the joint
   comparison context and sample uniformly over distinct legal values,

@@ -54029,7 +54029,7 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_expr(&args[3]);
+                        let val = self.eval_target_rhs(lvalue, &args[3]);
                         let saved = self.make_intra_saved_expr(val, rvalue.span);
                         let assign = Statement::new(
                             StatementKind::BlockingAssign {
@@ -89645,6 +89645,25 @@ impl Simulator {
                     }
                     None => lvalue,
                 };
+                // §11.4.1: an lvalue index with a side effect
+                // (`v[i++ +: 18] <= ...`) is evaluated once. Fold it to the
+                // literal it evaluates to now, as the blocking path does, so
+                // the target's width and the captured target below read the
+                // same index. Before, `i` advanced more than once per
+                // assignment and the value landed in the wrong slice. The
+                // statement carries on with the folded target, so its
+                // statement callbacks fire once.
+                let lvalue_folded;
+                let lvalue: &Expression = match Self::lvalue_has_incdec_index(lvalue)
+                    .then(|| self.rewrite_lvalue_index_side_effects(lvalue))
+                    .flatten()
+                {
+                    Some(f) => {
+                        lvalue_folded = f;
+                        &lvalue_folded
+                    }
+                    None => lvalue,
+                };
                 // §14.4: normalize a plain dotted-chain lvalue (`vif.cb.data`
                 // inside a method) to the flat Ident the clocking-drive check
                 // below expects — the chain shape skipped the check and the
@@ -89696,7 +89715,7 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(1) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_expr(&args[3]);
+                        let val = self.eval_target_rhs(packed_lvalue, &args[3]);
                         let saved = self.make_intra_saved_expr(val, rvalue.span);
                         let edge = match edge_code {
                             1 => Some(Edge::Posedge),
@@ -89814,7 +89833,7 @@ impl Simulator {
                         .packed_pattern_for_lhs(lvalue, items)
                         .or_else(|| self.eval_packed_struct_pattern(lvalue, items))
                         .unwrap_or_else(|| self.eval_expr(rvalue)),
-                    _ => self.eval_expr(rvalue),
+                    _ => self.eval_target_rhs(packed_lvalue, rvalue),
                 };
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
@@ -105440,11 +105459,16 @@ impl Simulator {
                 // -1 became 0xFFFF_FFFF, `l >= r` picked the wrong branch and
                 // the width came out 0 — which then resized the RHS to nothing,
                 // so a partially out-of-range NBA wrote no bits at all.
-                let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                // An indexed select's width is its constant width alone: its
+                // start is not evaluated here, so one with a side effect
+                // (`v[i++ +: 8]`) runs only where the target is captured.
                 let r = self.eval_expr(right).to_i64().unwrap_or(0);
                 let count = match kind {
                     RangeKind::IndexedUp | RangeKind::IndexedDown => r.max(0) as u32,
-                    RangeKind::Constant => (l - r).unsigned_abs() as u32 + 1,
+                    RangeKind::Constant => {
+                        let l = self.eval_expr(left).to_i64().unwrap_or(0);
+                        (l - r).unsigned_abs() as u32 + 1
+                    }
                 };
                 // §7.4.1: an element range on a packed multi-D lvalue is
                 // count × elem_w bits wide, not count bits — the RHS was
@@ -125678,15 +125702,65 @@ impl Simulator {
         self.eval_expr_ctx(rvalue, w)
     }
 
-    /// Only an operator takes a width from its context; a plain operand
-    /// converts to the same real either way, so only then does an
-    /// assignment need `assign_rhs_ctx`.
+    /// The right-hand side of an assignment the interpreter evaluates apart
+    /// from the blocking path: a nonblocking one (§10.4.2) and an
+    /// intra-assignment event control (§9.4.5). Its operators still take the
+    /// target's width as context (§11.6.1), so `s <= a16 + b16` into an
+    /// 18-bit `s` keeps the carry. Evaluated self-determined, the sum lost
+    /// it whenever the statement ran here instead of as bytecode, for
+    /// example in a `for` loop bounded by `$clog2(...)`.
+    ///
+    /// §11.4.1 has a side-effecting lvalue index (`v[i++ +: 18] = @(e) ...`)
+    /// evaluated once, when the assignment captures its target, so the
+    /// width lookup must not evaluate it (see `effect_free_target_width`).
+    fn eval_target_rhs(&mut self, lvalue: &Expression, rvalue: &Expression) -> Value {
+        if !Self::rhs_takes_context(rvalue) {
+            return self.eval_expr(rvalue);
+        }
+        match self.effect_free_target_width(lvalue) {
+            0 => self.eval_expr(rvalue),
+            w => self.eval_assign_rhs(lvalue, rvalue, w),
+        }
+    }
+
+    /// The width of an assignment target, or 0 when finding it would
+    /// evaluate a side-effecting index. Only an indexed part-select of a
+    /// plain base (`v[i++ +: 18]`) has a width that doesn't depend on such an
+    /// index: `infer_lhs_width` reads only its constant width. An element or
+    /// member target (`arr[i++].f`) is sized by reading it, and the
+    /// class-aggregate lookup may evaluate indices, so those give 0 and keep
+    /// the old self-determined evaluation.
+    fn effect_free_target_width(&mut self, lvalue: &Expression) -> u32 {
+        if !Self::lvalue_has_incdec_index(lvalue) {
+            return self.infer_lhs_width(lvalue);
+        }
+        match &lvalue.kind {
+            ExprKind::RangeSelect {
+                expr,
+                right,
+                kind: RangeKind::IndexedUp | RangeKind::IndexedDown,
+                ..
+            } if self.no_class_objects()
+                && !Self::lvalue_has_incdec_index(expr)
+                && Self::cond_expr_is_effect_free(right, false) =>
+            {
+                self.infer_lhs_width(lvalue)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Only an operator takes a width from its context (§11.6.1: unary `+`,
+    /// `-` and `~` too); a plain operand converts to the same real either
+    /// way, so only then does an assignment need `assign_rhs_ctx`.
     #[inline]
     fn rhs_takes_context(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Paren(x) => Self::rhs_takes_context(x),
             ExprKind::Binary { .. } | ExprKind::Conditional { .. } => true,
-            ExprKind::Unary { op, .. } => matches!(op, UnaryOp::Minus | UnaryOp::BitNot),
+            ExprKind::Unary { op, .. } => {
+                matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot)
+            }
             _ => false,
         }
     }

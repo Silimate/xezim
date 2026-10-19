@@ -183,6 +183,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   calls, and persistent methods recompile for the new conversion
   (§6.16, §6.18, §6.24.3, §11.4.12).
   (#391, reported by urbanij; #396, contributed by Ganesh-TNL)
+* Interpreted nonblocking assignments and intra-assignment event controls
+  evaluate their right-hand sides at the target's width, so `s <= a + b`
+  keeps the carry and `s <= -a` extends `a` first. A side-effecting index in
+  a nonblocking target is evaluated once (§9.4.5, §10.4.2, §11.4.1, §11.6.1).
+  (#399, reported by akashlevy)
 
 **Performance**
 

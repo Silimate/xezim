@@ -40,6 +40,22 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* Concurrent assertions read a flop's value from before the clock edge that
+  updates it when the clock is written from a VPI callback: an edge cocotb's
+  `Clock` writes from cbReadWriteSynch ticks the assertions in its own slot,
+  where they ticked in the next slot. Values are sampled once per time slot,
+  before its cbAtStartOfSimTime and cbAfterDelay routines, so a clock edge in
+  a later delta of the slot, or a value written in the edge's own
+  cbAfterDelay, no longer counts as sampled (§16.5.1, §4.4.2.1). A
+  cbReadWriteSynch due at an assertion's clock edge now runs, after the
+  slot's remaining Active, NBA and cbNBASynch work, before the assertions and
+  before that delta's clocking-event waiters (Post-NBA before Observed,
+  §4.4.2), whether a VPI routine or the design drives the clock,
+  so a reset a cocotb test releases after `RisingEdge` no longer disables
+  that edge's attempt, and one a clocking-event waiter raises at the edge
+  still does not (§16.12). A clock event is recorded when it happens, so a
+  routine that moves the clock back in the same slot does not lose it.
+  (Silimate/xezim#11, Silimate/xezim#56)
 * In concurrent assertions, `$past` with fewer past clock ticks than asked
   for returns its operand's default sampled value instead of x, and `$rose`,
   `$fell`, `$stable` and `$changed` compare the first tick's sample with it.

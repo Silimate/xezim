@@ -127,6 +127,8 @@ mod vpi_object_model_walk;
 mod vpi_routines;
 #[path = "strings/vpi_seed_option.rs"]
 mod vpi_seed_option;
+#[path = "strings/vpi_sva_sampling.rs"]
+mod vpi_sva_sampling;
 #[path = "strings/vpi_typed_port_kinds.rs"]
 mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]

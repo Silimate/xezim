@@ -1564,6 +1564,10 @@ pub(crate) struct CodeCov {
     /// made while evaluations were pending (`Simulator::cov_block_ran`).
     blocks: HashMap<usize, HashMap<String, u32>>,
     ran: Vec<u64>,
+    /// The last `if` of an `else if` chain, by branch site: where block
+    /// granularity puts the chain's implicit `else`, as without branch
+    /// coverage.
+    tails: HashMap<usize, Span>,
     /// Inside a read that only coverage makes (`Simulator::cov_quietly`):
     /// count nothing.
     quiet: u32,
@@ -2465,6 +2469,7 @@ impl Instr<'_> {
         }
         let mut conds = vec![self.skeleton(&condition)];
         let mut has_else = false;
+        let mut last = span;
         let mut tail = else_stmt.as_deref();
         while let Some(e) = tail {
             match &e.kind {
@@ -2474,6 +2479,7 @@ impl Instr<'_> {
                     ..
                 } => {
                     conds.push(self.skeleton(condition));
+                    last = e.span;
                     tail = else_stmt.as_deref();
                 }
                 _ => {
@@ -2493,6 +2499,9 @@ impl Instr<'_> {
             arms: Vec::new(),
             excluded: false,
         });
+        if last.start != span.start {
+            self.cov.tails.insert(site, last);
+        }
         let mut chain = Chain::default();
         let ((), c) = self.region(|me| me.cond(&mut condition, "if", true));
         chain.conds.push(c);
@@ -2560,9 +2569,20 @@ impl Instr<'_> {
                     then_stmt: t,
                     else_stmt: el,
                 } => {
-                    let ((), c) = self.region(|me| me.cond(&mut cond, "if", true));
+                    // Block granularity: the `else` that makes this decision
+                    // is a block, counted at it as without branch coverage
+                    // (and ruled out with the condition).
+                    let mut v = Vec::new();
+                    let ((), c) = self.region(|me| {
+                        if me.blocks {
+                            me.boundary();
+                            me.count(espan, "statement", &mut v);
+                        }
+                        me.cond(&mut cond, "if", true)
+                    });
                     chain.conds.push(c);
-                    self.if_arms(up, cond, t, el, espan, false, chain)
+                    v.push(self.if_arms(up, cond, t, el, espan, false, chain));
+                    block(v, espan)
                 }
                 kind => {
                     let c = self.counter();
@@ -4262,6 +4282,7 @@ impl Simulator {
             assigned: Vec::new(),
             pending: HashMap::default(),
             blocks: HashMap::default(),
+            tails: HashMap::default(),
             ran: Vec::new(),
             quiet: 0,
         };
@@ -5871,11 +5892,12 @@ impl Simulator {
     /// a bit of a net or variable that is tied itself, through whole, bit and
     /// part-select connections. An operator ties nothing, even on constant
     /// operands (`a & 1'b0`), and neither does a value range a bit never
-    /// leaves. A signal some other code writes is not tied: a process, a
-    /// subroutine or a `force` (`Census`), a user-defined primitive, a
+    /// leaves. A signal some other code writes, tracked for toggles or not,
+    /// is not tied: a process, a subroutine or a `force` (`Census`), a
+    /// user-defined primitive, a
     /// bidirectional switch, a driver with a strength, or an assignment whose
     /// target bits can't be told. Writes from a VPI client don't count.
-    fn cov_tied(&self, names: &[(String, &'static str)]) -> HashMap<usize, Vec<bool>> {
+    fn cov_tied(&self) -> HashMap<usize, Vec<bool>> {
         let m = &self.module;
         let mut drivers: HashMap<(u32, u32), Vec<Tie>> = HashMap::default();
         let mut bad: HashSet<u32> = HashSet::default();
@@ -5912,13 +5934,35 @@ impl Simulator {
                 }
             }
         }
-        let index: HashMap<String, usize> = names
+        // Every name of every signal in the graph, tracked for toggles or
+        // not (a generate block's, say), for the writes the census finds.
+        let graph: HashSet<u32> = drivers
+            .iter()
+            .flat_map(|(k, v)| {
+                std::iter::once(k.0).chain(v.iter().filter_map(|t| match t {
+                    Tie::Bit(i, _) => Some(*i),
+                    _ => None,
+                }))
+            })
+            .collect();
+        let known: Vec<(String, u32)> = self
+            .signal_name_to_id
+            .iter()
+            .map(|(n, &i)| (n.to_string(), i as u32))
+            .filter(|(_, i)| graph.contains(i))
+            .collect();
+        let index: HashMap<String, usize> = known
             .iter()
             .enumerate()
-            .map(|(i, (n, _))| (n.clone(), i))
+            .map(|(k, (n, _))| (n.clone(), k))
             .collect();
-        let mut c = Census::new(self, index, names.len());
+        let mut c = Census::new(self, index, known.len());
         c.procedures();
+        for (k, (_, i)) in known.iter().enumerate() {
+            if c.more[k] || c.once[k] > 0 {
+                bad.insert(*i);
+            }
+        }
         let top = format!("{}.", m.name);
         let id = |n: &str| {
             self.signal_name_to_id
@@ -5926,11 +5970,6 @@ impl Simulator {
                 .or_else(|| self.signal_name_to_id.get(format!("{top}{n}").as_str()))
                 .map(|&i| i as u32)
         };
-        for (i, (n, _)) in names.iter().enumerate() {
-            if c.more[i] || c.once[i] > 0 {
-                bad.extend(id(n));
-            }
-        }
         for u in &m.udp_instances {
             self.tie_bad(&u.output, None, &mut bad);
         }
@@ -6232,7 +6271,7 @@ impl Simulator {
         };
         let ties = code_coverage()
             .filter(|c| !c.tied)
-            .map(|_| self.cov_tied(&names))
+            .map(|_| self.cov_tied())
             .unwrap_or_default();
         let top_prefix = format!("{}.", self.module.name);
         for (name, ty) in names {
@@ -6367,7 +6406,7 @@ impl Simulator {
                 excluded: s.excluded,
             });
         }
-        for b in &cov.branches {
+        for (i, b) in cov.branches.iter().enumerate() {
             let src = cov.scopes[b.scope as usize].src;
             let (file, line) = lines.locate(b.span, src).unwrap_or_default();
             let taken: u64 = b.arms.iter().filter_map(|a| a.counter).map(count).sum();
@@ -6387,11 +6426,14 @@ impl Simulator {
             // In block granularity an implicit `else` or `default` is a
             // block of its own, run when no written arm is.
             if cov.blockwise && cov.kinds & KIND_STATEMENT != 0 {
+                let at = cov.tails.get(&i).copied();
                 for a in arms.iter().filter(|a| a.label.ends_with("(implicit)")) {
                     reports[b.scope as usize].stmts.push(StmtRow {
                         file: file.clone(),
-                        line: a.line,
-                        start: b.span.start,
+                        line: at
+                            .and_then(|t| lines.locate(t, src))
+                            .map_or(a.line, |(_, l)| l),
+                        start: at.map_or(b.span.start, |t| t.start),
                         kind: a.label,
                         count: a.count,
                         excluded: b.excluded || a.excluded,

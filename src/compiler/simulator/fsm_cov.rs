@@ -141,6 +141,34 @@ fn whole(e: &Expression) -> Option<&str> {
     }
 }
 
+/// The value of the one-bit control `sig` under which `cond` holds when it
+/// only tests `sig`: `rst` at 1, `!rst_n` and `rst == 1'b0` at 0.
+fn level(cond: &Expression, sig: &str) -> Option<bool> {
+    if whole(cond) == Some(sig) {
+        return Some(true);
+    }
+    match &cond.kind {
+        ExprKind::Paren(x) => level(x, sig),
+        ExprKind::Unary {
+            op: UnaryOp::LogNot | UnaryOp::BitNot,
+            operand,
+        } => level(operand, sig).map(|l| !l),
+        ExprKind::Binary { op, left, right } => {
+            let c = match (whole(strip(left)), whole(strip(right))) {
+                (Some(n), _) if n == sig => Simulator::try_const_u64(right)?,
+                (_, Some(n)) if n == sig => Simulator::try_const_u64(left)?,
+                _ => return None,
+            };
+            match op {
+                BinaryOp::Eq | BinaryOp::CaseEq => Some(c != 0),
+                BinaryOp::Neq | BinaryOp::CaseNeq => Some(c == 0),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Every identifier `e` names, selects included.
 fn idents<'a>(e: &'a Expression, out: &mut Vec<&'a str>) {
     match &e.kind {
@@ -605,9 +633,11 @@ struct Walk<'a> {
     /// Some assignment of the target, a hold included, is made under a
     /// test of the variable.
     guarded: bool,
-    /// The address of the state process's reset `if`, and whether the walk
-    /// is in its first branch.
+    /// The address of the state process's reset `if`, whether its `else`
+    /// is the reset branch instead of its first, and whether the walk is in
+    /// the reset branch.
     reset_at: usize,
+    reset_else: bool,
     resetting: bool,
     /// The innermost case item or `if` testing the variable around the walk.
     at: Option<Span>,
@@ -1004,7 +1034,7 @@ impl Walk<'_> {
                 };
                 let reset = then.is_none() && self.reset_at == s as *const Statement as usize;
                 let was = self.resetting;
-                self.resetting |= reset;
+                self.resetting |= reset && !self.reset_else;
                 let outer = self.at;
                 if then.is_some() {
                     self.at = Some(s.span);
@@ -1017,7 +1047,9 @@ impl Walk<'_> {
                         Some(p) => ctx.and(&p.not()),
                         None => ctx.clone(),
                     };
+                    self.resetting |= reset && self.reset_else;
                     self.stmt(e, &f);
+                    self.resetting = was;
                 }
             }
             StatementKind::Case {
@@ -1514,15 +1546,22 @@ impl Simulator {
                 continue;
             };
             // Asynchronous controls: the edges of an event control with more
-            // than one (`rst` of `@(posedge clk or posedge rst)`).
-            let asyncs: Vec<&str> = match &ab.stmt.kind {
+            // than one (`rst` of `@(posedge clk or posedge rst)`), each with
+            // the level its edge goes to (none for `edge`).
+            let asyncs: Vec<(&str, Option<bool>)> = match &ab.stmt.kind {
                 StatementKind::TimingControl {
                     control: TimingControl::Event(EventControl::EventExpr(items)),
                     ..
                 } if items.iter().filter(|i| i.edge.is_some()).count() > 1 => items
                     .iter()
-                    .filter(|i| i.edge.is_some())
-                    .filter_map(|i| whole(&i.expr))
+                    .filter_map(|i| {
+                        let level = match i.edge? {
+                            Edge::Posedge => Some(true),
+                            Edge::Negedge => Some(false),
+                            Edge::Edge => None,
+                        };
+                        Some((whole(&i.expr)?, level))
+                    })
                     .collect(),
                 _ => Vec::new(),
             };
@@ -1559,14 +1598,29 @@ impl Simulator {
                     StatementKind::SeqBlock { stmts, .. } => stmts.as_slice(),
                     _ => std::slice::from_ref(proc_body),
                 };
-                let arm = stmts.iter().find(|s| match &s.kind {
+                let arm = stmts.iter().find_map(|s| match &s.kind {
                     StatementKind::If { condition, .. } => {
                         let mut n = Vec::new();
                         idents(condition, &mut n);
-                        n.iter().any(|x| asyncs.contains(x))
+                        asyncs
+                            .iter()
+                            .find(|(a, _)| n.contains(a))
+                            .map(|&(a, active)| (s, a, active))
                     }
+                    _ => None,
+                });
+                // The control resets in the arm where it is at its edge's
+                // level: the `else` of `if (!rst) ... else` under `posedge
+                // rst`.
+                let reset_else = arm.is_some_and(|(s, a, active)| match &s.kind {
+                    StatementKind::If {
+                        condition,
+                        else_stmt: Some(_),
+                        ..
+                    } => active.is_some() && level(condition, a) == active.map(|l| !l),
                     _ => false,
                 });
+                let arm = arm.map(|(s, _, _)| s);
                 let first = arm.or_else(|| {
                     stmts.iter().find(|s| {
                         !matches!(
@@ -1611,6 +1665,7 @@ impl Simulator {
                     bad: false,
                     guarded: false,
                     reset_at,
+                    reset_else,
                     resetting: false,
                     at: None,
                 };
@@ -1687,6 +1742,7 @@ impl Simulator {
                         bad: false,
                         guarded: false,
                         reset_at: 0,
+                        reset_else: false,
                         resetting: false,
                         at: None,
                     };

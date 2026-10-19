@@ -331,7 +331,7 @@ fn logical_conditions_scored_by_term_values() {
 
 const BLOCKS: &str = "\
 module m(input logic clk, input logic rst, input logic [1:0] s, output logic [3:0] q);
-  logic x, y, z;
+  logic x, y, z, w;
   assign z = x ^ y;
   always @(posedge clk) begin
     x <= 1;
@@ -347,6 +347,9 @@ module m(input logic clk, input logic rst, input logic [1:0] s, output logic [3:
   end
   always @(posedge clk)
     if (s == 2'd3) x <= 0;
+  always @(posedge clk)
+    if (s == 2'd0) w <= 1;
+    else if (s == 2'd1) w <= 0;
   initial begin
     for (int i = 0; i < 2; i++) begin
       y = i[0];
@@ -366,10 +369,12 @@ endmodule
 /// `--code-coverage-granularity=block` counts straight-line blocks, each
 /// at its first statement: a process body up to its first branch (5), each
 /// arm (6, 8, 10, 11), the code after a branch (14) or a loop, a loop body
-/// (20) and the code after a delay (22, with 23). An implicit `else` or
-/// `default` is a block of its own (9, 17), run when no written arm is. A
-/// continuous assignment (3) and the `always` construct itself are no
-/// blocks. Branch coverage or not, the blocks are the same.
+/// (23) and the code after a delay (25, with 26). An implicit `else` or
+/// `default` is a block of its own (9, 17), run when no written arm is; an
+/// `else if` is an `else` making a decision (20), and the chain's implicit
+/// `else` belongs to its last `if`. A continuous assignment (3) and the
+/// `always` construct itself are no blocks. Branch coverage or not, the
+/// blocks are the same.
 #[test]
 fn block_granularity() {
     let d = scratch("blocks");
@@ -405,15 +410,20 @@ fn block_granularity() {
         (17, "else (implicit)"),
         (17, "block"),
         (19, "block"),
+        (19, "block"),
+        (20, "block"),
+        (20, "else (implicit)"),
         (20, "block"),
         (22, "block"),
+        (23, "block"),
+        (25, "block"),
     ]
     .into_iter()
     .map(|(l, k)| (l, k.to_string()))
     .collect();
     assert_eq!(rows(&json), expected, "{u}");
     assert!(
-        u.contains("\"statement\": {\"covered\": 12, \"total\": 13, \"percent\": 92.31}"),
+        u.contains("\"statement\": {\"covered\": 17, \"total\": 18, \"percent\": 94.44}"),
         "{u}"
     );
     let stmts = run(
@@ -475,12 +485,24 @@ module b(input logic clk, input logic rst_n, input logic go, output logic seen);
     endcase
   end
 endmodule
+module c(input logic clk, input logic rst, input logic go);
+  typedef enum logic [1:0] {IDLE, RUN, DONE} st_t;
+  st_t st;
+  always @(posedge clk or posedge rst)
+    if (!rst) case (st)
+      IDLE: if (go) st <= RUN;
+      RUN: st <= DONE;
+      DONE: if (!go) st <= RUN;
+    endcase
+    else st <= IDLE;
+endmodule
 module tb;
   logic clk = 0, rst = 1, go = 0; wire busy;
   m u(.clk, .rst, .go, .busy);
   e g(.clk, .en(go), .go);
   a ua(.clk, .reset(rst), .go);
   b ub(.clk, .rst_n(!rst), .go, .seen());
+  c uc(.clk, .rst, .go);
   always #5 clk = ~clk;
   initial begin #12 rst = 0; go = 1; #30 go = 0; #20 rst = 1; #10 rst = 0; #20 $finish; end
 endmodule
@@ -490,7 +512,8 @@ endmodule
 /// state process's reset branch makes (`RUN -> IDLE`, `DONE -> IDLE`); the
 /// others stay. With an asynchronous reset, the `if` testing it is the reset
 /// branch, past a declaration (`a`) or another statement (`b`) in front of
-/// it. A clock enable (`if (en) case (st)`) is no reset: its FSM keeps every
+/// it, and its arm at the edge's level resets: the `else` of `if (!rst)`
+/// under `posedge rst` (`c`). A clock enable (`if (en) case (st)`) is no reset: its FSM keeps every
 /// transition. A state that stays put is never a transition.
 #[test]
 fn fsm_reset_transitions_left_out() {
@@ -523,7 +546,7 @@ fn fsm_reset_transitions_left_out() {
         pairs(&logic, "tb.u"),
         ["IDLE->RUN", "RUN->DONE", "DONE->RUN"]
     );
-    for inst in ["tb.ua", "tb.ub"] {
+    for inst in ["tb.ua", "tb.ub", "tb.uc"] {
         assert_eq!(pairs(&all, inst), pairs(&all, "tb.u"), "{inst}");
         assert_eq!(
             pairs(&logic, inst),
@@ -661,6 +684,11 @@ module tb;
   fa f(.a(b), .b(P), .cin(1'b0), .s(s), .co(co));
   assign q = 1'b0;
   assign k = 1'b1;
+  if (1) begin : g
+    wire x = 1'b0;
+  end
+  wire yg = g.x;
+  initial #2 force g.x = 1'b1;
   initial begin
     #1 force k = 1'b0;
     repeat (6) begin #5 a = (a + 1) % 4; b = ~b; end
@@ -689,7 +717,8 @@ fn tied(json: &str, scope_name: &str) -> Vec<String> {
 /// `f.cin`, `q`), and the bits wired to such a bit (`w`, `y[0]`, the
 /// parent's `y` and `w`). An operator on a constant (`f.co`) ties nothing,
 /// nor does a value range (`a[3:2]` stay 0), nor a net a `force` writes
-/// (`k`). The bits are listed by position in the vector, least significant
+/// (`k`), nor one wired from a forced net, also when that net is not
+/// tracked (`yg` from `g.x` with `--no-toggle-generate`). The bits are listed by position in the vector, least significant
 /// first, whichever way its range runs.
 #[test]
 fn toggle_tied_bits_left_out() {
@@ -716,6 +745,20 @@ fn toggle_tied_bits_left_out() {
         "{left}"
     );
     assert!(scope(&left, "tb.f").contains("\"excluded\": 4}"), "{left}");
+    let both = run(
+        &d,
+        TIED,
+        &[
+            "--code-coverage=toggle",
+            "--no-toggle-tied",
+            "--no-toggle-generate",
+        ],
+    );
+    assert_eq!(
+        tied(&both, "tb"),
+        ["q: [0]", "w: [4, 5, 6, 7]", "y: [0, 3]"],
+        "{both}"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 

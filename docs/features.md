@@ -89,8 +89,10 @@ See the [UVM guide](uvm-guide.md).
   it).
 * **Code coverage**, off by default — statement, branch, toggle and FSM
   (state and transition) counts with `--code-coverage` (or `+cover`), per
-  instance and per design unit, in the same `xezim_cov.json`. Instrumented at compile time, so a run without it pays
-  nothing.
+  instance and per design unit, in the same `xezim_cov.json`. Code that a
+  constant condition rules out in an instance (a `case` on a parameter) is
+  left out of the totals, as in other simulators. Instrumented at compile
+  time, so a run without it pays nothing.
 
 See the [coverage guide](coverage-guide.md).
 

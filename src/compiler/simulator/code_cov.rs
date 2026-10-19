@@ -12,6 +12,11 @@
 //! Continuous assignments count in their comb entry (`ca_counter`). Toggles
 //! compare each tracked signal with its value at the end of the previous
 //! time slot, off the dirty set the waveform writers share.
+//!
+//! Code a constant condition rules out (a `case` on a parameter) is left
+//! out of the totals: instrumentation records each `Decision` a constant
+//! may make, and `cov_resolve_constants` makes them once the design is
+//! compiled, with the evaluator the run uses, and marks the sites excluded.
 use super::fsm_cov::{FSM_MARK, FsmCov, FsmRow};
 use super::*;
 use crate::ast::Span;
@@ -44,12 +49,15 @@ const LIBRARY_PACKAGES: [&str; 2] = ["std", "uvm_pkg"];
 /// `integers` keeps the signals declared with an integer atom type
 /// (`TOGGLE_INTEGER_TYPES`) in toggle coverage; on by default,
 /// `--no-toggle-integers` turns it off.
+/// `keep_constant` keeps the statements and branch arms a constant
+/// condition rules out in the totals (see `Decision`).
 #[derive(Clone, Debug)]
 pub struct CodeCoverage {
     pub kinds: u8,
     pub scopes: Vec<String>,
     pub exclude_input_ports: bool,
     pub integers: bool,
+    pub keep_constant: bool,
 }
 
 impl Default for CodeCoverage {
@@ -59,7 +67,24 @@ impl Default for CodeCoverage {
             scopes: Vec::new(),
             exclude_input_ports: false,
             integers: true,
+            keep_constant: false,
         }
+    }
+}
+
+/// Why a statement, branch or arm is left out of the totals.
+const EXCLUDED: &str = "constant";
+
+/// `--code-coverage-constant=<mode>`: `exclude` (the default) leaves code a
+/// constant condition rules out of the totals, `keep` counts it.
+pub fn parse_constant_mode(spec: &str) -> Result<bool, String> {
+    match spec.trim() {
+        "exclude" => Ok(false),
+        "keep" => Ok(true),
+        other => Err(format!(
+            "unknown constant-code mode '{}' (want exclude or keep)",
+            other
+        )),
     }
 }
 
@@ -170,6 +195,8 @@ struct StmtSite {
     span: Span,
     kind: &'static str,
     counter: u32,
+    /// In an arm a constant condition rules out: left out of the totals.
+    excluded: bool,
 }
 
 struct Arm {
@@ -178,6 +205,8 @@ struct Arm {
     /// `None` for the implicit `else` / `default`: the branch's entry count
     /// minus the other arms.
     counter: Option<u32>,
+    /// A constant condition rules this arm out.
+    excluded: bool,
 }
 
 struct BranchSite {
@@ -186,6 +215,100 @@ struct BranchSite {
     kind: &'static str,
     entry: Option<u32>,
     arms: Vec<Arm>,
+    /// The decision is a constant, or the branch is in an excluded arm: all
+    /// of its arms are left out of the totals.
+    excluded: bool,
+}
+
+/// What a constant condition leaves of one arm of an `if` chain or a `case`.
+#[derive(Clone, Copy, PartialEq)]
+enum Fate {
+    /// Not decided by a constant: the arm counts.
+    Live,
+    /// The constant condition selects this arm: its statements count, and
+    /// the arm counts unless the whole decision is constant.
+    Taken,
+    /// The arm can never run: it and its statements are left out.
+    Dead,
+}
+
+/// The fates of an `if` chain's arms, one per condition and one for the
+/// final `else` (written or implicit), from the conditions' constant truths,
+/// and whether every condition is a constant (then the chain is no decision
+/// at all). The arm of the first constantly true condition takes everything
+/// that reaches it; arms whose condition is constantly false, and every arm
+/// after a constantly true one, never run.
+fn chain_fates(truths: &[Option<bool>]) -> (Vec<Fate>, bool) {
+    let mut fates = Vec::with_capacity(truths.len() + 1);
+    let mut whole = true;
+    let mut open = true;
+    for t in truths {
+        fates.push(match (open, t) {
+            (false, _) => Fate::Dead,
+            (true, Some(true)) => {
+                open = false;
+                Fate::Taken
+            }
+            (true, Some(false)) => Fate::Dead,
+            (true, None) => {
+                whole = false;
+                Fate::Live
+            }
+        });
+    }
+    fates.push(match (open, whole) {
+        (false, _) => Fate::Dead,
+        (true, true) => Fate::Taken,
+        (true, false) => Fate::Live,
+    });
+    (fates, whole)
+}
+
+/// A condition reduced to the parts a constant can decide (see
+/// `Instr::skeleton`).
+enum Cond {
+    /// An elaboration-time constant expression (IEEE 1800 §11.2.1),
+    /// evaluated once the design is compiled.
+    Const(Expression),
+    Not(Box<Cond>),
+    /// `&&` (or `&` when `bitwise`): false when either side is.
+    And(Box<Cond>, Box<Cond>, bool),
+    /// `||` (or `|` when `bitwise`): true when either side is.
+    Or(Box<Cond>, Box<Cond>, bool),
+    Unknown,
+}
+
+/// The statement sites and branch sites one arm or condition holds, as
+/// ranges of `CodeCov::stmts` and `CodeCov::branches`.
+type Region = (std::ops::Range<usize>, std::ops::Range<usize>);
+
+/// What a decision is made of.
+enum Choice {
+    /// An `if` chain's conditions.
+    If(Vec<Cond>),
+    /// A `case` whose selector and items are constants (items keep their
+    /// patterns only).
+    Case(CaseKind, Expression, Vec<CaseItem>),
+    /// A `?:` condition.
+    Ternary(Cond),
+    /// The left operand of an `&&` (`||` when `true`) with a `?:` in its
+    /// right operand, which never runs when the left one is constantly
+    /// false (true).
+    Operand(Cond, bool),
+}
+
+/// A decision a constant may make, recorded while the design is
+/// instrumented and made once it is compiled (`cov_resolve_constants`), by
+/// the simulator's own evaluator. Instrumentation does not depend on it.
+struct Decision {
+    choice: Choice,
+    /// The branch site, if branch coverage is on.
+    site: Option<usize>,
+    /// What each arm holds, in arm order (the implicit `else` / `default`
+    /// last, empty).
+    arms: Vec<Region>,
+    /// The `?:` branches inside each condition.
+    conds: Vec<std::ops::Range<usize>>,
 }
 
 /// Per-bit rise/fall counts of the tracked signals.
@@ -232,6 +355,8 @@ impl Toggle {
 
 pub(crate) struct CodeCov {
     kinds: u8,
+    /// `--code-coverage-constant=keep`: nothing is excluded.
+    keep_constant: bool,
     limit: Vec<String>,
     scopes: Vec<Scope>,
     scope_index: HashMap<String, u32>,
@@ -242,8 +367,19 @@ pub(crate) struct CodeCov {
     ca_counter: HashMap<(usize, usize, String), u32>,
     /// Instance paths below the top.
     inst_paths: HashSet<String>,
+    /// Decisions constants may make, until `cov_resolve_constants`.
+    decisions: Vec<Decision>,
     pub(crate) toggle: Option<Toggle>,
     pub(crate) fsm: Option<FsmCov>,
+}
+
+/// What instrumenting an `if` chain collects: its arms, what each holds,
+/// and the `?:` branches in each condition.
+#[derive(Default)]
+struct Chain {
+    arms: Vec<Arm>,
+    regions: Vec<Region>,
+    conds: Vec<std::ops::Range<usize>>,
 }
 
 /// Rewrites one scope's statements; see the module docs.
@@ -251,9 +387,32 @@ struct Instr<'a> {
     cov: &'a mut CodeCov,
     kinds: u8,
     scope: u32,
+    /// The design whose parameters make conditions constant, or `None` when
+    /// nothing is excluded: `--code-coverage-constant=keep`, and scopes
+    /// outside the instance tree, whose bare names are not resolved yet.
+    consts: Option<&'a ElaboratedModule>,
+    /// Names declared in the code being rewritten (variables, subroutine
+    /// arguments): never constants, even where they shadow a parameter.
+    locals: HashSet<String>,
 }
 
-impl Instr<'_> {
+impl<'a> Instr<'a> {
+    fn new(
+        cov: &'a mut CodeCov,
+        kinds: u8,
+        scope: u32,
+        consts: Option<&'a ElaboratedModule>,
+    ) -> Self {
+        let consts = consts.filter(|_| !cov.keep_constant);
+        Instr {
+            cov,
+            kinds,
+            scope,
+            consts,
+            locals: HashSet::default(),
+        }
+    }
+
     fn counter(&mut self) -> u32 {
         let c = self.cov.counters;
         self.cov.counters += 1;
@@ -270,8 +429,271 @@ impl Instr<'_> {
             span,
             kind,
             counter,
+            excluded: false,
         });
         out.push(hit(counter, span));
+    }
+
+    /// Run `f`, and return the statement and branch sites it created.
+    fn region<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, Region) {
+        let (s0, b0) = (self.cov.stmts.len(), self.cov.branches.len());
+        let r = f(self);
+        (r, (s0..self.cov.stmts.len(), b0..self.cov.branches.len()))
+    }
+
+    fn decide(
+        &mut self,
+        choice: Choice,
+        site: Option<usize>,
+        arms: Vec<Region>,
+        conds: Vec<std::ops::Range<usize>>,
+    ) {
+        self.cov.decisions.push(Decision {
+            choice,
+            site,
+            arms,
+            conds,
+        });
+    }
+
+    /// Whether an identifier names a parameter (an enum constant or a
+    /// genvar included, which elaboration records or substitutes as one).
+    /// Elaboration has already resolved an instance's names to flat paths
+    /// (`u0.WIDTH`); `pkg::P` (§26.3) is keyed by its package, and a
+    /// package's enum constants have a table of their own.
+    fn param(&self, h: &HierarchicalIdentifier) -> bool {
+        let Some(module) = self.consts else {
+            return false;
+        };
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return false;
+        }
+        let name = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        if self.locals.contains(&name) {
+            return false;
+        }
+        if module.parameters.contains_key(&name) {
+            return true;
+        }
+        let [pkg, leaf] = &h.path[..] else {
+            return false;
+        };
+        module
+            .parameters
+            .contains_key(&format!("{}::{}", pkg.name.name, leaf.name.name))
+            || module
+                .package_enum_members
+                .get(&pkg.name.name)
+                .is_some_and(|m| m.contains_key(&leaf.name.name))
+    }
+
+    /// Whether `e` is an elaboration-time constant expression (IEEE 1800
+    /// §11.2.1): literals and parameters under operators, `?:`,
+    /// concatenation, replication, selects of a parameter and the constant
+    /// system functions. Its value comes from the simulator's evaluator.
+    fn constant(&self, e: &Expression) -> bool {
+        self.split(e).is_ok()
+    }
+
+    /// What constants can decide of condition `e`: the constant parts,
+    /// under the `!`, `&&`, `||`, `&` and `|` that combine them.
+    fn skeleton(&self, e: &Expression) -> Cond {
+        match self.split(e) {
+            Ok(()) => Cond::Const(e.clone()),
+            Err(c) => c,
+        }
+    }
+
+    /// `Ok` when `e` is a constant expression (see `constant`), else what
+    /// constants can decide of it (see `skeleton`), in one walk. A `&&` or
+    /// `&` with a constantly false operand is false whatever the other
+    /// operand is, and a `||` or `|` with a constantly true one true, as in
+    /// the reference simulator.
+    fn split(&self, e: &Expression) -> Result<(), Cond> {
+        let Some(module) = self.consts else {
+            return Err(Cond::Unknown);
+        };
+        let known = |ok: bool| if ok { Ok(()) } else { Err(Cond::Unknown) };
+        let all = |es: &[&Expression]| es.iter().all(|x| self.split(x).is_ok());
+        match &e.kind {
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) => Ok(()),
+            ExprKind::Ident(h) => known(self.param(h)),
+            ExprKind::Paren(x) => self.split(x),
+            ExprKind::Unary { op, operand } => match (op, self.split(operand)) {
+                (UnaryOp::LogNot, Err(Cond::Unknown)) => Err(Cond::Unknown),
+                (UnaryOp::LogNot, Err(c)) => Err(Cond::Not(Box::new(c))),
+                (
+                    UnaryOp::PreIncr
+                    | UnaryOp::PreDecr
+                    | UnaryOp::PostIncr
+                    | UnaryOp::PostDecr
+                    | UnaryOp::HashHash
+                    | UnaryOp::SEventually
+                    | UnaryOp::SAlways,
+                    _,
+                ) => Err(Cond::Unknown),
+                (_, s) => known(s.is_ok()),
+            },
+            ExprKind::Binary { op, left, right } => {
+                let (l, r) = (self.split(left), self.split(right));
+                match op {
+                    BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::BitAnd | BinaryOp::BitOr => {
+                        if l.is_ok() && r.is_ok() {
+                            return Ok(());
+                        }
+                        // An operand of `&` or `|` takes the width of the
+                        // other (§11.6.1), so a constant one is used only
+                        // when its value does not depend on that width.
+                        let bitwise = matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr);
+                        let part = |s: Result<(), Cond>, x: &Expression| match s {
+                            Ok(()) if bitwise && !context_free(x) => Cond::Unknown,
+                            Ok(()) => Cond::Const(x.clone()),
+                            Err(c) => c,
+                        };
+                        let (l, r) = (part(l, left), part(r, right));
+                        if matches!((&l, &r), (Cond::Unknown, Cond::Unknown)) {
+                            return Err(Cond::Unknown);
+                        }
+                        let (l, r) = (Box::new(l), Box::new(r));
+                        Err(match op {
+                            BinaryOp::LogAnd => Cond::And(l, r, false),
+                            BinaryOp::BitAnd => Cond::And(l, r, true),
+                            BinaryOp::LogOr => Cond::Or(l, r, false),
+                            _ => Cond::Or(l, r, true),
+                        })
+                    }
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::Power
+                    | BinaryOp::Eq
+                    | BinaryOp::Neq
+                    | BinaryOp::CaseEq
+                    | BinaryOp::CaseNeq
+                    | BinaryOp::WildcardEq
+                    | BinaryOp::WildcardNeq
+                    | BinaryOp::LogImplies
+                    | BinaryOp::LogEquiv
+                    | BinaryOp::Lt
+                    | BinaryOp::Leq
+                    | BinaryOp::Gt
+                    | BinaryOp::Geq
+                    | BinaryOp::BitXor
+                    | BinaryOp::BitXnor
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight
+                    | BinaryOp::ArithShiftLeft
+                    | BinaryOp::ArithShiftRight => known(l.is_ok() && r.is_ok()),
+                    _ => Err(Cond::Unknown),
+                }
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => known(all(&[condition, then_expr, else_expr])),
+            ExprKind::Concatenation(parts) => {
+                known(!parts.is_empty() && parts.iter().all(|p| self.split(p).is_ok()))
+            }
+            ExprKind::Replication { count, exprs } => {
+                known(self.split(count).is_ok() && exprs.iter().all(|p| self.split(p).is_ok()))
+            }
+            ExprKind::Index { expr, index } => {
+                known(matches!(&expr.kind, ExprKind::Ident(h) if self.param(h)) && all(&[index]))
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => known(
+                matches!(&expr.kind, ExprKind::Ident(h) if self.param(h)) && all(&[left, right]),
+            ),
+            ExprKind::SystemCall { name, args } => match (name.as_str(), &args[..]) {
+                (
+                    "$clog2" | "$signed" | "$unsigned" | "$countones" | "$onehot" | "$onehot0",
+                    [a],
+                ) => known(all(&[a])),
+                // §20.6.2: the width of a type, or of a fixed-width net or
+                // variable.
+                ("$bits", [a]) => match &a.kind {
+                    ExprKind::TypeLiteral(_) => Ok(()),
+                    ExprKind::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty() =>
+                    {
+                        let n = h.path[0].name.name.as_str();
+                        known(
+                            !self.locals.contains(n)
+                                && !module.dynamic_arrays.contains(n)
+                                && !module.associative_arrays.contains_key(n)
+                                && !module.queue_vars.contains(n)
+                                && !module.string_signals.contains(n),
+                        )
+                    }
+                    _ => known(all(&[a])),
+                },
+                _ => Err(Cond::Unknown),
+            },
+            _ => Err(Cond::Unknown),
+        }
+    }
+
+    /// The choice a `case` makes when its selector and every item are
+    /// constants. `None` otherwise: as in the reference simulator, a `case`
+    /// with any item that is not a constant keeps all of its arms, and so
+    /// does a `case inside`.
+    fn case_choice(&self, kind: CaseKind, expr: &Expression, items: &[CaseItem]) -> Option<Choice> {
+        let constant = !matches!(kind, CaseKind::CaseInside)
+            && self.constant(expr)
+            && items.iter().all(|it| {
+                it.pattern.is_none()
+                    && it.guard.is_none()
+                    && it.patterns.iter().all(|p| self.constant(p))
+            });
+        constant.then(|| {
+            let items = items
+                .iter()
+                .map(|it| CaseItem {
+                    patterns: it.patterns.clone(),
+                    is_default: it.is_default,
+                    stmt: Statement::new(StatementKind::Null, it.span),
+                    span: it.span,
+                    pattern: None,
+                    guard: None,
+                })
+                .collect();
+            Choice::Case(kind, expr.clone(), items)
+        })
+    }
+
+    /// Note the names a statement declares (see `locals`).
+    fn declare(&mut self, s: &Statement) {
+        match &s.kind {
+            StatementKind::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    self.locals.insert(d.name.name.clone());
+                }
+            }
+            StatementKind::For { init, .. } => {
+                for i in init {
+                    if let ForInit::VarDecl { name, .. } = i {
+                        self.locals.insert(name.name.clone());
+                    }
+                }
+            }
+            StatementKind::Foreach { vars, .. } => {
+                for v in vars.iter().flatten() {
+                    self.locals.insert(v.name.clone());
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A statement in a single-statement position.
@@ -282,12 +704,13 @@ impl Instr<'_> {
         block(v, span)
     }
 
-    /// A branch arm: its counter, then the arm's own statements.
-    fn arm(&mut self, s: Statement, counter: u32) -> Statement {
+    /// A branch arm: its counter, then the arm's own statements, and the
+    /// sites they hold.
+    fn arm(&mut self, s: Statement, counter: u32) -> (Statement, Region) {
         let span = s.span;
         let mut v = vec![hit(counter, span)];
-        self.stmt(s, &mut v);
-        block(v, span)
+        let ((), r) = self.region(|me| me.stmt(s, &mut v));
+        (block(v, span), r)
     }
 
     fn stmts(&mut self, items: Vec<Statement>) -> Vec<Statement> {
@@ -330,6 +753,9 @@ impl Instr<'_> {
     fn stmt(&mut self, s: Statement, out: &mut Vec<Statement>) {
         let span = s.span;
         let rebuilt = |kind| Statement::new(kind, span);
+        if self.consts.is_some() {
+            self.declare(&s);
+        }
         match s.kind {
             StatementKind::SeqBlock { name, stmts } => {
                 let stmts = self.stmts(stmts);
@@ -371,8 +797,9 @@ impl Instr<'_> {
                                 span: st.span,
                                 label: "item",
                                 counter: Some(c),
+                                excluded: false,
                             });
-                            (w, self.arm(st, c))
+                            (w, self.arm(st, c).0)
                         })
                         .collect();
                     self.cov.branches.push(BranchSite {
@@ -381,6 +808,7 @@ impl Instr<'_> {
                         kind: "randcase",
                         entry: None,
                         arms,
+                        excluded: false,
                     });
                     items
                 } else {
@@ -521,6 +949,7 @@ impl Instr<'_> {
     /// An `if`, with its `else if` chain as one branch: one arm per
     /// condition plus the final `else`, written or implicit. A `unique` or
     /// `priority` chain has no implicit arm (no match is a violation).
+    /// Conditions constants can decide make a `Choice::If`.
     fn if_stmt(
         &mut self,
         unique_priority: Option<UniquePriority>,
@@ -531,8 +960,12 @@ impl Instr<'_> {
         out: &mut Vec<Statement>,
     ) {
         if self.kinds & KIND_BRANCH == 0 {
-            let then_stmt = Box::new(self.wrap(*then_stmt));
-            let else_stmt = else_stmt.map(|e| Box::new(self.wrap(*e)));
+            let cond = self.skeleton(&condition);
+            let (then_stmt, t) = self.region(|me| Box::new(me.wrap(*then_stmt)));
+            let (else_stmt, e) = self.region(|me| else_stmt.map(|e| Box::new(me.wrap(*e))));
+            if !matches!(cond, Cond::Unknown) {
+                self.decide(Choice::If(vec![cond]), None, vec![t, e], Vec::new());
+            }
             out.push(Statement::new(
                 StatementKind::If {
                     unique_priority,
@@ -544,11 +977,19 @@ impl Instr<'_> {
             ));
             return;
         }
+        let mut conds = vec![self.skeleton(&condition)];
         let mut has_else = false;
         let mut tail = else_stmt.as_deref();
         while let Some(e) = tail {
             match &e.kind {
-                StatementKind::If { else_stmt, .. } => tail = else_stmt.as_deref(),
+                StatementKind::If {
+                    condition,
+                    else_stmt,
+                    ..
+                } => {
+                    conds.push(self.skeleton(condition));
+                    tail = else_stmt.as_deref();
+                }
                 _ => {
                     has_else = true;
                     break;
@@ -564,9 +1005,11 @@ impl Instr<'_> {
             kind: "if",
             entry,
             arms: Vec::new(),
+            excluded: false,
         });
-        let mut arms = Vec::new();
-        self.expr(&mut condition);
+        let mut chain = Chain::default();
+        let ((), (_, c)) = self.region(|me| me.expr(&mut condition));
+        chain.conds.push(c);
         let rewritten = self.if_arms(
             unique_priority,
             condition,
@@ -574,22 +1017,30 @@ impl Instr<'_> {
             else_stmt,
             span,
             true,
-            &mut arms,
+            &mut chain,
         );
         if implicit {
-            arms.push(Arm {
+            chain.arms.push(Arm {
                 span,
                 label: "else (implicit)",
                 counter: None,
+                excluded: false,
             });
         }
-        self.cov.branches[site].arms = arms;
+        if !has_else {
+            chain.regions.push((0..0, 0..0));
+        }
+        self.cov.branches[site].arms = chain.arms;
+        if conds.iter().any(|c| !matches!(c, Cond::Unknown)) {
+            self.decide(Choice::If(conds), Some(site), chain.regions, chain.conds);
+        }
         if let Some(e) = entry {
             out.push(hit(e, span));
         }
         out.push(rewritten);
     }
 
+    /// The arms of an `if` chain from the one `chain` has reached on.
     #[allow(clippy::too_many_arguments)]
     fn if_arms(
         &mut self,
@@ -599,15 +1050,17 @@ impl Instr<'_> {
         else_stmt: Option<Box<Statement>>,
         span: Span,
         first: bool,
-        arms: &mut Vec<Arm>,
+        chain: &mut Chain,
     ) -> Statement {
         let c = self.counter();
-        arms.push(Arm {
+        chain.arms.push(Arm {
             span: then_stmt.span,
             label: if first { "if" } else { "else if" },
             counter: Some(c),
+            excluded: false,
         });
-        let then_stmt = Box::new(self.arm(*then_stmt, c));
+        let (then_stmt, r) = self.arm(*then_stmt, c);
+        chain.regions.push(r);
         let else_stmt = else_stmt.map(|e| {
             let e = *e;
             let espan = e.span;
@@ -618,17 +1071,21 @@ impl Instr<'_> {
                     then_stmt: t,
                     else_stmt: el,
                 } => {
-                    self.expr(&mut cond);
-                    self.if_arms(up, cond, t, el, espan, false, arms)
+                    let ((), (_, c)) = self.region(|me| me.expr(&mut cond));
+                    chain.conds.push(c);
+                    self.if_arms(up, cond, t, el, espan, false, chain)
                 }
                 kind => {
                     let c = self.counter();
-                    arms.push(Arm {
+                    chain.arms.push(Arm {
                         span: espan,
                         label: "else",
                         counter: Some(c),
+                        excluded: false,
                     });
-                    self.arm(Statement::new(kind, espan), c)
+                    let (s, r) = self.arm(Statement::new(kind, espan), c);
+                    chain.regions.push(r);
+                    s
                 }
             })
         });
@@ -636,7 +1093,7 @@ impl Instr<'_> {
             StatementKind::If {
                 unique_priority,
                 condition,
-                then_stmt,
+                then_stmt: Box::new(then_stmt),
                 else_stmt,
             },
             span,
@@ -644,7 +1101,8 @@ impl Instr<'_> {
     }
 
     /// A `case`: one arm per item, plus an implicit `default` when there is
-    /// none (except for `unique` / `priority` cases).
+    /// none (except for `unique` / `priority` cases). A constant selector
+    /// with constant items makes a `Choice::Case`.
     fn case_stmt(
         &mut self,
         unique_priority: Option<UniquePriority>,
@@ -654,15 +1112,20 @@ impl Instr<'_> {
         span: Span,
         out: &mut Vec<Statement>,
     ) {
+        let choice = self.case_choice(kind, &expr, &items);
+        let mut regions = Vec::with_capacity(items.len() + 1);
+        let mut site = None;
         if self.kinds & KIND_BRANCH == 0 {
             for it in items.iter_mut() {
                 let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
-                it.stmt = self.wrap(st);
+                let (s, r) = self.region(|me| me.wrap(st));
+                it.stmt = s;
+                regions.push(r);
             }
         } else {
             let implicit = !items.iter().any(|it| it.is_default) && unique_priority.is_none();
             let entry = implicit.then(|| self.counter());
-            let site = self.cov.branches.len();
+            site = Some(self.cov.branches.len());
             self.cov.branches.push(BranchSite {
                 scope: self.scope,
                 span,
@@ -674,6 +1137,7 @@ impl Instr<'_> {
                 },
                 entry,
                 arms: Vec::new(),
+                excluded: false,
             });
             let mut arms = Vec::new();
             for it in items.iter_mut() {
@@ -682,21 +1146,32 @@ impl Instr<'_> {
                     span: it.span,
                     label: if it.is_default { "default" } else { "item" },
                     counter: Some(c),
+                    excluded: false,
                 });
                 let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
-                it.stmt = self.arm(st, c);
+                let (s, r) = self.arm(st, c);
+                it.stmt = s;
+                regions.push(r);
             }
             if implicit {
                 arms.push(Arm {
                     span,
                     label: "default (implicit)",
                     counter: None,
+                    excluded: false,
                 });
             }
-            self.cov.branches[site].arms = arms;
+            if let Some(i) = site {
+                self.cov.branches[i].arms = arms;
+            }
             if let Some(e) = entry {
                 out.push(hit(e, span));
             }
+        }
+        // The implicit `default` holds nothing.
+        regions.push((0..0, 0..0));
+        if let Some(choice) = choice {
+            self.decide(choice, site, regions, Vec::new());
         }
         out.push(Statement::new(
             StatementKind::Case {
@@ -710,23 +1185,39 @@ impl Instr<'_> {
     }
 
     /// Wrap the condition of every `?:` in `e` (see `COND_FN`). Stops at
-    /// system calls, whose arguments some tasks read by shape.
+    /// system calls, whose arguments some tasks read by shape. A `?:` whose
+    /// condition constants can decide makes a `Choice::Ternary`, and an
+    /// `&&`, `||`, `&` or `|` with a `?:` inside a `Choice::Operand`.
     fn expr(&mut self, e: &mut Expression) {
-        if self.kinds & KIND_BRANCH == 0 {
+        if self.kinds & KIND_BRANCH == 0 || !has_ternary(e) {
             return;
         }
         let espan = e.span;
+        // An `&&` (`||`) never evaluates its right operand when the left one
+        // is false (true). Taken before the `?:`s inside are rewritten,
+        // which hides the constants among them.
+        let decider = match &e.kind {
+            ExprKind::Binary {
+                op: op @ (BinaryOp::LogAnd | BinaryOp::LogOr),
+                left,
+                right,
+            } if has_ternary(right) => Some((self.skeleton(left), *op == BinaryOp::LogOr)),
+            _ => None,
+        };
+        let mut operand = None;
         match &mut e.kind {
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
+                let cond = self.skeleton(condition);
                 self.expr(condition);
-                self.expr(then_expr);
-                self.expr(else_expr);
-                let t = self.counter();
-                let f = self.counter();
+                let ((), t) = self.region(|me| me.expr(then_expr));
+                let ((), f) = self.region(|me| me.expr(else_expr));
+                let tc = self.counter();
+                let fc = self.counter();
+                let site = self.cov.branches.len();
                 self.cov.branches.push(BranchSite {
                     scope: self.scope,
                     span: espan,
@@ -736,22 +1227,28 @@ impl Instr<'_> {
                         Arm {
                             span: then_expr.span,
                             label: "true",
-                            counter: Some(t),
+                            counter: Some(tc),
+                            excluded: false,
                         },
                         Arm {
                             span: else_expr.span,
                             label: "false",
-                            counter: Some(f),
+                            counter: Some(fc),
+                            excluded: false,
                         },
                     ],
+                    excluded: false,
                 });
+                if !matches!(cond, Cond::Unknown) {
+                    self.decide(Choice::Ternary(cond), Some(site), vec![t, f], Vec::new());
+                }
                 let cspan = condition.span;
                 let cond =
                     std::mem::replace(&mut **condition, Expression::new(ExprKind::Empty, cspan));
                 **condition = Expression::new(
                     ExprKind::SystemCall {
                         name: COND_FN.to_string(),
-                        args: vec![number(t, cspan), cond],
+                        args: vec![number(tc, cspan), cond],
                     },
                     cspan,
                 );
@@ -759,7 +1256,7 @@ impl Instr<'_> {
             ExprKind::Unary { operand, .. } => self.expr(operand),
             ExprKind::Binary { left, right, .. } => {
                 self.expr(left);
-                self.expr(right);
+                operand = Some(self.region(|me| me.expr(right)).1);
             }
             ExprKind::Paren(inner) => self.expr(inner),
             ExprKind::Concatenation(parts) => {
@@ -783,6 +1280,69 @@ impl Instr<'_> {
             }
             _ => {}
         }
+        if let (Some((cond, skip)), Some(r)) = (decider, operand)
+            && !r.1.is_empty()
+            && !matches!(cond, Cond::Unknown)
+        {
+            self.decide(Choice::Operand(cond, skip), None, vec![r], Vec::new());
+        }
+    }
+}
+
+/// Whether `e` has the same value in a wider context (§11.6.1): a
+/// self-determined expression (a literal, a parameter or a select of one,
+/// a concatenation, a system function, a comparison, or a logical or
+/// reduction operator), so that whether it is zero, or has a 1 bit, does
+/// not depend on the operator it is an operand of. `4'hf + 4'h1` is 0 on
+/// its own but 8'h10 beside an 8-bit operand.
+fn context_free(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Paren(x) => context_free(x),
+        ExprKind::Number(_)
+        | ExprKind::StringLiteral(_)
+        | ExprKind::Ident(_)
+        | ExprKind::Index { .. }
+        | ExprKind::RangeSelect { .. }
+        | ExprKind::Concatenation(_)
+        | ExprKind::Replication { .. }
+        | ExprKind::SystemCall { .. } => true,
+        ExprKind::Unary { op, .. } => {
+            !matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot)
+        }
+        ExprKind::Binary { op, .. } => matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::CaseEq
+                | BinaryOp::CaseNeq
+                | BinaryOp::WildcardEq
+                | BinaryOp::WildcardNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+                | BinaryOp::LogAnd
+                | BinaryOp::LogOr
+                | BinaryOp::LogImplies
+                | BinaryOp::LogEquiv
+        ),
+        _ => false,
+    }
+}
+
+/// Whether `expr` would find a `?:` to instrument in `e`: it walks the same
+/// operands.
+fn has_ternary(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Conditional { .. } => true,
+        ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => has_ternary(operand),
+        ExprKind::Binary { left, right, .. } => has_ternary(left) || has_ternary(right),
+        ExprKind::Concatenation(parts) | ExprKind::Replication { exprs: parts, .. } => {
+            parts.iter().any(has_ternary)
+        }
+        ExprKind::Index { expr, index } => has_ternary(expr) || has_ternary(index),
+        ExprKind::Call { args, .. } => args.iter().any(has_ternary),
+        _ => false,
     }
 }
 
@@ -841,6 +1401,7 @@ struct StmtRow {
     start: usize,
     kind: &'static str,
     count: u64,
+    excluded: bool,
 }
 
 #[derive(Clone)]
@@ -848,6 +1409,7 @@ struct ArmRow {
     line: u32,
     label: &'static str,
     count: u64,
+    excluded: bool,
 }
 
 #[derive(Clone)]
@@ -857,6 +1419,32 @@ struct BranchRow {
     start: usize,
     kind: &'static str,
     arms: Vec<ArmRow>,
+    excluded: bool,
+}
+
+/// Add the count of another copy of a row (another instance of the design
+/// unit, or a copy elaboration made) to a row's. The row stays excluded
+/// only when both are, and an included row does not take in an excluded
+/// copy's count: the taken arm of a constant decision runs, but it is no
+/// arm where the decision is not constant.
+fn add_count(count: &mut u64, excluded: &mut bool, other: u64, other_excluded: bool) {
+    match (*excluded, other_excluded) {
+        (true, false) => {
+            *count = other;
+            *excluded = false;
+        }
+        (false, true) => {}
+        _ => *count += other,
+    }
+}
+
+/// The JSON member marking an excluded row.
+fn excluded_json(excluded: bool) -> String {
+    if excluded {
+        format!(", \"excluded\": \"{}\"", EXCLUDED)
+    } else {
+        String::new()
+    }
 }
 
 #[derive(Clone)]
@@ -875,27 +1463,39 @@ struct Report {
     fsms: Vec<FsmRow>,
 }
 
+/// Covered and total items; `excluded` counts the ones left out of both.
 #[derive(Clone, Copy, Default)]
 struct Tally {
     covered: u64,
     total: u64,
+    excluded: u64,
 }
 
 impl Tally {
     fn add(&mut self, o: Tally) {
         self.covered += o.covered;
         self.total += o.total;
+        self.excluded += o.excluded;
     }
 
     fn json(&self) -> String {
+        let excluded = if self.excluded > 0 {
+            format!(", \"excluded\": {}", self.excluded)
+        } else {
+            String::new()
+        };
         if self.total == 0 {
-            "{\"covered\": 0, \"total\": 0, \"percent\": null}".to_string()
+            format!(
+                "{{\"covered\": 0, \"total\": 0, \"percent\": null{}}}",
+                excluded
+            )
         } else {
             format!(
-                "{{\"covered\": {}, \"total\": {}, \"percent\": {:.2}}}",
+                "{{\"covered\": {}, \"total\": {}, \"percent\": {:.2}{}}}",
                 self.covered,
                 self.total,
-                self.percent()
+                self.percent(),
+                excluded
             )
         }
     }
@@ -905,10 +1505,17 @@ impl Tally {
     }
 
     fn text(&self) -> String {
-        if self.total == 0 {
-            "0/0".to_string()
+        let mut notes = Vec::new();
+        if self.total > 0 {
+            notes.push(format!("{:.2}%", self.percent()));
+        }
+        if self.excluded > 0 {
+            notes.push(format!("{} excluded", self.excluded));
+        }
+        if notes.is_empty() {
+            format!("{}/{}", self.covered, self.total)
         } else {
-            format!("{}/{} ({:.2}%)", self.covered, self.total, self.percent())
+            format!("{}/{} ({})", self.covered, self.total, notes.join("; "))
         }
     }
 
@@ -929,11 +1536,19 @@ impl Report {
     fn tallies(&self) -> Tallies {
         let mut t = Tallies::default();
         for s in &self.stmts {
+            if s.excluded {
+                t[0].excluded += 1;
+                continue;
+            }
             t[0].total += 1;
             t[0].covered += (s.count > 0) as u64;
         }
         for b in &self.branches {
             for a in &b.arms {
+                if b.excluded || a.excluded {
+                    t[1].excluded += 1;
+                    continue;
+                }
                 t[1].total += 1;
                 t[1].covered += (a.count > 0) as u64;
             }
@@ -947,6 +1562,7 @@ impl Report {
         t[KIND_FSM.trailing_zeros() as usize] = Tally {
             covered: s.covered + x.covered,
             total: s.total + x.total,
+            excluded: 0,
         };
         t
     }
@@ -959,10 +1575,12 @@ impl Report {
             t[0].add(Tally {
                 covered: sc,
                 total: st,
+                excluded: 0,
             });
             t[1].add(Tally {
                 covered: tc,
                 total: tt,
+                excluded: 0,
             });
         }
         t
@@ -978,7 +1596,7 @@ impl Report {
         for s in self.stmts.drain(..) {
             match merged.last_mut() {
                 Some(m) if m.file == s.file && m.start == s.start && m.kind == s.kind => {
-                    m.count += s.count
+                    add_count(&mut m.count, &mut m.excluded, s.count, s.excluded)
                 }
                 _ => merged.push(s),
             }
@@ -996,9 +1614,17 @@ impl Report {
                         && m.kind == b.kind
                         && m.arms.len() == b.arms.len() =>
                 {
+                    // Where both copies are excluded whole, an arm's own
+                    // marker says whether it can run at all; otherwise an
+                    // arm is out where its branch is.
+                    let whole = m.excluded && b.excluded;
                     for (x, y) in m.arms.iter_mut().zip(&b.arms) {
-                        x.count += y.count;
+                        let mut out = x.excluded || (m.excluded && !whole);
+                        let other = y.excluded || (b.excluded && !whole);
+                        add_count(&mut x.count, &mut out, y.count, other);
+                        x.excluded = out;
                     }
+                    m.excluded = whole;
                 }
                 _ => merged.push(b),
             }
@@ -1068,12 +1694,13 @@ impl Report {
             out.push_str(&format!("{}\"statements\": [", indent));
             for (i, s) in self.stmts.iter().enumerate() {
                 out.push_str(&format!(
-                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\", \"count\": {}}}",
+                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\", \"count\": {}{}}}",
                     if i == 0 { "" } else { ", " },
                     json_escape(&s.file),
                     s.line,
                     s.kind,
-                    s.count
+                    s.count,
+                    excluded_json(s.excluded)
                 ));
             }
             out.push_str("],\n");
@@ -1082,19 +1709,21 @@ impl Report {
             out.push_str(&format!("{}\"branches\": [", indent));
             for (i, b) in self.branches.iter().enumerate() {
                 out.push_str(&format!(
-                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\", \"arms\": [",
+                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\"{}, \"arms\": [",
                     if i == 0 { "" } else { ", " },
                     json_escape(&b.file),
                     b.line,
-                    b.kind
+                    b.kind,
+                    excluded_json(b.excluded)
                 ));
                 for (j, a) in b.arms.iter().enumerate() {
                     out.push_str(&format!(
-                        "{}{{\"line\": {}, \"arm\": \"{}\", \"count\": {}}}",
+                        "{}{{\"line\": {}, \"arm\": \"{}\", \"count\": {}{}}}",
                         if j == 0 { "" } else { ", " },
                         a.line,
                         a.label,
-                        a.count
+                        a.count,
+                        excluded_json(a.excluded)
                     ));
                 }
                 out.push_str("]}");
@@ -1296,6 +1925,7 @@ impl Simulator {
             .collect();
         let mut cov = CodeCov {
             kinds,
+            keep_constant: cfg.keep_constant,
             limit: cfg.scopes,
             scopes: Vec::new(),
             scope_index: HashMap::default(),
@@ -1304,6 +1934,7 @@ impl Simulator {
             counters: 0,
             ca_counter: HashMap::default(),
             inst_paths: inst_paths.clone(),
+            decisions: Vec::new(),
             toggle: None,
             fsm: None,
         };
@@ -1326,12 +1957,7 @@ impl Simulator {
                     let span = ib.stmt.span;
                     let s =
                         std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
-                    ib.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .wrap(s);
+                    ib.stmt = Instr::new(&mut cov, kinds, sc, Some(&self.module)).wrap(s);
                 }
             }
             self.module.program_initial_blocks = program;
@@ -1343,12 +1969,7 @@ impl Simulator {
                     let span = fb.stmt.span;
                     let s =
                         std::mem::replace(&mut fb.stmt, Statement::new(StatementKind::Null, span));
-                    fb.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .wrap(s);
+                    fb.stmt = Instr::new(&mut cov, kinds, sc, Some(&self.module)).wrap(s);
                 }
             }
             self.module.final_blocks = fin;
@@ -1365,12 +1986,7 @@ impl Simulator {
                     let span = ab.stmt.span;
                     let s =
                         std::mem::replace(&mut ab.stmt, Statement::new(StatementKind::Null, span));
-                    ab.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .always(s, kind);
+                    ab.stmt = Instr::new(&mut cov, kinds, sc, Some(&self.module)).always(s, kind);
                 }
             }
             // Subroutines: a package's belong to the package, the others to
@@ -1398,12 +2014,9 @@ impl Simulator {
                 }
                 if let Some(sc) = self.cov_subroutine_scope(&mut cov, &inst_paths, key) {
                     let items = std::mem::take(&mut fd.items);
-                    fd.items = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .stmts(items);
+                    fd.items = self
+                        .cov_subroutine_instr(&mut cov, kinds, sc, key, &fd.ports)
+                        .stmts(items);
                 }
             }
             self.module.functions = xezim_core::elaborate::FuncTable::from_map(functions);
@@ -1414,12 +2027,9 @@ impl Simulator {
                 }
                 if let Some(sc) = self.cov_subroutine_scope(&mut cov, &inst_paths, key) {
                     let items = std::mem::take(&mut td.items);
-                    td.items = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .stmts(items);
+                    td.items = self
+                        .cov_subroutine_instr(&mut cov, kinds, sc, key, &td.ports)
+                        .stmts(items);
                 }
             }
             self.module.tasks = tasks;
@@ -1466,12 +2076,7 @@ impl Simulator {
             if let Some(sc) = Self::cov_instance_scope(&self.module, &mut cov, &paths, &ib.scope) {
                 let span = ib.stmt.span;
                 let s = std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
-                ib.stmt = Instr {
-                    cov: &mut cov,
-                    kinds,
-                    scope: sc,
-                }
-                .wrap(s);
+                ib.stmt = Instr::new(&mut cov, kinds, sc, Some(&self.module)).wrap(s);
             }
             cov.inst_paths = paths;
             self.code_cov_hits.resize(cov.counters as usize, 0);
@@ -1504,11 +2109,7 @@ impl Simulator {
         let sc = Self::cov_instance_scope(module, cov, &paths, &scope);
         cov.inst_paths = paths;
         let sc = sc?;
-        let mut ins = Instr {
-            cov,
-            kinds,
-            scope: sc,
-        };
+        let mut ins = Instr::new(cov, kinds, sc, Some(module));
         ins.expr(&mut ca.rhs);
         let mut counter = None;
         if kinds & KIND_STATEMENT != 0 {
@@ -1522,6 +2123,7 @@ impl Simulator {
                         span,
                         kind: "assign",
                         counter: c,
+                        excluded: false,
                     });
                     ins.cov.ca_counter.insert(key, c);
                     c
@@ -1670,6 +2272,159 @@ impl Simulator {
         Self::cov_instance_scope(&self.module, cov, inst_paths, scope)
     }
 
+    /// The rewriter for subroutine `key`: an instance's sees its parameters,
+    /// and its arguments shadow them; a package's excludes nothing.
+    fn cov_subroutine_instr<'a>(
+        &'a self,
+        cov: &'a mut CodeCov,
+        kinds: u8,
+        scope: u32,
+        key: &str,
+        ports: &[crate::ast::decl::FunctionPort],
+    ) -> Instr<'a> {
+        let pkg = key.contains("::") || self.module.pkg_subr_owner.contains_key(key);
+        let mut ins = Instr::new(cov, kinds, scope, (!pkg).then_some(&self.module));
+        for p in ports {
+            ins.locals.insert(p.name.name.clone());
+            ins.locals.insert(format!("{}.{}", key, p.name.name));
+        }
+        ins
+    }
+
+    /// Make the decisions constants make (see `Decision`), with the
+    /// evaluator the run uses, so a decision is what the run does: exclude
+    /// the arms that cannot run and what they hold, and the whole branch
+    /// when the decision is constant. Runs at the end of `compile`, once
+    /// every block is instrumented.
+    pub(super) fn cov_resolve_constants(&mut self) {
+        let Some(mut cov) = self.code_cov.take() else {
+            return;
+        };
+        for d in std::mem::take(&mut cov.decisions) {
+            // Per arm, and whether the decision is constant as a whole.
+            let (fates, whole, conds) = match &d.choice {
+                Choice::If(conds) => {
+                    let truths: Vec<_> = conds.iter().map(|c| self.cov_truth(c)).collect();
+                    let (fates, whole) = chain_fates(&truths);
+                    // A condition after a constantly true one is never
+                    // evaluated.
+                    let dead = (0..conds.len())
+                        .map(|i| fates[..i].contains(&Fate::Taken))
+                        .collect();
+                    (fates, whole, dead)
+                }
+                Choice::Case(kind, sel, items) => match self.cov_case_fates(kind, sel, items) {
+                    Some(fates) => (fates, true, Vec::new()),
+                    None => continue,
+                },
+                Choice::Ternary(c) => match self.cov_truth(c) {
+                    Some(t) => {
+                        let (yes, no) = if t {
+                            (Fate::Taken, Fate::Dead)
+                        } else {
+                            (Fate::Dead, Fate::Taken)
+                        };
+                        (vec![yes, no], true, Vec::new())
+                    }
+                    None => continue,
+                },
+                Choice::Operand(c, skip) => match self.cov_truth(c) {
+                    Some(t) if t == *skip => (vec![Fate::Dead], false, Vec::new()),
+                    _ => continue,
+                },
+            };
+            let mut dead = |(s, b): &Region| {
+                for x in &mut cov.stmts[s.clone()] {
+                    x.excluded = true;
+                }
+                for x in &mut cov.branches[b.clone()] {
+                    x.excluded = true;
+                }
+            };
+            for (f, r) in fates.iter().zip(&d.arms) {
+                if *f == Fate::Dead {
+                    dead(r);
+                }
+            }
+            for (out, b) in conds.iter().zip(&d.conds) {
+                if *out {
+                    dead(&(0..0, b.clone()));
+                }
+            }
+            if let Some(site) = d.site.and_then(|i| cov.branches.get_mut(i)) {
+                site.excluded |= whole;
+                for (a, f) in site.arms.iter_mut().zip(&fates) {
+                    a.excluded |= *f == Fate::Dead;
+                }
+            }
+        }
+        self.code_cov = Some(cov);
+    }
+
+    /// Whether a condition's constant parts make it constantly true or
+    /// false, as the run evaluates them (`Value::is_nonzero`: x or z bits
+    /// and no 1 decide nothing).
+    fn cov_truth(&mut self, c: &Cond) -> Option<bool> {
+        match c {
+            Cond::Const(e) => self.eval_expr(e).is_nonzero(),
+            Cond::Not(c) => self.cov_truth(c).map(|t| !t),
+            Cond::And(l, r, bitwise) => match (self.cov_truth(l), self.cov_truth(r)) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) if !bitwise => Some(true),
+                _ => None,
+            },
+            Cond::Or(l, r, bitwise) => match (self.cov_truth(l), self.cov_truth(r)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) if !bitwise => Some(false),
+                _ => None,
+            },
+            Cond::Unknown => None,
+        }
+    }
+
+    /// The fates of a constant `case`'s items and of its implicit
+    /// `default`, matching the items as the run does: the first item that
+    /// matches is taken, or the `default` (written or implicit) when none
+    /// does. `None` when a comparison has x or z bits.
+    fn cov_case_fates(
+        &mut self,
+        kind: &CaseKind,
+        sel: &Expression,
+        items: &[CaseItem],
+    ) -> Option<Vec<Fate>> {
+        let val = self.case_selector_value(kind, sel, items);
+        let mut hit = None;
+        for (i, it) in items.iter().enumerate() {
+            for p in &it.patterns {
+                let pv = self.eval_expr(p);
+                let m = match kind {
+                    CaseKind::Casez => val.casez_eq(&pv),
+                    CaseKind::Casex => val.casex_eq(&pv),
+                    _ => val.case_eq(&pv),
+                };
+                if m.is_nonzero()? && hit.is_none() {
+                    hit = Some(i);
+                }
+            }
+        }
+        let hit = hit.or_else(|| items.iter().position(|it| it.is_default));
+        let mut fates: Vec<Fate> = (0..items.len())
+            .map(|i| {
+                if Some(i) == hit {
+                    Fate::Taken
+                } else {
+                    Fate::Dead
+                }
+            })
+            .collect();
+        fates.push(if hit.is_some() {
+            Fate::Dead
+        } else {
+            Fate::Taken
+        });
+        Some(fates)
+    }
+
     fn cov_instrument_classes(&mut self, cov: &mut CodeCov) {
         let kinds = cov.kinds;
         let mut classes = std::mem::take(&mut self.module.classes);
@@ -1719,12 +2474,7 @@ impl Simulator {
                     crate::ast::decl::ClassMethodKind::PureVirtual(_) => continue,
                 };
                 let body = std::mem::take(items);
-                *items = Instr {
-                    cov: &mut *cov,
-                    kinds,
-                    scope: sc,
-                }
-                .stmts(body);
+                *items = Instr::new(&mut *cov, kinds, sc, None).stmts(body);
             }
             done.insert(ptr, arc.clone());
             classes.insert(key, arc);
@@ -2179,6 +2929,7 @@ impl Simulator {
                 start: s.span.start,
                 kind: s.kind,
                 count: count(s.counter),
+                excluded: s.excluded,
             });
         }
         for b in &cov.branches {
@@ -2195,6 +2946,7 @@ impl Simulator {
                         Some(c) => count(c),
                         None => b.entry.map(count).unwrap_or(0).saturating_sub(taken),
                     },
+                    excluded: a.excluded,
                 })
                 .collect();
             reports[b.scope as usize].branches.push(BranchRow {
@@ -2203,6 +2955,7 @@ impl Simulator {
                 start: b.span.start,
                 kind: b.kind,
                 arms,
+                excluded: b.excluded,
             });
         }
         if let Some(t) = &cov.toggle {

@@ -512,10 +512,10 @@ fn code_coverage_keeps_ports() {
         .find("\"scope\": ")
         .map_or(cell.len(), |e| e + key.len())];
     for row in [
-        "{\"signal\": \"d\", \"width\": 1, \"rise\": [2], \"fall\": [2]}",
-        "{\"signal\": \"rs\", \"width\": 1, \"rise\": [1], \"fall\": [2]}",
-        "{\"signal\": \"we\", \"width\": 1, \"rise\": [4], \"fall\": [4]}",
-        "{\"signal\": \"wl\", \"width\": 1, \"rise\": [1], \"fall\": [1]}",
+        "{\"signal\": \"d\", \"width\": 1, \"type\": \"logic\", \"rise\": [2], \"fall\": [2]}",
+        "{\"signal\": \"rs\", \"width\": 1, \"type\": \"logic\", \"rise\": [1], \"fall\": [2]}",
+        "{\"signal\": \"we\", \"width\": 1, \"type\": \"logic\", \"rise\": [4], \"fall\": [4]}",
+        "{\"signal\": \"wl\", \"width\": 1, \"type\": \"logic\", \"rise\": [1], \"fall\": [1]}",
     ] {
         assert!(cell.contains(row), "{row}: {cell}");
     }

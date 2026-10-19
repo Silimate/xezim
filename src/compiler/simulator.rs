@@ -60405,22 +60405,22 @@ impl Simulator {
     /// still holds its declaration value or its type's default (§16.5.1). A
     /// concurrent assertion registers only when its process first runs, so
     /// its operands are found here by name: every signal whose last name
-    /// segment a concurrent assertion or a named property or sequence
-    /// spells. That needs no scope resolution, and an extra match only costs
-    /// its entry.
+    /// segment a concurrent assertion (its action blocks included) or a
+    /// named property or sequence spells. That needs no scope resolution,
+    /// and an extra match only costs its entry.
     fn capture_sampled_defaults(&mut self) {
         let mut names: HashSet<String> = HashSet::default();
         for b in &self.module.initial_blocks {
-            Self::sva_stmt_names(&b.stmt, &mut names);
+            Self::sva_stmt_names(&b.stmt, false, &mut names);
         }
         for p in &self.module.pending_initial {
-            Self::sva_stmt_names(&p.source, &mut names);
+            Self::sva_stmt_names(&p.source, false, &mut names);
         }
         for b in self.edge_blocks.iter() {
-            Self::sva_stmt_names(&b.stmt, &mut names);
+            Self::sva_stmt_names(&b.stmt, false, &mut names);
         }
         for (st, ..) in &self.proc_sampled_blocks {
-            Self::sva_stmt_names(st, &mut names);
+            Self::sva_stmt_names(st, false, &mut names);
         }
         for body in self.module.property_decls.values() {
             Self::sva_expr_names(body, &mut names);
@@ -60438,38 +60438,71 @@ impl Simulator {
         }
     }
 
-    /// The name segments the concurrent assertions in `st` spell.
-    fn sva_stmt_names(st: &Statement, out: &mut HashSet<String>) {
+    /// The name segments the concurrent assertions in `st` spell, in every
+    /// statement that can hold one. With `all` (inside a concurrent
+    /// assertion's action block, whose sampled-value calls the assertion
+    /// clocks) the names of the statements' expressions count too.
+    fn sva_stmt_names(st: &Statement, all: bool, out: &mut HashSet<String>) {
         use crate::ast::stmt::StatementKind as SK;
         match &st.kind {
-            SK::Assertion(a) if a.is_property || a.is_sequence => {
-                Self::sva_expr_names(&a.expr, out)
+            SK::Assertion(a) => {
+                let sva = a.is_property || a.is_sequence;
+                if sva || all {
+                    Self::sva_expr_names(&a.expr, out);
+                }
+                for s in [&a.action, &a.else_action].into_iter().flatten() {
+                    Self::sva_stmt_names(s, all || sva, out);
+                }
+            }
+            SK::Expr(e) if all => Self::sva_expr_names(e, out),
+            SK::BlockingAssign { rvalue, .. } | SK::NonblockingAssign { rvalue, .. } if all => {
+                Self::sva_expr_names(rvalue, out)
             }
             SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
-                stmts.iter().for_each(|s| Self::sva_stmt_names(s, out))
+                stmts.iter().for_each(|s| Self::sva_stmt_names(s, all, out))
             }
             SK::If {
+                condition,
                 then_stmt,
                 else_stmt,
                 ..
             } => {
-                Self::sva_stmt_names(then_stmt, out);
+                if all {
+                    Self::sva_expr_names(condition, out);
+                }
+                Self::sva_stmt_names(then_stmt, all, out);
                 if let Some(e) = else_stmt {
-                    Self::sva_stmt_names(e, out);
+                    Self::sva_stmt_names(e, all, out);
                 }
             }
-            SK::Case { items, .. } => items
+            SK::Case { expr, items, .. } => {
+                if all {
+                    Self::sva_expr_names(expr, out);
+                }
+                items
+                    .iter()
+                    .for_each(|it| Self::sva_stmt_names(&it.stmt, all, out))
+            }
+            SK::RandCase { items } => items
                 .iter()
-                .for_each(|it| Self::sva_stmt_names(&it.stmt, out)),
+                .for_each(|(_, s)| Self::sva_stmt_names(s, all, out)),
             SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => {
-                Self::sva_stmt_names(stmt, out)
+                Self::sva_stmt_names(stmt, all, out)
+            }
+            SK::WaitOrder { pass, fail, .. } => {
+                for s in [pass, fail].into_iter().flatten() {
+                    Self::sva_stmt_names(s, all, out);
+                }
             }
             SK::For { body, .. }
             | SK::While { body, .. }
             | SK::DoWhile { body, .. }
             | SK::Repeat { body, .. }
             | SK::Forever { body }
-            | SK::Foreach { body, .. } => Self::sva_stmt_names(body, out),
+            | SK::ForeverTail { body }
+            | SK::Foreach { body, .. }
+            | SK::ForeachTail { body, .. }
+            | SK::RsAction { body } => Self::sva_stmt_names(body, all, out),
             _ => {}
         }
     }

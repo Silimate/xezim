@@ -138,3 +138,74 @@ endmodule
     let fails: Vec<&str> = text.lines().map(str::trim).filter(|l| l.starts_with("FAIL")).collect();
     assert!(fails.is_empty(), "report lines:\n{text}");
 }
+
+/// An inline assertion in any statement that can hold one reads the same
+/// defaults: a `randcase` arm, a `wait_order` pass or fail statement, a
+/// `randsequence` code block, and a sampled-value call in an assertion's
+/// action block, which the assertion clocks. Each operand is written at time
+/// 0 just before its assertion registers, so reading the live value instead
+/// of the default sampled value fails at the first tick, the only one an
+/// assertion in an `initial` procedure attempts (§16.9.3, §16.14.6).
+#[test]
+fn inline_assertion_in_any_statement_uses_default_sampled_values() {
+    let text = run(
+        "nested_inline",
+        r#"
+module t;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  bit rc = 0, wp = 0, wf = 0, rs = 0, ab = 0;
+  event e1, e2, e3, e4;
+  initial begin
+    rc = 1;
+    randcase
+      1: a_rc: assert property (@(posedge clk) $past(rc) === 1'b0) $display("ran randcase");
+        else $display("FAIL randcase %0t", $time);
+    endcase
+  end
+  initial begin
+    wp = 1;
+    wait_order (e1, e2)
+      a_wp: assert property (@(posedge clk) $past(wp) === 1'b0) $display("ran wait_order");
+        else $display("FAIL wait_order %0t", $time);
+  end
+  initial begin
+    wf = 1;
+    wait_order (e3, e4)
+    else a_wf: assert property (@(posedge clk) $past(wf) === 1'b0) $display("ran wait_order_else");
+        else $display("FAIL wait_order_else %0t", $time);
+  end
+  initial begin #1 -> e1; #1 -> e2; #1 -> e4; #1 -> e3; end
+  initial begin
+    rs = 1;
+    randsequence (main)
+      main : { a_rs: assert property (@(posedge clk) $past(rs) === 1'b0) $display("ran randsequence");
+        else $display("FAIL randsequence %0t", $time); };
+    endsequence
+  end
+  initial begin
+    ab = 1;
+    a_ab: assert property (@(posedge clk) 0)
+      else if ($past(ab) === 1'b0) $display("ran action");
+      else $display("FAIL action %0t", $time);
+  end
+  initial begin repeat (3) @(negedge clk); $finish; end
+endmodule
+"#,
+    );
+    assert!(text.contains("$finish called"), "did not finish:\n{text}");
+    let mut reports: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("FAIL") || l.starts_with("ran "))
+        .collect();
+    reports.sort_unstable();
+    let ran = [
+        "ran action",
+        "ran randcase",
+        "ran randsequence",
+        "ran wait_order",
+        "ran wait_order_else",
+    ];
+    assert_eq!(reports, ran, "report lines:\n{text}");
+}

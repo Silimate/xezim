@@ -16,6 +16,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* Toggle coverage no longer lists the names of the top module's instance
+  arrays, instances in generate blocks and generate blocks as 1-bit signals.
+  They are scopes, not signals, so their bins could never be covered and the
+  top instance's toggle score read low (§23.6). (#441)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

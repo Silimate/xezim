@@ -363,6 +363,119 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Instances and generate blocks are scopes, not signals (§23.6): the names
+/// of an instance array, of an instance in a generate block and of `for`,
+/// `if` and `case` generate blocks, chosen or not and nested, have no toggle
+/// bins. The signals declared in a generate block count in the enclosing
+/// instance, as does a signal named like a nested generate block. Verilator
+/// 5.038 (`--coverage-toggle`) lists the same 20 bits for `tb` (clk, d, q, p,
+/// inner, u_r[0..1].r, u_if.s, cd.c, outer[0..1].inner[0..1].t), each
+/// toggled both ways, and `gw[0].w`, `gw[1].w` in `tb.u_w`.
+#[test]
+fn toggle_skips_instance_and_generate_names() {
+    let d = scratch("scope_names");
+    let src = "\
+module leaf(input logic clk, input logic d, output logic q);
+  always_ff @(posedge clk) q <= d;
+endmodule
+module wrap(input logic clk, input logic [1:0] d, output logic [1:0] q);
+  for (genvar g = 0; g < 2; g++) begin : gw
+    logic w;
+    always_ff @(posedge clk) w <= d[g];
+    assign q[g] = w;
+  end
+endmodule
+module tb;
+  logic clk = 0;
+  logic [3:0] d = 0;
+  logic [3:0] q;
+  logic [1:0] p;
+  logic inner = 0;
+  leaf ua[1:0] (.clk(clk), .d(d[1:0]), .q(q[1:0]));
+  wrap u_w (.clk(clk), .d(d[3:2]), .q(q[3:2]));
+  for (genvar i = 0; i < 2; i++) begin : u_r
+    logic r;
+    always_ff @(posedge clk) r <= d[i];
+    leaf u_s (.clk(clk), .d(d[i]), .q(p[i]));
+  end
+  if (1) begin : u_if
+    logic s;
+    always_ff @(posedge clk) s <= d[0];
+  end else begin : u_else
+    logic s;
+  end
+  case (2)
+    1: begin : c1 logic c; end
+    default: begin : cd logic c; always_ff @(posedge clk) c <= d[1]; end
+  endcase
+  for (genvar i = 0; i < 2; i++) begin : outer
+    for (genvar j = 0; j < 2; j++) begin : inner
+      logic t;
+      always_ff @(posedge clk) t <= d[i + j];
+    end
+  end
+  always #5 clk = ~clk;
+  initial begin
+    repeat (2) @(negedge clk) d = 4'hf;
+    inner = 1;
+    repeat (2) @(negedge clk) d = 4'h0;
+    inner = 0;
+    repeat (2) @(negedge clk);
+    $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    // A scope's entry up to the end of its toggle rows.
+    let scope = |name: &str| {
+        let at = json
+            .find(&format!("\"scope\": \"{name}\","))
+            .unwrap_or_else(|| panic!("no {name}: {json}"));
+        let rows = at + json[at..].find("\"toggles\": [").unwrap();
+        json[at..rows + json[rows..].find('\n').unwrap()].to_string()
+    };
+    let tb = scope("tb");
+    for name in [
+        "ua", "u_w", "u_r", "u_s", "u_if", "u_else", "c1", "cd", "outer",
+    ] {
+        assert!(
+            !tb.contains(&format!("\"signal\": \"{name}\"")),
+            "{name}: {tb}"
+        );
+    }
+    for name in [
+        "u_r[1].r",
+        "u_if.s",
+        "cd.c",
+        "outer[1].inner[0].t",
+        "inner",
+        "p",
+    ] {
+        assert!(
+            tb.contains(&format!("\"signal\": \"{name}\", ")),
+            "{name}: {tb}"
+        );
+    }
+    assert!(
+        tb.contains("\"toggle\": {\"covered\": 40, \"total\": 40, \"percent\": 100.00}"),
+        "{tb}"
+    );
+    let wrap = scope("tb.u_w");
+    for name in ["gw[0].w", "gw[1].w"] {
+        assert!(
+            wrap.contains(&format!("\"signal\": \"{name}\", ")),
+            "{name}: {wrap}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 const SMALL: &str = "\
 module sub(input logic a, output logic y);
   assign y = ~a;

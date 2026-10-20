@@ -505,3 +505,10 @@ mod next_rest_typedef_casts_377;
 
 #[path = "types/unsigned_shift_context_384.rs"]
 mod unsigned_shift_context_384;
+
+#[path = "types/package_unpacked_array_parameter.rs"]
+mod package_unpacked_array_parameter;
+#[path = "types/body_localparam_array_in_instance.rs"]
+mod body_localparam_array_in_instance;
+#[path = "types/bits_of_concatenation_localparam.rs"]
+mod bits_of_concatenation_localparam;

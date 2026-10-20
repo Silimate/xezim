@@ -266,9 +266,19 @@ impl Simulator {
         // fire: xezim has no `$reset`.)
         let mut start = false;
         if self.vpi_cb_mask != 0 {
+            let before: Vec<(usize, Value)> = self
+                .sampled_defaults
+                .keys()
+                .filter_map(|&id| Some((id, self.signal_table.get(id)?.clone())))
+                .collect();
+            self.start_of_simulation_writes = Some(Vec::new());
             self.vpi_start_of_simulation();
+            let wrote = self.start_of_simulation_writes.take().unwrap_or_default();
             // A value a routine wrote there left work for the time-0 slot.
             start = self.dirty_any;
+            if !before.is_empty() {
+                self.adopt_start_of_simulation_writes(before, &wrote);
+            }
         }
         if !self.wake_rank_built {
             self.build_sig_wake_rank();

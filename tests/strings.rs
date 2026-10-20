@@ -129,6 +129,8 @@ mod vpi_routines;
 mod vpi_seed_option;
 #[path = "strings/vpi_sva_sampling.rs"]
 mod vpi_sva_sampling;
+#[path = "strings/vpi_sva_time0.rs"]
+mod vpi_sva_time0;
 #[path = "strings/vpi_typed_port_kinds.rs"]
 mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]

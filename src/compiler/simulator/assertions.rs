@@ -1408,10 +1408,13 @@ impl Simulator {
         }
         // A site registered mid-slot (a procedural assertion, while its
         // procedure runs in the Active region) has no slot-entry samples yet:
-        // take the values now, before this slot's nonblocking updates.
+        // take the values now, before this slot's nonblocking updates. In
+        // time slot 0 (where the declarative sites register, after the time-0
+        // settle has run the continuous assignments) a slot-entry value is
+        // the default sampled value (§16.5.1).
         for &id in &sampled_ids {
             if !self.sva_preponed.contains_key(&id) {
-                if let Some(v) = self.sva_cell_value(id) {
+                if let Some(v) = self.slot0_default(id).or_else(|| self.sva_cell_value(id)) {
                     self.sva_preponed.insert(id, v);
                 }
             }

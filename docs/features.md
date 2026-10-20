@@ -28,7 +28,11 @@ per release are in the [release notes](../NOTES.md).
   value in each time slot, so a large memory is never copied. An index known
   only when the property is evaluated (a sequence local variable, a
   procedure's loop variable, a sampled-value function or a call) samples the
-  whole array. The `disable iff` condition reads current values (§16.12).
+  whole array. In time slot 0 a variable's sampled value is its declaration
+  initializer, else its type's default, and a net's is x, so an attempt at a
+  time-0 clock edge does not see what the slot's continuous assignments and
+  processes write; a value a VPI client writes from cbStartOfSimulation
+  counts. The `disable iff` condition reads current values (§16.12).
   Dynamic-array and queue elements past index 63 and associative-array
   entries are still read unsampled.
 * **Assertion control** (§20.11, §20.12) — `$asserton`, `$assertoff`,

@@ -1521,16 +1521,23 @@ impl Simulator {
         // scope, which process re-entry does not keep in the transient hint.
         {
             let hint = self.name_resolve_hint.borrow();
-            let scopes = [
-                hint.as_deref(),
-                self.task_cleanup
-                    .last()
-                    .and_then(|c| c.frame_scope_hint.as_deref()),
-                self.process_scope_hint
-                    .get(&self.current_pid)
-                    .map(String::as_str),
-            ];
-            for sc in scopes.into_iter().flatten().filter(|s| !s.is_empty()) {
+            // A bare call from one instance task into another (`outer` ->
+            // `wait_clks` -> `@cb`) pushes a frame with no scope hint of its
+            // own, so look through every enclosing task frame, innermost
+            // first, for the instance that owns the clocking block.
+            let scopes = std::iter::once(hint.as_deref())
+                .chain(
+                    self.task_cleanup
+                        .iter()
+                        .rev()
+                        .map(|c| c.frame_scope_hint.as_deref()),
+                )
+                .chain(std::iter::once(
+                    self.process_scope_hint
+                        .get(&self.current_pid)
+                        .map(String::as_str),
+                ));
+            for sc in scopes.flatten().filter(|s| !s.is_empty()) {
                 let scoped = format!("{}.{}", sc, raw);
                 if self.clocking_meta.contains_key(&scoped) {
                     return Some(scoped);

@@ -4268,6 +4268,7 @@ impl Simulator {
             vcd_id_to_trace: Vec::new(),
             vcd_event_indices: Vec::new(),
             dump_dirty_active: false,
+            dump_full: false,
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),

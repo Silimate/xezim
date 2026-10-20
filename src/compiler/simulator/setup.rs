@@ -264,13 +264,16 @@ impl Simulator {
         // model was built before the VPI startup routines ran, so both come
         // here, before the time-0 slot. (cbStartOfReset/cbEndOfReset never
         // fire: xezim has no `$reset`.)
+        let mut start = false;
         if self.vpi_cb_mask != 0 {
             self.vpi_start_of_simulation();
+            // A value a routine wrote there left work for the time-0 slot.
+            start = self.dirty_any;
         }
         if !self.wake_rank_built {
             self.build_sig_wake_rank();
         }
-        self.event_loop();
+        self.event_loop(start);
         if self.ended_waiting_in_c {
             // Stopped, not finished: no `$finish` was called.
             self.finished = false;

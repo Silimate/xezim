@@ -579,6 +579,8 @@ impl Simulator {
                 if slot_pending {
                     slot_pending = false;
                     self.run_postponed_region();
+                } else {
+                    self.dump_slot_end();
                 }
                 self.time = nt;
                 publish_sim_time(nt);

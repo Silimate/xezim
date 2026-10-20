@@ -719,6 +719,7 @@ impl Simulator {
         let force_full = std::env::var("XEZIM_VCD_FULL").ok().as_deref() == Some("1");
         if force_full {
             self.dump_dirty_active = false;
+            self.dump_full = true;
         } else {
             let nsig = self.signal_table.len();
             let mut id_to_trace: Vec<Vec<u32>> = vec![Vec::new(); nsig];
@@ -749,6 +750,7 @@ impl Simulator {
     pub(super) fn enable_dump_dirty_tracking(&mut self) {
         if std::env::var("XEZIM_DUMP_FULL").ok().as_deref() == Some("1") {
             self.dump_dirty_active = false;
+            self.dump_full = true;
             return;
         }
         if self.dump_dirty_active {
@@ -812,6 +814,27 @@ impl Simulator {
         if self.dump_dirty_active {
             self.dump_dirty.clear();
             self.dump_dirty_epoch = self.dump_dirty_epoch.wrapping_add(1);
+        }
+    }
+
+    /// End of a time slot, before time moves: flush what was written after
+    /// the slot's last tick. The end-of-slot VPI callbacks (§38.36.2: a
+    /// leftover cbReadWriteSynch, cbAtEndOfSimTime) run after that tick's
+    /// flush, and cocotb applies its writes from cbReadWriteSynch, so without
+    /// this a value written there reached the dumps and toggle coverage only
+    /// at the next slot, merged with that slot's changes: a reset cocotb
+    /// wrote at time 0 was never a toggle baseline, so its release did not
+    /// count. Under a forced full scan there is no dirty set to tell, so
+    /// every slot flushes.
+    #[inline]
+    pub(super) fn dump_slot_end(&mut self) {
+        let due = if self.dump_dirty_active {
+            !self.dump_dirty.is_empty()
+        } else {
+            self.dump_full
+        };
+        if due {
+            self.dump_write_changes();
         }
     }
 

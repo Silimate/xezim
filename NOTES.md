@@ -16,6 +16,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Native case equality sign-extends signed operands of different widths,
   including comparisons against constants, matching four-state execution
   (§11.4.5).
+* A value a VPI client writes at time 0 is the toggle-coverage baseline.
+  Values written from the end-of-slot callbacks (`cbReadWriteSynch`,
+  `cbAtEndOfSimTime`) reach toggle coverage and the waveform dumps in their
+  own time slot, not the next one. A value written from
+  `cbStartOfSimulation` is evaluated in the time-0 slot even when nothing
+  else runs there, so the logic it drives no longer reads x until the next
+  slot. cocotb writes its first values from both, so in a design with
+  nothing of its own at time 0 every signal those values reached lost its
+  first toggle. A toggle is counted once per time slot from the slot's net
+  change (§38.36.2, §38.36.3). (#442)
 
 * Class task handles and local variables remain alive across same-slot
   clocking waits, including guarded waits and cancellation (§14.13).

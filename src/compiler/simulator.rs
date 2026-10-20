@@ -8280,6 +8280,10 @@ pub struct Simulator {
     vcd_id_to_trace: Vec<Vec<u32>>,
     vcd_event_indices: Vec<usize>,
     dump_dirty_active: bool,
+    /// A dump writer or toggle coverage is open under a forced full scan
+    /// (`XEZIM_VCD_FULL=1` / `XEZIM_DUMP_FULL=1`), so `dump_dirty_active` is
+    /// off with something still to flush.
+    dump_full: bool,
     /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
     /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
     /// once the budget is spent and permanently stops the dump.

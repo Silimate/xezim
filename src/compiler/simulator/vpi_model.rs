@@ -1659,7 +1659,7 @@ impl<'a> Builder<'a> {
                     b.target_module.name == def_name
                 } else {
                     paths.filter(|p| !p.is_empty()).any(|p| {
-                        let joined: Vec<&str> = p.iter().map(|i| i.name.as_str()).collect();
+                        let joined: Vec<&str> = p.iter().map(|i| i.name.name.as_str()).collect();
                         joined.join(".") == full
                     })
                 }

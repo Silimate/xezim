@@ -660,11 +660,11 @@ fn expr_refs(e: &Expression, out: &mut Vec<Ref>) {
             slice_size.iter().for_each(|x| each(x));
             exprs.iter().for_each(each);
         }
-        ExprKind::SvaClocked {
-            clock, iff, body, ..
-        } => {
-            each(clock);
-            iff.iter().for_each(|x| each(x));
+        ExprKind::SvaClocked { events, body } => {
+            for ev in events {
+                each(&ev.expr);
+                ev.iff.iter().for_each(|x| each(x));
+            }
             each(body);
         }
         _ => {}

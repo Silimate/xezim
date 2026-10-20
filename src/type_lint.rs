@@ -3043,6 +3043,9 @@ fn package_member_names(items: &[PackageItem]) -> Option<HashSet<String>> {
             PackageItem::Checker(c) => {
                 out.insert(c.name.name.clone());
             }
+            PackageItem::Net(n) => {
+                out.extend(n.declarators.iter().map(|d| d.name.name.clone()));
+            }
             PackageItem::Nettype(n) => {
                 out.insert(n.name.name.clone());
             }

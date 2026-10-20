@@ -68,12 +68,12 @@ impl Simulator {
         let mut hit = false;
         Self::walk_operands(e, &mut |x| match &x.kind {
             ExprKind::MemberAccess { .. } => hit = true,
-            ExprKind::SvaClocked {
-                clock, iff, body, ..
-            } => {
-                hit |= Self::has_member_access(clock)
-                    || Self::has_member_access(body)
-                    || iff.as_deref().is_some_and(Self::has_member_access)
+            ExprKind::SvaClocked { events, body } => {
+                hit |= Self::has_member_access(body)
+                    || events.iter().any(|ev| {
+                        Self::has_member_access(&ev.expr)
+                            || ev.iff.as_ref().is_some_and(Self::has_member_access)
+                    })
             }
             ExprKind::NamedArg { expr, .. } => {
                 hit |= expr.as_deref().is_some_and(Self::has_member_access)

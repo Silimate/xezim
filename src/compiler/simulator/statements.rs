@@ -5300,22 +5300,20 @@ impl Simulator {
                     // clocking (§14.12).
                     let clocked: Option<(String, u8, Option<Expression>, Expression)> =
                         match &resolved_expr.kind {
-                            ExprKind::SvaClocked {
-                                clock,
-                                edge,
-                                iff,
-                                body,
-                            } => {
-                                let clock_signal = match &clock.kind {
+                            // A clocking event LIST (§16.5) keeps its first term:
+                            // one clock per site, as before the list form.
+                            ExprKind::SvaClocked { events, body } if !events.is_empty() => {
+                                let ev = &events[0];
+                                let clock_signal = match &ev.expr.kind {
                                     ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
                                     _ => String::new(),
                                 };
-                                Some((
-                                    clock_signal,
-                                    *edge,
-                                    iff.as_deref().cloned(),
-                                    (**body).clone(),
-                                ))
+                                let edge = match ev.edge {
+                                    Some(crate::ast::stmt::Edge::Negedge) => 1u8,
+                                    Some(crate::ast::stmt::Edge::Edge) => 2u8,
+                                    _ => 0u8,
+                                };
+                                Some((clock_signal, edge, ev.iff.clone(), (**body).clone()))
                             }
                             // §16.14.6: a procedural assertion without a clock
                             // of its own takes the one inferred from its

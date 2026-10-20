@@ -931,9 +931,9 @@ impl Simulator {
     pub(super) fn sva_expr_names(e: &Expression, out: &mut HashSet<String>) {
         Self::walk_operands(e, &mut |x| match &x.kind {
             ExprKind::Ident(h) => out.extend(h.path.iter().map(|s| s.name.name.clone())),
-            ExprKind::SvaClocked { body, iff, .. } => {
+            ExprKind::SvaClocked { events, body } => {
                 Self::sva_expr_names(body, out);
-                if let Some(g) = iff {
+                for g in events.iter().filter_map(|ev| ev.iff.as_ref()) {
                     Self::sva_expr_names(g, out);
                 }
             }

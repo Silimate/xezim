@@ -320,3 +320,6 @@ mod package_array_params;
 
 #[path = "hierarchy/vif_defaults_469.rs"]
 mod vif_defaults_469;
+
+#[path = "hierarchy/interface_task_nested_clocking_wait.rs"]
+mod interface_task_nested_clocking_wait;

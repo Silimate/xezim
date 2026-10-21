@@ -3700,6 +3700,7 @@ impl Simulator {
             leaf_name_to_ids,
             id_to_name,
             elem_name_cache: RefCell::new(HashMap::default()),
+            array_suffix_cache: RefCell::new((0, HashMap::default())),
             instance_path_order,
             signal_widths: signal_widths_vec,
             signal_signed: signal_signed_vec,

@@ -6312,6 +6312,9 @@ pub struct Simulator {
     /// `name_for_id` (append-only: entries are never replaced or removed,
     /// which is what lets it hand out `&str` borrowed from `&self`).
     elem_name_cache: RefCell<HashMap<usize, Box<str>>>,
+    /// `resolve_array_name_from_expr` suffix-scan results keyed by
+    /// `(resolved, raw)`, valid while `module.arrays` has the stamped length.
+    array_suffix_cache: RefCell<(usize, HashMap<(String, String), Option<String>>)>,
     /// Indices into `module.instances`, sorted by instance path. Hierarchical
     /// upward-name resolution probes instance paths repeatedly; binary search
     /// avoids a full instance-list scan without duplicating the long paths.

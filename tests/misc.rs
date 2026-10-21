@@ -227,6 +227,8 @@ mod package_reexport_explicit_import;
 mod package_scope_and_call_kind;
 #[path = "misc/packed_2d_instance_param_bounds.rs"]
 mod packed_2d_instance_param_bounds;
+#[path = "misc/package_packed_2d_param_element_select.rs"]
+mod package_packed_2d_param_element_select;
 #[path = "misc/packed_mem_arena.rs"]
 mod packed_mem_arena;
 #[path = "misc/param_class_cast_type_args.rs"]

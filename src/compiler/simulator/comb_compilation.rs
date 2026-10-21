@@ -1339,11 +1339,31 @@ impl Simulator {
                 // then the field write commit two different values per eval), which
                 // churns to the settle limit. Strip a read whose '.'-base prefix is
                 // in the write set.
+                // A packed multi-dimensional vector is the exception: the block
+                // reads one element and writes another (`ds[r+1] = f(ds[r])`),
+                // both named `ds`, and the element it reads is driven from
+                // outside. Dropping `ds` left the block deaf to that driver, so
+                // `prim_subst_perm`'s round chain never re-evaluated and its
+                // outputs stayed X. Loop variables and temps are never packed
+                // multi-dimensional, so the churn guard above still covers them.
+                let is_packed_multi = |r: &str| -> bool {
+                    let multi = |k: &str| {
+                        self.module
+                            .packed_full_dims
+                            .get(k)
+                            .is_some_and(|d| d.len() > 1)
+                    };
+                    multi(r)
+                        || (!ab.scope.is_empty() && multi(&format!("{}.{}", ab.scope, r)))
+                        || scope_hint
+                            .as_ref()
+                            .is_some_and(|sc| multi(&format!("{}.{}", sc, r)))
+                };
                 let sens_reads: HashSet<String> = reads
                     .iter()
                     .filter(|r| {
                         if writes.contains(*r) {
-                            return false;
+                            return is_packed_multi(r.as_str());
                         }
                         let mut base: &str = r.as_str();
                         while let Some(pos) = base.rfind('.') {

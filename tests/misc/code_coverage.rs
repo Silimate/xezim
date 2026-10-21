@@ -1426,6 +1426,25 @@ static PLI_INT32 cb(p_cb_data d) {
     vpi_register_cb(&c);
     return 0;
 }
+static void start(void) {
+    s_cb_data c;
+    memset(&c, 0, sizeof c);
+    c.reason = cbStartOfSimulation;
+    c.cb_rtn = cb;
+    vpi_register_cb(&c);
+}
+void (*vlog_startup_routines[])(void) = {start, 0};
+"#;
+    let src = "\
+module top;
+  logic x;
+  initial begin x = 0; #10 x = 1; #10 x = 1; #10 $finish; end
+endmodule
+";
+    let (_, json) = vpi_toggles(&d, c, src, "");
+    toggle_rows(&json, &[("x", 1, 0)], "undone");
+    let _ = std::fs::remove_dir_all(&d);
+}
 
 /// §20.2: `$finish` ends the run inside its time slot, so the flush at the
 /// end of the last slot is skipped when `$finish` ended it: `d` rises and
@@ -1456,25 +1475,6 @@ endmodule
     toggle_rows(&json, &[("clk", 1, 1), ("d", 0, 0), ("e", 1, 1)], "finish");
     let total = toggle_total(4, 6, "66.67");
     assert!(json.contains(&total), "{total}: {json}");
-    let _ = std::fs::remove_dir_all(&d);
-}
-static void start(void) {
-    s_cb_data c;
-    memset(&c, 0, sizeof c);
-    c.reason = cbStartOfSimulation;
-    c.cb_rtn = cb;
-    vpi_register_cb(&c);
-}
-void (*vlog_startup_routines[])(void) = {start, 0};
-"#;
-    let src = "\
-module top;
-  logic x;
-  initial begin x = 0; #10 x = 1; #10 x = 1; #10 $finish; end
-endmodule
-";
-    let (_, json) = vpi_toggles(&d, c, src, "");
-    toggle_rows(&json, &[("x", 1, 0)], "undone");
     let _ = std::fs::remove_dir_all(&d);
 }
 

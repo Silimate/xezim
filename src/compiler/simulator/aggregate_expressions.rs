@@ -1110,6 +1110,25 @@ impl Simulator {
                 }
                 let dt = self.module.var_decl_types.get(&name)?;
                 let (element_type, dimensions, width) = self.declared_packed_type(dt)?;
+                // The declaration's dimension bounds are evaluated against the
+                // flat parameter table by bare name. In an instance whose
+                // parameters are stored as `inst.PARAM`, a bound naming one of
+                // them either fails (the dimension list comes back short) or
+                // picks up an unrelated same-named parameter, so `width` can
+                // disagree with the signal's real width and every later index
+                // would compute a wrong bit offset. A stored width that
+                // differs means the declared geometry is untrustworthy; leave
+                // the access to the storage-driven path.
+                if !self.module.arrays.contains_key(&name)
+                    && !self.module.arrays_2d.contains_key(&name)
+                    && !self.module.arrays_nd.contains_key(&name)
+                    && !self.module.dynamic_arrays.contains(&name)
+                    && self
+                        .lookup_signal_width(&name)
+                        .is_some_and(|stored| stored != width)
+                {
+                    return None;
+                }
                 let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(&name) {
                     dims.len()
                 } else if self.module.arrays_2d.contains_key(&name) {

@@ -957,15 +957,36 @@ impl Simulator {
         if self.module.arrays.contains_key(&raw) {
             return Some(raw);
         }
-        if let Some(found) = self.module.arrays.keys().find(|k| {
-            *k == &resolved
-                || *k == &raw
-                || k.ends_with(&format!(".{}", resolved))
-                || k.ends_with(&format!(".{}", raw))
-        }) {
-            return Some(found.clone());
+        // The suffix scan walks every memory in the design, and `$fread` into a
+        // scalar calls this once per byte, so repeat lookups of the same name
+        // (almost always misses) are answered from a cache. The cache is
+        // dropped when the set of memories changes size.
+        let key = (resolved.to_string(), raw);
+        {
+            let mut cache = self.array_suffix_cache.borrow_mut();
+            if cache.0 != self.module.arrays.len() {
+                cache.0 = self.module.arrays.len();
+                cache.1.clear();
+            }
+            if let Some(hit) = cache.1.get(&key) {
+                return hit.clone();
+            }
         }
-        None
+        let dot_resolved = format!(".{}", key.0);
+        let dot_raw = format!(".{}", key.1);
+        let found = self
+            .module
+            .arrays
+            .keys()
+            .find(|k| {
+                **k == key.0 || **k == key.1 || k.ends_with(&dot_resolved) || k.ends_with(&dot_raw)
+            })
+            .cloned();
+        self.array_suffix_cache
+            .borrow_mut()
+            .1
+            .insert(key, found.clone());
+        found
     }
 
     /// The memory a `$readmem*` / `$writemem*` call names, with its

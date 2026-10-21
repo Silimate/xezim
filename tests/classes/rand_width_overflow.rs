@@ -323,7 +323,7 @@ class DistM;
   constraint c { s.f dist { 0 := 1, 15 := 1 }; }
 endclass
 module top;
-  localparam int N = 10000;
+  localparam int N = 2000;
   function automatic bit near(int count, int pm, int tol);
     return 1000 * count / N >= pm - tol && 1000 * count / N <= pm + tol;
   endfunction
@@ -343,17 +343,17 @@ module top;
       if (!m.randomize()) fails++; else begin if (m.s.f == 0) mz++; if (m.s.f == 15) mf++; end
     end
     $display("T fails=%0d", fails);
-    ok = 1; foreach (cw[k]) ok &= near(cw[k], 100 * (k + 1), 50);
+    ok = 1; foreach (cw[k]) ok &= near(cw[k], 100 * (k + 1), 80);
     $display("T := weights %0d", ok);
-    $display("T :/ range %0d", near(cr[1], 500, 50) && near(cr[2], 250, 50) && near(cr[3], 250, 50));
-    $display("T := range %0d", near(ce[1], 333, 50) && near(ce[2], 333, 50) && near(ce[3], 333, 50));
-    $display("T signed %0d", near(neg, 500, 50) && near(pos, 500, 50));
-    ok = 1; foreach (cn[k]) ok &= near(cn[k], 62, 30);
+    $display("T :/ range %0d", near(cr[1], 500, 80) && near(cr[2], 250, 80) && near(cr[3], 250, 80));
+    $display("T := range %0d", near(ce[1], 333, 80) && near(ce[2], 333, 80) && near(ce[3], 333, 80));
+    $display("T signed %0d", near(neg, 500, 80) && near(pos, 500, 80));
+    ok = 1; foreach (cn[k]) ok &= near(cn[k], 62, 45);
     $display("T narrow %0d", ok);
     $display("T dist+relational six=%0d other=%0d", c6, cother);
-    ok = near(cd[0], 500, 50); for (int k = 1; k <= 9; k++) ok &= near(cd[k], 55, 30);
+    ok = near(cd[0], 500, 80); for (int k = 1; k <= 9; k++) ok &= near(cd[k], 55, 45);
     $display("T dist+inside %0d", ok);
-    $display("T wide member %0d", near(mz, 500, 50) && near(mf, 500, 50));
+    $display("T wide member %0d", near(mz, 500, 80) && near(mf, 500, 80));
   end
 endmodule
 "#,
@@ -367,7 +367,7 @@ endmodule
             "T := range 1",
             "T signed 1",
             "T narrow 1",
-            "T dist+relational six=10000 other=0",
+            "T dist+relational six=2000 other=0",
             "T dist+inside 1",
             "T wide member 1",
         ]

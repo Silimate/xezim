@@ -3575,6 +3575,9 @@ impl Simulator {
                 }
                 self.signals.remove(&format!("{}.size", en));
                 self.module.associative_arrays.remove(&en);
+                self.module.assoc_index_widths.remove(&en);
+                self.module.assoc_key_type_names.remove(&en);
+                self.module.assoc_elem_widths.remove(&en);
                 self.module.dynamic_arrays.remove(&en);
                 self.module.arrays.remove(&en);
             }

@@ -945,6 +945,19 @@ impl Simulator {
                 .return_type
                 .clone(),
             Some(recv) => {
+                if let ExprKind::Ident(h) = &recv.kind
+                    && h.path.len() == 1
+                    && self.module.packages.contains(&h.path[0].name.name)
+                {
+                    let key = format!("{}::{}", h.path[0].name.name, method_name);
+                    let function = self.module.functions.get(&key).or_else(|| {
+                        self.module.functions.get(&method_name).filter(|_| {
+                            self.module.pkg_subr_owner.get(&method_name)
+                                == Some(&h.path[0].name.name)
+                        })
+                    })?;
+                    return Some(function.return_type.clone());
+                }
                 // A CALL receiver (`o.get().rd()`) cannot be re-evaluated to
                 // find its instance without running it twice — resolve the
                 // receiver's DECLARED return class statically instead. No

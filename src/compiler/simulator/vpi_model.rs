@@ -1245,6 +1245,18 @@ impl<'a> Builder<'a> {
                         nested(&m.items, file, defs, binds);
                     }
                     ModuleItem::Bind(b) => binds.push((b, file)),
+                    ModuleItem::GenerateRegion(g) => nested(&g.items, file, defs, binds),
+                    ModuleItem::GenerateFor(g) => nested(&g.items, file, defs, binds),
+                    ModuleItem::GenerateIf(g) => {
+                        for (_, items) in &g.branches {
+                            nested(items, file, defs, binds);
+                        }
+                    }
+                    ModuleItem::GenerateCase(g) => {
+                        for arm in &g.arms {
+                            nested(&arm.items, file, defs, binds);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1563,11 +1575,20 @@ impl<'a> Builder<'a> {
         conns: Option<(&'a [PortConnection], u32)>,
     ) -> u32 {
         let sim = self.sim;
-        let def_name = if inst_idx < 0 {
+        let mut def_name = if inst_idx < 0 {
             sim.module.name.clone()
         } else {
             sim.module.instances[inst_idx as usize].def_name.clone()
         };
+        // §23.11 / §37: bind specializations retain the host's source
+        // definition, so its declarations and bound port connections exist.
+        while !self.defs.contains_key(def_name.as_str()) {
+            let base = xezim_core::bind_spec_base(&def_name);
+            if base == def_name {
+                break;
+            }
+            def_name = base.to_string();
+        }
         if inst_idx >= 0 {
             self.attached[inst_idx as usize] = true;
         }
@@ -1650,19 +1671,29 @@ impl<'a> Builder<'a> {
         self.walk_items(items, &ctx, &mut ord, &mut port_decls);
         // §23.11: instances `bind` adds to this one, connected in its scope.
         let binds: Vec<(&'a BindDirective, u32)> = self
-            .binds
-            .iter()
-            .copied()
-            .filter(|(b, _)| {
-                let paths = std::iter::once(&b.target_path).chain(b.extra_paths.iter());
-                if b.target_path.is_empty() && b.extra_paths.is_empty() {
-                    b.target_module.name == def_name
-                } else {
-                    paths.filter(|p| !p.is_empty()).any(|p| {
-                        let joined: Vec<&str> = p.iter().map(|i| i.name.as_str()).collect();
-                        joined.join(".") == full
+            .sim
+            .module
+            .resolved_binds
+            .get(flat.trim_end_matches('.'))
+            .into_iter()
+            .flatten()
+            .map(|b| {
+                let file = self
+                    .binds
+                    .iter()
+                    .find(|(original, _)| {
+                        original.span == b.span
+                            && original.instantiation.module_name.name
+                                == b.instantiation.module_name.name
+                            && original
+                                .instantiation
+                                .instances
+                                .iter()
+                                .map(|i| &i.name.name)
+                                .eq(b.instantiation.instances.iter().map(|i| &i.name.name))
                     })
-                }
+                    .map_or(fi, |(_, file)| *file);
+                (b, file)
             })
             .collect();
         for (b, bf) in binds {

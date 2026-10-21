@@ -3039,6 +3039,13 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> bool {
+        // §25.9 / §26.3: bind a package-qualified variable through the same
+        // storage name used by ordinary package reads and writes.
+        if !self.module.packages.is_empty()
+            && let Some(stripped) = self.strip_package_lvalue(lvalue)
+        {
+            return self.try_bind_virtual_iface(&stripped, rvalue);
+        }
         if self.try_bind_virtual_iface_inner(lvalue, rvalue) {
             return true;
         }

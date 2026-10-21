@@ -787,6 +787,10 @@ impl Simulator {
                             | "rsort"
                             | "reverse"
                             | "shuffle"
+                            | "first"
+                            | "last"
+                            | "next"
+                            | "prev"
                     ))
             {
                 if let Some(qn) = self.flat_member_name(expr) {

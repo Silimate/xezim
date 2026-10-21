@@ -3489,9 +3489,18 @@ struct ObservedProbe {
     inst: usize,
 }
 
+/// §9.4.2: one term in an assertion clocking event, including its last
+/// value. A simple signal keeps its resolved name for the common fast path.
+#[derive(Debug, Clone)]
+struct SvaClockEvent {
+    event: EventExpr,
+    signal: Option<String>,
+    previous: Value,
+}
+
 /// LRM §16.5 SVA clocked property site. Registered once when an
 /// `assert property (@clk body)` statement first executes; thereafter
-/// edge-detect on `clock_signal` drives per-cycle evaluation of `body`.
+/// any term in its clocking event drives per-cycle evaluation of `body`.
 /// Every clock tick starts one attempt of `node`; `attempts` holds the ones
 /// still in flight (multi-cycle sequences, deferred consequents).
 #[derive(Debug, Clone)]
@@ -3513,13 +3522,13 @@ struct SvaClockedSite {
     /// §16.14.3 `cover sequence`: an attempt counts every match of the
     /// sequence and lives on while it can still match.
     all_matches: bool,
-    /// Resolved signal name for the clock; we re-resolve to value
-    /// each tick rather than caching an id (small site count).
+    /// The first term's simple signal, if any, for sampled calls using the
+    /// single-signal history path. `events` drives assertion evaluation.
     clock_signal: String,
-    /// Clock edge: 0 posedge, 1 negedge, 2 any edge (§16.5).
+    /// The first term's edge: 0 posedge, 1 negedge, 2 any change.
     edge: u8,
-    /// `@(posedge clk iff g)`: the tick counts only while `g` holds.
-    iff: Option<Expression>,
+    /// §16.5: a tick is the union of the per-term edge/iff events.
+    events: Vec<SvaClockEvent>,
     /// The bare signal names `$past` reads in the body (sorted, unique), found
     /// once at registration: the walk ran on every clock fire.
     past_names: Vec<String>,
@@ -3529,9 +3538,6 @@ struct SvaClockedSite {
     /// flight is cancelled and no new one starts. Evaluated with the current
     /// (unsampled) values, as the LRM's asynchronous reset semantics require.
     disable: Option<Expression>,
-    /// LSB of the most recent clock value: 0, 1, X (2), or Z (3).
-    /// Declarative sites start with the value before Active processes run.
-    prev_clock: u8,
     /// The clock event happened and the attempts it starts have not been
     /// evaluated yet (`sva_note_edges`).
     fired: bool,
@@ -4619,6 +4625,8 @@ struct TaskCleanup {
     /// (`active_task_pids`). None for frames without a stable name.
     task_name: Option<String>,
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
+    /// §25.9: flat binding slots shadowed by this task's formals.
+    saved_vif_formals: Vec<(String, Option<Value>)>,
     assoc_params: Vec<(String, String, bool)>,
     array_params: Vec<String>,
     /// `(formal, actual, lo, hi)` for an `output`/`inout`/`ref` ARRAY formal:
@@ -6518,7 +6526,7 @@ pub struct Simulator {
     class_prop_dim_cache: std::cell::RefCell<HashMap<(String, String), Option<(i64, i64)>>>,
     /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
     /// the first time the AssertionStatement{is_property,
-    /// expr:SvaClocked} executes. Each site's `prev_clock` lets us
+    /// expr:SvaClocked} executes. Each site's saved event values let us
     /// edge-detect the clock signal each loop iteration; `pending`
     /// queues consequents deferred by `|=>` or `##N`.
     sva_sites: Vec<SvaClockedSite>,
@@ -9396,8 +9404,11 @@ pub struct Simulator {
 
 /// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
 struct SampledWatch {
+    /// A simple clock id, or usize::MAX when `clock_events` supplies it.
     clk_id: usize,
     edge: EdgeKind,
+    /// A union, guarded, or expression-valued implicit assertion clock.
+    clock_events: Vec<SvaClockEvent>,
     /// Simple-signal operand: sampled PREPONED via the prev-value snapshot.
     sig_id: Option<usize>,
     /// General operand, evaluated using the slot-entry snapshot.

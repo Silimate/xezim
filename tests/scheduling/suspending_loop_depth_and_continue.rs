@@ -47,6 +47,7 @@ module tb;
       while (j < 3500) begin @(posedge clk); wcnt++; j++; end
     end
     tail = 1;          // statements after the loop must still run
+    $finish;
   end
 endmodule
 "#;
@@ -78,6 +79,7 @@ module tb;
     for (int i = 0; i < 10; i++) begin step(); if (i % 2) continue; end
     // the non-suspending path was always correct — keep it covered
     for (int i = 0; i < 20; i++) begin if (i % 2) continue; sync++; end
+    $finish;
   end
 endmodule
 "#;

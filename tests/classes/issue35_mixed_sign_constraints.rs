@@ -34,6 +34,7 @@ class sign_test_class;
 endclass
 module test;
     int failures = 0;
+    int result = -1;
     initial begin
         sign_test_class item = new();
         bit success;
@@ -69,7 +70,6 @@ module test;
 
         result = failures;
     end
-    int result = -1;
 endmodule
 "#;
     let sim = simulate(SRC, 1000).expect("simulate failed");

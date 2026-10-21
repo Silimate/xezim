@@ -3028,6 +3028,10 @@ fn package_member_names(items: &[PackageItem]) -> Option<HashSet<String>> {
                 enum_members(&d.data_type, &mut out);
                 out.extend(d.declarators.iter().map(|dc| dc.name.name.clone()));
             }
+            PackageItem::Net(d) => {
+                enum_members(&d.data_type, &mut out);
+                out.extend(d.declarators.iter().map(|dc| dc.name.name.clone()));
+            }
             PackageItem::Class(c) => {
                 out.insert(c.name.name.clone());
             }

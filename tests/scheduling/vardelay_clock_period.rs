@@ -32,6 +32,7 @@ module tb;
     half = 2.5;                 // speed up 4x (PLL reconfig)
     #100;
     $display("edges=%0d", edges);
+    $finish;
   end
 endmodule
 "#;
@@ -71,6 +72,7 @@ module tb;
     m = 8;                      // 4x faster VCO
     #1000;
     $display("SLOW=%0d FAST=%0d", slow, ev - slow);
+    $finish;
   end
 endmodule
 "#;
@@ -100,7 +102,7 @@ module tb;
   reg clk = 0; integer edges = 0;
   always #(P/2) clk = ~clk;
   always @(clk) edges = edges + 1;
-  initial #100 $display("edges=%0d", edges);
+  initial #100 begin $display("edges=%0d", edges); $finish; end
 endmodule
 "#;
     let out = line(src);

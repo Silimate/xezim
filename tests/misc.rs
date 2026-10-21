@@ -526,3 +526,5 @@ mod relaxed_static_initializers_351;
 
 #[path = "misc/string_casts_391.rs"]
 mod string_casts_391;
+#[path = "misc/undefined_macro_recovery.rs"]
+mod undefined_macro_recovery;

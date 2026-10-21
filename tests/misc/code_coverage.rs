@@ -819,309 +819,6 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// The VPI client of `toggle_baseline_from_vpi_at_time_0`. With
-/// `T0_CASE=start`, `a` is written from cbStartOfSimulation (where cocotb
-/// writes `Immediate` values and starts its clocks); with `T0_CASE=rw`, `b`
-/// and `v` from cbReadWriteSynch at time 0 (where cocotb applies its other
-/// writes). Either way all three are set at 10 and cleared at 20, and the
-/// time-0 cbReadOnlySynch prints `na`, `nb` and `v`.
-const TIME0_VPI: &str = r#"
-#include <stdlib.h>
-#include <string.h>
-#include "vpi_user.h"
-
-static void put(const char *name, int val, int flags) {
-    s_vpi_value v;
-    s_vpi_time t = {vpiSimTime, 0, 0, 0.0};
-    v.format = vpiIntVal;
-    v.value.integer = val;
-    vpi_put_value(vpi_handle_by_name((PLI_BYTE8 *)name, NULL), &v, &t, flags);
-}
-
-static const char *bin(const char *name, char *buf) {
-    s_vpi_value v;
-    v.format = vpiBinStrVal;
-    vpi_get_value(vpi_handle_by_name((PLI_BYTE8 *)name, NULL), &v);
-    strncpy(buf, v.value.str, 7);
-    buf[7] = 0;
-    return buf;
-}
-
-static PLI_INT32 cb(p_cb_data d);
-
-static void at(int reason, unsigned t, long tag) {
-    s_cb_data c;
-    s_vpi_time tm = {vpiSimTime, 0, t, 0.0};
-    memset(&c, 0, sizeof c);
-    c.reason = reason;
-    c.cb_rtn = cb;
-    c.time = &tm;
-    c.user_data = (PLI_BYTE8 *)tag;
-    vpi_register_cb(&c);
-}
-
-static PLI_INT32 cb(p_cb_data d) {
-    long tag = (long)d->user_data;
-    const char *mode = getenv("T0_CASE");
-    char x[8], y[8], z[8];
-    switch (tag) {
-    case 0:
-        if (mode && !strcmp(mode, "start"))
-            put("top.a", 0, vpiNoDelay);
-        else
-            at(cbReadWriteSynch, 0, 1);
-        at(cbReadOnlySynch, 0, 9);
-        at(cbAfterDelay, 10, 2);
-        at(cbAfterDelay, 20, 3);
-        at(cbAfterDelay, 30, 4);
-        break;
-    case 1:
-        put("top.b", 0, vpiInertialDelay);
-        put("top.v", 0, vpiNoDelay);
-        break;
-    case 2:
-    case 3:
-        put("top.a", tag == 2, vpiNoDelay);
-        put("top.b", tag == 2, vpiNoDelay);
-        put("top.v", tag == 2, vpiNoDelay);
-        break;
-    case 4:
-        vpi_control(vpiFinish, 0);
-        break;
-    case 9:
-        vpi_printf("RO na=%s nb=%s v=%s\n", bin("top.na", x), bin("top.nb", y), bin("top.v", z));
-        break;
-    }
-    return 0;
-}
-
-static void start(void) {
-    s_cb_data c;
-    memset(&c, 0, sizeof c);
-    c.reason = cbStartOfSimulation;
-    c.cb_rtn = cb;
-    vpi_register_cb(&c);
-}
-
-void (*vlog_startup_routines[])(void) = {start, 0};
-"#;
-
-/// Build the VPI client `c` in `d` and run `src` (top `top`) with it and
-/// toggle coverage, `T0_CASE` set to `case`; returns the output and the
-/// results file.
-fn vpi_toggles(d: &Path, c: &str, src: &str, case: &str) -> (String, String) {
-    let so = d.join("t0.so");
-    if !so.exists() {
-        std::fs::write(d.join("t0.c"), c).unwrap();
-        let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-        let ok = Command::new("cc")
-            .args(["-shared", "-fPIC", "-I"])
-            .arg(&include)
-            .arg(d.join("t0.c"))
-            .arg("-o")
-            .arg(&so)
-            .status()
-            .expect("launch cc")
-            .success();
-        assert!(ok, "cc failed");
-    }
-    std::fs::write(d.join("t.sv"), src).unwrap();
-    let _ = std::fs::remove_file(d.join("cov.json"));
-    let out = Command::new(xezim())
-        .current_dir(d)
-        .env("XEZIM_COV_DB", d.join("cov.json"))
-        .env("T0_CASE", case)
-        .env_remove("XEZIM_CODE_COVERAGE")
-        .arg("--vpi-lib")
-        .arg(&so)
-        .args(["--code-coverage=toggle", "-s", "top", "t.sv"])
-        .output()
-        .expect("run xezim");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(out.status.success(), "{case}: {text}");
-    (text, results(d))
-}
-
-/// Assert the (signal, rise, fall) counts of one-bit signals, whatever other
-/// members their entries carry.
-fn toggle_rows(json: &str, rows: &[(&str, u32, u32)], what: &str) {
-    for (name, rise, fall) in rows {
-        let key = format!("{{\"signal\": \"{name}\", \"width\": 1,");
-        let start = json
-            .find(&key)
-            .unwrap_or_else(|| panic!("{what}: no {name}: {json}"));
-        let row = &json[start..start + json[start..].find('}').unwrap()];
-        let counts = format!("\"rise\": [{rise}], \"fall\": [{fall}]");
-        assert!(row.contains(&counts), "{what}: {name} {counts}: {row}");
-    }
-}
-
-/// IEEE 1800-2017 §38.36.2, §38.36.3: a value a VPI client writes at time 0,
-/// from cbStartOfSimulation or from that slot's cbReadWriteSynch, is the
-/// toggle baseline, as one the testbench wrote at time 0 would be. Nothing
-/// in the design runs at time 0, so only the VPI writes make that slot. In
-/// both cases the reference simulator has settled `~a` or `~b` by the time-0
-/// cbReadOnlySynch and counts one rise and one fall on each signal written
-/// at time 0, the counts below. xezim used to skip the time-0 slot: the
-/// cbStartOfSimulation write did not reach `na` until 10, the
-/// cbReadWriteSynch writes were first sampled at 10, and each of those
-/// signals lost its first toggle.
-#[test]
-fn toggle_baseline_from_vpi_at_time_0() {
-    let d = scratch("vpi_time0");
-    let src = "\
-module top(input logic a, input logic b, output logic na, output logic nb);
-  logic v;
-  assign na = ~a;
-  assign nb = ~b;
-endmodule
-";
-    // (signal, rise, fall): the reference simulator's counts. A signal not
-    // written at time 0 starts at x and loses its first change.
-    for (case, ro, rows) in [
-        (
-            "start",
-            "RO na=1 nb=x v=x",
-            [("na", 1, 1), ("nb", 1, 0), ("v", 0, 1)],
-        ),
-        (
-            "rw",
-            "RO na=x nb=1 v=0",
-            [("na", 1, 0), ("nb", 1, 1), ("v", 1, 1)],
-        ),
-    ] {
-        let (text, json) = vpi_toggles(&d, TIME0_VPI, src, case);
-        assert!(text.contains(ro), "{case}: {text}");
-        toggle_rows(&json, &rows, case);
-    }
-    let _ = std::fs::remove_dir_all(&d);
-}
-
-/// A client whose only routine is cbStartOfSimulation (§38.36.3), in a
-/// design whose first event is a clock edge at 5: `w` written there is the
-/// baseline of `w` and of `nw = ~w`, so `nw` falls at 5 and 25 and rises at
-/// 15, as in the reference simulator. The routine is gone once it has run,
-/// so nothing VPI holds the scheduler at time 0.
-#[test]
-fn toggle_baseline_from_lone_start_routine() {
-    let d = scratch("vpi_start_only");
-    let c = r#"
-#include <string.h>
-#include "vpi_user.h"
-static PLI_INT32 cb(p_cb_data d) {
-    s_vpi_value v;
-    s_vpi_time t = {vpiSimTime, 0, 0, 0.0};
-    v.format = vpiIntVal;
-    v.value.integer = 0;
-    vpi_put_value(vpi_handle_by_name("top.w", NULL), &v, &t, vpiNoDelay);
-    return 0;
-}
-static void start(void) {
-    s_cb_data c;
-    memset(&c, 0, sizeof c);
-    c.reason = cbStartOfSimulation;
-    c.cb_rtn = cb;
-    vpi_register_cb(&c);
-}
-void (*vlog_startup_routines[])(void) = {start, 0};
-"#;
-    let src = "\
-module top;
-  logic clk, w, nw;
-  assign nw = ~w;
-  initial begin clk = 0; forever #5 clk = ~clk; end
-  always @(posedge clk) w <= ~w;
-  always @(negedge clk) if ($time > 25) $finish;
-endmodule
-";
-    let (_, json) = vpi_toggles(&d, c, src, "");
-    toggle_rows(&json, &[("w", 2, 1), ("nw", 1, 2)], "start only");
-    let _ = std::fs::remove_dir_all(&d);
-}
-
-/// A slot can be sampled more than once: at the end of its tick and again
-/// at its end, after cbAtEndOfSimTime (§38.36.2). `x` goes to 1 at 10 and a
-/// cbAtEndOfSimTime routine puts it back to 0 in the same slot, so 10 is no
-/// toggle; the rise at 20 is the only one, as in the reference simulator.
-#[test]
-fn toggle_change_undone_in_its_slot() {
-    let d = scratch("vpi_undo");
-    let c = r#"
-#include <string.h>
-#include "vpi_user.h"
-static PLI_INT32 cb(p_cb_data d) {
-    s_cb_data c;
-    s_vpi_time t = {vpiSimTime, 0, 10, 0.0};
-    if (d->reason == cbAtEndOfSimTime) {
-        s_vpi_value v;
-        v.format = vpiIntVal;
-        v.value.integer = 0;
-        vpi_put_value(vpi_handle_by_name("top.x", NULL), &v, &t, vpiNoDelay);
-        return 0;
-    }
-    memset(&c, 0, sizeof c);
-    c.reason = cbAtEndOfSimTime;
-    c.cb_rtn = cb;
-    c.time = &t;
-    vpi_register_cb(&c);
-    return 0;
-}
-static void start(void) {
-    s_cb_data c;
-    memset(&c, 0, sizeof c);
-    c.reason = cbStartOfSimulation;
-    c.cb_rtn = cb;
-    vpi_register_cb(&c);
-}
-void (*vlog_startup_routines[])(void) = {start, 0};
-"#;
-    let src = "\
-module top;
-  logic x;
-  initial begin x = 0; #10 x = 1; #10 x = 1; #10 $finish; end
-endmodule
-";
-    let (_, json) = vpi_toggles(&d, c, src, "");
-    toggle_rows(&json, &[("x", 1, 0)], "undone");
-    let _ = std::fs::remove_dir_all(&d);
-}
-
-/// §20.2: `$finish` ends the run inside its time slot, so the flush at the
-/// end of the last slot is skipped when `$finish` ended it: `d` rises and
-/// `clk` rises a second time only in the finishing slot at 15, and neither
-/// counts. The reference simulator reports `d` untoggled and 4 of 6 bins.
-#[test]
-fn no_slot_end_flush_after_finish() {
-    let d = scratch("finish_slot");
-    let src = "\
-module tb;
-  logic clk = 0;
-  logic d = 0, e = 0;
-  always #5 clk = ~clk;
-  initial begin
-    #12 e = 1; #1 e = 0;
-    #2 d = 1;
-    $finish;
-  end
-endmodule
-";
-    let out = run(&d, src, &["--code-coverage=toggle"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let json = results(&d);
-    toggle_rows(&json, &[("clk", 1, 1), ("d", 0, 0), ("e", 1, 1)], "finish");
-    let total = toggle_total(4, 6, "66.67");
-    assert!(json.contains(&total), "{total}: {json}");
-    let _ = std::fs::remove_dir_all(&d);
-}
-
 /// The signals of a scope's toggle entries, in report order.
 fn toggled(scope: &str) -> Vec<&str> {
     scope
@@ -1371,8 +1068,10 @@ endmodule
 /// of an instance array, of an instance in a generate block and of `for`,
 /// `if` and `case` generate blocks, chosen or not and nested, have no toggle
 /// bins. The signals declared in a generate block count in the enclosing
-/// instance, as does a signal named like a nested generate block. The top's
-/// 20 signals and 40 bins are the reference simulator's.
+/// instance, as does a signal named like a nested generate block. Verilator
+/// 5.038 (`--coverage-toggle`) lists the same 20 bits for `tb` (clk, d, q, p,
+/// inner, u_r[0..1].r, u_if.s, cd.c, outer[0..1].inner[0..1].t), each
+/// toggled both ways, and `gw[0].w`, `gw[1].w` in `tb.u_w`.
 #[test]
 fn toggle_skips_instance_and_generate_names() {
     let d = scratch("scope_names");
@@ -1475,6 +1174,307 @@ endmodule
             "{name}: {wrap}"
         );
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The VPI client of `toggle_baseline_from_vpi_at_time_0`. With
+/// `T0_CASE=start`, `a` is written from cbStartOfSimulation; with
+/// `T0_CASE=rw`, `b` and `v` from cbReadWriteSynch at time 0 (where cocotb
+/// applies its writes). Either way all three are set at 10 and cleared at
+/// 20, and the time-0 cbReadOnlySynch prints `na`, `nb` and `v`.
+const TIME0_VPI: &str = r#"
+#include <stdlib.h>
+#include <string.h>
+#include "vpi_user.h"
+
+static void put(const char *name, int val, int flags) {
+    s_vpi_value v;
+    s_vpi_time t = {vpiSimTime, 0, 0, 0.0};
+    v.format = vpiIntVal;
+    v.value.integer = val;
+    vpi_put_value(vpi_handle_by_name((PLI_BYTE8 *)name, NULL), &v, &t, flags);
+}
+
+static const char *bin(const char *name, char *buf) {
+    s_vpi_value v;
+    v.format = vpiBinStrVal;
+    vpi_get_value(vpi_handle_by_name((PLI_BYTE8 *)name, NULL), &v);
+    strncpy(buf, v.value.str, 7);
+    buf[7] = 0;
+    return buf;
+}
+
+static PLI_INT32 cb(p_cb_data d);
+
+static void at(int reason, unsigned t, long tag) {
+    s_cb_data c;
+    s_vpi_time tm = {vpiSimTime, 0, t, 0.0};
+    memset(&c, 0, sizeof c);
+    c.reason = reason;
+    c.cb_rtn = cb;
+    c.time = &tm;
+    c.user_data = (PLI_BYTE8 *)tag;
+    vpi_register_cb(&c);
+}
+
+static PLI_INT32 cb(p_cb_data d) {
+    long tag = (long)d->user_data;
+    const char *mode = getenv("T0_CASE");
+    char x[8], y[8], z[8];
+    switch (tag) {
+    case 0:
+        if (mode && !strcmp(mode, "start"))
+            put("top.a", 0, vpiNoDelay);
+        else
+            at(cbReadWriteSynch, 0, 1);
+        at(cbReadOnlySynch, 0, 9);
+        at(cbAfterDelay, 10, 2);
+        at(cbAfterDelay, 20, 3);
+        at(cbAfterDelay, 30, 4);
+        break;
+    case 1:
+        put("top.b", 0, vpiInertialDelay);
+        put("top.v", 0, vpiNoDelay);
+        break;
+    case 2:
+    case 3:
+        put("top.a", tag == 2, vpiNoDelay);
+        put("top.b", tag == 2, vpiNoDelay);
+        put("top.v", tag == 2, vpiNoDelay);
+        break;
+    case 4:
+        vpi_control(vpiFinish, 0);
+        break;
+    case 9:
+        vpi_printf("RO na=%s nb=%s v=%s\n", bin("top.na", x), bin("top.nb", y), bin("top.v", z));
+        break;
+    }
+    return 0;
+}
+
+static void start(void) {
+    s_cb_data c;
+    memset(&c, 0, sizeof c);
+    c.reason = cbStartOfSimulation;
+    c.cb_rtn = cb;
+    vpi_register_cb(&c);
+}
+
+void (*vlog_startup_routines[])(void) = {start, 0};
+"#;
+
+/// Build the VPI client `c` in `d` and run `src` (top `top`) with it and
+/// toggle coverage, `T0_CASE` set to `case`; returns the output and the
+/// results file.
+fn vpi_toggles(d: &Path, c: &str, src: &str, case: &str) -> (String, String) {
+    let so = d.join("t0.so");
+    if !so.exists() {
+        std::fs::write(d.join("t0.c"), c).unwrap();
+        let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
+        let ok = Command::new("cc")
+            .args(["-shared", "-fPIC", "-I"])
+            .arg(&include)
+            .arg(d.join("t0.c"))
+            .arg("-o")
+            .arg(&so)
+            .status()
+            .expect("launch cc")
+            .success();
+        assert!(ok, "cc failed");
+    }
+    std::fs::write(d.join("t.sv"), src).unwrap();
+    let _ = std::fs::remove_file(d.join("cov.json"));
+    let out = Command::new(xezim())
+        .current_dir(d)
+        .env("XEZIM_COV_DB", d.join("cov.json"))
+        .env("T0_CASE", case)
+        .env_remove("XEZIM_CODE_COVERAGE")
+        .arg("--vpi-lib")
+        .arg(&so)
+        .args(["--code-coverage=toggle", "-s", "top", "t.sv"])
+        .output()
+        .expect("run xezim");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{case}: {text}");
+    (text, results(d))
+}
+
+/// Assert the (signal, rise, fall) counts of one-bit signals, whatever other
+/// members their entries carry.
+fn toggle_rows(json: &str, rows: &[(&str, u32, u32)], what: &str) {
+    for (name, rise, fall) in rows {
+        let key = format!("{{\"signal\": \"{name}\", \"width\": 1,");
+        let start = json
+            .find(&key)
+            .unwrap_or_else(|| panic!("{what}: no {name}: {json}"));
+        let row = &json[start..start + json[start..].find('}').unwrap()];
+        let counts = format!("\"rise\": [{rise}], \"fall\": [{fall}]");
+        assert!(row.contains(&counts), "{what}: {name} {counts}: {row}");
+    }
+}
+
+/// IEEE 1800-2023 §38.36.2, §38.36.3: a value a VPI client writes at time
+/// 0, from cbStartOfSimulation or from that slot's cbReadWriteSynch, belongs
+/// to the time-0 slot, so it is the toggle baseline, as a value the design
+/// wrote at time 0 would be: toggles compare the ends of time slots and
+/// never count a change from x. Nothing in the design runs at time 0, so
+/// only the VPI writes make that slot. The cbStartOfSimulation write is
+/// evaluated there: the time-0 cbReadOnlySynch reads `na` = 1 (§38.36.2,
+/// read-only synch at the end of the slot). A signal not written at time 0
+/// starts at x and its first change is no toggle. Verilator 5.038 counts the
+/// same first toggle when cocotb drives these writes.
+#[test]
+fn toggle_baseline_from_vpi_at_time_0() {
+    let d = scratch("vpi_time0");
+    let src = "\
+module top(input logic a, input logic b, output logic na, output logic nb);
+  logic v;
+  assign na = ~a;
+  assign nb = ~b;
+endmodule
+";
+    for (case, ro, rows) in [
+        (
+            "start",
+            "RO na=1 nb=x v=x",
+            [("na", 1, 1), ("nb", 1, 0), ("v", 0, 1)],
+        ),
+        (
+            "rw",
+            "RO na=x nb=1 v=0",
+            [("na", 1, 0), ("nb", 1, 1), ("v", 1, 1)],
+        ),
+    ] {
+        let (text, json) = vpi_toggles(&d, TIME0_VPI, src, case);
+        assert!(text.contains(ro), "{case}: {text}");
+        toggle_rows(&json, &rows, case);
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A client whose only routine is cbStartOfSimulation (§38.36.3), in a
+/// design whose first event is a clock edge at 5: `w` written there is the
+/// baseline of `w` and of `nw = ~w`, so `w` rises at 5 and 25 and falls at
+/// 15, and `nw` the other way round. The routine is gone once it has run,
+/// so nothing VPI holds the scheduler at time 0.
+#[test]
+fn toggle_baseline_from_lone_start_routine() {
+    let d = scratch("vpi_start_only");
+    let c = r#"
+#include <string.h>
+#include "vpi_user.h"
+static PLI_INT32 cb(p_cb_data d) {
+    s_vpi_value v;
+    s_vpi_time t = {vpiSimTime, 0, 0, 0.0};
+    v.format = vpiIntVal;
+    v.value.integer = 0;
+    vpi_put_value(vpi_handle_by_name("top.w", NULL), &v, &t, vpiNoDelay);
+    return 0;
+}
+static void start(void) {
+    s_cb_data c;
+    memset(&c, 0, sizeof c);
+    c.reason = cbStartOfSimulation;
+    c.cb_rtn = cb;
+    vpi_register_cb(&c);
+}
+void (*vlog_startup_routines[])(void) = {start, 0};
+"#;
+    let src = "\
+module top;
+  logic clk, w, nw;
+  assign nw = ~w;
+  initial begin clk = 0; forever #5 clk = ~clk; end
+  always @(posedge clk) w <= ~w;
+  always @(negedge clk) if ($time > 25) $finish;
+endmodule
+";
+    let (_, json) = vpi_toggles(&d, c, src, "");
+    toggle_rows(&json, &[("w", 2, 1), ("nw", 1, 2)], "start only");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A slot can now be sampled more than once: at the end of its tick and
+/// again at its end, after cbAtEndOfSimTime (§38.36.2), which is still in
+/// that slot. `x` goes to 1 at 10 and a cbAtEndOfSimTime routine puts it
+/// back to 0 in the same slot, so 10 is no toggle (the slot's net change is
+/// none); the rise at 20 is the only one.
+#[test]
+fn toggle_change_undone_in_its_slot() {
+    let d = scratch("vpi_undo");
+    let c = r#"
+#include <string.h>
+#include "vpi_user.h"
+static PLI_INT32 cb(p_cb_data d) {
+    s_cb_data c;
+    s_vpi_time t = {vpiSimTime, 0, 10, 0.0};
+    if (d->reason == cbAtEndOfSimTime) {
+        s_vpi_value v;
+        v.format = vpiIntVal;
+        v.value.integer = 0;
+        vpi_put_value(vpi_handle_by_name("top.x", NULL), &v, &t, vpiNoDelay);
+        return 0;
+    }
+    memset(&c, 0, sizeof c);
+    c.reason = cbAtEndOfSimTime;
+    c.cb_rtn = cb;
+    c.time = &t;
+    vpi_register_cb(&c);
+    return 0;
+}
+static void start(void) {
+    s_cb_data c;
+    memset(&c, 0, sizeof c);
+    c.reason = cbStartOfSimulation;
+    c.cb_rtn = cb;
+    vpi_register_cb(&c);
+}
+void (*vlog_startup_routines[])(void) = {start, 0};
+"#;
+    let src = "\
+module top;
+  logic x;
+  initial begin x = 0; #10 x = 1; #10 x = 1; #10 $finish; end
+endmodule
+";
+    let (_, json) = vpi_toggles(&d, c, src, "");
+    toggle_rows(&json, &[("x", 1, 0)], "undone");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// §20.2: `$finish` ends the run inside its time slot, so the flush at the
+/// end of the last slot is skipped when `$finish` ended it: `d` rises and
+/// `clk` rises a second time only in the finishing slot at 15, and neither
+/// counts. The reference simulator reports `d` untoggled and 4 of 6 bins.
+#[test]
+fn no_slot_end_flush_after_finish() {
+    let d = scratch("finish_slot");
+    let src = "\
+module tb;
+  logic clk = 0;
+  logic d = 0, e = 0;
+  always #5 clk = ~clk;
+  initial begin
+    #12 e = 1; #1 e = 0;
+    #2 d = 1;
+    $finish;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    toggle_rows(&json, &[("clk", 1, 1), ("d", 0, 0), ("e", 1, 1)], "finish");
+    let total = toggle_total(4, 6, "66.67");
+    assert!(json.contains(&total), "{total}: {json}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

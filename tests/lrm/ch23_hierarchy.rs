@@ -45,7 +45,6 @@ fn c23_11_bind_and_unit_scope() {
             "T|26.unit|t23i.u1 2 1 501",
             "T|26.unit|t23i.u2 2 1 501",
             "T|26.unit|t23i.u3 2 1 501",
-            "T|23.11b|3 15 9",
             "T|23.5|eo=30",
             "T|26.unit2|1 6 502",
         ],
@@ -53,6 +52,7 @@ fn c23_11_bind_and_unit_scope() {
             "T|23.11a|t23i.u2.c_path P=8 a=22",
             "T|23.11a|t23i.u2.c_list P=3 a=22",
             "T|23.11a|t23i.u3.c_",
+            "T|23.11b|",
             "T|23.11c|",
         ],
     );

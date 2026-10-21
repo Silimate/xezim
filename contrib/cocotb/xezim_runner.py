@@ -116,6 +116,15 @@ class Xezim(Runner):
         """Arguments recorded by :meth:`build`, used by :meth:`test`."""
         return self.build_dir / "xezim_build.json"
 
+    @staticmethod
+    def _parameter_build_identity(record: Path) -> tuple:
+        record = record.resolve()
+        if not record.is_file():
+            return record, None, None
+        # A rewrite resets overrides even when it records the same options.
+        # Contents also catch replacements that preserve the timestamp.
+        return record, record.stat().st_mtime_ns, record.read_bytes()
+
     @property
     def _vpi_lib(self) -> Path:
         return Path(cocotb_tools.config.libs_dir) / cocotb_tools.config.lib_name(
@@ -164,7 +173,7 @@ class Xezim(Runner):
         }
         self.build_dir.mkdir(parents=True, exist_ok=True)
         self.build_file.write_text(json.dumps(record, indent=1) + "\n")
-        self._parameter_build = self.build_file.resolve()
+        self._parameter_build = self._parameter_build_identity(self.build_file)
 
         # Nothing to execute: xezim elaborates at run time, so the "build" is
         # the record above. Returning no commands keeps `build()` a no-op
@@ -175,15 +184,16 @@ class Xezim(Runner):
 
     def test(self, *args, **kwargs) -> Path:
         # Bind against Runner's signature so positional parameters keep the
-        # same meaning. Seed a fresh runner from its recorded build once;
-        # Runner.test then retains explicit overrides between calls.
+        # same meaning. Reload a rebuilt record even when another runner
+        # wrote it; retain explicit overrides while the record is unchanged.
         bound = inspect.signature(Runner.test).bind(self, *args, **kwargs)
         build_dir = bound.arguments.get("build_dir") or self.build_dir
         record = Path(build_dir).resolve() / "xezim_build.json"
-        if getattr(self, "_parameter_build", None) != record:
-            if bound.arguments.get("parameters") is None and record.is_file():
-                self.parameters = dict(json.loads(record.read_text())["parameters"])
-            self._parameter_build = record
+        identity = self._parameter_build_identity(record)
+        if getattr(self, "_parameter_build", None) != identity:
+            if bound.arguments.get("parameters") is None and identity[2] is not None:
+                self.parameters = dict(json.loads(identity[2])["parameters"])
+            self._parameter_build = identity
         return super().test(*args, **kwargs)
 
     def _test_command(self) -> List[_Command]:

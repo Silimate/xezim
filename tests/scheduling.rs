@@ -349,6 +349,12 @@ mod action_scopes_386;
 
 #[path = "scheduling/pending_negation_393.rs"]
 mod pending_negation_393;
+#[path = "scheduling/or_end_of_sim_compose_420.rs"]
+mod or_end_of_sim_compose_420;
+#[path = "scheduling/sampled_preponed_421.rs"]
+mod sampled_preponed_421;
+#[path = "scheduling/assertion_m_scope_419.rs"]
+mod assertion_m_scope_419;
 #[path = "scheduling/followed_vacuity_395.rs"]
 mod followed_vacuity_395;
 
@@ -360,3 +366,5 @@ mod sva_named_property_hier_sampling;
 
 #[path = "scheduling/array_port_connection_timing.rs"]
 mod array_port_connection_timing;
+#[path = "scheduling/sva_event_lists.rs"]
+mod sva_event_lists;

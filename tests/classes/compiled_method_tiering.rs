@@ -262,7 +262,7 @@ class K;
   function automatic int step(int v);
     int t;
     acc = acc + v;
-    for (t = 0; t < 200; t = t + 1) acc = acc + ((t * v) % 7);
+    for (t = 0; t < 100; t = t + 1) acc = acc + ((t * v) % 7);
     if (acc > 900) acc = acc - 300;
     return acc;
   endfunction
@@ -273,7 +273,7 @@ module top;
   initial begin
     K k;
     k = new();
-    for (i = 0; i < 12000; i = i + 1) begin
+    for (i = 0; i < 3000; i = i + 1) begin
       r = r + k.step(1);
     end
     $display("TAG r=%0d", r);

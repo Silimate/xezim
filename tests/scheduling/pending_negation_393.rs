@@ -36,7 +36,7 @@ fn pending_negation_is_settled_before_finish_final_blocks() {
 fn pending_negation_composes_with_property_operators() {
     check(
         PENDING,
-        &["T|pending|'{1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0}"],
+        &["T|pending|'{1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0}"],
     );
 }
 
@@ -54,7 +54,7 @@ fn disable_pulse_cancels_negation_without_another_clock_tick() {
     let source = PENDING.replace("#10;", "#2 reset = 0; #8;");
     check(
         &source,
-        &["T|pending|'{1, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0}"],
+        &["T|pending|'{1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0}"],
     );
 }
 

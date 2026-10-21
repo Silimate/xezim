@@ -3972,6 +3972,18 @@ impl Simulator {
                                 *slot = fitted;
                             }
                         }
+                        if self.vif_frame_alias(&fname).is_some() {
+                            // §13.5.2: ref rebinding is visible immediately.
+                            if let Some(bound) = val
+                                .to_u64()
+                                .and_then(|t| self.iface_by_token(t))
+                                .map(str::to_string)
+                            {
+                                self.viface_var_aliases.insert(storage.clone(), bound);
+                            } else {
+                                self.viface_var_aliases.remove(&storage);
+                            }
+                        }
                         let prev = self.get_signal_value_by_name(&storage);
                         self.set_signal_value_by_name(&storage, val.clone());
                         return prev.as_ref() != self.get_signal_value_by_name(&storage).as_ref();

@@ -4262,12 +4262,30 @@ impl Simulator {
                 let self_ptr = self as *mut Simulator;
                 vpi_call_systf(self_ptr, name, args, expr.span).unwrap_or_else(|| Value::zero(32))
             }
-            // §16.9.3 `$sampled(e)` outside a property: the value in the
-            // current time step, which is the operand's current value.
-            "$sampled" => args
-                .first()
-                .map(|a| self.eval_expr(a))
-                .unwrap_or(Value::zero(32)),
+            // §16.9.3 / §16.5.1 `$sampled(e)`: the sampled value of `e` in
+            // the current time slot — its value as of the Preponed region,
+            // before any active/NBA update of the slot. Where the evaluator
+            // runs after a same-slot update (e.g. a concurrent assertion's
+            // action block, which runs in the reactive region), the live
+            // signal is newer, so swap in the Preponed snapshot of the
+            // operand's signals, evaluate against those, then restore the
+            // live values. Signals with no snapshot fall back to live.
+            "$sampled" => {
+                let a = args.first().cloned();
+                match a {
+                    Some(e) => {
+                        let mut ids = Vec::new();
+                        self.collect_sva_signal_ids(&e, &mut ids);
+                        ids.sort_unstable();
+                        ids.dedup();
+                        let saved = self.install_preponed(&ids);
+                        let v = self.eval_expr(&e);
+                        self.restore_preponed(saved);
+                        v
+                    }
+                    None => Value::zero(32),
+                }
+            }
             // §38.36.3 cbUnresolvedSystf may register the name.
             _ if self.vpi_cb_mask != 0
                 && self.vpi_resolve_unknown_systf(name)

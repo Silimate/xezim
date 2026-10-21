@@ -673,6 +673,7 @@ impl Simulator {
                         reads.insert(parent.to_string());
                     }
                 }
+                Self::note_packed_access(&name, None, false);
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -725,6 +726,8 @@ impl Simulator {
                             }
                         }
                     } else {
+                        let idx = Self::constant_array_index(index, module);
+                        Self::note_packed_access(&name, Some(idx), false);
                         reads.insert(name);
                     }
                 } else if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
@@ -1034,7 +1037,9 @@ impl Simulator {
     ) {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
-                writes.insert(Self::resolve_hier_name_static(hier, module));
+                let name = Self::resolve_hier_name_static(hier, module);
+                Self::note_packed_access(&name, None, true);
+                writes.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
                 if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
@@ -1065,6 +1070,8 @@ impl Simulator {
                                 }
                             }
                         } else {
+                            let idx = Self::constant_array_index(index, module);
+                            Self::note_packed_access(&name, Some(idx), true);
                             writes.insert(name);
                         }
                     }
@@ -1104,6 +1111,27 @@ impl Simulator {
             }
             _ => {}
         }
+    }
+
+    /// Record one access to `name` for the packed-vector sensitivity rule in
+    /// `comb_compilation`. `elem` is `None` for a whole-variable access and
+    /// `Some(None)` for a select whose index is not a constant.
+    fn note_packed_access(name: &str, elem: Option<Option<i64>>, is_write: bool) {
+        PACKED_ACCESS.with(|p| {
+            let mut p = p.borrow_mut();
+            let Some(map) = p.as_mut() else { return };
+            let acc = map.entry(name.to_string()).or_default();
+            match elem {
+                Some(Some(i)) => {
+                    if is_write {
+                        acc.writes.insert(i);
+                    } else {
+                        acc.reads.insert(i);
+                    }
+                }
+                _ => acc.irregular = true,
+            }
+        });
     }
 
     /// Collect reads/writes from a statement (for always @* / always_comb blocks).

@@ -92,3 +92,50 @@ endmodule
     assert!(text.contains("DONE"), "{text}");
     assert!(!text.contains("FAIL"), "{text}");
 }
+
+/// A block that reads and writes the SAME element of a packed vector
+/// (`v[0] = ..; v[0] ^= ..`) sees its own transient writes. Keeping `v` in its
+/// sensitivity made the chain below re-queue itself to the settle limit (PRINCE
+/// in Ibex's scrambled RAMs). It must settle with the right values and no
+/// settle-limit warning.
+#[test]
+fn always_comb_rewriting_one_packed_element_does_not_churn() {
+    let dir = std::env::temp_dir().join(format!("xezim_pkchurn_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pkchurn.sv");
+    std::fs::write(
+        &path,
+        r#"module tb;
+  logic [7:0] di;
+  logic [2:0][7:0] lo;
+  logic [7:0] r1;
+  always_comb begin lo[0] = di ^ 8'h0f; lo[0] ^= 8'h01; end
+  always_comb begin r1 = ~lo[0]; end
+  assign lo[1] = r1 ^ 8'h3c;
+  assign lo[2] = ~lo[1];
+  initial begin
+    di = 8'h10; #1;
+    if (lo[2] !== (8'h10 ^ 8'h0f ^ 8'h01 ^ 8'hff ^ 8'h3c ^ 8'hff)) $display("FAIL first lo2=%h", lo[2]);
+    di = 8'h33; #1;
+    if (lo[2] !== (8'h33 ^ 8'h0f ^ 8'h01 ^ 8'hff ^ 8'h3c ^ 8'hff)) $display("FAIL second lo2=%h", lo[2]);
+    $display("DONE");
+    $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--simulate", "-s", "tb", path.to_str().unwrap(), "--no-cache"])
+        .output()
+        .expect("run xezim");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("DONE"), "{text}");
+    assert!(!text.contains("FAIL"), "{text}");
+    assert!(!text.contains("settle limit"), "{text}");
+}

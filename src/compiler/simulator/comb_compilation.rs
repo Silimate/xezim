@@ -1275,7 +1275,10 @@ impl Simulator {
                 if !is_always_comb {
                     SKIP_FN_BODY_READS.with(|c| c.set(true));
                 }
+                PACKED_ACCESS.with(|p| *p.borrow_mut() = Some(HashMap::default()));
                 Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
+                let packed_access: HashMap<String, PackedAccess> =
+                    PACKED_ACCESS.with(|p| p.borrow_mut().take()).unwrap_or_default();
                 SKIP_FN_BODY_READS.with(|c| c.set(false));
                 // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
                 // to resolve hierarchical refs whose path includes the
@@ -1344,8 +1347,12 @@ impl Simulator {
                 // both named `ds`, and the element it reads is driven from
                 // outside. Dropping `ds` left the block deaf to that driver, so
                 // `prim_subst_perm`'s round chain never re-evaluated and its
-                // outputs stayed X. Loop variables and temps are never packed
-                // multi-dimensional, so the churn guard above still covers them.
+                // outputs stayed X. Only a block whose reads and writes of the
+                // vector hit disjoint constant elements qualifies. One that reads
+                // an element it also writes (`v[0] = a; v[0] ^= b`) or assigns the
+                // whole vector (`v = '0; v[i] = ...`) sees its own transient
+                // values and re-queues itself to the settle limit, so the guard
+                // above still drops those.
                 let is_packed_multi = |r: &str| -> bool {
                     let multi = |k: &str| {
                         self.module
@@ -1353,11 +1360,15 @@ impl Simulator {
                             .get(k)
                             .is_some_and(|d| d.len() > 1)
                     };
-                    multi(r)
-                        || (!ab.scope.is_empty() && multi(&format!("{}.{}", ab.scope, r)))
-                        || scope_hint
-                            .as_ref()
-                            .is_some_and(|sc| multi(&format!("{}.{}", sc, r)))
+                    let disjoint = packed_access.get(r).is_some_and(|a| {
+                        !a.irregular && !a.writes.is_empty() && a.reads.is_disjoint(&a.writes)
+                    });
+                    disjoint
+                        && (multi(r)
+                            || (!ab.scope.is_empty() && multi(&format!("{}.{}", ab.scope, r)))
+                            || scope_hint
+                                .as_ref()
+                                .is_some_and(|sc| multi(&format!("{}.{}", sc, r))))
                 };
                 let sens_reads: HashSet<String> = reads
                     .iter()

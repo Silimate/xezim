@@ -240,3 +240,68 @@ endmodule
     assert_eq!(u(&sim, "pos0_at_21"), 2, "two posedges elapsed");
     assert_eq!(u(&sim, "w0_at_21"), 2, "and the member assign forwards it");
 }
+
+/// `assign ifc.arr = src;` drives every element, and `cb.arr[i]` returns
+/// the clocking sample of that element. A scalar treatment of the array
+/// left the interface at 0 and the clocking read at 0, so Ibex's RVFI
+/// mhpmcounter sample never reached the cosim ISS.
+#[test]
+fn interface_whole_array_assign_and_clocking_element() {
+    let src = r#"
+`timescale 1ns/1ns
+interface rvfi_if (input logic clk);
+  logic [31:0] ext_mhpmcounters [10];
+  clocking monitor_cb @(posedge clk);
+    input ext_mhpmcounters;
+  endclocking
+endinterface
+class mon;
+  virtual rvfi_if vif;
+  function new(virtual rvfi_if v);
+    vif = v;
+  endfunction
+  function int at1();
+    return vif.monitor_cb.ext_mhpmcounters[1];
+  endfunction
+endclass
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  logic [31:0] src [10];
+  rvfi_if rvfi (clk);
+  assign rvfi.ext_mhpmcounters = src;
+  int iface, sampled, held, other, live_after, via_vif, sampled_x;
+  logic [31:0] sampled_raw;
+  mon m;
+  initial begin
+    m = new(rvfi);
+    src[1] = 32'h46e;
+    src[2] = 32'h11;
+    @(posedge clk);
+    #1;
+    iface = rvfi.ext_mhpmcounters[1];
+    sampled_raw = rvfi.monitor_cb.ext_mhpmcounters[1];
+    sampled_x = $isunknown(sampled_raw);
+    sampled = sampled_raw;
+    other = rvfi.monitor_cb.ext_mhpmcounters[2];
+    via_vif = m.at1();
+    src[1] = 32'h99;
+    #1;
+    held = rvfi.monitor_cb.ext_mhpmcounters[1];
+    live_after = rvfi.ext_mhpmcounters[1];
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "iface"), 0x46e, "the interface element is driven");
+    assert_eq!(u(&sim, "sampled_x"), 0, "the clocking element is not X");
+    assert_eq!(u(&sim, "sampled"), 0x46e, "the clocking read sees that element");
+    assert_eq!(u(&sim, "other"), 0x11, "a neighboring element is distinct");
+    assert_eq!(u(&sim, "via_vif"), 0x46e, "a virtual interface reads the same element");
+    assert_eq!(
+        u(&sim, "held"),
+        0x46e,
+        "the sample holds until the next clock edge"
+    );
+    assert_eq!(u(&sim, "live_after"), 0x99, "the net itself tracks the assign");
+}

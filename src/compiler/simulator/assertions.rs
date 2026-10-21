@@ -2025,7 +2025,14 @@ impl Simulator {
             })
             .collect();
         for n in names {
-            if let Some(v) = self.get_signal_value_by_name(&n) {
+            if let Some((lo, hi)) = self.unpacked_array_bounds(&n) {
+                for idx in lo..=hi {
+                    let elem = format!("{n}[{idx}]");
+                    if let Some(v) = self.get_signal_value_by_name(&elem) {
+                        self.clocking_preponed.insert(elem, v);
+                    }
+                }
+            } else if let Some(v) = self.get_signal_value_by_name(&n) {
                 self.clocking_preponed.insert(n, v);
             }
         }

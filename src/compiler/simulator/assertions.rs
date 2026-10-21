@@ -68,12 +68,12 @@ impl Simulator {
         let mut hit = false;
         Self::walk_operands(e, &mut |x| match &x.kind {
             ExprKind::MemberAccess { .. } => hit = true,
-            ExprKind::SvaClocked {
-                clock, iff, body, ..
-            } => {
-                hit |= Self::has_member_access(clock)
-                    || Self::has_member_access(body)
-                    || iff.as_deref().is_some_and(Self::has_member_access)
+            ExprKind::SvaClocked { events, body } => {
+                hit |= Self::has_member_access(body)
+                    || events.iter().any(|ev| {
+                        Self::has_member_access(&ev.expr)
+                            || ev.iff.as_ref().is_some_and(Self::has_member_access)
+                    });
             }
             ExprKind::NamedArg { expr, .. } => {
                 hit |= expr.as_deref().is_some_and(Self::has_member_access)
@@ -649,6 +649,18 @@ impl Simulator {
         }
     }
 
+    /// Whether one `and`/`or` operand fails at the end of simulation: a
+    /// resolved Pass/Vacuous holds, a resolved Fail already failed, and a
+    /// still-pending operand fails iff its own evaluation would fail once the
+    /// clock stops.
+    fn sva_op_fails(resolved: &Option<SvaOutcome>, node: &SvaNode, st: &SvaState) -> bool {
+        match resolved {
+            Some(SvaOutcome::Fail) => true,
+            Some(_) => false, // Pass / Vacuous
+            None => Self::sva_fails_at_end(node, st),
+        }
+    }
+
     /// Whether a pending property fails at the end of simulation (§16.12.2–3).
     /// A weak sequence holds when the clock stops; property `not` inverts
     /// that result just as it inverts a completed operand's result.
@@ -664,10 +676,16 @@ impl Simulator {
                 cons.iter()
                     .any(|(delay, cs)| *delay == 0 && Self::sva_fails_at_end(cn, cs))
             }
-            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb })
-            | (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
-                (ra.is_none() && Self::sva_fails_at_end(na, a))
-                    || (rb.is_none() && Self::sva_fails_at_end(nb, b))
+            // §16.12.6: `p && q` (And) fails at end when EITHER operand fails;
+            // `p or q` (Or) fails only when BOTH operands fail. An operand
+            // already resolved to Pass/Vacuous can't fail; one already
+            // resolved to Fail already failed; one still pending fails iff
+            // its own evaluation would fail once the clock stops.
+            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb }) => {
+                Self::sva_op_fails(ra, na, a) || Self::sva_op_fails(rb, nb, b)
+            }
+            (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                Self::sva_op_fails(ra, na, a) && Self::sva_op_fails(rb, nb, b)
             }
             _ => false,
         }
@@ -1321,15 +1339,47 @@ impl Simulator {
         }
     }
 
-    /// §9.4.2: a vector clock uses its least significant bit, even when
-    /// other bits are unknown. Keep X and Z distinct for edge transitions.
-    pub(super) fn sva_clock_bit(&self, name: &str) -> u8 {
-        match self.get_signal_value_by_name(name).map(|v| v.get_bit(0)) {
-            Some(LogicBit::Zero) => 0,
-            Some(LogicBit::One) => 1,
-            Some(LogicBit::Z) => 3,
-            _ => 2,
+    fn sva_event_value(&mut self, event: &SvaClockEvent) -> Value {
+        match &event.signal {
+            Some(name) => self
+                .get_signal_value_by_name(name)
+                .unwrap_or_else(|| Value::all_x(1)),
+            None => self.eval_expr(&event.event.expr),
         }
+    }
+
+    /// §9.4.2: edge controls inspect the LSB; an unqualified expression
+    /// event notices any value change, including changes above bit zero.
+    pub(super) fn sva_events_fired(&mut self, events: &mut [SvaClockEvent]) -> bool {
+        let mut fired = false;
+        for event in events {
+            let current = self.sva_event_value(event);
+            let bit = |v: &Value| match v.get_bit(0) {
+                LogicBit::Zero => 0,
+                LogicBit::One => 1,
+                LogicBit::X => 2,
+                LogicBit::Z => 3,
+            };
+            let previous = bit(&event.previous);
+            let now = bit(&current);
+            let changed = match event.event.edge {
+                Some(Edge::Posedge) => (previous == 0 && now != 0) || (previous >= 2 && now == 1),
+                Some(Edge::Negedge) => (previous == 1 && now != 1) || (previous >= 2 && now == 0),
+                Some(Edge::Edge) => previous != now && (previous < 2 || now < 2),
+                None => current != event.previous,
+            };
+            event.previous = current;
+            if changed
+                && event
+                    .event
+                    .iff
+                    .as_ref()
+                    .is_none_or(|g| self.eval_expr(g).is_true())
+            {
+                fired = true;
+            }
+        }
+        fired
     }
 
     /// LRM §16.5: register the clocked site of a concurrent assertion
@@ -1340,9 +1390,7 @@ impl Simulator {
     pub(super) fn register_sva_site(
         &mut self,
         a: &crate::ast::stmt::AssertionStatement,
-        clock_signal: String,
-        edge: u8,
-        iff: Option<Expression>,
+        events: Vec<EventExpr>,
         body: Expression,
     ) {
         use crate::ast::stmt::AssertionKind;
@@ -1461,16 +1509,48 @@ impl Simulator {
         // A procedural assertion registers while its procedure runs, which
         // for an edge-triggered procedure is at the tick that starts its
         // first attempt: take that edge as seen (§16.14.6).
-        let cur = self.sva_clock_bit(&clock_signal);
-        let prev_clock = if procedural {
-            match (edge, cur) {
-                (0, 1) => 0,
-                (1, 0) => 1,
-                (2, 0 | 1) => cur ^ 1,
-                _ => cur,
+        let mut clock_events = Vec::with_capacity(events.len());
+        for mut event in events {
+            self.sva_fold_scopes(&mut event.expr);
+            self.sva_resolve_signals(&mut event.expr);
+            if let Some(guard) = &mut event.iff {
+                self.sva_resolve_signals(guard);
             }
-        } else {
-            cur
+            let signal = match &event.expr.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|p| p.selects.is_empty()) => {
+                    Some(self.resolve_hier_name(h).into_owned())
+                }
+                _ => None,
+            };
+            let mut clock_event = SvaClockEvent {
+                event,
+                signal,
+                previous: Value::all_x(1),
+            };
+            clock_event.previous = self.sva_event_value(&clock_event);
+            if procedural {
+                let bit = clock_event.previous.get_bit(0);
+                let opposite = match (clock_event.event.edge, bit) {
+                    (Some(Edge::Posedge), LogicBit::One) => Some(LogicBit::Zero),
+                    (Some(Edge::Negedge), LogicBit::Zero) => Some(LogicBit::One),
+                    (None | Some(Edge::Edge), LogicBit::Zero) => Some(LogicBit::One),
+                    (None | Some(Edge::Edge), LogicBit::One) => Some(LogicBit::Zero),
+                    _ => None,
+                };
+                if let Some(bit) = opposite {
+                    clock_event.previous.set_bit(0, bit);
+                }
+            }
+            clock_events.push(clock_event);
+        }
+        let clock_signal = clock_events
+            .first()
+            .and_then(|ev| ev.signal.clone())
+            .unwrap_or_default();
+        let edge = match clock_events.first().and_then(|ev| ev.event.edge) {
+            Some(Edge::Posedge) => 0,
+            Some(Edge::Negedge) => 1,
+            _ => 2,
         };
         let inst = self.assert_inst(
             kind,
@@ -1489,11 +1569,10 @@ impl Simulator {
             all_matches: a.is_sequence,
             clock_signal,
             edge,
-            iff,
+            events: clock_events,
             past_names,
             node: std::sync::Arc::new(node),
             disable,
-            prev_clock,
             fired: false,
             attempts: Vec::new(),
             past_snapshots: HashMap::default(),
@@ -1515,10 +1594,12 @@ impl Simulator {
         });
         // §16.9.3: the assertion's leading clock also clocks sampled calls
         // used only in its action blocks; history starts before the first tick.
-        if let Some(&cid) = self
-            .signal_name_to_id
-            .get(self.sva_sites.last().unwrap().clock_signal.as_str())
         {
+            let cid = self
+                .signal_name_to_id
+                .get(self.sva_sites.last().unwrap().clock_signal.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
             let ec = match edge {
                 1 => 2,
                 2 => 0,
@@ -2245,33 +2326,12 @@ impl Simulator {
     /// its `iff` guard checked then.
     pub(super) fn sva_note_edges(&mut self) {
         for i in 0..self.sva_sites.len() {
-            let clk_name = &self.sva_sites[i].clock_signal;
-            if clk_name.is_empty() {
-                continue;
-            }
-            let cur_clk_bit = self.sva_clock_bit(clk_name);
-            let prev = self.sva_sites[i].prev_clock;
-            // Update prev_clock for next iteration *before* edge logic
-            // so a posedge fires exactly once per 0→1 transition.
-            self.sva_sites[i].prev_clock = cur_clk_bit;
-            let fired = match self.sva_sites[i].edge {
-                // §9.4.2, Table 9-2: X/Z -> 1 and 0 -> X/Z are
-                // positive edges; the converse transitions are negative.
-                1 => (prev == 1 && cur_clk_bit != 1) || (prev >= 2 && cur_clk_bit == 0),
-                2 => prev != cur_clk_bit && (prev < 2 || cur_clk_bit < 2),
-                _ => (prev == 0 && cur_clk_bit != 0) || (prev >= 2 && cur_clk_bit == 1),
-            };
+            let mut events = std::mem::take(&mut self.sva_sites[i].events);
+            let fired = self.sva_events_fired(&mut events);
+            self.sva_sites[i].events = events;
             if !fired {
-                // §16.12: cancellation does not need a sampling edge.
                 self.sva_cancel_disabled(i);
                 continue;
-            }
-            // `@(posedge clk iff g)`: no tick while the guard is false.
-            if let Some(g) = self.sva_sites[i].iff.clone() {
-                if !self.eval_expr(&g).is_true() {
-                    self.sva_cancel_disabled(i);
-                    continue;
-                }
             }
             self.sva_sites[i].fired = true;
             self.sva_owed = true;

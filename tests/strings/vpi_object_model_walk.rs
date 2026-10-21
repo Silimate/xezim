@@ -26,10 +26,16 @@ fn scratch(tag: &str) -> PathBuf {
 
 /// Build `src` as a VPI module and run `sv` with it; return the `OM|` lines.
 fn walk(tag: &str, src: &str, sv: &str, top: Option<&str>) -> Vec<String> {
+    walk_sources(tag, src, &[("top.sv", sv)], top)
+}
+
+fn walk_sources(tag: &str, src: &str, sources: &[(&str, &str)], top: Option<&str>) -> Vec<String> {
     let d = scratch(tag);
     std::fs::write(d.join("common.h"), PRELUDE).unwrap();
     std::fs::write(d.join("walk.c"), src).unwrap();
-    std::fs::write(d.join("top.sv"), sv).unwrap();
+    for (name, source) in sources {
+        std::fs::write(d.join(name), source).unwrap();
+    }
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
     let so = d.join("walk.so");
     let ok = Command::new("cc")
@@ -50,7 +56,7 @@ fn walk(tag: &str, src: &str, sv: &str, top: Option<&str>) -> Vec<String> {
         cmd.args(["-s", t]);
     }
     let out = cmd
-        .arg("top.sv")
+        .args(sources.iter().map(|(name, _)| name))
         .current_dir(&d)
         .output()
         .expect("failed to run xezim");
@@ -980,5 +986,129 @@ fn design_walk_multi_top_program_and_port_kinds() {
             "OM|port top1.arr[1].b index=1 dir=1 size=1 porttype=44 high=top1.b1:vpiReg low=top1.arr[1].b:vpiNet byname=1",
             "OM|port top1.arr[1].y index=2 dir=2 size=1 porttype=44 high=NULL:NULL low=top1.arr[1].y:vpiReg byname=1",
         ],
+    );
+}
+
+/// §23.11 / §37: indexed binds retain port metadata in the selected scope,
+/// even when a child shadows the root constant used in the target path.
+#[test]
+fn design_walk_indexed_bind_root_parameter() {
+    let sv = r###"module probe(input logic [3:0] s); initial #2 $display("T|bound=%0d",s); endmodule
+module mem;
+    localparam int SEL=0;
+    logic [3:0] data=7;
+endmodule
+module top;
+    localparam int SEL=1;
+    for(genvar g=0;g<2;g++) begin: bank mem m(); end
+    bind top.bank[SEL].m probe bound(.s(data));
+    initial begin #1 $walk; $finish; end
+endmodule
+"###;
+    let c = r###"#include "common.h"
+static PLI_INT32 walk(PLI_BYTE8 *u) {
+    (void)u;
+    vpiHandle b = H("top.bank[1].m.bound");
+    char name[256], def[256], host[256];
+    snprintf(name, sizeof name, "%s", fname(b));
+    snprintf(def, sizeof def, "%s", S(vpi_get_str(vpiDefName, b)));
+    snprintf(host, sizeof host, "%s", S(vpi_get_str(vpiDefName, H("top.bank[1].m"))));
+    vpi_printf("OM|selected %s def=%s decoy=%s line=%d\n", name, def,
+               fname(H("top.bank[0].m.bound")), vpi_get(vpiLineNo, b));
+    vpiHandle it = vpi_iterate(vpiPort, b);
+    vpiHandle port = it ? vpi_scan(it) : NULL;
+    vpi_printf("OM|host def=%s port=%s\n", host, S(vpi_get_str(vpiName, port)));
+    return 0;
+}
+static void reg(void) { reg_task("$walk", walk); }
+void (*vlog_startup_routines[])(void) = {reg, 0};
+"###;
+    let got = walk("vpi_om_selected_bind", c, sv, Some("top"));
+    assert_eq!(
+        got,
+        [
+            "OM|selected top.bank[1].m.bound def=probe decoy=NULL line=9",
+            "OM|host def=mem port=s",
+        ]
+    );
+}
+
+/// §23.11/§37: the source model uses the same resolved bind targets as
+/// simulation for lexical constants, effective overrides and interface hosts.
+#[test]
+fn design_walk_bind_sibling_contexts() {
+    let c = r###"#include "common.h"
+static PLI_INT32 walk(PLI_BYTE8 *u) {
+    (void)u;
+    vpiHandle b = H("top.h.bank[1].m.bound");
+    char name[256], def[256], host[256];
+    snprintf(name, sizeof name, "%s", fname(b));
+    snprintf(def, sizeof def, "%s", S(vpi_get_str(vpiDefName, b)));
+    snprintf(host, sizeof host, "%s", S(vpi_get_str(vpiDefName, H("top.h.bank[1].m"))));
+    vpiHandle it = vpi_iterate(vpiPort, b);
+    vpiHandle port = it ? vpi_scan(it) : NULL;
+    vpi_printf("OM|selected %s def=%s host=%s port=%s decoy=%d\n", name, def, host,
+               S(vpi_get_str(vpiName, port)), H("top.h.bank[0].m.bound") != NULL);
+    return 0;
+}
+static void reg(void) { reg_task("$walk", walk); }
+void (*vlog_startup_routines[])(void) = {reg, 0};
+"###;
+    let prefix =
+        "module probe(input logic[3:0] s);endmodule\nmodule mem;logic[3:0]data=7;endmodule\n";
+    let host = "module host#(parameter N=2,SEL=1);for(genvar g=0;g<N;g++)begin:bank mem m();end endmodule\n";
+    let sources = [
+        format!("{prefix}{host}module binder;localparam SEL=1;bind top.h.bank[SEL].m probe bound(.s(data));endmodule module top;localparam SEL=0;host h();binder cfg();initial begin #1;$walk;$finish;end endmodule"),
+        format!("{prefix}{host}module top;host h();bind top.h.bank[top.h.SEL].m probe bound(.s(data));initial begin #1;$walk;$finish;end endmodule"),
+        format!("{prefix}{host}module top;host#(1) h();defparam h.N=2;bind top.h.bank[1].m probe bound(.s(data));initial begin #1;$walk;$finish;end endmodule"),
+        "interface probe(input logic[3:0]s);endinterface interface mem;logic[3:0]data=7;endinterface interface host;for(genvar g=0;g<2;g++)begin:bank mem m();end endinterface module top;host h();bind top.h.bank[1].m probe bound(.s(data));initial begin #1;$walk;$finish;end endmodule".to_string(),
+        format!("{prefix}{host}module top;host h();if(1)begin:active bind top.h.bank[1].m probe bound(.s(data));end initial begin #1;$walk;$finish;end endmodule"),
+    ];
+    for (index, source) in sources.iter().enumerate() {
+        let got = walk(&format!("vpi_bind_sibling_{index}"), c, source, Some("top"));
+        assert_eq!(
+            got,
+            ["OM|selected top.h.bank[1].m.bound def=probe host=mem port=s decoy=0"],
+            "variant {index}"
+        );
+    }
+}
+
+/// §23.11/§37: equal bind offsets in different files retain both instances
+/// and the source location of each declaration.
+#[test]
+fn design_walk_bind_equal_offsets_across_files() {
+    let c = r###"#include "common.h"
+static PLI_INT32 walk(PLI_BYTE8 *u) {
+    (void)u;
+    const char *names[] = {"top.m.a", "top.m.b"};
+    for (int i=0; i<2; ++i) {
+        vpiHandle b=H(names[i]);
+        vpi_printf("OM|%s file=%s line=%d\n", names[i], S(vpi_get_str(vpiFile,b)), vpi_get(vpiLineNo,b));
+    }
+    return 0;
+}
+static void reg(void) { reg_task("$walk", walk); }
+void (*vlog_startup_routines[])(void) = {reg, 0};
+"###;
+    let got = walk_sources(
+        "vpi_bind_file_offsets",
+        c,
+        &[
+            (
+                "top.sv",
+                "module mem;endmodule module probe;endmodule module top;mem m();initial begin #1;$walk;$finish;end endmodule",
+            ),
+            ("first.sv", "bind top.m probe a();\n"),
+            ("second.sv", "bind top.m probe b();\n"),
+        ],
+        Some("top"),
+    );
+    assert_eq!(
+        got,
+        [
+            "OM|top.m.a file=first.sv line=1",
+            "OM|top.m.b file=second.sv line=1"
+        ]
     );
 }

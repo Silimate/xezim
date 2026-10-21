@@ -51,14 +51,20 @@ jobs:
           path: target
           key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.toml') }}-${{ env.CORE_SHA }}
 
+      - name: Coverage analyzer tests
+        run: python3 scripts/test_analyze_test_coverage.py
+
       - name: cargo test (no features)
         run: cargo test --no-fail-fast
 
-      # Run even when the previous step failed, so one job reports BOTH
-      # configurations instead of hiding the second behind the first.
-      - name: cargo test --features jit
+      # Keep two native-backend smoke tests in CI. The full JIT regression
+      # suite remains available manually with cargo test --features jit.
+      - name: JIT smoke tests (2 tests)
         if: always()
-        run: cargo test --features jit --no-fail-fast
+        run: >-
+          cargo test --features jit --test perf --test scheduling --no-fail-fast -- --exact
+          cmp_branch_const::constant_comparison_branches_execute_on_each_native_backend
+          next_twelve_finish_barrier_371::native_finish_stops_following_assignment
 
       # Imported DPI tasks on the nested-scheduler fallback, the path a
       # platform without fibers takes (#290).

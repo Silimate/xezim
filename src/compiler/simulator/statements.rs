@@ -443,6 +443,60 @@ impl Simulator {
         self.record_ast_loop_heat(iterations);
     }
 
+    /// A selected row of a fixed array of collections has its own store.
+    /// Resolve the declaration before evaluating selectors, so a failed
+    /// probe cannot repeat an index expression's side effects.
+    #[cold]
+    #[inline(never)]
+    fn foreach_selected_collection(&mut self, array: &Expression) -> Option<String> {
+        let selected = match &array.kind {
+            ExprKind::Ident(h) if h.path.iter().any(|p| !p.selects.is_empty()) => {
+                std::borrow::Cow::Owned(Self::hier_select_chain(h, array.span))
+            }
+            ExprKind::Index { .. } => std::borrow::Cow::Borrowed(array),
+            _ => return None,
+        };
+        if let Some(name) = self.class_array_of_coll_key(&selected) {
+            return Some(name);
+        }
+        let mut indices = Vec::new();
+        let mut base = selected.as_ref();
+        while let ExprKind::Index { expr, index } = &base.kind {
+            indices.push(index.as_ref());
+            base = expr;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        let mut name = self.resolve_hier_name(h).into_owned();
+        if let Some(local) = self.dyn_name_lookup(&name) {
+            name = local.to_string();
+        }
+        if self.foreach_dims(&name).is_none()
+            && let Some(scoped) = self.hint_scoped(&name)
+        {
+            name = scoped;
+        }
+        let dims = self.foreach_dims(&name)?;
+        if dims.len() != indices.len() {
+            return None;
+        }
+        let mut first = name.clone();
+        for &(lo, _) in &dims {
+            first.push_str(&format!("[{lo}]"));
+        }
+        if !self.module.associative_arrays.contains_key(&first)
+            && !self.module.dynamic_arrays.contains(&first)
+        {
+            return None;
+        }
+        for index in indices.into_iter().rev() {
+            let value = self.eval_expr(index).to_i64().unwrap_or(0);
+            name.push_str(&format!("[{value}]"));
+        }
+        Some(name)
+    }
+
     pub(super) fn exec_stmt_foreach_inner(
         &mut self,
         _stmt: &Statement,
@@ -627,7 +681,14 @@ impl Simulator {
         // instance-scoped associative array (base may be a 2-seg
         // Ident `b.edges` or a MemberAccess).
         {
-            if let Some(an) = self.expr_assoc_name(array) {
+            let selected = match &array.kind {
+                ExprKind::Index { .. } => self.foreach_selected_collection(array),
+                ExprKind::Ident(h) if h.path.iter().any(|p| !p.selects.is_empty()) => {
+                    self.foreach_selected_collection(array)
+                }
+                _ => None,
+            };
+            if let Some(an) = selected.or_else(|| self.expr_assoc_name(array)) {
                 // §12.7.3 `foreach (m[i, j])` over a DYNAMIC ARRAY OF
                 // (`<h>#m[i].size`), so the two dimensions cannot be
                 // iterated as a rectangle.
@@ -867,6 +928,9 @@ impl Simulator {
                     // of a failed u64 parse clobbering it to 0.
                     let (kw, ks_sign) = self.assoc_index_width_for(&an).unwrap_or((32, false));
                     self.widths.insert(var.name.clone(), kw);
+                    let var_scope = (!an.contains('#'))
+                        .then(|| an.rsplit_once('.').map(|(scope, _)| scope.to_string()))
+                        .flatten();
                     for key in keys {
                         if self.finished {
                             break;
@@ -888,7 +952,7 @@ impl Simulator {
                             v.is_signed = ks_sign;
                             v
                         };
-                        self.set_loop_var(&var.name, kv);
+                        self.set_loop_var_aliased(var_scope.as_deref(), &var.name, kv);
                         self.continue_flag = false;
                         *iterations = iterations.saturating_add(1);
                         self.exec_statement(body);
@@ -1751,11 +1815,8 @@ impl Simulator {
             };
         // §25.9 / IEEE 1800-2023 Table 6-7: a virtual-interface handle
         // defaults to `null`, also when its type is a typedef alias
-        // (`vif_t v;`). The spelled-out `virtual bus_if v;` has no data
-        // width (w0 == 0) and was already zeroed below.
-        let is_vif_handle = !is_class_handle
-            && matches!(data_type, crate::ast::types::DataType::TypeReference { .. })
-            && Self::dt_is_virtual_iface(data_type, &self.module);
+        // (`vif_t v;`) or an explicit `virtual bus_if v` declaration.
+        let is_vif_handle = !is_class_handle && Self::dt_is_virtual_iface(data_type, &self.module);
         let mut default_v = if is_real_type {
             Value::from_f64(0.0)
         } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle || is_vif_handle
@@ -3464,6 +3525,17 @@ impl Simulator {
         {
             return;
         }
+        // §10.4.2 / §25.9: evaluate receiver calls once while capturing an
+        // NBA target, before rebasing it to the interface instance. Re-enter
+        // with those calls pinned so callbacks still fire once below.
+        if let StatementKind::NonblockingAssign { lvalue, rvalue, .. } = &stmt.kind
+            && (Self::recv_chain_call(rvalue).is_some() || Self::recv_chain_call(lvalue).is_some())
+            && let Some(base) = self.pin_stmt_recv_calls(&[rvalue, lvalue])
+        {
+            self.exec_statement(stmt);
+            self.recv_call_memo.truncate(base);
+            return;
+        }
         // §38.36.1 cbStmt, before the statement runs (interpreted code only).
         if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_STMT) != 0 {
             self.vpi_stmt_hook(stmt, false);
@@ -4926,15 +4998,15 @@ impl Simulator {
                         self.stage_ret_struct_colls(e);
                     }
                     self.return_value = Some(v);
-                    // §25.9: a returned VIRTUAL INTERFACE carries only a
-                    // sentinel value; record the instance it is bound to so
-                    // the caller's `vd = getter();` can re-establish the
-                    // alias. Guarded on the name resolving to a REAL
-                    // interface instance, so ordinary returns never match.
+                    // §25.9: return the interface's handle token as well as
+                    // its binding, so a memoized `getter().member` receiver
+                    // can resolve the instance without repeating the call.
                     let vif_free = !self.vif_rhs_possible(e);
                     if let Some(bound) = (!vif_free).then(|| self.resolve_vif_rhs_name(e)).flatten()
                     {
                         if self.is_interface_instance(&bound) {
+                            self.return_value =
+                                Some(Value::from_u64(Self::iface_handle_token(&bound), 32));
                             self.last_vif_return = Some(bound);
                         }
                     }
@@ -5291,62 +5363,48 @@ impl Simulator {
                         }
                         _ => a.expr.clone(),
                     };
-                    // LRM §16.5: a `SvaClocked{clock, body}` body
+                    // LRM §16.5: a `SvaClocked{events, body}` body
                     // registers a clocked site instead of going through
                     // the per-iteration observed-probe path. Dedup by
                     // span_key so re-execution (e.g. inside an always
                     // block) doesn't grow the site list unbounded.
                     // A clockless `assert property` samples on the default
                     // clocking (§14.12).
-                    let clocked: Option<(String, u8, Option<Expression>, Expression)> =
-                        match &resolved_expr.kind {
-                            ExprKind::SvaClocked {
-                                clock,
-                                edge,
-                                iff,
-                                body,
-                            } => {
-                                let clock_signal = match &clock.kind {
-                                    ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
-                                    _ => String::new(),
+                    let clocked: Option<(Vec<EventExpr>, Expression)> = match &resolved_expr.kind {
+                        ExprKind::SvaClocked { events, body } => {
+                            Some((events.clone(), (**body).clone()))
+                        }
+                        _ if a.inferred_clock.is_some() => Some((
+                            vec![a.inferred_clock.clone().unwrap()],
+                            resolved_expr.clone(),
+                        )),
+                        _ => match self.clocking_meta.get("__xz_default_clocking") {
+                            Some((clk, _)) => {
+                                let edge = match self.clocking_edge.get("__xz_default_clocking") {
+                                    Some(EdgeKind::Negedge) => Edge::Negedge,
+                                    _ => Edge::Posedge,
                                 };
-                                Some((
-                                    clock_signal,
-                                    *edge,
-                                    iff.as_deref().cloned(),
-                                    (**body).clone(),
-                                ))
+                                let event = EventExpr {
+                                    expr: Self::hier_ident_expr(
+                                        vec![HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: clk.clone(),
+                                                span: a.span,
+                                            },
+                                            selects: Vec::new(),
+                                        }],
+                                        a.span,
+                                    ),
+                                    edge: Some(edge),
+                                    iff: None,
+                                    span: a.span,
+                                };
+                                Some((vec![event], resolved_expr.clone()))
                             }
-                            // §16.14.6: a procedural assertion without a clock
-                            // of its own takes the one inferred from its
-                            // `always` procedure, ahead of the default clocking.
-                            _ if a.inferred_clock.is_some() => {
-                                let ev = a.inferred_clock.as_ref().unwrap();
-                                let clock_signal = match &ev.expr.kind {
-                                    ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
-                                    _ => String::new(),
-                                };
-                                let edge = match ev.edge {
-                                    Some(crate::ast::stmt::Edge::Negedge) => 1u8,
-                                    Some(crate::ast::stmt::Edge::Edge) => 2u8,
-                                    _ => 0u8,
-                                };
-                                Some((clock_signal, edge, ev.iff.clone(), resolved_expr.clone()))
-                            }
-                            _ => match self.clocking_meta.get("__xz_default_clocking") {
-                                Some((clk, _)) => {
-                                    let clk = clk.clone();
-                                    let edge = match self.clocking_edge.get("__xz_default_clocking")
-                                    {
-                                        Some(EdgeKind::Negedge) => 1u8,
-                                        _ => 0u8,
-                                    };
-                                    Some((clk, edge, None, resolved_expr.clone()))
-                                }
-                                None => None,
-                            },
-                        };
-                    if let Some((clock_signal, edge, iff, body)) = clocked {
+                            None => None,
+                        },
+                    };
+                    if let Some((events, body)) = clocked {
                         let span_key = a.span.start;
                         let here = self.running_instance_scope();
                         let existing = self
@@ -5356,7 +5414,7 @@ impl Simulator {
                         let idx = match existing {
                             Some(i) => i,
                             None => {
-                                self.register_sva_site(a, clock_signal, edge, iff, body);
+                                self.register_sva_site(a, events, body);
                                 self.sva_sites.len() - 1
                             }
                         };
@@ -5796,6 +5854,15 @@ impl Simulator {
             })),
             _ => None,
         };
+        let key_info = match &dims[k] {
+            UD::Associative { data_type, .. } => super::elaborate::assoc_key_type_info(
+                data_type.as_deref(),
+                &self.module.parameters,
+                &self.module.typedefs,
+                &self.module.typedef_types,
+            ),
+            _ => (None, None),
+        };
         let mut elems = Vec::new();
         for sfx in Self::nd_elem_suffixes(&shape) {
             let en = format!("{}{}", name, sfx);
@@ -5807,6 +5874,15 @@ impl Simulator {
             }
             match assoc_key {
                 Some(is_str) => {
+                    if let Some(index) = key_info.0 {
+                        self.module.assoc_index_widths.insert(en.clone(), index);
+                    }
+                    if let Some(key_type) = &key_info.1 {
+                        self.module
+                            .assoc_key_type_names
+                            .insert(en.clone(), key_type.clone());
+                    }
+                    self.module.assoc_elem_widths.insert(en.clone(), w);
                     self.module.associative_arrays.insert(en, is_str);
                 }
                 None => {

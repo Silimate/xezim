@@ -3557,7 +3557,16 @@ impl Simulator {
                         }
                         _ => (None, String::new()),
                     };
-                    if (method == "get" || method == "peek") && !args.is_empty() {
+                    // §25.9: an interface task may also be called `get` or
+                    // `put`. Probing its getter as a mailbox receiver would
+                    // run that function before the actual task dispatch.
+                    let vif_receiver = match recv_expr_opt.as_ref().map(|e| &e.kind) {
+                        Some(ExprKind::Call { func, .. }) => self
+                            .call_return_type(func)
+                            .is_some_and(|dt| self.is_virtual_iface_type(&dt)),
+                        _ => false,
+                    };
+                    if !vif_receiver && (method == "get" || method == "peek") && !args.is_empty() {
                         if let Some(recv) = recv_expr_opt.clone() {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
@@ -3652,7 +3661,7 @@ impl Simulator {
                     // §15.4.1: blocking `mailbox.put(v)` on a FULL bounded
                     // mailbox. Capture the value now, park the producer, and
                     // return; a later get/try_get admits it and resumes here.
-                    if method == "put" && !args.is_empty() {
+                    if !vif_receiver && method == "put" && !args.is_empty() {
                         if let Some(recv) = recv_expr_opt.clone() {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;
@@ -3675,7 +3684,7 @@ impl Simulator {
                     // semaphore. Park until a `put` raises the count enough; the
                     // decrement happens at wake. A get that CAN proceed falls
                     // through to the method handler, which decrements there.
-                    if method == "get" {
+                    if !vif_receiver && method == "get" {
                         if let Some(recv) = recv_expr_opt {
                             let recv_val = self.eval_expr(&recv);
                             let handle = recv_val.to_u64().unwrap_or(0) as usize;

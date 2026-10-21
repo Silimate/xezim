@@ -436,3 +436,67 @@ fn issue_391_string_cast_concat_padding() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
+
+#[test]
+fn issue_427_non_static_vif_elem_null() {
+    let msgs = outputs(
+        include_str!("../issue_cases/non_static_vif_elem_null_427.sv"),
+        100_000,
+    );
+    assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
+}
+
+/// A static virtual-interface member reached through a TYPEDEF ALIAS of its
+/// class never resolved. A static property belongs to the class, not to the
+/// spelling used to reach it, so after `typedef box_c box_t;` `box_t::svif` is
+/// the very same cell as `box_c::svif` — but the vif paths keyed class-scope
+/// cells by the source name, so an alias forked a second cell: writing through
+/// the alias landed where no real-class read looked, and reading through the
+/// alias consulted a cell no write had filled. Both directions read as an
+/// unbound vif.
+#[test]
+fn issue_430_static_vif_typedef_alias() {
+    let msgs = outputs(
+        include_str!("../issue_cases/static_vif_typedef_alias_430.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+
+/// A static virtual-interface member read as a VALUE yielded a placeholder, not
+/// the bound interface handle. Member access through it worked
+/// (`S::sa.count` read the right interface), but `==`/`!=` and use as an actual
+/// argument did not see the binding: two statics bound to two different
+/// interfaces always compared EQUAL, and a static never compared equal to the
+/// interface it was bound to. A class-scope read reaches the comparison
+/// classifier as `Ident([Holder]).sa`, and `eval_ident_handle` cannot name a
+/// class at all, so the operand classified as unclassifiable and fell through
+/// to value semantics.
+#[test]
+fn issue_428_static_vif_handle_value() {
+    let msgs = outputs(
+        include_str!("../issue_cases/static_vif_handle_value_428.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+
+/// A BARE read of a static virtual-interface member reported null while bound.
+/// Inside an instance method the bare name was looked up only in the per-object
+/// table, which cannot hold a static cell; inside a STATIC method there is no
+/// object at all, so the operand fell out of the classifier entirely; and
+/// `this.svif` parses as `MemberAccess { expr: This, .. }`, which neither the
+/// one-segment ident arm nor `chain_handle` (Ident chains only) could name.
+/// Member access through the same static was always correct, which is why only
+/// the scalar/null reads failed.
+#[test]
+fn issue_432_static_vif_instance_method() {
+    let msgs = outputs(
+        include_str!("../issue_cases/static_vif_instance_method_432.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}

@@ -1495,9 +1495,12 @@ impl Simulator {
         let saved_scope = self.current_scope.clone();
         let saved_hint = self.name_resolve_hint.borrow_mut().take();
         let saved_activation = self.activation_scope.borrow_mut().take();
-        // Not a comb/edge block either: the time-0 settle's last block scope
-        // must not name these sites' instance (`running_instance_scope`).
+        // §21.2.1.7: a declarative assertion is not a comb/edge block, so the
+        // scope the time-0 settle last recorded must not leak into its
+        // registration (and so into the site's `%m` chain / action), as a
+        // process run clears it (see `run_process`).
         let saved_block_scope = std::mem::take(&mut self.m_block_scope);
+        let saved_block_scope_id = std::mem::replace(&mut self.m_block_scope_id, u32::MAX);
         let saved_block_active = std::mem::replace(&mut self.m_block_active, false);
         for ib in initial_blocks
             .extract_if(.., |ib| declarative(&ib.stmt))
@@ -1522,6 +1525,7 @@ impl Simulator {
         *self.name_resolve_hint.borrow_mut() = saved_hint;
         *self.activation_scope.borrow_mut() = saved_activation;
         self.m_block_scope = saved_block_scope;
+        self.m_block_scope_id = saved_block_scope_id;
         self.m_block_active = saved_block_active;
         for ib in early
             .into_iter()

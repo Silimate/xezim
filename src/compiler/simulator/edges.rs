@@ -704,9 +704,11 @@ impl Simulator {
                 break;
             }
         }
-        if edge_code.is_none()
-            && let Some(si) = self.active_sva_site
-        {
+        let implicit_site = edge_code
+            .is_none()
+            .then_some(self.active_sva_site)
+            .flatten();
+        if let Some(si) = implicit_site {
             let site = &self.sva_sites[si];
             edge_code = Some(match site.edge {
                 1 => 2,
@@ -716,7 +718,8 @@ impl Simulator {
             clk_id = self
                 .signal_name_to_id
                 .get(site.clock_signal.as_str())
-                .copied();
+                .copied()
+                .or(Some(usize::MAX));
         }
         if edge_code.is_none() {
             // Procedural context + default clocking: infer from it.
@@ -748,7 +751,14 @@ impl Simulator {
         let clk_id = clk_id?;
         let operand = args.first()?.clone();
         let site = expr.span.start;
-        let widx = self.sampled_watch_for(site, &operand, edge_code.unwrap_or(0), clk_id, n)?;
+        let widx = self.sampled_watch_for(
+            site,
+            &operand,
+            edge_code.unwrap_or(0),
+            clk_id,
+            n,
+            implicit_site,
+        )?;
         if let ExprKind::SystemCall { name, .. } = &expr.kind {
             if name == "$past" {
                 self.sampled_watches[widx].gate = args
@@ -931,10 +941,13 @@ impl Simulator {
     pub(super) fn sva_expr_names(e: &Expression, out: &mut HashSet<String>) {
         Self::walk_operands(e, &mut |x| match &x.kind {
             ExprKind::Ident(h) => out.extend(h.path.iter().map(|s| s.name.name.clone())),
-            ExprKind::SvaClocked { body, iff, .. } => {
+            ExprKind::SvaClocked { events, body } => {
                 Self::sva_expr_names(body, out);
-                if let Some(g) = iff {
-                    Self::sva_expr_names(g, out);
+                for event in events {
+                    Self::sva_expr_names(&event.expr, out);
+                    if let Some(g) = &event.iff {
+                        Self::sva_expr_names(g, out);
+                    }
                 }
             }
             _ => {}
@@ -1476,6 +1489,7 @@ impl Simulator {
         edge_code: u8,
         clk_id: usize,
         depth: usize,
+        clock_site: Option<usize>,
     ) -> Option<usize> {
         if let Some(i) = Self::sampled_site_lookup(
             &self.sampled_watch_site,
@@ -1504,11 +1518,11 @@ impl Simulator {
         // a declaration-initialised operand (`logic [7:0] v = 8'hA5;`) is
         // never written, so its first sample read a stale x. Seed the
         // snapshot from the current value on registration.
-        if !self.edge_signal_ids.contains(&clk_id) {
+        if clk_id != usize::MAX && !self.edge_signal_ids.contains(&clk_id) {
             self.edge_signal_ids.push(clk_id);
             self.seed_prev_from_current(clk_id);
         }
-        if !self.preponed_ids.contains(&clk_id) {
+        if clk_id != usize::MAX && !self.preponed_ids.contains(&clk_id) {
             self.preponed_ids.push(clk_id);
         }
         if let Some(sid) = sig_id {
@@ -1563,10 +1577,18 @@ impl Simulator {
                 }
             }
         };
+        let clock_events = clock_site
+            .map(|si| &self.sva_sites[si].events)
+            .filter(|events| {
+                events.len() != 1 || events[0].signal.is_none() || events[0].event.iff.is_some()
+            })
+            .cloned()
+            .unwrap_or_default();
         let i = self.sampled_watches.len();
         self.sampled_watches.push(SampledWatch {
             clk_id,
             edge,
+            clock_events,
             sig_id,
             expr: operand.clone(),
             hist: std::collections::VecDeque::new(),
@@ -1614,7 +1636,15 @@ impl Simulator {
                 let w = &self.sampled_watches[i];
                 (w.clk_id, w.edge)
             };
-            if !self.check_edge_id(clk_id, edge) {
+            let fired = if self.sampled_watches[i].clock_events.is_empty() {
+                self.check_edge_id(clk_id, edge)
+            } else {
+                let mut events = std::mem::take(&mut self.sampled_watches[i].clock_events);
+                let fired = self.sva_events_fired(&mut events);
+                self.sampled_watches[i].clock_events = events;
+                fired
+            };
+            if !fired {
                 continue;
             }
             let mut saved = self.sampled_watches[i].slot_values.clone();

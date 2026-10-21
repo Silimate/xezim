@@ -518,6 +518,9 @@ impl Simulator {
             match (&l_assoc, &r_assoc) {
                 (Some(d), None) => self.plain_assoc_operand(rvalue).map(|s| (d.clone(), s)),
                 (None, Some(s)) => self.plain_assoc_operand(lvalue).map(|d| (d, s.clone())),
+                (None, None) => self
+                    .plain_assoc_operand(lvalue)
+                    .and_then(|d| Some((d, self.plain_assoc_operand(rvalue)?))),
                 _ => None,
             }
         };

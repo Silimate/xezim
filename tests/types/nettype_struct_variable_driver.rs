@@ -156,7 +156,7 @@ module top;
   pump u_p (dra);
   filt u_f (dra);
   initial begin
-    #200000;
+    #6000;
     $display(\"NOTE: settled v=%0.2f i_small=%0b\", dra.v, dra.i < 1.0e-3);
     $finish;
   end

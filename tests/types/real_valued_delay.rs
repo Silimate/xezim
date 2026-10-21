@@ -15,10 +15,10 @@ fn count_toggles(delay: &str) -> u64 {
 `timescale 1ps/1ps
 module t;
   reg clk; real period = 41666.0; int n = 0;
-  initial begin clk = 0; forever {} clk = ~clk; end
-  initial begin repeat (6) @(posedge clk) n++; done = 1; end
-  initial #2000000 done = 1;   // watchdog
   bit done = 0;
+  initial begin clk = 0; forever {} clk = ~clk; end
+  initial begin repeat (6) @(posedge clk) n++; done = 1; $finish; end
+  initial #2000000 begin done = 1; $finish; end   // watchdog
 endmodule
 "#,
         delay

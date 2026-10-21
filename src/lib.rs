@@ -674,7 +674,7 @@ fn walk_module_static_inits(
     }
 }
 
-/// Re-issue module-scope static variable initializers that call
+/// Re-issue module/interface-scope static variable initializers that call
 /// simulation-time system functions (which elaboration const-folded to
 /// 0/"") as time-0 `static_init_blocks` assignments — IEEE 1800-2017 §6.21.
 pub fn defer_static_syscall_inits(
@@ -684,6 +684,19 @@ pub fn defer_static_syscall_inits(
     let mut out: Vec<elaborate::InitialBlock> = Vec::new();
     if let Some(SourceDefinition::Module(top)) = defs.get(&elab.name) {
         walk_module_static_inits(&top.items, defs, elab, "", 0, &mut out);
+    }
+    // §6.21 / §25.3: interface variables have static lifetime too. The module
+    // walk above only descends through module definitions, so it never sees
+    // an interface's initializers. Use the elaborated instance paths here:
+    // they include generated and arrayed interfaces, with the actual scope
+    // needed by `%m`, and exclude inactive generate branches.
+    if let Some(SourceDefinition::Interface(top)) = defs.get(&elab.name) {
+        walk_module_static_inits(&top.items, defs, elab, "", 0, &mut out);
+    }
+    for inst in &elab.instances {
+        if let Some(SourceDefinition::Interface(iface)) = defs.get(&inst.def_name) {
+            walk_module_static_inits(&iface.items, defs, elab, &inst.path, 0, &mut out);
+        }
     }
     // Package-scope variables too (`string n = $sformatf("%m.notifier")` in
     // UVM's polling package). The assignment runs inside a block named with

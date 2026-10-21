@@ -706,6 +706,7 @@ impl Simulator {
                         cd.assoc_properties.insert(pname, is_string_key);
                     }
                     Some(UD::Queue { max_size, .. }) => {
+                        cd.queue_property_names.insert(pname.clone());
                         let cap = max_size
                             .as_ref()
                             .and_then(|e| {

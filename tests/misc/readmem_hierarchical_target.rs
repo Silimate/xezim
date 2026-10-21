@@ -170,9 +170,8 @@ endmodule
     );
 }
 
-/// A target that names no memory rejects the design at elaboration, as on the
-/// reference simulator: `r.nomem` is a hierarchical name that does not resolve
-/// (IEEE 1800-2023 §23.8).
+/// A target that names no memory rejects the design at elaboration: `r.nomem`
+/// is a hierarchical name that does not resolve (IEEE 1800-2023 §23.8).
 #[test]
 fn readmem_rejects_missing_target() {
     let dir = scratch("missing");

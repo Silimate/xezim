@@ -2093,12 +2093,12 @@ impl Simulator {
             );
         }
         // §38.36.3: a value a VPI client writes before time 0 (from
-        // cbStartOfSimulation; cocotb drives its first values and starts its
-        // clocks there) is processed in the time-0 slot, like one written at
-        // time 0. With nothing else due at time 0 the loop used to skip that
-        // slot, so the combinational logic read the old value until the next
-        // one and toggle coverage never saw the written value as a baseline.
-        // `start` holds the loop at time 0 until that slot has run.
+        // cbStartOfSimulation, where cocotb starts its first test, so its
+        // `Immediate` writes there) is processed in the time-0 slot, like one
+        // written at time 0. With nothing else due at time 0 the loop used to
+        // skip that slot, so the combinational logic read the old value until
+        // the next one and toggle coverage never saw the written value as a
+        // baseline. `start` holds the loop at time 0 until that slot has run.
         while !self.finished && iters < max_iters {
             iters += 1;
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
@@ -2506,8 +2506,8 @@ impl Simulator {
             }
         }
         // The last slot ends too, unless `$finish` ended it: §20.2 stops the
-        // run inside that slot, and the reference simulator counts no toggle
-        // there (`no_slot_end_flush_after_finish`).
+        // run inside that slot, and toggle coverage counts nothing written
+        // there, as before.
         if !self.finished {
             self.dump_slot_end();
         }

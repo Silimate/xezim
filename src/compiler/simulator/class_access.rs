@@ -1212,15 +1212,13 @@ impl Simulator {
                 this.signal_name_to_id.contains_key(name) || check_known_or_signal(name, this)
             };
             // Does scope path `p` ("" = top) instantiate a module named `d`?
-            // A per-instance-bind specialization clone ("target__bind0")
-            // must still answer to its ORIGINAL module name, or upward
-            // references from inside the bound module stop resolving.
+            // §23.11: bound instances preserve their hosts' source
+            // definition names, including names that contain suffixes.
             let def_matches = |p: &str, d: &str, this: &Self| -> bool {
                 if p.is_empty() {
-                    return xezim_core::bind_spec_base(&this.module.name) == d;
+                    return this.module.name == d;
                 }
-                this.instance_by_path(p)
-                    .is_some_and(|i| xezim_core::bind_spec_base(&i.def_name) == d)
+                this.instance_by_path(p).is_some_and(|i| i.def_name == d)
             };
             let hint_owned = self.name_resolve_hint.borrow().clone();
             // Walk from the stable executing scope first; the transient

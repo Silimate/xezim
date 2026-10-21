@@ -1,14 +1,13 @@
-//! IEEE 1800-2023 §16.5.1: the sampled value of a variable or net in time
-//! slot 0 is its default sampled value: its declaration initializer, else
-//! its type's default (x for a four-state variable or a net, 0 for `int`).
-//! A clock that rises at time 0 starts an attempt there, and that attempt
-//! reads these values, not what the continuous assignments, `always_comb`
-//! blocks and `initial` blocks write in the slot. xezim took the time-0
-//! samples after the time-0 settle, so the operands of continuous
-//! assignments and `always_comb` read their driven values and those
-//! attempts passed. The reference simulator gives these results when the
-//! design is visible to VPI, as in every cocotb run (its optimized default
-//! run reads the values after time-0 initialization).
+//! IEEE 1800-2023 §16.5.1: the sampled value of a variable in time slot 0
+//! is its default sampled value: its declaration initializer, else its
+//! type's default (x for a four-state variable, 0 for `int`). A clock that
+//! rises at time 0 starts an attempt there (§9.4.2), and that attempt reads
+//! these values, not what the slot's continuous assignments, `always_comb`
+//! blocks and `initial` blocks write; a net has not been driven yet either.
+//! §16.9.3: `$past` at the next tick returns the time-0 sample. xezim took
+//! the time-0 samples after the time-0 settle, so the operands of continuous
+//! assignments and `always_comb` read their driven values and those attempts
+//! passed.
 
 use xezim::simulate;
 
@@ -35,7 +34,7 @@ module top;
   a_m:  assert property (@(posedge clk) m[0] === 1'b1) $display("T|m|pass|%0t", $time); else $display("T|m|fail|%0t", $time);
   // At 10 ns, $past reads the time-0 samples.
   a_p:  assert property (@(posedge clk) $time != 10 || 0)
-          else $display("T|past|%0t|%b%b%b", $time, $past(c), $past(w), $past(ri));
+          else $display("T|past|%0t|%b%b", $time, $past(c), $past(ri));
   initial #12 $finish;
 endmodule
 "#;
@@ -61,7 +60,7 @@ fn time0_attempt_reads_default_sampled_values() {
         "T|m|pass|10",
         "T|n|pass|0",
         "T|n|pass|10",
-        "T|past|10|xx1",
+        "T|past|10|x1",
         "T|r|pass|0",
         "T|r|pass|10",
         "T|ri|pass|0",

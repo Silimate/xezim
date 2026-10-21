@@ -57,6 +57,8 @@ mod foreach_in_inlined_child;
 mod foreach_over_submodule_array;
 #[path = "hierarchy/genblk_dotted_ref_nettype_none.rs"]
 mod genblk_dotted_ref_nettype_none;
+#[path = "hierarchy/genblk_cont_assign.rs"]
+mod genblk_cont_assign;
 #[path = "hierarchy/generate_label_hier_roots.rs"]
 mod generate_label_hier_roots;
 #[path = "hierarchy/generate_scope_names.rs"]
@@ -258,3 +260,48 @@ mod next_twelve_positional_ports_358;
 
 #[path = "hierarchy/generate_names_380.rs"]
 mod next_rest_generate_names_380;
+
+#[path = "hierarchy/package_virtual_interfaces.rs"]
+mod package_virtual_interfaces;
+
+#[path = "hierarchy/vif_associative_bindings.rs"]
+mod vif_associative_bindings;
+
+#[path = "hierarchy/vif_returned_receivers.rs"]
+mod vif_returned_receivers;
+
+#[path = "hierarchy/vif_specialized_collections.rs"]
+mod vif_specialized_collections;
+
+#[path = "hierarchy/vif_null_binding_copies.rs"]
+mod vif_null_binding_copies;
+
+#[path = "hierarchy/bind_generate_paths.rs"]
+mod bind_generate_paths;
+
+#[path = "hierarchy/signed_generate_instances.rs"]
+mod signed_generate_instances;
+
+#[path = "hierarchy/vif_sibling_regressions.rs"]
+mod vif_sibling_regressions;
+
+#[path = "hierarchy/bind_sibling_regressions.rs"]
+mod bind_sibling_regressions;
+
+#[path = "hierarchy/vif_sibling_neighbors.rs"]
+mod vif_sibling_neighbors;
+
+#[path = "hierarchy/bind_sibling_neighbors.rs"]
+mod bind_sibling_neighbors;
+
+#[path = "hierarchy/interface_static_initializers.rs"]
+mod interface_static_initializers;
+
+#[path = "hierarchy/bare_bind_targets.rs"]
+mod bare_bind_targets;
+
+#[path = "hierarchy/pr_core_followups.rs"]
+mod pr_core_followups;
+
+#[path = "hierarchy/interface_array_slices.rs"]
+mod interface_array_slices;

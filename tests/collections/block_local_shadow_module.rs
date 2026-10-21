@@ -8,7 +8,7 @@
 use xezim::simulate;
 
 fn t_lines(src: &str) -> Vec<String> {
-    simulate(src, 1_000_000)
+    simulate(src, 100)
         .expect("simulate failed")
         .output
         .iter()

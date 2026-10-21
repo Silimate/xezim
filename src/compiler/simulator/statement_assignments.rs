@@ -2566,15 +2566,21 @@ impl Simulator {
         // §7.9.9 / §7.10.2.5: a whole associative-array copy with a plain
         // variable on one side, or a popped associative element (see
         // `assoc_copy_with_plain_side`).
-        if (formal_operand
+        if !self.module.associative_arrays.is_empty()
+            && (formal_operand
             || l_assoc.is_some() != r_assoc.is_some()
+            // §7.9.9: plain associative assignment replaces all entries too.
+            || (l_assoc.is_none() && r_assoc.is_none()
+                && matches!(&lvalue.kind, ExprKind::Ident(h) if h.path.len() == 1
+                    && self.module.associative_arrays.contains_key(
+                        self.dyn_name_lookup(&h.path[0].name.name).unwrap_or(&h.path[0].name.name)))
+                && matches!(&rvalue.kind, ExprKind::Ident(_)))
             || matches!(
                 &rvalue.kind,
                 ExprKind::Call { func, args }
                     if args.is_empty()
                         && self.callee_method_name_is(func, |m| matches!(m, "pop_front" | "pop_back"))
             ))
-            && !self.module.associative_arrays.is_empty()
             && self.assoc_copy_with_plain_side(lvalue, rvalue, lf, rf, &l_assoc, &r_assoc)
         {
             return;

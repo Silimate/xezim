@@ -243,7 +243,7 @@ impl Simulator {
         rvalue: &Expression,
     ) -> bool {
         let Some(lkey) = self.event_ref_key(lvalue) else {
-            return false;
+            return self.try_class_event_handle_assign(lvalue, rvalue);
         };
         if matches!(rvalue.kind, ExprKind::Null) {
             self.event_aliases
@@ -273,6 +273,77 @@ impl Simulator {
             return true;
         }
         false
+    }
+
+    /// §15.5.5 for a class-property event (`seqr.tick = mon.tick`, or `= null`).
+    /// Module-scope events are handled by `try_event_handle_assign` before
+    /// this runs. A non-event property returns false so the value assign
+    /// still copies it.
+    fn try_class_event_handle_assign(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> bool {
+        let Some(linst) = self.class_event_assign_key(lvalue) else {
+            return false;
+        };
+        if matches!(rvalue.kind, ExprKind::Null) {
+            self.instance_event_aliases.insert(linst, None);
+            return true;
+        }
+        let Some(rinst) = self.class_event_assign_key(rvalue) else {
+            return false;
+        };
+        match self.canonical_instance_event(rinst) {
+            Some(target) if target == linst => {
+                self.instance_event_aliases.remove(&linst);
+            }
+            Some(target) => {
+                self.instance_event_aliases.insert(linst, Some(target));
+            }
+            None => {
+                self.instance_event_aliases.insert(linst, None);
+            }
+        }
+        true
+    }
+
+    /// `(handle, field)` of a class property declared `event`, or None.
+    /// Select-free only: an index with a side effect must not be evaluated
+    /// twice when this probe misses and the value assign runs next.
+    pub(super) fn class_event_assign_key(&mut self, e: &Expression) -> Option<(usize, String)> {
+        if !Self::select_free_event_expr(e) {
+            return None;
+        }
+        let key = if let ExprKind::Ident(h) = &e.kind {
+            if h.path.len() == 1 {
+                self.resolve_this_event_field(&h.path[0].name.name)?
+            } else {
+                self.expr_instance_prop_field_general(e)?
+            }
+        } else {
+            self.expr_instance_prop_field_general(e)?
+        };
+        self.class_prop_declared_event(key.0, &key.1)
+            .then_some(key)
+    }
+
+    fn select_free_event_expr(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+            ExprKind::MemberAccess { expr, .. } => Self::select_free_event_expr(expr),
+            ExprKind::This => true,
+            _ => false,
+        }
+    }
+
+    /// Chase `instance_event_aliases` to the synchronization object `key`
+    /// currently names. `None` means the handle was assigned null.
+    pub(super) fn canonical_instance_event(
+        &self,
+        key: (usize, String),
+    ) -> Option<(usize, String)> {
+        canonical_instance_event_key(&self.instance_event_aliases, key)
     }
 
     /// Truth of a `wait` condition. A bare named-event operand (`wait(ev)`) is
@@ -323,7 +394,12 @@ impl Simulator {
             }
         }
         // `h.ce.triggered` / `this.ce.triggered` — a per-instance class event.
+        // Follow a handle assignment so the alias and the target share one
+        // `.triggered` bit. A null handle reads 0.
         if let Some(k) = self.expr_handle_event_field(e) {
+            let Some(k) = self.canonical_instance_event(k) else {
+                return Some(false);
+            };
             let stamp = Self::instance_event_stamp_key(&k);
             if self.event_triggered_time.get(stamp.as_str()) == Some(&now) {
                 return Some(true);
@@ -514,6 +590,36 @@ impl Simulator {
         true
     }
 
+    /// `class_prop_is_event` treats a missing type as an event. Assignment
+    /// must not: an untyped or integral property is a value, and consuming
+    /// the statement would drop the copy. True only for an explicit `event`.
+    pub(super) fn class_prop_declared_event(&self, handle: usize, field: &str) -> bool {
+        let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
+            return false;
+        };
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if let Some(dt) = cd.property_types.get(field) {
+                return matches!(
+                    dt,
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Event,
+                        ..
+                    }
+                );
+            }
+            cur = cd.extends.clone();
+        }
+        false
+    }
+
     /// `@prop` / `@(h.prop)` on a NON-event class property (§9.4.2: any
     /// change of the expression value triggers). Returns a condition that
     /// becomes true when the property differs from its value right now, to
@@ -640,8 +746,17 @@ impl Simulator {
         if matches!(e.kind, ExprKind::Null) {
             return Some(Self::EVENT_NULL_KEY.to_string());
         }
-        let k = self.event_ref_key(e)?;
-        Some(self.resolve_event_key(&k))
+        if let Some(k) = self.event_ref_key(e) {
+            return Some(self.resolve_event_key(&k));
+        }
+        // Class-property events have no module-scope name. Compare the
+        // canonical object, so `seqr.tick == mon.tick` is 1 after the
+        // handle assignment and 0 before it.
+        let k = self.class_event_assign_key(e)?;
+        match self.canonical_instance_event(k) {
+            Some(c) => Some(Self::instance_event_stamp_key(&c)),
+            None => Some(Self::EVENT_NULL_KEY.to_string()),
+        }
     }
 
     /// `.triggered` stamp key for a per-instance class event. Instance events
@@ -1014,26 +1129,52 @@ impl Simulator {
     /// the same slot's remaining active region — mirroring how a blocking
     /// `->e` resumes an `@e` waiter for a module-scope named event.
     pub(super) fn fire_instance_event(&mut self, key: (usize, String)) {
+        // §15.5.5: `-> seqr.tick` and `-> mon.tick` are one object after
+        // `seqr.tick = mon.tick`. A null handle triggers nothing.
+        let Some(canon) = self.canonical_instance_event(key.clone()) else {
+            return;
+        };
         let now = self.time;
         // §15.5.3: `<h>.<ev>.triggered` must read 1 for the rest of this slot.
         // Instance events have no backing signal, so stamp the same table the
         // name-keyed path uses, under a synthetic per-instance key.
-        let stamp = Self::instance_event_stamp_key(&key);
+        let stamp = Self::instance_event_stamp_key(&canon);
         self.event_triggered_time.insert(stamp, now);
+        if canon != key {
+            let raw = Self::instance_event_stamp_key(&key);
+            self.event_triggered_time.insert(raw, now);
+        }
         if !self.cg_instance_event_waiters.is_empty() {
-            if let Some(w) = self.cg_instance_event_waiters.get(&key).cloned() {
+            if let Some(w) = self.cg_instance_event_waiters.get(&canon).cloned() {
                 self.sample_event_covergroups(w);
+            }
+            if canon != key {
+                if let Some(w) = self.cg_instance_event_waiters.get(&key).cloned() {
+                    self.sample_event_covergroups(w);
+                }
             }
         }
         let mut woken = Vec::new();
-        self.instance_event_waiters.retain(|w| {
-            if w.key.contains(&key) {
-                woken.push((w.pid, w.continuation.clone()));
-                false
-            } else {
-                true
-            }
-        });
+        if self.instance_event_aliases.is_empty() {
+            self.instance_event_waiters.retain(|w| {
+                if w.key.contains(&canon) {
+                    woken.push((w.pid, w.continuation.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        } else {
+            let aliases = self.instance_event_aliases.clone();
+            self.instance_event_waiters.retain(|w| {
+                if instance_waiter_sees(&aliases, &w.key, &canon) {
+                    woken.push((w.pid, w.continuation.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         for (pid, cont) in woken {
             self.event_queue.schedule(now, pid, cont);
         }
@@ -1233,5 +1374,38 @@ impl Simulator {
             return Some(Value::from_f64(val));
         }
         None
+    }
+}
+
+/// Follow a class-event handle chain. `None` in the map is a null handle.
+/// The hop cap matches `resolve_event_key_ref`.
+fn canonical_instance_event_key(
+    aliases: &HashMap<(usize, String), Option<(usize, String)>>,
+    key: (usize, String),
+) -> Option<(usize, String)> {
+    let mut cur = key;
+    for _ in 0..16 {
+        match aliases.get(&cur) {
+            Some(None) => return None,
+            Some(Some(next)) if next != &cur => cur = next.clone(),
+            _ => return Some(cur),
+        }
+    }
+    Some(cur)
+}
+
+/// A waiter matches a trigger when any of its events names the same object
+/// as `fired` after handle assignment.
+fn instance_waiter_sees(
+    aliases: &HashMap<(usize, String), Option<(usize, String)>>,
+    keys: &InstanceEventKeys,
+    fired: &(usize, String),
+) -> bool {
+    let sees = |k: &(usize, String)| {
+        canonical_instance_event_key(aliases, k.clone()) == Some(fired.clone())
+    };
+    match keys {
+        InstanceEventKeys::One(k) => sees(k),
+        InstanceEventKeys::Any(ks) => ks.iter().any(sees),
     }
 }

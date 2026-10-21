@@ -1295,6 +1295,13 @@ impl Simulator {
         // §25.9: a static virtual-interface property binds by name before
         // any value path below stores (and returns).
         self.bind_static_vif(lvalue, rvalue);
+        // §15.5.5: `event_var = other_event / null` re-binds the HANDLE.
+        // This has to precede member assignment: `seqr.tick = mon.tick` is
+        // a class-property write, and the value path would store 0 and
+        // leave the two events as distinct synchronization objects.
+        if self.try_event_handle_assign(lvalue, rvalue) {
+            return;
+        }
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
         {
             return;
@@ -1314,11 +1321,6 @@ impl Simulator {
             && self.try_struct_aggregate_assign(stmt, lvalue, rvalue)
         {
             self.settle_after_proc_write();
-            return;
-        }
-        // §15.5.5: `event_var = other_event / null / q[i]` re-binds
-        // the HANDLE, it does not copy a value.
-        if self.try_event_handle_assign(lvalue, rvalue) {
             return;
         }
         // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)

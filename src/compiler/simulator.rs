@@ -7642,6 +7642,12 @@ pub struct Simulator {
     /// `EVENT_NULL_KEY` marks a null handle. Trigger/`.triggered`/wait_order
     /// all chase this map to the canonical key first.
     event_aliases: HashMap<String, String>,
+    /// §15.5.5: a class-property `event` is a handle. `seqr.tick = mon.tick`
+    /// stores the canonical `(handle, field)` the left-hand property now
+    /// names. `None` is a null handle. Trigger, wait, `.triggered`, and
+    /// `==` chase this; the raw `(this, field)` key is not a separate
+    /// synchronization object once it has been assigned.
+    instance_event_aliases: HashMap<(usize, String), Option<(usize, String)>>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that

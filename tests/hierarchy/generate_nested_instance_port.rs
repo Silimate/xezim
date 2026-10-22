@@ -57,3 +57,79 @@ endmodule
         "output: {msgs:?}"
     );
 }
+
+/// The same relative port, read from a concurrent assertion rather than an
+/// initial block. The property walk has to see `tag_bank.key_i` or the
+/// inner generate scopes never extend the outer prefix, and the consequent
+/// binds the module-level `vi` instead of the port.
+#[test]
+fn relative_port_read_in_nested_generate_assertion() {
+    let src = r#"
+module prim_like (
+  input logic clk_i,
+  input logic key_valid_i,
+  input logic [31:0] key_i
+);
+endmodule
+module top;
+  logic clk = 0;
+  logic rst_ni = 0;
+  logic vi = 0;
+  logic [31:0] ki = 0;
+  logic [31:0] kq;
+  logic vq;
+  always #1 clk = ~clk;
+  always_ff @(posedge clk or negedge rst_ni) begin
+    if (!rst_ni) begin
+      kq <= 32'h1;
+      vq <= 1'b0;
+    end else begin
+      if (vi) kq <= ki;
+      vq <= vi;
+    end
+  end
+  if (1) begin : gen_rams
+    for (genvar way = 0; way < 2; way++) begin : gen_rams_inner
+      if (1) begin : gen_scramble_rams
+        prim_like tag_bank (
+          .clk_i(clk),
+          .key_valid_i(vq),
+          .key_i(kq)
+        );
+        logic [31:0] sampled;
+        always_ff @(posedge clk or negedge rst_ni) begin
+          if (!rst_ni) sampled <= 'x;
+          else if (vi) sampled <= ki;
+        end
+        assert property (@(posedge clk) disable iff (!rst_ni)
+          vi |-> ##[0:10] tag_bank.key_valid_i && (tag_bank.key_i == sampled))
+        else $display("FAIL hier %0d", way);
+      end
+    end
+  end
+  initial begin
+    repeat (2) @(posedge clk);
+    @(negedge clk);
+    rst_ni = 1;
+    @(negedge clk);
+    ki = 32'h1111;
+    vi = 1;
+    @(negedge clk);
+    vi = 0;
+    repeat (12) @(posedge clk);
+    $display("DONE");
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("sim");
+    let msgs = messages(&sim);
+    assert!(
+        msgs.iter().any(|m| m == "DONE"),
+        "simulation did not finish; output: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().all(|m| !m.starts_with("FAIL")),
+        "output: {msgs:?}"
+    );
+}

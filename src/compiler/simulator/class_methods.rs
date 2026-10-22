@@ -204,6 +204,7 @@ impl Simulator {
             let mut assoc_props: HashSet<String> = HashSet::default();
             let mut string_props: HashSet<String> = HashSet::default();
             let mut static_or_param: HashSet<String> = HashSet::default();
+            let mut constant_arrays: HashSet<String> = HashSet::default();
             let mut string_methods: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
                 for (name, cm) in cd.methods.iter() {
@@ -237,12 +238,22 @@ impl Simulator {
                         }
                     }
                 }
+                constant_arrays.extend(cd.array_properties.keys().filter(|name| {
+                    cd.param_order.contains(*name)
+                        || (cd.properties.get(*name).is_some_and(|s| s.is_const)
+                            && !cd.property_order.contains(*name))
+                }).cloned());
+                constant_arrays.extend(cd.static_fixed_arrays.iter().map(|(name, ..)| name.clone()));
                 static_methods.extend(cd.static_methods.iter().cloned());
                 params.extend(cd.type_param_names.iter().cloned());
                 params.extend(cd.param_order.iter().cloned());
                 assoc_props.extend(cd.assoc_properties.keys().cloned());
                 static_or_param.extend(cd.static_properties.iter().cloned());
                 static_or_param.extend(cd.param_defaults.iter().map(|(n, _)| n.clone()));
+                static_or_param.extend(cd.array_properties.keys().filter(|name| {
+                    cd.properties.get(*name).is_some_and(|s| s.is_const)
+                        && !cd.property_order.contains(*name)
+                }).cloned());
             }
             let mut subroutine_suffixes: HashSet<String> = HashSet::default();
             for k in self.module.functions.keys().chain(self.module.tasks.keys()) {
@@ -350,6 +361,7 @@ impl Simulator {
                 assoc_props,
                 string_props,
                 static_or_param,
+                constant_arrays,
             }
         })
     }
@@ -1206,6 +1218,11 @@ impl Simulator {
         args: &[Expression],
     ) -> Value {
         use crate::ast::decl::ClassMethodKind;
+        if method_name == "new"
+            && let Some(value) = self.try_implicit_class_constructor(handle, start_class, args)
+        {
+            return value;
+        }
         // Re-entrant registration guard: a factory `register(obj)` whose
         // body calls `obj.get_type_name()` can trigger a parameterized class
         // specialization's lazy static init, which re-enters
@@ -1593,6 +1610,11 @@ impl Simulator {
                             || self.module.arrays_2d.contains_key(&port.name.name)
                             || self.module.arrays_nd.contains_key(&port.name.name);
                         if let Some(info) = self.bind_array_arg(port, actual) {
+                            // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                            locals.insert(
+                                format!("\u{1}array_formal:{}", port.name.name),
+                                Value::zero(1),
+                            );
                             if matches!(
                                 port.direction,
                                 PortDirection::Output | PortDirection::Inout | PortDirection::Ref
@@ -2041,6 +2063,24 @@ impl Simulator {
                 // run against a partially-constructed object.
                 if method_name == "new" {
                     self.ctor_class_stack.push((handle, cname.clone()));
+                    if self
+                        .pending_class_initializers
+                        .get(&handle)
+                        .is_some_and(|classes| {
+                            classes.iter().any(|cd| {
+                                cd.name == *cname
+                                    || self
+                                        .module
+                                        .classes
+                                        .get(cname.as_str())
+                                        .is_some_and(|target| std::sync::Arc::ptr_eq(target, cd))
+                            })
+                        })
+                        && !self.constructor_calls_super_new(cname)
+                    {
+                        self.initialize_implicit_constructor_base(handle, cname);
+                        self.initialize_pending_class_properties(handle, cname);
+                    }
                 }
                 // A function returning a bare type-parameter name: the
                 // width and signedness of the type bound on this object, for
@@ -2323,6 +2363,12 @@ impl Simulator {
                 }
                 if method_name == "new" {
                     self.ctor_class_stack.pop();
+                    if let Some((caller_handle, caller_class)) =
+                        self.ctor_class_stack.last().cloned()
+                        && caller_handle == handle
+                    {
+                        self.initialize_pending_class_properties(handle, &caller_class);
+                    }
                 }
                 self.m_scope_stack = saved_m_scope;
                 self.class_context_stack.pop();

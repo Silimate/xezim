@@ -606,7 +606,6 @@ fn make_bare_ident(name: &str, span: ast::Span) -> ast::expr::Expression {
 
 fn walk_module_static_inits(
     items: &[ast::decl::ModuleItem],
-    defs: &xezim_core::hasher::HashMap<String, SourceDefinition>,
     elab: &elaborate::ElaboratedModule,
     scope: &str,
     depth: u32,
@@ -643,31 +642,7 @@ fn walk_module_static_inits(
             }
             // Unconditional `generate ... endgenerate` region — same scope.
             ModuleItem::GenerateRegion(gr) => {
-                walk_module_static_inits(&gr.items, defs, elab, scope, depth + 1, out);
-            }
-            ModuleItem::ModuleInstantiation(mi) => {
-                if let Some(SourceDefinition::Module(child)) = defs.get(&mi.module_name.name) {
-                    for inst in &mi.instances {
-                        // Instance arrays get per-element scopes ("u[i]") —
-                        // out of scope here; leave elaboration behavior.
-                        if !inst.dimensions.is_empty() {
-                            continue;
-                        }
-                        let child_scope = if scope.is_empty() {
-                            inst.name.name.clone()
-                        } else {
-                            format!("{}.{}", scope, inst.name.name)
-                        };
-                        walk_module_static_inits(
-                            &child.items,
-                            defs,
-                            elab,
-                            &child_scope,
-                            depth + 1,
-                            out,
-                        );
-                    }
-                }
+                walk_module_static_inits(&gr.items, elab, scope, depth + 1, out);
             }
             _ => {}
         }
@@ -682,21 +657,38 @@ pub fn defer_static_syscall_inits(
     elab: &mut elaborate::ElaboratedModule,
 ) {
     let mut out: Vec<elaborate::InitialBlock> = Vec::new();
-    if let Some(SourceDefinition::Module(top)) = defs.get(&elab.name) {
-        walk_module_static_inits(&top.items, defs, elab, "", 0, &mut out);
-    }
-    // §6.21 / §25.3: interface variables have static lifetime too. The module
-    // walk above only descends through module definitions, so it never sees
-    // an interface's initializers. Use the elaborated instance paths here:
-    // they include generated and arrayed interfaces, with the actual scope
-    // needed by `%m`, and exclude inactive generate branches.
-    if let Some(SourceDefinition::Interface(top)) = defs.get(&elab.name) {
-        walk_module_static_inits(&top.items, defs, elab, "", 0, &mut out);
-    }
-    for inst in &elab.instances {
-        if let Some(SourceDefinition::Interface(iface)) = defs.get(&inst.def_name) {
-            walk_module_static_inits(&iface.items, defs, elab, &inst.path, 0, &mut out);
+    // The top module/interface/program is not listed in `elab.instances`
+    // (instance paths are relative to it), so walk it separately at "".
+    if let Some(top) = defs.get(&elab.name) {
+        let top_items = match top {
+            SourceDefinition::Module(m) => Some(&m.items),
+            SourceDefinition::Interface(i) => Some(&i.items),
+            SourceDefinition::Program(p) => Some(&p.items),
+            _ => None,
+        };
+        if let Some(items) = top_items {
+            walk_module_static_inits(items, elab, "", 0, &mut out);
         }
+    }
+    // §6.21 / §23.11 / §24 / §26.5: walk every ELABORATED instance rather than
+    // the AST instantiation tree. `ElabInstance::path` is exactly the scope
+    // `%m` needs, so this reaches what an AST walk cannot:
+    //   * instances inside `generate for` / `generate if` bodies (`g[0].u`) —
+    //     the AST has no trip count or taken branch without redoing
+    //     elaboration, and inactive branches must NOT be emitted;
+    //   * instance-array elements (`u[0]`, `u[1]`), which the AST walk skipped
+    //     whenever `inst.dimensions` was nonempty;
+    //   * `bind`-inserted instances (§23.11) and everything below them — a bind
+    //     is not an AST item in its host, so an AST walk never sees them;
+    //   * `program` instances (§24), which are not `SourceDefinition::Module`.
+    for inst in &elab.instances {
+        let items = match defs.get(&inst.def_name) {
+            Some(SourceDefinition::Module(m)) => &m.items,
+            Some(SourceDefinition::Interface(i)) => &i.items,
+            Some(SourceDefinition::Program(p)) => &p.items,
+            _ => continue,
+        };
+        walk_module_static_inits(items, elab, &inst.path, 0, &mut out);
     }
     // Package-scope variables too (`string n = $sformatf("%m.notifier")` in
     // UVM's polling package). The assignment runs inside a block named with

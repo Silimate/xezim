@@ -396,6 +396,34 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   retain the left operand's signing for unknown amounts and overshifts
   (§11.4.10).
 
+* Class parameter and localparam arrays preserve specialization bindings,
+  element types, declared index order and assignment-pattern keys across
+  class, object and method access. Recompile saved designs to refresh their
+  array declaration metadata
+  (§6.20.2, §8.25, §10.9.1).
+  (#423, #503 and xezim-core#82, reported and contributed by Ganesh-TNL)
+* Deferred static initializers run once in each elaborated instance,
+  including bound instances, generated scopes and instance arrays (§6.21).
+  (#494 and #504, reported and contributed by Ganesh-TNL)
+* Class fields initialize once in declaration order after the base constructor,
+  using their declared assignment types and lexical scope. Dynamic-array and
+  class-typed field constructors retain their sizes and type bindings (§8.7).
+  (#496 and #505, reported and contributed by Ganesh-TNL)
+* Hierarchical class-member access follows nested object handles and updates
+  selected bits in instance or shared static storage. Same-named observer
+  variables cannot redirect hierarchical struct accesses (§8.4, §11.5.1, §23.7).
+  (#497 and #506, reported and contributed by Ganesh-TNL)
+
+* Unsigned expression types reach context-determined operands before nested
+  division, modulus and widening are evaluated (§11.8.1/§11.8.2). Compiled
+  expressions also recognize unbased fill literals as unsigned. Signed array
+  elements and increment/decrement results retain their declared types
+  (#501, reported by akashlevy).
+
+* Packed selects in parameterized child instances use each instance's
+  elaborated dimensions, including typedef element widths and hierarchical
+  reads (§7.4.1/§23.10; #507, contributed by chenbhil).
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and

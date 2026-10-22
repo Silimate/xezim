@@ -888,6 +888,7 @@ impl Simulator {
                 name.name,
                 self.expr_to_spec_fragment(x)?
             )),
+            ExprKind::AssignmentPattern(_) => self.class_array_arg_fragment(e),
             ExprKind::Number(NumberLiteral::Integer { value, .. }) => Some(value.clone()),
             ExprKind::Number(NumberLiteral::Real(r)) => Some(format!("{}", r)),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Some(c.to_string()),

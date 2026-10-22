@@ -2519,6 +2519,8 @@ mod class_access;
 mod class_members;
 mod class_methods;
 mod class_specialization;
+mod class_array_constants;
+mod property_initialization;
 mod clocking;
 mod collection_methods;
 mod collections;
@@ -3294,6 +3296,22 @@ impl StaticMap {
     }
 }
 
+/// §8.25/§6.20.2 (issue #423): the materialized elements of one class-scope
+/// ARRAY constant of one specialization — a header VALUE parameter declared
+/// with unpacked dimensions (`class C #(int unsigned TBL [4] = '{...})`,
+/// read `C#(..)::TBL[i]`) or a class-body `localparam` array (`LP[i]`).
+/// Lazily built on first element read by
+/// `Simulator::materialize_class_param_array`; `lo`/`hi` preserve bounds;
+/// `default` carries the declared element type for invalid/unknown indices.
+#[derive(Debug, Clone)]
+struct ClassParamArray {
+    lo: i64,
+    hi: i64,
+    descending: bool,
+    default: Value,
+    elems: Vec<Value>,
+}
+
 impl std::ops::Deref for StaticMap {
     type Target = HashMap<String, Value>;
     fn deref(&self) -> &Self::Target {
@@ -3363,6 +3381,8 @@ struct ClassMemberNames {
     /// Every static property and class `localparam` name: the only names
     /// `static_prop_key` can resolve.
     static_or_param: HashSet<String>,
+    /// Names of class constant arrays and fixed static arrays.
+    constant_arrays: HashSet<String>,
     /// Names `plain_ident_read` leaves to the full path: static, vif and
     /// struct-capable properties, and the UVM activity constants.
     ident_slow: HashSet<String>,
@@ -6872,6 +6892,13 @@ pub struct Simulator {
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
     class_statics: StaticMap,
+    /// §8.25/§6.20.2 (issue #423): lazily materialized per-specialization
+    /// elements of class-scope ARRAY constants (header value parameters
+    /// with unpacked dims, class localparam arrays), keyed
+    /// `DeclClass#canon_sig::name` — or `DeclClass::name`-shaped default
+    /// bindings when no specialization is active. See
+    /// `materialize_class_param_array`.
+    class_param_arrays: HashMap<String, ClassParamArray>,
     /// Per-frame overlay for class/typedef types of frame-locals. The
     /// global var_class_types/var_typedef_types are keyed by BARE name and
     /// shared across every process, so a class-typed local declared in one
@@ -6955,6 +6982,9 @@ pub struct Simulator {
     /// Recursion guard for evaluating call-bearing instance-property
     /// initializers at construction (see `evaluate_call_init_at_construct`).
     construct_init_depth: u32,
+    /// Classes awaiting their §8.7 initialization for each constructing object.
+    pending_class_initializers:
+        HashMap<usize, Vec<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>>>,
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,

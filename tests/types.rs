@@ -523,3 +523,9 @@ mod procedural_bitwise_sign_500;
 
 #[path = "types/arithmetic_shift_xz.rs"]
 mod arithmetic_shift_xz;
+
+#[path = "types/child_param_packed_elem_width.rs"]
+mod child_param_packed_elem_width;
+
+#[path = "types/unsigned_context_501.rs"]
+mod unsigned_context_501;

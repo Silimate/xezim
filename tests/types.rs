@@ -506,6 +506,9 @@ mod next_rest_typedef_casts_377;
 #[path = "types/unsigned_shift_context_384.rs"]
 mod unsigned_shift_context_384;
 
+#[path = "types/unsigned_operand_context.rs"]
+mod unsigned_operand_context;
+
 #[path = "types/const_fn_call_in_generate_if.rs"]
 mod const_fn_call_in_generate_if;
 

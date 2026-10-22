@@ -3208,9 +3208,10 @@ impl Simulator {
         let Some(Some(inst)) = self.heap.get(handle) else {
             return false;
         };
-        let mut cur = Some(inst.class_name.clone());
+        // Borrowed names: the expression type probe asks this per read.
+        let mut cur = Some(inst.class_name.as_str());
         while let Some(cn) = cur {
-            let Some(cd) = self.module.classes.get(&cn) else {
+            let Some(cd) = self.module.classes.get(cn) else {
                 return false;
             };
             if let Some(sig) = cd.properties.get(prop) {
@@ -3231,7 +3232,7 @@ impl Simulator {
                 }
                 return sig.is_signed;
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.as_deref();
         }
         false
     }

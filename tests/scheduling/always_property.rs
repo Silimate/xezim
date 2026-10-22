@@ -1,0 +1,41 @@
+//! §16.12.6 `always property_expr` is a property operator, not an always block.
+//! The icache bench writes `always (|v) == (&v)` with no extra parentheses.
+#[test]
+fn always_property_holds_then_fails() {
+    let result = xezim::simulate(
+        r#"
+module t;
+  bit clk;
+  logic [1:0] a;
+  always #5 clk = ~clk;
+  always @(posedge clk) $display("TICK %b", a);
+  assert property (@(posedge clk) always (|a) == (&a))
+    else $display("FAIL");
+  initial begin
+    a = 2'b11;
+    repeat (2) @(posedge clk);
+    @(negedge clk) a = 2'b10;
+    repeat (2) @(posedge clk);
+    $display("DONE");
+    $finish;
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let lines: Vec<_> = result
+        .output
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert!(
+        lines.len() >= 2 && lines[0] == "TICK 11" && lines[1] == "TICK 11",
+        "held cycles should not fail: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| *line == "FAIL"),
+        "missing FAIL: {lines:?}"
+    );
+    assert!(lines.contains(&"DONE"), "missing DONE: {lines:?}");
+}

@@ -118,6 +118,8 @@ mod struct_collections_across_calls;
 mod void_cast_queue_ops;
 #[path = "collections/whole_array_continuous_assign.rs"]
 mod whole_array_continuous_assign;
+#[path = "collections/cast_new_of_enclosing_value_params.rs"]
+mod cast_new_of_enclosing_value_params;
 #[path = "collections/with_clause_class_receivers.rs"]
 mod with_clause_class_receivers;
 

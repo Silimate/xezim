@@ -1,0 +1,96 @@
+//! `item #(H, D) req = new;` inside `my_seq #(32, 194)` must build
+//! `item #(32, 194)`, not the default specialization.
+//!
+//! The type arguments are the enclosing class's value parameters. They
+//! already read back as 32 and 194, and the inherited `$cast` destination
+//! (`RSP`, bound through a type-parameter base) is that same specialization.
+//! The constructor used to keep the bare names and fall back to the
+//! defaults, so `put_response` rejected its own request. UVM's
+//! scrambling-key device sequence does this with `HostDataWidth` and
+//! `DeviceDataWidth`.
+
+use xezim::simulate;
+
+fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
+    sim.get_signal(n)
+        .or_else(|| sim.get_signal(&format!("top.{n}")))
+        .unwrap_or_else(|| panic!("signal not found: {n}"))
+        .to_u64()
+        .unwrap_or_else(|| panic!("{n} not u64-able"))
+        & 0xFFFF_FFFF
+}
+
+#[test]
+fn new_inside_a_method_uses_the_enclosing_value_parameters() {
+    let src = r#"
+class base_item;
+endclass
+
+class item #(int H = 32, int D = H) extends base_item;
+  int tag;
+endclass
+
+class uvm_sequence #(type REQ = base_item, type RSP = REQ);
+  virtual function int put_response(base_item response_item);
+    RSP response;
+    return $cast(response, response_item);
+  endfunction
+endclass
+
+class mid #(type REQ = base_item, type RSP = REQ) extends uvm_sequence #(REQ, RSP);
+endclass
+
+class my_seq #(int H = 32, int D = H) extends mid #(item #(H, D), item #(H, D));
+  function int check();
+    item #(H, D) req;
+    req = new;
+    req.tag = D;
+    return put_response(req);
+  endfunction
+  function int seen_d();
+    item #(H, D) req;
+    req = new;
+    return req.D;
+  endfunction
+  function int check_lit();
+    item #(32, 194) req;
+    req = new;
+    return put_response(req);
+  endfunction
+endclass
+
+module top;
+  my_seq #(32, 194) wide;
+  my_seq #(32, 32) narrow;
+  item #(32, 32) nitem;
+  item #(32, 194) witem;
+  int wide_ok, narrow_ok, swapped, explicit, lit_ok, got_d;
+  initial begin
+    wide = new;
+    narrow = new;
+    nitem = new;
+    witem = new;
+    got_d = wide.seen_d();
+    wide_ok = wide.check();
+    narrow_ok = narrow.check();
+    swapped = wide.put_response(nitem);
+    explicit = wide.put_response(witem);
+    lit_ok = wide.check_lit();
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    let got = (
+        u(&sim, "wide_ok"),
+        u(&sim, "narrow_ok"),
+        u(&sim, "swapped"),
+        u(&sim, "explicit"),
+        u(&sim, "lit_ok"),
+        u(&sim, "got_d"),
+    );
+    assert_eq!(
+        got,
+        (1, 1, 0, 1, 1, 194),
+        "wide, narrow, swapped, explicit, lit, got_d"
+    );
+}

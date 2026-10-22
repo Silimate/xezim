@@ -1208,8 +1208,15 @@ impl Simulator {
             None
         };
         if let Some(cn) = static_class {
-            if let Some(v) = self.class_static_get(&cn, &member.name) {
-                return v;
+            // Header value parameters are per instance. They also sit in
+            // `param_defaults`, so `class_static_get` answers them from the
+            // elaborated default (`int D = H` is 32) and used to hide the
+            // specialization stored on the object. Localparams and `static`
+            // members are in `static_properties` and stay on the shared cell.
+            if self.member_is_static_prop(&cn, &member.name) {
+                if let Some(v) = self.class_static_get(&cn, &member.name) {
+                    return v;
+                }
             }
         }
         if handle == 0 || handle >= self.heap.len() {

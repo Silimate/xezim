@@ -225,6 +225,8 @@ impl Simulator {
         // The array table is snapshotted because the loop below needs `&mut
         // self`; it is names→ranges only, not ASTs.
         let arrays_snapshot = self.module.arrays.clone();
+        let arrays_2d_snapshot = self.module.arrays_2d.clone();
+        let params_snapshot = self.module.parameters.clone();
         let descending_snapshot = self.module.descending_arrays.clone();
         let decl_dims_snapshot = self.module.unpacked_decl_dims.clone();
         // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
@@ -261,13 +263,19 @@ impl Simulator {
         for mut ca in cas
             .into_iter()
             .chain({
-                let params_snapshot = self.module.parameters.clone();
+                let params_snapshot = params_snapshot.clone();
                 pending_ca
                     .into_iter()
                     .map(move |p| p.materialize(&params_snapshot))
             })
             .flat_map(|ca| {
-                match crate::compiler::elaborate::whole_array_assign_parts_dir(
+                // Submodule bodies stay pending until here. A 1-D
+                // `assign dst = src` expands above. `assign dst = src[row]`
+                // (one row of a 2-D unpacked array) is the same shape and
+                // was left as a scalar assign, so an output port driven
+                // that way stayed 0. Ibex RVFI publishes mhpmcounters as
+                // `rvfi_ext_mhpmcounters = rvfi_ext_stage_mhpmcounters[N-1]`.
+                if let Some(parts) = crate::compiler::elaborate::whole_array_assign_parts_dir(
                     &ca.lhs,
                     &ca.rhs,
                     ca.delay,
@@ -275,9 +283,21 @@ impl Simulator {
                     Some(&descending_snapshot),
                     Some(&decl_dims_snapshot),
                 ) {
-                    Some(parts) => parts,
-                    None => vec![ca],
+                    return parts;
                 }
+                if let Some(parts) = crate::compiler::elaborate::whole_array_row_assign_parts(
+                    &ca.lhs,
+                    &ca.rhs,
+                    ca.delay,
+                    &arrays_snapshot,
+                    &arrays_2d_snapshot,
+                    &params_snapshot,
+                    Some(&descending_snapshot),
+                    Some(&decl_dims_snapshot),
+                ) {
+                    return parts;
+                }
+                vec![ca]
             })
             .flat_map(|ca| {
                 let chain: Option<Vec<String>> = match &ca.lhs.kind {

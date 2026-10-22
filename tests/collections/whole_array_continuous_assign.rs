@@ -305,3 +305,55 @@ endmodule
     );
     assert_eq!(u(&sim, "live_after"), 0x99, "the net itself tracks the assign");
 }
+
+/// `assign dst = src[row]` publishes one row of a 2-D unpacked array.
+/// Ibex RVFI drives its mhpmcounter output this way
+/// (`rvfi_ext_mhpmcounters = rvfi_ext_stage_mhpmcounters[RVFI_STAGES-1]`).
+/// A scalar treatment of that assign left the output at 0.
+#[test]
+fn continuous_assign_of_one_row_of_a_2d_array() {
+    let src = r#"
+`timescale 1ns/1ns
+module producer (
+  output logic [31:0] row [4],
+  output logic [31:0] prow [4]
+);
+  localparam int ST = 2;
+  logic [31:0] stage [2][4];
+  logic [31:0] pst [ST][4];
+  assign row = stage[1];
+  assign prow = pst[ST-1];
+  initial begin
+    stage[1][1] = 32'h46e;
+    stage[1][2] = 32'h11;
+    pst[1][1] = 32'h46e;
+  end
+endmodule
+module top;
+  logic [31:0] got [4];
+  logic [31:0] pgot [4];
+  logic [31:0] local_row [4];
+  logic [31:0] local_stage [2][4];
+  producer u (.row(got), .prow(pgot));
+  assign local_row = local_stage[1];
+  int g1, g2, local_got, p1;
+  initial begin
+    local_stage[1][1] = 32'h46e;
+    #1;
+    g1 = got[1];
+    g2 = got[2];
+    local_got = local_row[1];
+    p1 = pgot[1];
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "local_got"), 0x46e, "a local row assign drives the element");
+    assert_eq!(u(&sim, "g1"), 0x46e, "an instance row assign drives the port");
+    assert_eq!(u(&sim, "g2"), 0x11, "the neighboring element comes along");
+    assert_eq!(
+        u(&sim, "p1"),
+        0x46e,
+        "a localparam-sized row assign drives the port"
+    );
+}

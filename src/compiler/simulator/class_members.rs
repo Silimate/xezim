@@ -2978,6 +2978,21 @@ impl Simulator {
         cur.to_string()
     }
 
+    /// Class key for a property's declared type. A typedef such as
+    /// `typedef inner#(.W(194)) inner_t` is not itself a key in `classes`,
+    /// so `rand inner_t p` was drawn as an integer and the object was lost.
+    pub(super) fn resolved_class_key(&self, tn: &str) -> Option<String> {
+        if self.module.classes.contains_key(tn) {
+            return Some(tn.to_string());
+        }
+        let unrolled = self.typedef_unroll(tn);
+        if self.module.classes.contains_key(&unrolled) {
+            Some(unrolled)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn class_is_a(&self, derived: &str, base: &str) -> bool {
         // Class names are keyed bare (the parser keeps only the leaf segment
         // of a scoped name), so the comparison strips just the specialization

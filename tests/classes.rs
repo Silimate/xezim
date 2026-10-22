@@ -101,6 +101,8 @@ mod parameterized_class_scope;
 mod pre_randomize_mode_changes;
 #[path = "classes/pure_constraint_implemented.rs"]
 mod pure_constraint_implemented;
+#[path = "classes/pure_constraint_nonvirtual.rs"]
+mod pure_constraint_nonvirtual;
 #[path = "classes/rand_array_elem_signedness.rs"]
 mod rand_array_elem_signedness;
 #[path = "classes/rand_obj_array_elem_constraints.rs"]
@@ -771,3 +773,9 @@ mod randomize_hook_signatures;
 
 #[path = "classes/static_class_members_382.rs"]
 mod static_class_members_382;
+
+#[path = "classes/foreach_array_of_collections_elem.rs"]
+mod foreach_array_of_collections_elem;
+
+#[path = "classes/class_assignment_types_499.rs"]
+mod class_assignment_types_499;

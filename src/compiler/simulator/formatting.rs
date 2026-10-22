@@ -807,6 +807,9 @@ impl Simulator {
         handle: Option<usize>,
         prop: &str,
     ) -> Option<u32> {
+        // §8.14: a hidden base property has a qualified storage key.
+        let storage_prop = prop;
+        let (class_name, prop) = prop.rsplit_once("::").unwrap_or((class_name, prop));
         let memo = self
             .prop_width_memo
             .borrow()
@@ -861,7 +864,7 @@ impl Simulator {
                     .is_some_and(|t| cd.type_param_names.contains(t))
                 {
                     let h = handle?;
-                    let concrete = self.class_prop_type_name(h, prop)?;
+                    let concrete = self.class_prop_type_name(h, storage_prop)?;
                     let w = self.concrete_type_width(&concrete)?;
                     // §7.4.1: `T [1:0] k;` is a packed array of the bound type.
                     if let Some(DataType::TypeReference { dimensions, .. }) =
@@ -1056,25 +1059,22 @@ impl Simulator {
     }
 
     pub(super) fn fit_class_prop(&self, handle: usize, prop: &str, val: &Value) -> Value {
-        // The property's DECLARED signedness governs the stored value when a
-        // resize is needed — not the RHS literal's. A `bit` field is unsigned,
-        // so assigning the 32-bit signed literal `1` must store an UNSIGNED
-        // 1-bit 1; without normalizing signedness, `resize_for_assign(1)`
-        // inherits the literal's `is_signed=true`, yielding a signed-1-bit
-        // value that reads back as -1 (IEEE 1800-2023 §6.6.1, §10.7).
-        // Only normalize on the resize path (width differs) — touching the
-        // width-match path perturbs tests that rely on the RHS signedness
-        // flowing through unchanged for same-width assignments.
+        // §10.7: every integral store takes the destination's signedness,
+        // including stores whose width already matches the declaration.
         if val.is_real {
             return val.clone();
         }
         let fitted = match self.heap_prop_width(handle, prop) {
-            Some(w) if w != val.width => {
-                let mut fitted = val.resize_for_assign(w);
+            Some(w) => {
+                let mut fitted = if w != val.width {
+                    val.resize_for_assign(w)
+                } else {
+                    val.clone()
+                };
                 fitted.is_signed = self.class_prop_signed_of(handle, prop);
                 fitted
             }
-            _ => val.clone(),
+            None => val.clone(),
         };
         // §6.11.1/§10.7: a 2-state property drops X/Z on every write.
         if fitted.has_xz() && self.class_prop_two_state(handle, prop) {
@@ -1089,7 +1089,10 @@ impl Simulator {
         let Some(Some(inst)) = self.heap.get(handle) else {
             return false;
         };
-        let mut cur = Some(inst.class_name.as_str());
+        let (start, prop) = prop
+            .rsplit_once("::")
+            .unwrap_or((inst.class_name.as_str(), prop));
+        let mut cur = Some(start);
         while let Some(cn) = cur {
             let Some(cd) = self.module.classes.get(cn) else {
                 return false;

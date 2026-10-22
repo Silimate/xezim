@@ -40,3 +40,24 @@ fn c26_4_package_import_rules() {
         &[],
     );
 }
+
+// §26.3 (issue #425): an unpacked-array package localparam used through its
+// package-qualified name outside the package — `pkg::LIM[3]` as an unpacked
+// dimension const-folds to the element value, and a scoped scalar localparam
+// still sizes a dimension (no sticky diagnostics from the speculative
+// associative-index data-type parse of either spelling).
+#[test]
+fn c26_3_pkg_array_param_element_dim() {
+    check(
+        "26.3_pkg_array_param_element_dim",
+        include_str!("sv/26.3_pkg_array_param_element_dim.sv"),
+        "c26pad",
+        Order::Exact,
+        &[
+            "T|26.3g|size(ctl)=8",
+            "T|26.3g|size(mem)=8",
+            "T|26.3g|mem[7]=5 elem=8",
+        ],
+        &[],
+    );
+}

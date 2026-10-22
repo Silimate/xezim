@@ -17,6 +17,28 @@ fn c25_8_parameterized_interfaces() {
     );
 }
 
+// §25.10: an omitted virtual-interface argument binds the formal's DEFAULT
+// (also §13.5.3) — both for reading an `input` vif and for copying an
+// `inout` binding back to the caller, across tasks, functions and class
+// methods. Regression for #469.
+#[test]
+fn c25_9_vif_omitted_default() {
+    check(
+        "c25_9_vif_default",
+        include_str!("sv/c25_9_vif_default.sv"),
+        "t",
+        Order::Exact,
+        &[
+            "T|25.9.vifdef|fn-read 42",
+            "T|25.9.vifdef|task-read 42",
+            "T|25.9.vifdef|inout-read 43",
+            "T|25.9.vifdef|after-inout 43",
+            "T|25.9.vifdef|method-read 44",
+        ],
+        &[],
+    );
+}
+
 // §14.9: clocking block reached through a virtual interface
 #[test]
 fn c25_9_virtual_interface_clocking() {

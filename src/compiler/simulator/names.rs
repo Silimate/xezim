@@ -43,6 +43,8 @@ pub struct NameMap {
     /// Bumped by every call that can change what a name maps to, so a
     /// caller can tell the map is untouched since it last looked.
     generation: u64,
+    /// Interface port prefixes share the actual instance's signal IDs.
+    interface_aliases: Option<Arc<(String, HashMap<String, String>)>>,
 }
 
 /// The elided port nets: `elided_port_hash` of each flat name, sorted.
@@ -103,6 +105,22 @@ impl NameMap {
         NameMap {
             map: HashMap::with_capacity_and_hasher(n, Default::default()),
             ..Default::default()
+        }
+    }
+
+    pub fn set_interface_aliases(&mut self, top: String, aliases: HashMap<String, String>) {
+        if !aliases.is_empty() {
+            self.interface_aliases = Some(Arc::new((top, aliases)));
+            self.generation += 1;
+        }
+    }
+
+    pub fn canonical_interface_name<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.interface_aliases {
+            Some(aliases) => {
+                xezim_core::elaborate::interface_ports::resolve(name, &aliases.1, &aliases.0)
+            }
+            None => std::borrow::Cow::Borrowed(name),
         }
     }
 
@@ -175,7 +193,14 @@ impl NameMap {
         match self.map.get(name) {
             Some(id) => Some(id),
             None => {
-                let v = self.virtual_id(name).map(|id| &self.identity[id]);
+                let v = self
+                    .virtual_id(name)
+                    .map(|id| &self.identity[id])
+                    .or_else(|| {
+                        self.interface_aliases
+                            .as_ref()
+                            .and_then(|_| self.interface_id(name))
+                    });
                 if v.is_none() {
                     self.audit_miss(name);
                 }
@@ -184,13 +209,21 @@ impl NameMap {
         }
     }
 
+    #[inline(never)]
+    fn interface_id(&self, name: &str) -> Option<&usize> {
+        self.interface_aliases.as_ref()?;
+        let canonical = self.canonical_interface_name(name);
+        if canonical == name {
+            return None;
+        }
+        self.map
+            .get(canonical.as_ref())
+            .or_else(|| self.virtual_id(&canonical).map(|id| &self.identity[id]))
+    }
+
     #[inline(always)]
     pub fn contains_key(&self, name: &str) -> bool {
-        let hit = self.map.contains_key(name) || self.virtual_id(name).is_some();
-        if !hit {
-            self.audit_miss(name);
-        }
-        hit
+        self.get(name).is_some()
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut usize> {

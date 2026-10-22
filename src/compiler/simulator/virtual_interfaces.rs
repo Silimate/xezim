@@ -21,11 +21,32 @@ impl Simulator {
     /// the object's class when a `this` is live, else the class of the
     /// currently executing method, which is what a static method has.
     pub(super) fn static_vif_slot_of_bare(&self, name: &str) -> Option<(usize, String)> {
+        // §6.21/§8.4: a LOCAL of the executing frame shadows the class static.
+        // `virtual counter_if svif;` declared inside the method reads THAT
+        // frame's (unbound) handle, not the class cell the static binding
+        // lives in; without this filter a bound static leaked through an
+        // uninitialised local and `svif == null` read false. Mirrors the local
+        // filter `static_vif_key` applies on the write side.
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(name))
+        {
+            return None;
+        }
         if !self.vif_prop_name_possible(name) {
             return None;
         }
-        let class_name = self
-            .this_stack
+        let class_name = self.static_vif_bare_class()?;
+        let (slot, _) = self.vif_slot(&class_name, 0, name)?;
+        (slot.0 == 0).then_some(slot)
+    }
+
+    /// The class whose STATIC virtual-interface property a bare name reads: the
+    /// object's class when a `this` is live, else the class of the currently
+    /// executing method, which is all a static method has.
+    pub(super) fn static_vif_bare_class(&self) -> Option<String> {
+        self.this_stack
             .last()
             .copied()
             .flatten()
@@ -36,9 +57,35 @@ impl Simulator {
                     .and_then(|o| o.as_ref())
                     .map(|i| i.class_name.clone())
             })
-            .or_else(|| self.class_context_stack.last().cloned().flatten())?;
-        let (slot, _) = self.vif_slot(&class_name, 0, name)?;
-        (slot.0 == 0).then_some(slot)
+            .or_else(|| self.class_context_stack.last().cloned().flatten())
+    }
+
+    /// §8.26: the interface bound to the STATIC virtual-interface property
+    /// `prop` of class scope `obj`, asked with the PARAMETERIZED-CLASS
+    /// specialization preserved.
+    ///
+    /// A parameterized class keeps one static cell PER specialization, and the
+    /// write side files it in `static_vif_bindings` under the canonical spec
+    /// key (`C#(T)::p`) that `static_prop_key_spec` builds. `vif_slot`
+    /// canonicalises through `vif_class_of_scope_name`, which drops the
+    /// signature, so the slot it yields asks for `C::p` and misses the
+    /// `C#(T)::p` cell the write filled — a bound static then classifies as
+    /// null. The member-read path DOES resolve the spec, which is why
+    /// `C#(T)::svif.count` reads back correctly while `C#(T)::svif == null`
+    /// still reported null (§25.10).
+    ///
+    /// `None` means "no opinion": a plain class, an unbound property, or an
+    /// instance property, all of which the caller resolves its own way.
+    pub(super) fn static_vif_binding_of_scope(
+        &self,
+        obj: &str,
+        prop: &str,
+        spec_override: Option<&(String, String)>,
+    ) -> Option<String> {
+        let (base, spec) = self.resolve_class_scope_prefix(obj)?;
+        let spec_pair = spec.map(|s| (base.clone(), s));
+        let key = self.static_prop_key_spec(&base, prop, spec_pair.as_ref().or(spec_override))?;
+        self.static_vif_bindings.get(&key).cloned()
     }
 
     /// Classify an equality operand as a VIRTUAL-INTERFACE VARIABLE:
@@ -139,12 +186,37 @@ impl Simulator {
                 // method has no object at all and used to fall out of this arm
                 // entirely, so the read went to `class_static_get` and a bound
                 // static vif again compared equal to null (§25.10).
-                if let Some(slot) = self.static_vif_slot_of_bare(raw) {
-                    return Some(
-                        self.virtual_iface_bindings
-                            .get(&slot)
-                            .map(|(b, _)| b.clone()),
-                    );
+                if let Some(cls) = self.static_vif_bare_class() {
+                    // §6.21/§8.4: a LOCAL of the executing frame shadows the
+                    // class static, and this lookup answers straight from the
+                    // class cell, so it has to defer to the frame exactly as
+                    // `static_vif_slot_of_bare` below does. Without it a bound
+                    // static leaked through an uninitialised local here.
+                    if !self
+                        .local_stack
+                        .last()
+                        .is_some_and(|l| l.contains_key(raw.as_str()))
+                    {
+                        // §8.26: inside a static method of a PARAMETERIZED class the
+                        // executing specialization IS the context, and the write
+                        // filed the binding under the spec key. The slot below is
+                        // base-canonical and would miss it, reporting a bound
+                        // static as null.
+                        if let Some(bound) =
+                            self.static_vif_binding_of_scope(&cls, raw, self.current_spec.as_ref())
+                        {
+                            return Some(Some(bound));
+                        }
+                    }
+                }
+                if self.static_vif_slot_of_bare(raw).is_some()
+                    && let Some(cls) = self.static_vif_bare_class()
+                {
+                    return Some(self.static_vif_binding_of_scope(
+                        &cls,
+                        raw,
+                        self.current_spec.as_ref(),
+                    ));
                 }
                 // A DECLARED vif property of `this` with no binding: unbound.
                 if let Some(th) = self
@@ -205,6 +277,25 @@ impl Simulator {
                 None
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §8.26/§25.10: `C#(T)::svif` — a static virtual interface of a
+                // SPECIALIZATION. The receiver is a `Specialization` node, so no
+                // Ident/This arm below can name it, and the operand classified as
+                // unclassifiable: `==`/`!=` fell through to value semantics, where
+                // a bound static is an opaque placeholder that never matches null.
+                // Ask the static map through the same key builder the write used;
+                // `vif_recv_target` already does this for the member-read path,
+                // which is why `C#(T)::svif.count` read back correctly while
+                // `C#(T)::svif == null` did not.
+                if self.vif_prop_name_possible(&member.name)
+                    && let Some(key) = self.static_vif_key(e)
+                    && let Some((owner, _)) = key.rsplit_once("::")
+                    && let Some(decl) = owner.split('#').next()
+                    && self.class_vif_decl(decl, &member.name).is_some()
+                {
+                    // Qualified, object and specialization spellings share
+                    // the same identity; absence from this store means null.
+                    return Some(self.static_vif_bindings.get(&key).cloned());
+                }
                 if let ExprKind::Ident(bh) = &expr.kind {
                     if bh.path.len() == 1 && !self.is_interface_instance(&bh.path[0].name.name) {
                         if self.is_interface_instance(&member.name)
@@ -269,12 +360,8 @@ impl Simulator {
         // (§25.10). `vif_slot` yields None for a non-static prop at handle 0,
         // so instance properties still fall through to the object path.
         if let Some(cls) = self.vif_class_of_scope_name(obj) {
-            let (slot, _) = self.vif_slot(&cls, 0, prop)?;
-            return Some(
-                self.virtual_iface_bindings
-                    .get(&slot)
-                    .map(|(b, _)| b.clone()),
-            );
+            self.vif_slot(&cls, 0, prop)?;
+            return Some(self.vif_prop_target(obj, 0, prop).map(|(bound, _)| bound));
         }
         let oh = if obj == "this" {
             self.this_stack.last().copied().flatten().unwrap_or(0)
@@ -291,49 +378,11 @@ impl Simulator {
     /// `oh`'s class chain declares `prop` as a virtual interface and a
     /// binding exists, `Some(None)` when declared but unbound (null).
     pub(super) fn vif_operand_handle_prop(&self, oh: usize, prop: &str) -> Option<Option<String>> {
-        let mut cur = self
-            .heap
-            .get(oh)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone());
-        let mut declared = false;
-        while let Some(cn) = cur {
-            let Some(cd) = self.module.classes.get(&cn) else {
-                break;
-            };
-            if cd.virtual_iface_properties.contains_key(prop) {
-                declared = true;
-                break;
-            }
-            cur = cd.extends.clone();
-        }
-        if !declared {
-            return None;
-        }
-        // A STATIC vif property has ONE cell, keyed to the declaring class at
-        // handle 0, not one per object — so the per-object key below cannot see
-        // it and `this.svif == null` inside an instance method reported a bound
-        // static as null. `vif_slot` is what decides which of the two cells a
-        // property uses; the object key stays the fallback for the cases
-        // `vif_slot` declines to answer (§25.10).
-        let leaf_class = self
-            .heap
-            .get(oh)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone());
-        if let Some(cn) = leaf_class.as_deref()
-            && let Some((slot, _)) = self.vif_slot(cn, oh, prop)
-        {
-            return Some(
-                self.virtual_iface_bindings
-                    .get(&slot)
-                    .map(|(b, _)| b.clone()),
-            );
-        }
+        let class = self.heap.get(oh)?.as_ref()?.class_name.as_str();
+        self.class_vif_decl(class, prop)?;
         Some(
-            self.virtual_iface_bindings
-                .get(&(oh, prop.to_string()))
-                .map(|(b, _)| b.clone()),
+            self.vif_prop_target(class, oh, prop)
+                .map(|(bound, _)| bound),
         )
     }
 
@@ -487,7 +536,28 @@ impl Simulator {
             }),
             crate::ast::Span::dummy(),
         );
+        self.bind_static_vif(caller, &synth);
         let _ = self.try_bind_virtual_iface(caller, &synth);
+    }
+
+    /// §13.5.2 / §25.9: output writeback also replaces an old binding with
+    /// null. A zero-valued non-vif actual retains ordinary value semantics.
+    pub(super) fn vif_writeback(
+        &mut self,
+        caller: &Expression,
+        value: &Value,
+        bound: Option<&str>,
+    ) {
+        if bound == Some("")
+            || (bound.is_none() && value.to_u64() == Some(0) && self.vif_operand(caller).is_some())
+        {
+            let null = Expression::new(ExprKind::Null, caller.span);
+            self.bind_static_vif(caller, &null);
+            self.try_bind_virtual_iface(caller, &null);
+        } else if let Some(bound) = bound {
+            self.vif_bind_actual(caller, bound);
+        }
+        self.assign_value(caller, value);
     }
 
     /// Every static property some class declares as a virtual interface or
@@ -616,7 +686,9 @@ impl Simulator {
     /// virtual interface (see `bind_static_vif`)? A name test only.
     pub(super) fn static_vif_target_possible(&self, lv: &Expression) -> bool {
         let leaf = match &lv.kind {
-            ExprKind::Ident(h) if h.path.len() <= 2 => h.path.last().map(|s| s.name.name.as_str()),
+            // `C::p` and `pkg::C::p` (§8.3.6-1, §26.3) both name a static
+            // property; the leaf is the property either way.
+            ExprKind::Ident(h) if h.path.len() <= 3 => h.path.last().map(|s| s.name.name.as_str()),
             ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
             _ => None,
         };
@@ -669,10 +741,29 @@ impl Simulator {
         if matches!(&rvalue.kind, ExprKind::Null) {
             self.static_vif_bindings.remove(&key);
         } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
+            // A bound formal may still have an opaque zero value. Its
+            // interface identity takes priority over that representation.
             if let Some(leaf) = key.rsplit("::").next() {
                 self.static_vif_names.insert(leaf.to_string());
             }
             self.static_vif_bindings.insert(key, nm);
+        } else {
+            let null_variable = match &rvalue.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    let raw = h.path[0].name.name.as_str();
+                    !self.is_interface_instance(raw)
+                        && self
+                            .module
+                            .var_decl_types
+                            .get(self.vif_variable_name(raw).as_ref())
+                            .is_some_and(|dt| self.is_virtual_iface_type(dt))
+                        && self.eval_scalar_self(rvalue) == Some(0)
+                }
+                _ => false,
+            };
+            if null_variable || self.vif_operand(rvalue) == Some(None) {
+                self.static_vif_bindings.remove(&key);
+            }
         }
     }
 
@@ -701,9 +792,21 @@ impl Simulator {
             None
         };
         let keyed = |cls: &str, spec: Option<(String, String)>, p: &str| -> Option<String> {
+            // §8.13: a nearer instance declaration hides an ancestor's static.
+            let mut owner = Some(cls);
+            while let Some(name) = owner {
+                let cd = self.module.classes.get(name)?;
+                if cd.properties.contains_key(p) || cd.virtual_iface_properties.contains_key(p) {
+                    if !cd.static_properties.contains(p) {
+                        return None;
+                    }
+                    break;
+                }
+                owner = cd.extends.as_deref();
+            }
             let k = self.static_prop_key_spec(cls, p, spec.as_ref())?;
             // A class constant is no variable.
-            let decl = k.split("::").next()?.split('#').next()?;
+            let decl = k.rsplit_once("::")?.0.split('#').next()?;
             self.module
                 .classes
                 .get(decl)
@@ -747,8 +850,19 @@ impl Simulator {
                             return keyed(&cls, spec, p);
                         }
                         let oh = self.eval_ident_handle(&head.name.name)?;
-                        let cls = self.heap.get(oh)?.as_ref()?.class_name.clone();
-                        keyed(&cls, None, p)
+                        let inst = self.heap.get(oh)?.as_ref()?;
+                        keyed(&inst.class_name, inst.spec.clone(), p)
+                    }
+                    [_pkg, cls_seg, prop] => {
+                        // §26.3: `pkg::C::p` — the parser keeps the package as
+                        // a leading path segment, so the class is the MIDDLE
+                        // segment and the property the last.
+                        let p = prop.name.name.as_str();
+                        if !static_name(p) {
+                            return None;
+                        }
+                        let (cls, spec) = class_head(&cls_seg.name.name)?;
+                        keyed(&cls, spec, p)
                     }
                     _ => None,
                 }
@@ -771,14 +885,23 @@ impl Simulator {
                             return keyed(&cls, spec, p);
                         }
                         let oh = self.eval_ident_handle(&h.path[0].name.name)?;
-                        let cls = self.heap.get(oh)?.as_ref()?.class_name.clone();
-                        keyed(&cls, None, p)
+                        let inst = self.heap.get(oh)?.as_ref()?;
+                        keyed(&inst.class_name, inst.spec.clone(), p)
                     }
                     ExprKind::This => {
                         let th = self.this_stack.last().copied().flatten()?;
-                        let cls = self.heap.get(th)?.as_ref()?.class_name.clone();
-                        keyed(&cls, None, p)
+                        let inst = self.heap.get(th)?.as_ref()?;
+                        keyed(&inst.class_name, inst.spec.clone(), p)
                     }
+                    // §26.3: `pkg::C::p` — the class head is itself a member
+                    // access whose OUTERMOST member names the class, the same
+                    // head `extract_call_spec` reads for `pkg::C#(args)::p`.
+                    // The READ side parses this way; the write side keeps the
+                    // package as a leading Ident path segment (arm above).
+                    ExprKind::MemberAccess { member: head, .. } => match class_head(&head.name) {
+                        Some((cls, spec)) => keyed(&cls, spec, p),
+                        None => None,
+                    },
                     _ => None,
                 }
             }
@@ -873,6 +996,10 @@ impl Simulator {
                 // A same-named class vif PROPERTY written bare inside a
                 // method takes the binding path below, not the var alias.
                 let shadows_class_prop = is_viface_var
+                    && !self
+                        .local_stack
+                        .last()
+                        .is_some_and(|f| f.contains_key(name))
                     && self
                         .this_stack
                         .last()
@@ -1059,6 +1186,22 @@ impl Simulator {
             // Bare `v = ...` inside a method — `v` is `this.<v>` (a class vif
             // property). The prop_info check below filters non-vif locals.
             ExprKind::Ident(h) if h.path.len() == 1 => {
+                // §6.21/§8.4: a LOCAL of the executing frame shadows the class
+                // static, and it must shadow the WRITE as well as the read.
+                // A static method has no `this`, so `handle` is 0 and the name
+                // below resolves to the CLASS cell; without this filter the
+                // initializer of a frame-local declaration — `virtual
+                // counter_if svif = null;`, whose assignment the declaration
+                // statement synthesises — cleared the static binding for every
+                // later reader, not just for its own frame. Mirrors the local
+                // filters `static_vif_key` and `static_vif_slot_of_bare` apply.
+                if self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(h.path[0].name.name.as_str()))
+                {
+                    return false;
+                }
                 let handle = self.this_stack.last().copied().flatten().unwrap_or(0);
                 if handle == 0 {
                     static_scope = self.class_context_stack.last().cloned().flatten();
@@ -1427,6 +1570,19 @@ impl Simulator {
                 if self.is_interface_instance(head) {
                     return Some(head.clone());
                 }
+                // §25.9: `t.v` where `v` is a module-scope virtual-interface
+                // VARIABLE (a name alias, not a class property) — e.g. an
+                // omitted formal's default `x = t.v`. Resolve through the
+                // module's variable aliases. Narrow to the current module's
+                // own name so a same-named class property still wins.
+                if head == &self.module.name
+                    && let Some(b) = self
+                        .viface_var_aliases
+                        .get(&h.path[1].name.name)
+                        .filter(|b| !b.is_empty())
+                {
+                    return Some(b.clone());
+                }
                 if let Some(p) = self.iface_instance_by_path(rvalue) {
                     return Some(p);
                 }
@@ -1442,6 +1598,17 @@ impl Simulator {
                         // Same §25.9 modport-view case in MemberAccess shape.
                         if self.is_interface_instance(head) {
                             return Some(head.clone());
+                        }
+                        // §25.9: `t.v` where `v` is a module-scope
+                        // virtual-interface VARIABLE alias (an omitted
+                        // formal's default, e.g. `x = t.v`).
+                        if head == &self.module.name
+                            && let Some(b) = self
+                                .viface_var_aliases
+                                .get(&member.name)
+                                .filter(|b| !b.is_empty())
+                        {
+                            return Some(b.clone());
                         }
                     }
                 }
@@ -1546,6 +1713,40 @@ impl Simulator {
             })
         {
             return Some(rest.to_string());
+        }
+        // §25.3: the formal interface-port path is an alias, so it need
+        // not be a suffix of any physical subroutine key in the table.
+        let top_shadowed = !explicit_root
+            && path
+                .strip_prefix(self.module.name.as_str())
+                .is_some_and(|s| s.starts_with('.'))
+            && (self.dyn_name_lookup(&self.module.name).is_some()
+                || self.eval_ident_handle(&self.module.name).is_some());
+        if !self.module.interface_port_aliases.is_empty() && !top_shadowed {
+            let lookup = |candidate: &str| {
+                let bound = xezim_core::elaborate::interface_ports::resolve(
+                    candidate,
+                    &self.module.interface_port_aliases,
+                    &self.module.name,
+                );
+                (bound != candidate
+                    && (self.module.functions.contains_key(bound.as_ref())
+                        || self.module.tasks.contains_key(bound.as_ref())))
+                .then(|| bound.into_owned())
+            };
+            if let Some(bound) = lookup(path) {
+                return Some(bound);
+            }
+            if !explicit_root {
+                let hint = self.name_resolve_hint.borrow();
+                let mut scope = hint.as_deref();
+                while let Some(current) = scope {
+                    if let Some(bound) = lookup(&format!("{current}.{path}")) {
+                        return Some(bound);
+                    }
+                    scope = current.rsplit_once('.').map(|(p, _)| p);
+                }
+            }
         }
         // Only a path that ends some subroutine key can resolve below.
         if !self.class_member_names().subroutine_suffixes.contains(path) {
@@ -1674,25 +1875,70 @@ impl Simulator {
         Some(segs)
     }
 
-    /// LRM §25.9: build the `local_iface_aliases` entry (formal_name ->
-    /// bound_interface_instance) for a virtual-interface formal arg. Accepts a
-    /// formal whose type is `DataType::Interface` (the `virtual <iface>` form)
-    /// or a `TypeReference` naming a known interface; resolves the ACTUAL via
-    /// the vif binding so `<formal>.member` inside the callee dispatches to the
-    /// real interface (was: passing a vif arg yielded a 0/X member read).
-    /// Must be called while `this_stack` is the CALLER's context (where the
-    /// actual vif is bound).
+    /// §13.5.3 / §25.9: materialize a formal's interface identity while
+    /// its actual/default expression is still in the correct lexical scope.
+    pub(super) fn vif_argument_value(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+        expr: &Expression,
+        value: Value,
+    ) -> Value {
+        if !Self::formal_may_carry_vif(&port.data_type)
+            || !self.is_virtual_iface_type(&port.data_type)
+        {
+            return value;
+        }
+        if matches!(port.direction, crate::ast::types::PortDirection::Output) {
+            return Value::zero(32);
+        }
+        if value
+            .to_u64()
+            .and_then(|token| self.iface_by_token(token))
+            .is_some()
+        {
+            return value;
+        }
+        self.resolve_vif_rhs_name_strict(expr)
+            .map(|bound| Value::from_u64(Self::iface_handle_token(&bound), 32))
+            .unwrap_or(value)
+    }
+
+    /// §25.9: dispatch through the identity captured while binding the formal.
+    /// Only a supplied actual may fall back to its caller-scope name.
     pub(super) fn vif_formal_alias(
         &self,
-        dt: &crate::ast::types::DataType,
-        formal: &str,
-        arg: &Expression,
+        port: &crate::ast::decl::FunctionPort,
+        arg: Option<&Expression>,
+        locals: &HashMap<String, Value>,
     ) -> Option<(String, String)> {
-        if !self.is_virtual_iface_type(dt) {
+        if !self.is_virtual_iface_type(&port.data_type) {
             return None;
         }
-        self.resolve_vif_rhs_name(arg)
-            .map(|bound| (formal.to_string(), bound))
+        let formal = port.name.name.as_str();
+        // §13.5.2: an output starts at its type's default, with no copy-in.
+        if matches!(port.direction, crate::ast::types::PortDirection::Output) {
+            return Some((formal.to_string(), String::new()));
+        }
+        // §13.5.3: omitted defaults were already evaluated in the declaration
+        // scope. Reuse their value rather than resolving them in the caller.
+        let bound = locals
+            .get(formal)
+            .and_then(|value| value.to_u64())
+            .filter(|&token| token != 0)
+            .and_then(|token| self.iface_by_token(token))
+            .map(str::to_string)
+            .or_else(|| arg.and_then(|arg| self.resolve_vif_rhs_name_strict(arg)));
+        Some((formal.to_string(), bound.unwrap_or_default()))
+    }
+
+    /// A getter used as an argument has already delivered its token to the
+    /// formal. Its return marker must not bind the callee's scalar result.
+    pub(super) fn consume_vif_argument_return(&mut self) {
+        if self.vif_return_pending {
+            self.signals.remove("__vif_return__");
+            self.vif_return_pending = false;
+        }
+        self.last_vif_return = None;
     }
 
     /// LRM §25.9: resolve a leading identifier through the active
@@ -2003,7 +2249,9 @@ impl Simulator {
             if let Some(d) = cd.virtual_iface_properties.get(prop) {
                 return Some((cn, d));
             }
-            if cd.properties.contains_key(prop) {
+            if cd.properties.contains_key(prop)
+                || cd.param_defaults.iter().any(|(name, _)| name == prop)
+            {
                 return None;
             }
             cur = cd.extends.as_deref();
@@ -2067,6 +2315,18 @@ impl Simulator {
         key: &str,
     ) -> Option<(String, Option<String>)> {
         let (slot, modport) = self.vif_slot(class_name, handle, key)?;
+        if slot.0 == 0 && !key.contains('[') {
+            // §8.26: object and typedef spellings retain the specialization
+            // of the declaring class, including an inherited static.
+            let spec = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|o| o.spec.as_ref());
+            return self
+                .static_vif_binding_of_scope(class_name, key, spec)
+                .map(|bound| (bound, modport));
+        }
         let (bound, _) = self.virtual_iface_bindings.get(&slot)?;
         Some((bound.clone(), modport))
     }
@@ -2101,6 +2361,15 @@ impl Simulator {
                 // `Cls::svif` — a class scope owns only its statics.
                 _ if rest.is_empty() && self.vif_class_of_scope_name(head).is_some() => {
                     return Some((head, 0));
+                }
+                // §26.3: `pkg::Cls::p` — a PACKAGE-qualified class scope. The
+                // class is the LAST segment of the owner path, the same head
+                // `extract_call_spec` reads for `pkg::Cls#(args)::p`.
+                _ if rest.len() == 1
+                    && rest.iter().all(|s| s.selects.is_empty())
+                    && self.module.classes.contains_key(rest[0].name.name.as_str()) =>
+                {
+                    return Some((rest[0].name.name.as_str(), 0));
                 }
                 _ => return None,
             },
@@ -2164,13 +2433,35 @@ impl Simulator {
         if let Some(b) = self.iface_alias_for(key) {
             return Some((b, None));
         }
-        if self.virtual_iface_bindings.is_empty()
-            || !self.vif_prop_name_possible(name)
-            || self
-                .local_stack
-                .last()
-                .is_some_and(|l| l.contains_key(name))
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(name))
         {
+            return None;
+        }
+        // §8.26: a static virtual interface of a PARAMETERIZED class has one
+        // cell PER SPECIALIZATION, and the write files the binding in
+        // `static_vif_bindings` under the canonical spec key `C#(T)::p`. Inside
+        // a static method the executing specialization IS the context, so ask
+        // with it BEFORE the per-object table below — a design whose only bound
+        // virtual interfaces are class statics never fills
+        // `virtual_iface_bindings` at all, and the emptiness gate that lookup
+        // used to sit behind declined the read outright. `vif_prop_target`
+        // canonicalises the class and asks for `C::p`, missing the spec cell:
+        // that is why the same static read back fine through the qualified
+        // spelling but not bare. A miss is no opinion, and the paths below run
+        // exactly as before.
+        if key == name
+            && self.vif_prop_name_possible(name)
+            && let Some(ctx) = self.class_context_stack.last().cloned().flatten()
+            && let Some(b) =
+                self.static_vif_binding_of_scope(&ctx, name, self.current_spec.as_ref())
+        {
+            let modport = self.vif_slot(&ctx, 0, key).and_then(|(_, mp)| mp);
+            return Some((b, modport));
+        }
+        if self.virtual_iface_bindings.is_empty() || !self.vif_prop_name_possible(name) {
             return None;
         }
         match self.this_stack.last().copied().flatten() {
@@ -2396,9 +2687,18 @@ impl Simulator {
             } => {
                 // §8.25/§25.9: a static vif of a specialization,
                 // `G#(virtual pif)::one`, binds per specialization.
-                if matches!(owner.kind, ExprKind::Specialization { .. })
-                    && let Some(b) = self.static_vif_binding(recv)
-                {
+                // §26.3: a static vif of a PACKAGE-qualified class,
+                // `pkg::G::one`, reaches the same class-scope cell; neither
+                // spelling resolves an owner HANDLE, so consult the static
+                // binding directly instead of walking a nonexistent chain.
+                let class_scope_head = match &owner.kind {
+                    ExprKind::Specialization { .. } => true,
+                    ExprKind::MemberAccess { member, .. } => {
+                        self.module.classes.contains_key(member.name.as_str())
+                    }
+                    _ => false,
+                };
+                if class_scope_head && let Some(b) = self.static_vif_binding(recv) {
                     return Some((b, None));
                 }
                 if !self.vif_prop_name_possible(&member.name) {
@@ -2559,6 +2859,7 @@ impl Simulator {
         let returned_possible = !self.recv_call_memo.is_empty();
         if !alias_possible
             && self.virtual_iface_bindings.is_empty()
+            && self.static_vif_bindings.is_empty()
             && !self.vif_tokens_stored
             && !returned_possible
         {
@@ -2765,7 +3066,12 @@ impl Simulator {
                 let last = h.path[h.path.len() - 1].name.name.as_str();
                 (h.path.len() == 2
                     && (self.is_interface_instance(&h.path[0].name.name)
-                        || self.class_member_names().vif_props.contains(last)))
+                        || self.class_member_names().vif_props.contains(last)
+                        // §25.9: `t.v` where `v` is a module-scope
+                        // virtual-interface VARIABLE alias, e.g. an omitted
+                        // formal's default.
+                        || (h.path[0].name.name == self.module.name
+                            && self.viface_var_aliases.contains_key(last))))
                     || self.iface_path_parts().0.contains(last)
             }
             ExprKind::MemberAccess { expr, member } => {
@@ -2776,6 +3082,12 @@ impl Simulator {
                         .vif_props
                         .contains(member.name.as_str())
                     || self.iface_path_parts().0.contains(member.name.as_str())
+                    // §25.9: `t.v` where `v` is a module-scope virtual-interface
+                    // VARIABLE alias, e.g. an omitted formal's default.
+                    || (matches!(&expr.kind, ExprKind::Ident(bh)
+                            if bh.path.len() == 1
+                                && bh.path[0].name.name == self.module.name)
+                        && self.viface_var_aliases.contains_key(member.name.as_str()))
             }
             ExprKind::Index { expr: base, .. } => {
                 if self.vif_tokens_stored && self.static_vif_key(base).is_some() {
@@ -2864,14 +3176,20 @@ impl Simulator {
         }
     }
 
-    /// §23.9/§25.9: only the current task frame's real interface formals
-    /// preempt property/flat-slot lookup. Function frames retain their flat
-    /// binding slots, which their output writeback machinery snapshots. Generic class formals may also have
-    /// legacy name aliases; those are not virtual-interface variables.
+    /// §23.9/§25.9: task formals use their binding frame. Function formals
+    /// retain flat-slot lookup for bound values and an explicit null marker
+    /// for unbound ones. Generic class aliases are not vif variables.
     pub(super) fn vif_frame_alias(&self, name: &str) -> Option<Option<String>> {
         let frame = self.local_iface_aliases.last()?;
         if !frame.contains_key("__xezim_task_vif_frame__") {
-            return None;
+            // Function formals also carry an explicit null marker. Bound
+            // function values keep their existing flat-slot lookup order.
+            return (frame.get(name).is_some_and(String::is_empty)
+                && self
+                    .local_stack
+                    .last()
+                    .is_some_and(|f| f.contains_key(name)))
+            .then_some(None);
         }
         let bound = frame.get(name)?;
         let owned = self
@@ -2913,9 +3231,34 @@ impl Simulator {
         if self.viface_var_aliases.is_empty() {
             return None; // fast path: no vif variables bound anywhere
         }
-        self.viface_var_aliases
-            .get(self.vif_variable_name(name).as_ref())
-            .cloned()
+        let bound = self
+            .viface_var_aliases
+            .get(self.vif_variable_name(name).as_ref())?;
+        // §23.9 / §8.4: a frame-local or class property hides an enclosing
+        // module variable. Formal aliases above still take precedence.
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|frame| frame.contains_key(name))
+        {
+            return None;
+        }
+        let class = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|handle| self.heap.get(handle).and_then(|object| object.as_ref()))
+            .map(|object| object.class_name.as_str())
+            .or_else(|| {
+                self.class_context_stack
+                    .last()
+                    .and_then(|class| class.as_deref())
+            });
+        if class.is_some_and(|class| self.class_vif_decl(class, name).is_some()) {
+            return None;
+        }
+        Some(bound.clone())
     }
 
     /// §26.3: the task a `pkg::t` callee names — the package-qualified key

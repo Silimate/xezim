@@ -3277,8 +3277,11 @@ impl Simulator {
                                         let spec = self
                                             .task_method_spec(Some(rh), &mclass)
                                             .or_else(|| self.current_spec.clone());
-                                        let mut cleanup =
-                                            self.bind_task_frame(td, args, Some(spec));
+                                        let mut cleanup = self.bind_task_frame(
+                                            td,
+                                            args,
+                                            Some((spec, Some(rh), mclass.clone())),
+                                        );
                                         // Even a same-object bare call changes
                                         // the defining-class context used by
                                         // `super`; push both stacks uniformly.
@@ -3493,7 +3496,11 @@ impl Simulator {
                             };
                             if self.stmts_have_blocking(&td.items) {
                                 let spec = recv_spec.clone().or_else(|| self.current_spec.clone());
-                                let mut cleanup = self.bind_task_frame(td, args, Some(spec));
+                                let mut cleanup = self.bind_task_frame(
+                                    td,
+                                    args,
+                                    Some((spec, None, mclass.clone())),
+                                );
                                 // Static context: push the declaring class for
                                 // member/static resolution, with a null `this`.
                                 self.m_scope_stack.clear();

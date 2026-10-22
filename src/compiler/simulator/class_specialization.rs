@@ -3151,13 +3151,26 @@ impl Simulator {
                     key.push_str(lname);
                     key
                 };
-                if matches!(&rvalue.kind, ExprKind::Null) {
+                if matches!(&rvalue.kind, ExprKind::Null) || self.vif_operand(rvalue) == Some(None)
+                {
                     let key = make_key(is_prop_of);
                     self.signals.remove(&key);
+                    if frame_local
+                        && let Some(aliases) = self.local_iface_aliases.last_mut()
+                        && let Some(bound) = aliases.get_mut(lname)
+                    {
+                        bound.clear();
+                    }
                 } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
                     let key = make_key(is_prop_of);
                     self.vif_local_names.insert(lname.to_string());
                     self.signals.insert(key, Value::from_string(&nm));
+                    if frame_local
+                        && let Some(aliases) = self.local_iface_aliases.last_mut()
+                        && let Some(bound) = aliases.get_mut(lname)
+                    {
+                        *bound = nm;
+                    }
                 }
             }
         }

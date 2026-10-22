@@ -2530,6 +2530,7 @@ mod aggregate_expressions;
 mod aggregate_members;
 mod arguments;
 mod assertions;
+mod sva_until;
 mod assignments;
 mod bytecode_runtime;
 mod calls;
@@ -3629,6 +3630,10 @@ enum SvaSeq {
         min: u64,
         max: u64,
     },
+    /// §16.12.12 `left until right` / `left s_until right`: matches the
+    /// tick `right` first matches, provided `left` held at every earlier
+    /// tick.
+    Until(Box<SvaSeq>, Box<SvaSeq>),
     /// §16.10 / §16.11 match items, run within the cycle: local variable
     /// assignments and subroutine calls (no cycle of its own).
     Assign(Vec<SvaMatchItem>),
@@ -3685,6 +3690,10 @@ enum SvaCompound {
     Delay(u64, u64),
     /// §16.9.2: counted copies of the unit, one cycle apart.
     Repeat(SvaNfa, u64, u64),
+    /// §16.12.12 `left until right` / `left s_until right`: matches the
+    /// tick `right` first matches, provided `left` held at every earlier
+    /// tick.
+    Until { left: SvaNfa, right: SvaNfa },
 }
 
 /// A sequence in flight: `pcs` are the states waiting for the next cycle,
@@ -3748,6 +3757,13 @@ enum SvaNode {
     },
     And(Box<SvaNode>, Box<SvaNode>),
     Or(Box<SvaNode>, Box<SvaNode>),
+    Iff(Box<SvaNode>, Box<SvaNode>),
+    /// §16.12.12: arbitrary properties are started at each candidate tick.
+    Until {
+        left: Box<SvaNode>,
+        right: Box<SvaNode>,
+        strong: bool,
+    },
     /// §16.12.6 `s_eventually e`: holds once `e` samples true.
     Eventually(Expression),
     /// §16.12.6 `s_always e`: fails the first tick `e` samples false.
@@ -3757,9 +3773,8 @@ enum SvaNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SvaOutcome {
     Pass,
-    /// Holds, but the evaluation was vacuous (§16.14.8): an implication
-    /// whose antecedent never matched, or whose every consequent evaluation
-    /// was itself vacuous. Fires no pass action (§16.12.1).
+    /// A vacuous success (§16.14.8), including an implication whose
+    /// antecedent never matched or whose consequents all passed vacuously.
     Vacuous,
     /// A failure, never vacuous: the reference simulator counts `not p` of a
     /// failing `p` as a nonvacuous success, whatever made `p` fail.
@@ -3792,8 +3807,6 @@ enum SvaState {
     Impl {
         ante: SvaRun,
         ante_alive: bool,
-        /// A consequent evaluation has succeeded nonvacuously, which makes
-        /// the attempt nonvacuous (§16.14.8).
         nonvacuous: bool,
         /// Consequent evaluations `(ticks until they start, state)`.
         cons: Vec<(u32, SvaState)>,
@@ -3815,8 +3828,22 @@ enum SvaState {
         ra: Option<SvaOutcome>,
         rb: Option<SvaOutcome>,
     },
+    Until {
+        env: SvaEnv,
+        ticks: Vec<SvaUntilTick>,
+        closed: bool,
+    },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
     Leaf(SvaEnv),
+}
+
+/// One candidate start point of a property-valued until operand.
+#[derive(Debug, Clone)]
+struct SvaUntilTick {
+    left: SvaState,
+    right: SvaState,
+    left_result: Option<SvaOutcome>,
+    right_result: Option<SvaOutcome>,
 }
 
 /// Thompson-style construction of `SvaNfa` fragments.
@@ -4009,6 +4036,10 @@ impl SvaNfaBuilder {
             SvaSeq::Throughout(e, a) => {
                 self.sub(SvaCompound::Throughout(e.clone(), Self::build(a)))
             }
+            SvaSeq::Until(a, b) => self.sub(SvaCompound::Until {
+                left: Self::build(a),
+                right: Self::build(b),
+            }),
             SvaSeq::Within(a, b) => {
                 // §16.9.10: `(1[*0:$] ##1 a ##1 1[*0:$]) intersect b`.
                 let span = crate::ast::Span::dummy();
@@ -4586,6 +4617,9 @@ struct BlockScopeSave {
     declarations: Vec<DeclShadow>,
     /// The enclosing frame's string-kind overlay, not the global name table.
     string_kinds: Vec<(String, Option<bool>)>,
+    /// Virtual-interface aliases and auxiliary slots hidden by this block.
+    vif_aliases: Vec<(String, Option<String>)>,
+    vif_slots: Vec<(String, Option<Value>)>,
     /// A suspend-aware for loop closes its variable scope at the same sentinel.
     loop_vars: Vec<LoopVarSnapshot>,
     owns_loop_frame: bool,
@@ -4625,6 +4659,8 @@ struct TaskCleanup {
     /// (`active_task_pids`). None for frames without a stable name.
     task_name: Option<String>,
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
+    /// §13.5.3: omitted outputs copy back in the declaration's scope.
+    default_output_bindings: Vec<(String, crate::ast::expr::Expression)>,
     /// §25.9: flat binding slots shadowed by this task's formals.
     saved_vif_formals: Vec<(String, Option<Value>)>,
     assoc_params: Vec<(String, String, bool)>,

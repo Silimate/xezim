@@ -415,6 +415,69 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   of nested packed elements and sub-arrays, including packed struct elements
   wider than 32 bits (§7.4.1). (#461, contributed by chenbhil)
 
+* Nested implications and property `if` preserve vacuous successes through
+  their consequents, so `$assertvacuousoff` suppresses their pass actions.
+  Nonvacuous successes remain recorded across delayed and multiple matches
+  (§16.14.8, §20.12). (#445, reported by akashlevy)
+
+* Static virtual interfaces retain their specialization through qualified,
+  typedef and object-member reads, inheritance, copies, null assignments and
+  output writeback. Nested local bindings restore the enclosing interface
+  after function, task and loop scopes end (§6.21, §8.26, §25.9).
+  (#431, #433; #465 and #466 contributed by Ganesh-TNL)
+
+* Virtual-interface formals preserve the bindings of call and conditional
+  arguments without repeating getter calls or leaking their bindings into
+  scalar results. Output formals start null and copy that default back when
+  left unassigned (§13.5.2, §25.9).
+
+* Hierarchical references through interface ports resolve to the connected
+  interface instance, including modports, nested connections and generated
+  instances. Reads, writes, waits, events and subroutine calls share that
+  instance's storage (§23.8, §25.3). Recompile saved designs to refresh their
+  interface-port connections.
+
+* Unpacked parameter arrays preserve declared bounds, element types and
+  nested selections across package imports and hierarchical reads. Instance
+  body overrides and array-dependent constants use the selected values
+  (§6.20.2, §26.3). (#425, reported by Ganesh-TNL;
+  #467 and companion core changes contributed by Ganesh-TNL)
+
+* Assertions and sampled-value functions continue to tick when their clock
+  is reached through an interface port from a nested scope (§16.9.3, §23.8).
+
+* `foreach` walks fixed outer dimensions and each inner collection in
+  declaration order, including descending bounds, inherited properties and
+  hierarchical module arrays (§12.7.3). (#492, contributed by chenbhil)
+* Assertion actions read Preponed samples even when the property does not
+  read the operand. Omitted virtual-interface arguments bind their defaults
+  once in the declaration scope and preserve input/output identity (§16.9.3,
+  §13.5.3). (#468 and #469, reported by akashlevy;
+  #493 contributed by Thomasb81)
+* Assertion `until`, `s_until` and `iff` evaluate property operands and pending
+  obligations, with strong end-of-simulation failure and Boolean X/Z truth
+  handling (§16.12.8, §16.12.12). Pure constraints in concrete classes and
+  parameter initializers that read specify parameters receive scoped
+  diagnostics (§18.5.2, §6.20.5). Recompile saved designs to refresh their
+  declaration metadata. (#493 and core #81, contributed by Thomasb81)
+* Compilation-unit constant functions are available to program and interface
+  constants, including parameter headers (§13.4.3).
+  (#488, reported by Dragon-Git)
+* Body type parameters retain widths, aliases, signing and class
+  specializations. Module instances bind their own type overrides (§6.20.3,
+  §8.3). (#498, reported by Dragon-Git)
+
+* Class instance and static property assignments take the declared signing
+  even when the right-hand side already has the destination width. Hidden
+  base properties use their own declarations and type bindings (§10.7, §8.14).
+  (#499, reported by akashlevy)
+* Procedural bitwise `&`, `|`, `^` and `~^` results are signed when both
+  operands are signed, preserving arithmetic and comparison behavior
+  (§11.8.1). (#500, reported by akashlevy)
+* Arithmetic right shifts replicate X and Z sign bits in narrow values and
+  retain the left operand's signing for unknown amounts and overshifts
+  (§11.4.10).
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and

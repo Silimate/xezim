@@ -76,3 +76,68 @@ endmodule
         sim.output
     );
 }
+
+// §8.26.6.3: a fully-parameterized diamond that reuses the same type name T
+// through two different intermediate classes is legal when the leaf class
+// declares T itself (issue #476).
+#[test]
+fn parameterized_diamond_redeclares_type() {
+    let src = r#"
+module class_tb ();
+  interface class ibase#(type T);
+    pure virtual function T get();
+  endclass
+  interface class ic1#(type T) extends ibase#(T);
+  endclass
+  interface class ic2#(type T) extends ibase#(T);
+  endclass
+  // Diamond: both ic1 and ic2 (and ibase) contribute T; ic3 declares it.
+  interface class ic3#(type T) extends ic1#(T), ic2#(T);
+  endclass
+  class impl#(type T) implements ic3#(T);
+    virtual function T get(); return 42; endfunction
+  endclass
+  initial begin
+    impl#(int) o = new;
+    $display("T|476|%0d", o.get());
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("parameterized diamond with redeclaration is legal");
+    assert!(
+        sim.output.iter().any(|o| o.message == "T|476|42"),
+        "{:?}",
+        sim.output
+    );
+}
+
+// §8.26.6.2: distinct parameter names from different bases (T vs U) do not
+// collide when the leaf specializes both bases (issue #477).
+#[test]
+fn distinct_parameter_names_across_bases() {
+    let src = r#"
+module class_tb ();
+  interface class ic1#(type T);
+    pure virtual function T get();
+  endclass
+  interface class ic2#(int U);
+    pure virtual function int get();
+  endclass
+  interface class ic3 extends ic1#(int), ic2#(42);
+  endclass
+  class impl implements ic3;
+    virtual function int get(); return 42; endfunction
+  endclass
+  initial begin
+    impl o = new;
+    $display("T|477|%0d", o.get());
+  end
+endmodule
+"#;
+    let sim = simulate(src, 10).expect("distinct parameter names across bases are legal");
+    assert!(
+        sim.output.iter().any(|o| o.message == "T|477|42"),
+        "{:?}",
+        sim.output
+    );
+}

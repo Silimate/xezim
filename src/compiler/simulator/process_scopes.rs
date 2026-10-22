@@ -1325,6 +1325,28 @@ impl Simulator {
             let plain = Self::type_is_plain_scalar(data_type);
             for d in declarators {
                 let nm = d.name.name.as_str();
+                if d.dimensions.is_empty() && self.is_virtual_iface_type(data_type) {
+                    // §6.21 / §25.9: hiding a variable also hides its binding.
+                    // Values alone cannot restore the enclosing vif after a
+                    // nested block has rebound or cleared the same bare name.
+                    if let Some(aliases) = self.local_iface_aliases.last_mut() {
+                        sv.vif_aliases.push((nm.to_string(), aliases.remove(nm)));
+                    }
+                    let mut keys = vec![format!("__vif_local__{nm}")];
+                    if let Some(th) = self
+                        .this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .filter(|&h| h != 0)
+                    {
+                        keys.push(format!("__vif_local__{th}#{nm}"));
+                    }
+                    for key in keys {
+                        let saved = self.signals.remove(&key);
+                        sv.vif_slots.push((key, saved));
+                    }
+                }
                 let type_changes = match self.module.var_decl_types.get(nm) {
                     Some(old) => !Self::dt_trivially_equal(old, data_type),
                     None => self.widths.contains_key(nm),
@@ -1450,6 +1472,28 @@ impl Simulator {
         if !sv.dyn_shadowed.is_empty() {
             if let Some(ld) = self.local_dyn.last_mut() {
                 ld.extend(sv.dyn_shadowed);
+            }
+        }
+        if let Some(aliases) = self.local_iface_aliases.last_mut() {
+            for (name, previous) in sv.vif_aliases {
+                match previous {
+                    Some(bound) => {
+                        aliases.insert(name, bound);
+                    }
+                    None => {
+                        aliases.remove(&name);
+                    }
+                }
+            }
+        }
+        for (key, previous) in sv.vif_slots {
+            match previous {
+                Some(value) => {
+                    self.signals.insert(key, value);
+                }
+                None => {
+                    self.signals.remove(&key);
+                }
             }
         }
         self.restore_decl_shadows(sv.declarations);

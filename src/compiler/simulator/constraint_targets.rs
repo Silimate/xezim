@@ -548,6 +548,31 @@ impl Simulator {
     /// Returns that key when `e` supplies exactly the outer indices; with
     /// fewer or more indices the caller's element paths apply.
     pub(super) fn class_array_of_coll_key(&mut self, e: &Expression) -> Option<String> {
+        self.class_coll_elem_key(e, false)
+    }
+
+    /// [`class_array_of_coll_key`] restricted to a FIXED outer shape, with
+    /// every index inside its declared bounds: an element that exists for
+    /// as long as the object does.
+    pub(super) fn class_fixed_array_of_coll_key(&mut self, e: &Expression) -> Option<String> {
+        self.class_coll_elem_key(e, true)
+    }
+
+    /// The object store `<h>#q` and outer shape of a class property that is
+    /// a FIXED array of collections, named without selects (`q`, `this.q`,
+    /// `h.q`): what a multi-variable `foreach (q[i, j, k])` walks.
+    pub(super) fn class_fixed_array_of_coll_base(
+        &mut self,
+        base: &Expression,
+    ) -> Option<(String, Vec<(i64, i64)>)> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let (handle, member, _, shape) = self.class_coll_prop(base, true)?;
+        Some((format!("{}#{}", handle, member), shape?))
+    }
+
+    fn class_coll_elem_key(&mut self, e: &Expression, fixed_only: bool) -> Option<String> {
         let mut idxs: Vec<&Expression> = Vec::new();
         let mut cur = e;
         while let ExprKind::Index { expr: b, index } = &cur.kind {
@@ -558,7 +583,35 @@ impl Simulator {
             return None;
         }
         idxs.reverse();
-        let (handle, member): (usize, String) = match &cur.kind {
+        let (handle, member, outer_len, bounds) = self.class_coll_prop(cur, fixed_only)?;
+        if outer_len != idxs.len() {
+            return None;
+        }
+        let mut key = format!("{}#{}", handle, member);
+        for (d, ix) in idxs.into_iter().enumerate() {
+            let i = self.eval_expr(ix).to_i64().unwrap_or(0);
+            if let Some(b) = &bounds
+                && !(b[d].0.min(b[d].1)..=b[d].0.max(b[d].1)).contains(&i)
+            {
+                return None;
+            }
+            key.push('[');
+            key.push_str(&i.to_string());
+            key.push(']');
+        }
+        Some(key)
+    }
+
+    /// The receiver handle, member name and outer dimension count of the
+    /// class collection property `base` names; with `fixed_only`, only a
+    /// fixed array of collections, and its declared outer shape.
+    #[allow(clippy::type_complexity)]
+    fn class_coll_prop(
+        &mut self,
+        base: &Expression,
+        fixed_only: bool,
+    ) -> Option<(usize, String, usize, Option<Vec<(i64, i64)>>)> {
+        let (handle, member): (usize, String) = match &base.kind {
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let nm = &h.path[0].name.name;
                 if self.local_stack.last().is_some_and(|l| l.contains_key(nm)) {
@@ -590,34 +643,28 @@ impl Simulator {
             .and_then(|x| x.as_ref())
             .map(|i| i.class_name.clone())?;
         let mut cur_cls: Option<String> = Some(cn);
-        let mut outer_len: Option<usize> = None;
         while let Some(c) = cur_cls {
             let Some(cd) = self.module.classes.get(&c) else {
                 break;
             };
             if let Some((shape, _, _)) = cd.array_of_coll_properties.get(&member) {
-                outer_len = Some(shape.len());
-                break;
+                let bounds = fixed_only.then(|| {
+                    cd.array_prop_decl_dims
+                        .get(&member)
+                        .cloned()
+                        .unwrap_or_else(|| shape.clone())
+                });
+                return Some((handle, member, shape.len(), bounds));
             }
-            if !cd.dynamic_assoc_properties.is_empty()
+            if !fixed_only
+                && !cd.dynamic_assoc_properties.is_empty()
                 && cd.dynamic_assoc_properties.contains_key(&member)
             {
-                outer_len = Some(1);
-                break;
+                return Some((handle, member, 1, None));
             }
             cur_cls = cd.extends.clone();
         }
-        if outer_len? != idxs.len() {
-            return None;
-        }
-        let mut key = format!("{}#{}", handle, member);
-        for ix in idxs {
-            let i = self.eval_expr(ix).to_i64().unwrap_or(0);
-            key.push('[');
-            key.push_str(&i.to_string());
-            key.push(']');
-        }
-        Some(key)
+        None
     }
 
     /// Whether the collection element `key` (`<h>#m[i]`, or `m[i]` of

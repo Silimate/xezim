@@ -2488,6 +2488,34 @@ impl Simulator {
         }
     }
 
+    /// §13.5.3: normalization fills omitted named/positional slots from
+    /// defaults, but their evaluation still belongs to the declaration scope.
+    /// Constructed only for calls that actually require normalization.
+    pub(super) fn supplied_argument_mask(
+        ports: &[crate::ast::decl::FunctionPort],
+        args: &[Expression],
+    ) -> Vec<bool> {
+        let mut supplied = vec![false; ports.len()];
+        let mut pos = 0;
+        for arg in args {
+            match &arg.kind {
+                ExprKind::NamedArg { name, expr } => {
+                    if let Some(i) = ports.iter().position(|p| p.name.name == name.name) {
+                        supplied[i] = expr.is_some();
+                    }
+                }
+                ExprKind::Empty => pos += 1,
+                _ => {
+                    if let Some(slot) = supplied.get_mut(pos) {
+                        *slot = true;
+                    }
+                    pos += 1;
+                }
+            }
+        }
+        supplied
+    }
+
     pub(crate) fn normalize_call_args(
         ports: &[crate::ast::decl::FunctionPort],
         args: &[Expression],

@@ -371,6 +371,12 @@ impl Simulator {
                     Box::new(self.sva_seq_from_expr(left)),
                     Box::new(self.sva_seq_from_expr(right)),
                 ),
+                // §16.12.12. `s_until` (strong) must eventually match; the
+                // plain `until` (weak) holds regardless if it never does.
+                BinaryOp::Until | BinaryOp::SUntil => SvaSeq::Until(
+                    Box::new(self.sva_seq_from_expr(left)),
+                    Box::new(self.sva_seq_from_expr(right)),
+                ),
                 _ => SvaSeq::Bool(e.clone()),
             },
             // A trailing bare `##N`: a delay with nothing to check.
@@ -461,6 +467,8 @@ impl Simulator {
                         | BinaryOp::Within
                         | BinaryOp::OrMinusArrow
                         | BinaryOp::OrFatArrow
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
                 ) || Self::sva_is_temporal(left)
                     || Self::sva_is_temporal(right)
             }
@@ -560,7 +568,12 @@ impl Simulator {
             SvaNode::Seq(nfa, _) => inject(nfa),
             SvaNode::Impl { ante, .. } | SvaNode::Followed { ante, .. } => inject(ante),
             SvaNode::Not(inner) => Self::sva_inject_init(inner, init),
-            SvaNode::And(a, b) | SvaNode::Or(a, b) => {
+            SvaNode::And(a, b)
+            | SvaNode::Or(a, b)
+            | SvaNode::Iff(a, b)
+            | SvaNode::Until {
+                left: a, right: b, ..
+            } => {
                 Self::sva_inject_init(a, init);
                 Self::sva_inject_init(b, init);
             }
@@ -638,6 +651,39 @@ impl Simulator {
             ExprKind::Unary { op, operand } if matches!(op, UnaryOp::SAlways) => {
                 SvaNode::Always((**operand).clone())
             }
+            ExprKind::Binary { op, left, right }
+                if matches!(op, BinaryOp::Until | BinaryOp::SUntil) =>
+            {
+                let strong = matches!(op, BinaryOp::SUntil);
+                if !Self::sva_is_temporal(left)
+                    && !Self::sva_is_temporal(right)
+                    && !Self::sva_has_property_op(left)
+                    && !Self::sva_has_property_op(right)
+                {
+                    // Keep the constant-space NFA for Boolean operands.
+                    SvaNode::Seq(self.sva_build_seq(e), strong)
+                } else {
+                    SvaNode::Until {
+                        left: Box::new(self.sva_compile_node(left)),
+                        right: Box::new(self.sva_compile_node(right)),
+                        strong,
+                    }
+                }
+            }
+            ExprKind::Binary {
+                op: BinaryOp::Iff,
+                left,
+                right,
+            } if Self::sva_is_temporal(left)
+                || Self::sva_is_temporal(right)
+                || Self::sva_has_property_op(left)
+                || Self::sva_has_property_op(right) =>
+            {
+                SvaNode::Iff(
+                    Box::new(self.sva_compile_node(left)),
+                    Box::new(self.sva_compile_node(right)),
+                )
+            }
             // §16.12.2 `strong(seq)` / `weak(seq)` as a property.
             ExprKind::SystemCall { name, args }
                 if matches!(name.as_str(), "$sva_strong" | "$sva_weak") && args.len() == 1 =>
@@ -687,6 +733,17 @@ impl Simulator {
             (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
                 Self::sva_op_fails(ra, na, a) && Self::sva_op_fails(rb, nb, b)
             }
+            (SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb }) => {
+                Self::sva_op_fails(ra, na, a) != Self::sva_op_fails(rb, nb, b)
+            }
+            (
+                SvaNode::Until {
+                    left,
+                    right,
+                    strong,
+                },
+                SvaState::Until { ticks, .. },
+            ) => Self::sva_until_fails_at_end(left, right, *strong, ticks),
             _ => false,
         }
     }
@@ -797,9 +854,15 @@ impl Simulator {
                 true
             }
             ExprKind::Binary { op, left, right } => {
-                matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow)
-                    || (matches!(op, BinaryOp::SvaAnd | BinaryOp::SeqOr)
-                        && (Self::sva_has_property_op(left) || Self::sva_has_property_op(right)))
+                matches!(
+                    op,
+                    BinaryOp::OrMinusArrow
+                        | BinaryOp::OrFatArrow
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
+                        | BinaryOp::Iff
+                ) || (matches!(op, BinaryOp::SvaAnd | BinaryOp::SeqOr)
+                    && (Self::sva_has_property_op(left) || Self::sva_has_property_op(right)))
             }
             ExprKind::Unary { op, operand } => {
                 matches!(op, UnaryOp::SEventually | UnaryOp::SAlways)
@@ -839,7 +902,7 @@ impl Simulator {
                 ante_alive: true,
                 cons: Vec::new(),
             },
-            SvaNode::And(a, b) => SvaState::And {
+            SvaNode::And(a, b) | SvaNode::Iff(a, b) => SvaState::And {
                 a: Box::new(Self::sva_new_state(a, env)),
                 b: Box::new(Self::sva_new_state(b, env)),
                 ra: None,
@@ -850,6 +913,11 @@ impl Simulator {
                 b: Box::new(Self::sva_new_state(b, env)),
                 ra: None,
                 rb: None,
+            },
+            SvaNode::Until { .. } => SvaState::Until {
+                env: env.clone(),
+                ticks: Vec::new(),
+                closed: false,
             },
             SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf(env.clone()),
         }
@@ -992,6 +1060,7 @@ impl Simulator {
                     SvaEdge::Sub(comp, t) => {
                         let n = match &**comp {
                             SvaCompound::And(..) | SvaCompound::Intersect(..) => 2,
+                            SvaCompound::Until { .. } => 2,
                             _ => 1,
                         };
                         let mut sub = SvaSubRun {
@@ -1131,6 +1200,51 @@ impl Simulator {
                 };
                 (out, a1 && a2)
             }
+            SvaCompound::Until { left, right } => {
+                // §16.12.12. The whole matches the tick `right` first
+                // matches, provided `left` held at every earlier tick.
+                // `sub.ever[0]` tracks whether `left` has held so far; on
+                // the first tick (`ticks == 0`) there are no earlier ticks,
+                // so `left` held vacuously. Both operands are re-armed each
+                // tick so a single-cycle boolean operand is re-checked
+                // fresh.
+                let env = std::mem::take(&mut sub.env);
+                let mut out: Vec<SvaEnv> = Vec::new();
+                let on_first_tick = sub.ticks == 0;
+                sub.ticks = sub.ticks.saturating_add(1);
+                let left_held = sub.ever[0] || on_first_tick;
+                let (m2, alive_r) = self.sva_run_advance(right, &mut sub.runs[1], false);
+                if !m2.is_empty() {
+                    if left_held {
+                        for e in &m2 {
+                            out.push(e.clone());
+                        }
+                    }
+                    // The `until` matched (or was broken by `left`); either
+                    // way this compound is done for this attempt.
+                    return (out, false);
+                }
+                // `right` did not match this tick; `left` must hold here.
+                let (m1, alive_l) = self.sva_run_advance(left, &mut sub.runs[0], false);
+                let left_holds_here = !m1.is_empty() || alive_l;
+                if left_holds_here {
+                    // Left holds here: record it and re-arm both operands so
+                    // they are re-checked afresh next tick.
+                    sub.ever[0] = true;
+                    sub.runs[0] = SvaRun::with_env(env.clone());
+                    if !alive_r {
+                        sub.runs[1] = SvaRun::with_env(env);
+                    }
+                    return (out, true);
+                }
+                // `left` failed before `right` matched: the compound is
+                // broken. The weak/strong distinction for whether this is a
+                // hard failure is owned by the enclosing `SvaNode`'s strong
+                // flag (§16.12.12); here the attempt simply produces no
+                // match and dies.
+                sub.ever[0] = false;
+                (out, false)
+            }
         }
     }
 
@@ -1171,12 +1285,15 @@ impl Simulator {
                 if *ante_alive {
                     let (m, alive) = self.sva_run_advance(ante, arun, false);
                     *ante_alive = alive;
-                    for env in &m {
-                        fresh.push(Self::sva_new_state(cons_node, env));
+                    if !m.is_empty() {
+                        for env in &m {
+                            fresh.push(Self::sva_new_state(cons_node, env));
+                        }
                     }
                 }
-                // §16.14.8: the attempt is nonvacuous iff a consequent
-                // evaluation is; a failed one fails it.
+                // §16.14.8: a matching antecedent is not enough. At least
+                // one consequent must succeed nonvacuously; remember that
+                // success while other matches and consequents remain pending.
                 let mut failed = false;
                 let mut keep: Vec<(u32, SvaState)> = Vec::new();
                 for (mut delay, mut cst) in cons.drain(..) {
@@ -1188,16 +1305,18 @@ impl Simulator {
                         continue;
                     }
                     match self.sva_advance(cons_node, &mut cst) {
-                        Some(r) if !r.holds() => failed = true,
-                        Some(r) => *nonvacuous |= r.nonvacuous(),
+                        Some(SvaOutcome::Fail) => failed = true,
+                        Some(SvaOutcome::Pass) => *nonvacuous = true,
+                        Some(SvaOutcome::Vacuous) => {}
                         None => keep.push((0, cst)),
                     }
                 }
                 for mut cst in fresh {
                     if *overlap {
                         match self.sva_advance(cons_node, &mut cst) {
-                            Some(r) if !r.holds() => failed = true,
-                            Some(r) => *nonvacuous |= r.nonvacuous(),
+                            Some(SvaOutcome::Fail) => failed = true,
+                            Some(SvaOutcome::Pass) => *nonvacuous = true,
+                            Some(SvaOutcome::Vacuous) => {}
                             None => keep.push((0, cst)),
                         }
                     } else {
@@ -1211,7 +1330,11 @@ impl Simulator {
                     return Some(SvaOutcome::Fail);
                 }
                 if !*ante_alive && cons.is_empty() {
-                    Some(SvaOutcome::of(true, *nonvacuous))
+                    Some(if *nonvacuous {
+                        SvaOutcome::Pass
+                    } else {
+                        SvaOutcome::Vacuous
+                    })
                 } else {
                     None
                 }
@@ -1320,6 +1443,29 @@ impl Simulator {
                     )),
                     _ => None,
                 }
+            }
+            (SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb }) => {
+                if ra.is_none() {
+                    *ra = self.sva_advance(na, a);
+                }
+                if rb.is_none() {
+                    *rb = self.sva_advance(nb, b);
+                }
+                match (*ra, *rb) {
+                    (Some(a), Some(b)) => {
+                        Some(if (a == SvaOutcome::Fail) != (b == SvaOutcome::Fail) {
+                            SvaOutcome::Fail
+                        } else if a == SvaOutcome::Vacuous && b == SvaOutcome::Vacuous {
+                            SvaOutcome::Vacuous
+                        } else {
+                            SvaOutcome::Pass
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            (SvaNode::Until { left, right, .. }, SvaState::Until { env, ticks, closed }) => {
+                self.sva_advance_until(left, right, env, ticks, closed)
             }
             (SvaNode::Eventually(e), SvaState::Leaf(env)) => {
                 if self.sva_eval_env(e, env).is_true() {
@@ -1453,6 +1599,14 @@ impl Simulator {
         let fixed = sampled_ids.len();
         for (e, _) in &var_sels {
             self.sva_cells(e, &mut sampled_ids);
+        }
+        // §16.9.3 / §16.5.1: `$sampled(e)` in an action block reads the
+        // Preponed (slot-entry) value of `e`, whether or not the property
+        // reads `e`. Collect the operands of the action blocks' `$sampled`
+        // calls with the body's sampled signals, so `refresh_sva_preponed`
+        // captures their Preponed snapshots like the property's own operands.
+        for action in [&a.action, &a.else_action].into_iter().flatten() {
+            self.sva_collect_action_sampled(action, &mut sampled_ids);
         }
         // A site registered mid-slot (a procedural assertion, while its
         // procedure runs in the Active region) has no slot-entry samples yet:
@@ -2078,6 +2232,178 @@ impl Simulator {
                 self.collect_sva_signal_ids(hi, out);
             }
             ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
+            _ => {}
+        }
+    }
+
+    /// Collect the signal ids referenced by the `$sampled(...)` calls inside
+    /// an assertion action block, so their Preponed snapshots are captured
+    /// with the site's other sampled signals (§16.9.3, §16.5.1).
+    pub(super) fn sva_collect_action_sampled(&self, st: &Statement, out: &mut Vec<usize>) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    self.sva_collect_action_sampled(s, out);
+                }
+            }
+            SK::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.sva_collect_action_sampled_expr(condition, out);
+                self.sva_collect_action_sampled(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    self.sva_collect_action_sampled(e, out);
+                }
+            }
+            SK::TimingControl { stmt, .. } => self.sva_collect_action_sampled(stmt, out),
+            SK::For {
+                init,
+                condition,
+                step,
+                body,
+            } => {
+                for init in init {
+                    match init {
+                        crate::ast::stmt::ForInit::VarDecl { init, .. } => {
+                            self.sva_collect_action_sampled_expr(init, out)
+                        }
+                        crate::ast::stmt::ForInit::Assign { lvalue, rvalue } => {
+                            self.sva_collect_action_sampled_expr(lvalue, out);
+                            self.sva_collect_action_sampled_expr(rvalue, out);
+                        }
+                    }
+                }
+                if let Some(condition) = condition {
+                    self.sva_collect_action_sampled_expr(condition, out);
+                }
+                for expr in step {
+                    self.sva_collect_action_sampled_expr(expr, out);
+                }
+                self.sva_collect_action_sampled(body, out);
+            }
+            SK::While { condition, body } | SK::DoWhile { body, condition } => {
+                self.sva_collect_action_sampled_expr(condition, out);
+                self.sva_collect_action_sampled(body, out);
+            }
+            SK::Repeat { count, body } => {
+                self.sva_collect_action_sampled_expr(count, out);
+                self.sva_collect_action_sampled(body, out);
+            }
+            SK::Forever { body } | SK::Foreach { body, .. } => {
+                self.sva_collect_action_sampled(body, out)
+            }
+            SK::Case { expr, items, .. } => {
+                self.sva_collect_action_sampled_expr(expr, out);
+                for it in items {
+                    for pattern in &it.patterns {
+                        self.sva_collect_action_sampled_expr(pattern, out);
+                    }
+                    if let Some(guard) = &it.guard {
+                        self.sva_collect_action_sampled_expr(guard, out);
+                    }
+                    self.sva_collect_action_sampled(&it.stmt, out);
+                }
+            }
+            SK::BlockingAssign { lvalue, rvalue }
+            | SK::NonblockingAssign { lvalue, rvalue, .. } => {
+                self.sva_collect_action_sampled_expr(lvalue, out);
+                self.sva_collect_action_sampled_expr(rvalue, out);
+            }
+            SK::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    if let Some(init) = &d.init {
+                        self.sva_collect_action_sampled_expr(init, out);
+                    }
+                }
+            }
+            SK::Return(Some(expr)) => self.sva_collect_action_sampled_expr(expr, out),
+            SK::Wait { condition, stmt } => {
+                self.sva_collect_action_sampled_expr(condition, out);
+                self.sva_collect_action_sampled(stmt, out);
+            }
+            SK::Expr(e) => self.sva_collect_action_sampled_expr(e, out),
+            _ => {}
+        }
+    }
+
+    fn sva_collect_action_sampled_expr(&self, e: &Expression, out: &mut Vec<usize>) {
+        match &e.kind {
+            // §16.9.3: `$sampled(e)` — the operand's signals are sampled.
+            ExprKind::SystemCall { name, args } if name == "$sampled" => {
+                for a in args {
+                    self.collect_sva_signal_ids(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.sva_collect_action_sampled_expr(a, out);
+                }
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::AssignExpr {
+                lvalue: left,
+                rvalue: right,
+            } => {
+                self.sva_collect_action_sampled_expr(left, out);
+                self.sva_collect_action_sampled_expr(right, out);
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Paren(operand)
+            | ExprKind::MemberAccess { expr: operand, .. } => {
+                self.sva_collect_action_sampled_expr(operand, out)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.sva_collect_action_sampled_expr(condition, out);
+                self.sva_collect_action_sampled_expr(then_expr, out);
+                self.sva_collect_action_sampled_expr(else_expr, out);
+            }
+            ExprKind::Index { expr: base, index } => {
+                self.sva_collect_action_sampled_expr(base, out);
+                self.sva_collect_action_sampled_expr(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                left,
+                right,
+                ..
+            } => {
+                self.sva_collect_action_sampled_expr(base, out);
+                self.sva_collect_action_sampled_expr(left, out);
+                self.sva_collect_action_sampled_expr(right, out);
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.sva_collect_action_sampled_expr(count, out);
+                for a in exprs {
+                    self.sva_collect_action_sampled_expr(a, out);
+                }
+            }
+            ExprKind::Concatenation(exprs) | ExprKind::StreamOp { exprs, .. } => {
+                for a in exprs {
+                    self.sva_collect_action_sampled_expr(a, out);
+                }
+            }
+            ExprKind::AssignmentPattern(items) => {
+                for item in items {
+                    self.sva_collect_action_sampled_expr(item.expr(), out);
+                }
+            }
+            ExprKind::NamedArg {
+                expr: Some(expr), ..
+            } => self.sva_collect_action_sampled_expr(expr, out),
+            ExprKind::Inside { expr, ranges } => {
+                self.sva_collect_action_sampled_expr(expr, out);
+                for range in ranges {
+                    self.sva_collect_action_sampled_expr(range, out);
+                }
+            }
             _ => {}
         }
     }

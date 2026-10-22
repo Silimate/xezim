@@ -59,6 +59,8 @@ mod foreach_over_submodule_array;
 mod genblk_dotted_ref_nettype_none;
 #[path = "hierarchy/generate_label_hier_roots.rs"]
 mod generate_label_hier_roots;
+#[path = "hierarchy/generate_nested_instance_port.rs"]
+mod generate_nested_instance_port;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
 #[path = "hierarchy/generate_scope_subroutine_calls.rs"]

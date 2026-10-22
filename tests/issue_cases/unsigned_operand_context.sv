@@ -3,10 +3,21 @@
 // reaches the context-determined operands (§11.6.1) before they are
 // evaluated, so a division, a modulus, an arithmetic shift or a sign
 // extension in the other arm of a conditional, or in a sibling operand,
-// runs unsigned. Concatenation members, cast operands and call arguments
-// are self-determined and keep their own type.
+// runs unsigned. Concatenation members, cast operands, call arguments and
+// exponents are self-determined and keep their own type.
+class holder;
+  int p = 0;
+  logic signed [15:0] s = -50;
+  // Every operand is signed (§11.8.1), so s + 1 sign-extends; p holds a
+  // bitwise result, which must not make the sum unsigned.
+  function int sum(int j);
+    p = j & 255;
+    return p + (s + 1);
+  endfunction
+endclass
 module top;
   logic signed [7:0] a = -10, b = 3; // a is 8'hf6, 246 unsigned
+  logic signed [7:0] e = -2, f = 127;
   logic [7:0] u = 100;
   logic [15:0] u16 = 1000;
   logic z0 = 0, z1 = 1, y1 = 1, zx = 1'bx;
@@ -37,6 +48,7 @@ module top;
   wire [7:0] c_signed = z0 ? 8'sd0 : (a / b);
   wire [7:0] c_int = z0 ? 0 : (a / b);
   wire [15:0] c_concat = {u, a / b};
+  wire [7:0] c_power = u + (8'sd2 ** (e / f));
   logic signed [95:0] c_wide;
   always_comb c_wide = z0 ? '0 : (wa / wb / wc);
   task automatic ck(string label, logic [95:0] got, logic [95:0] want);
@@ -66,6 +78,7 @@ module top;
     ck("continuous signed arms", c_signed, 8'hfd);
     ck("continuous int literal arm", c_int, 8'hfd);
     ck("continuous concatenation member", c_concat, 16'h64fd);
+    ck("continuous exponent", c_power, 8'd101);
     ck("always_comb 96-bit", c_wide, 96'h5555_5555_5555_5555_5555_5552);
     // Procedural: the same expressions in an initial block.
     begin logic [7:0] v; v = z0 ? '0 : (a / b); ck("else arm", v, 82); end
@@ -97,6 +110,9 @@ module top;
     begin logic [15:0] v; v = {u, a / b}; ck("concatenation member", v, 16'h64fd); end
     begin logic [15:0] v; v = {z0 ? '0 : (a / b), u}; ck("concatenated conditional", v, 16'h5264); end
     begin logic [7:0] v; v = z0 ? '0 : 8'($signed(a / b)); ck("cast operand", v, 8'hfd); end
+    // §11.6.1: the exponent is self-determined, so e / f divides signed (0).
+    begin logic [7:0] v; v = u + (8'sd2 ** (e / f)); ck("exponent", v, 8'd101); end
+    begin holder h; h = new; ck("class property", h.sum(7), -42); end
     begin logic signed [95:0] v; v = z0 ? '0 : (wa / wb / wc); ck("96-bit", v, 96'h5555_5555_5555_5555_5555_5552); end
     // §11.4.11: an x condition merges both arms bit by bit, at the unsigned type.
     begin logic [7:0] v; v = zx ? '0 : (a / b); ck("x condition", v, 8'b0x0x_00x0); end

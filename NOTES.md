@@ -20,7 +20,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   unsigned, so `a = -10, b = 3` gave -3 instead of 82 at 8 bits. Compiled
   code now types `'0`, `'1`, `'x` and `'z` as unsigned; the interpreter
   passes the type into any nested operator, as it already did for shifts.
-  Concatenation members, casts and call arguments stay self-determined.
+  Concatenation members, casts, call arguments and exponents stay
+  self-determined.
 * A hierarchical name that does not resolve is an elaboration error (§23.8),
   wherever it is written: a read or a write, a continuous assignment, an
   event control, an assertion, a system task argument, or a task or function

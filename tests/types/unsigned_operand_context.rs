@@ -9,12 +9,19 @@ use std::process::Command;
 
 fn check(mode: &[(&str, &str)]) {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "xezim_unsigned_operand_{}_{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    // A fresh directory of our own: never one that already exists.
+    let dir = loop {
+        let dir = std::env::temp_dir().join(format!(
+            "xezim_unsigned_operand_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create {}: {e}", dir.display()),
+        }
+    };
     let path = dir.join("top.sv");
     std::fs::write(
         &path,

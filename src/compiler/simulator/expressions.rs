@@ -1888,46 +1888,24 @@ impl Simulator {
         }
         match &expr.kind {
             ExprKind::Number(n) => Some(self.eval_number(n).is_signed),
-            // A class property keeps the flag of the value last written to
-            // it, which can be unsigned for a signed property (a bitwise
-            // result is), so an unsigned one is checked against the
-            // declaration; a local is fitted to its type on every write.
-            ExprKind::Ident(h) => self
-                .plain_ident_read(h)
-                .map(|v| {
-                    let name = h.path[0].name.name.as_str();
-                    match self.this_stack.last().copied().flatten() {
-                        Some(handle)
-                            if !v.is_signed
-                                && !v.is_real
-                                && !self
-                                    .local_stack
-                                    .last()
-                                    .is_some_and(|l| l.contains_key(name)) =>
-                        {
-                            self.class_prop_signed_of(handle, name)
-                        }
-                        _ => v.is_signed,
-                    }
-                })
-                .or_else(|| {
-                    let name = self.resolve_hier_name(h);
-                    self.signal_name_to_id
-                        .get(name.as_ref())
-                        .map(|&id| self.signal_signed[id])
-                        .or_else(|| {
-                            self.module.var_decl_types.get(name.as_ref()).map(|dt| {
-                                super::elaborate::is_type_signed_resolved(
-                                    dt,
-                                    &self.module.typedef_types,
-                                )
-                            })
+            ExprKind::Ident(h) => self.plain_ident_read(h).map(|v| v.is_signed).or_else(|| {
+                let name = self.resolve_hier_name(h);
+                self.signal_name_to_id
+                    .get(name.as_ref())
+                    .map(|&id| self.signal_signed[id])
+                    .or_else(|| {
+                        self.module.var_decl_types.get(name.as_ref()).map(|dt| {
+                            super::elaborate::is_type_signed_resolved(
+                                dt,
+                                &self.module.typedef_types,
+                            )
                         })
-                        .or_else(|| {
-                            self.get_expr_type_name(expr)
-                                .and_then(|name| self.concrete_type_signed(&name))
-                        })
-                }),
+                    })
+                    .or_else(|| {
+                        self.get_expr_type_name(expr)
+                            .and_then(|name| self.concrete_type_signed(&name))
+                    })
+            }),
             ExprKind::Paren(e) => self.expression_signed_hint(e),
             ExprKind::Unary {
                 op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,

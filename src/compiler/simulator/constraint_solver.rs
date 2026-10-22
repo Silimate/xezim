@@ -3208,7 +3208,6 @@ impl Simulator {
         let Some(Some(inst)) = self.heap.get(handle) else {
             return false;
         };
-        // Borrowed names: the expression type probe asks this per read.
         let storage_prop = prop;
         let (start, prop) = prop
             .rsplit_once("::")

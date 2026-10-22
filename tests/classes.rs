@@ -771,3 +771,6 @@ mod randomize_hook_signatures;
 
 #[path = "classes/static_class_members_382.rs"]
 mod static_class_members_382;
+
+#[path = "classes/class_queue_empty_pattern.rs"]
+mod class_queue_empty_pattern;

@@ -2472,7 +2472,10 @@ impl Simulator {
             // elements render as strings), but `q = {...}` on it is a
             // QUEUE assignment — `q = {}` clears it — not a byte concat.
             let lhs_is_queue = self.module.dynamic_arrays.contains(&*lname)
-                || self.module.arrays.contains_key(&*lname);
+                || self.module.arrays.contains_key(&*lname)
+                || self
+                    .instance_assoc_member(&lname)
+                    .is_some_and(|scoped| self.class_queue_prop(&scoped));
             if !lhs_is_queue
                 && (self.string_signals.contains(&*lname)
                     || self.string_signals.contains(
@@ -3901,11 +3904,17 @@ impl Simulator {
             let mut class_dyn = false;
             if matches!(rvalue.kind, ExprKind::Concatenation(_))
                 && !self.module.arrays.contains_key(&*lname)
-                && let Some(n) = self.expr_assoc_name(lvalue)
-                && self.class_queue_prop(&n)
             {
-                lname = std::borrow::Cow::Owned(n);
-                class_dyn = true;
+                if let Some(n) = self.expr_assoc_name(lvalue) {
+                    if self.class_queue_prop(&n) {
+                        lname = std::borrow::Cow::Owned(n);
+                        class_dyn = true;
+                    }
+                } else if self.class_queue_prop(&lname) {
+                    // `instance_assoc_member` already rewrote a bare `q`
+                    // inside a method to `<handle>#q`. `q = {}` is that form.
+                    class_dyn = true;
+                }
             }
             if self.module.arrays.contains_key(&*lname) || class_dyn {
                 // Queue/array slice assignment: lq = rq[a:b]

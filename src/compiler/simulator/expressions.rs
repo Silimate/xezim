@@ -1874,7 +1874,7 @@ impl Simulator {
     }
 
     /// Declared expression signedness without executing conditional arms or
-    /// calls. Consulted only when a nested shift needs type propagation.
+    /// calls. Consulted only when a nested operator needs type propagation.
     #[inline(never)]
     pub(super) fn expression_signed_hint(&mut self, expr: &Expression) -> Option<bool> {
         fn joint(left: Option<bool>, right: Option<bool>) -> Option<bool> {
@@ -1888,24 +1888,46 @@ impl Simulator {
         }
         match &expr.kind {
             ExprKind::Number(n) => Some(self.eval_number(n).is_signed),
-            ExprKind::Ident(h) => self.plain_ident_read(h).map(|v| v.is_signed).or_else(|| {
-                let name = self.resolve_hier_name(h);
-                self.signal_name_to_id
-                    .get(name.as_ref())
-                    .map(|&id| self.signal_signed[id])
-                    .or_else(|| {
-                        self.module.var_decl_types.get(name.as_ref()).map(|dt| {
-                            super::elaborate::is_type_signed_resolved(
-                                dt,
-                                &self.module.typedef_types,
-                            )
+            // A class property keeps the flag of the value last written to
+            // it, which can be unsigned for a signed property (a bitwise
+            // result is), so an unsigned one is checked against the
+            // declaration; a local is fitted to its type on every write.
+            ExprKind::Ident(h) => self
+                .plain_ident_read(h)
+                .map(|v| {
+                    let name = h.path[0].name.name.as_str();
+                    match self.this_stack.last().copied().flatten() {
+                        Some(handle)
+                            if !v.is_signed
+                                && !v.is_real
+                                && !self
+                                    .local_stack
+                                    .last()
+                                    .is_some_and(|l| l.contains_key(name)) =>
+                        {
+                            self.class_prop_signed_of(handle, name)
+                        }
+                        _ => v.is_signed,
+                    }
+                })
+                .or_else(|| {
+                    let name = self.resolve_hier_name(h);
+                    self.signal_name_to_id
+                        .get(name.as_ref())
+                        .map(|&id| self.signal_signed[id])
+                        .or_else(|| {
+                            self.module.var_decl_types.get(name.as_ref()).map(|dt| {
+                                super::elaborate::is_type_signed_resolved(
+                                    dt,
+                                    &self.module.typedef_types,
+                                )
+                            })
                         })
-                    })
-                    .or_else(|| {
-                        self.get_expr_type_name(expr)
-                            .and_then(|name| self.concrete_type_signed(&name))
-                    })
-            }),
+                        .or_else(|| {
+                            self.get_expr_type_name(expr)
+                                .and_then(|name| self.concrete_type_signed(&name))
+                        })
+                }),
             ExprKind::Paren(e) => self.expression_signed_hint(e),
             ExprKind::Unary {
                 op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
@@ -4013,14 +4035,18 @@ impl Simulator {
                     }
                     pre_r = Some(r0);
                 }
-                // §11.8.2: propagate unsigned type into nested shifts before
-                // their operands widen. Type probes never execute calls.
+                // §11.8.2: propagate unsigned type into nested operators
+                // (a shift, a division, a sign extension) before their
+                // operands widen; a leaf operand is converted afterwards.
+                // Type probes never execute calls.
+                let left_typed = super::bytecode::has_context_type(left);
+                let right_typed = super::bytecode::has_context_type(right);
                 let joint_unsigned = if is_arith_or_bitwise
                     || matches!(op, BinaryOp::Div | BinaryOp::Mod)
                     || is_comparison
                 {
                     (!is_comparison && unsigned_context)
-                        || (has_shift
+                        || ((left_typed || right_typed)
                             && (pre_l
                                 .as_ref()
                                 .map(|v| v.is_signed)
@@ -4036,10 +4062,11 @@ impl Simulator {
                 } else {
                     false
                 };
-                let left_unsigned =
-                    joint_unsigned && (!is_comparison || super::bytecode::has_context_shift(left));
-                let right_unsigned =
-                    joint_unsigned && (!is_comparison || super::bytecode::has_context_shift(right));
+                let left_unsigned = joint_unsigned && (!is_comparison || left_typed);
+                // §11.6.1: an exponent is self-determined and keeps its type.
+                let right_unsigned = joint_unsigned
+                    && !matches!(op, BinaryOp::Power)
+                    && (!is_comparison || right_typed);
                 let mut l = match pre_l.take() {
                     Some(mut v) => {
                         if left_unsigned && !v.is_real {
@@ -4309,9 +4336,14 @@ impl Simulator {
                     return v;
                 }
                 let c = self.eval_expr(condition);
+                // §11.8.1/§11.8.2: one unsigned arm makes the conditional
+                // unsigned, and the arms are context-determined, so the other
+                // arm's operators take that type before they run:
+                // `z ? '0 : (a / b)` divides unsigned. Only the arms are
+                // consulted, never the condition.
                 let arms_unsigned = unsigned_context
-                    || ((super::bytecode::has_context_shift(then_expr)
-                        || super::bytecode::has_context_shift(else_expr))
+                    || ((super::bytecode::has_context_type(then_expr)
+                        || super::bytecode::has_context_type(else_expr))
                         && (self.expression_signed_hint(then_expr) == Some(false)
                             || self.expression_signed_hint(else_expr) == Some(false)));
                 let arm_ctx = if arms_unsigned {

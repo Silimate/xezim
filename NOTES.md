@@ -10,6 +10,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An unsigned operand makes every context-determined operator beside it
+  unsigned before it runs (§11.8.1, §11.8.2), not only a shift: in
+  `z ? '0 : (a / b)` with signed `a` and `b`, the unsigned `'0` (§5.7.1)
+  makes the division unsigned, and so does an unsigned variable or sized
+  literal in the other arm, an unsigned side of a comparison (`(a / b) > u`)
+  or of a sum (`u + a / b`). A signed operand that such an operator extends
+  is zero-extended. The division ran signed and only its result was made
+  unsigned, so `a = -10, b = 3` gave -3 instead of 82 at 8 bits. Compiled
+  code now types `'0`, `'1`, `'x` and `'z` as unsigned; the interpreter
+  passes the type into any nested operator, as it already did for shifts.
+  Concatenation members, casts, call arguments and exponents stay
+  self-determined.
 * A hierarchical name that does not resolve is an elaboration error (§23.8),
   wherever it is written: a read or a write, a continuous assignment, an
   event control, an assertion, a system task argument, or a task or function

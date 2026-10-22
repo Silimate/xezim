@@ -13639,10 +13639,13 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     sub_ctx
                 };
+                // §11.8.2: a comparison's operands take each other's type, so
+                // an unsigned side makes a division or sign extension on the
+                // other side unsigned too (`(a / b) > u` divides unsigned).
                 let left_unsigned =
-                    joint_unsigned && (!is_self_determined || has_context_shift(left));
+                    joint_unsigned && (!is_self_determined || has_context_type(left));
                 let right_unsigned =
-                    joint_unsigned && (!is_self_determined || has_context_shift(right));
+                    joint_unsigned && (!is_self_determined || has_context_type(right));
                 let l = self.compile_expr_typed(left, sub_ctx, left_unsigned)?;
                 // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
                 // width never affects the result, so it keeps its own.
@@ -18681,6 +18684,8 @@ impl<'a> BytecodeCompiler<'a> {
     fn expr_signedness(&mut self, e: &Expression) -> Option<bool> {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
+            // §5.7.1: an unsized unbased literal ('0, '1, 'x, 'z) is unsigned.
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(false),
             ExprKind::Paren(i) => self.expr_signedness(i),
             // §20/§21: an `int`/`integer`-valued system function is SIGNED
             // (`$countones(x) - 8 < 0` is a signed compare); `bit`, `time`
@@ -28042,6 +28047,43 @@ pub(crate) fn has_context_shift(e: &Expression) -> bool {
             else_expr,
             ..
         } => has_context_shift(then_expr) || has_context_shift(else_expr),
+        _ => false,
+    }
+}
+
+/// An operand whose value depends on the type of the expression around it:
+/// an operator whose operands are context-determined (§11.6.1), so §11.8.2
+/// converts them to the expression's type before they are extended or
+/// combined. A division, an arithmetic shift or a sign extension inside it
+/// gives a different result once the expression is unsigned, so the type
+/// must reach it before it is evaluated; clearing the sign of its result
+/// afterwards is too late. A leaf (a name, a literal, a call, a select or a
+/// concatenation) is self-determined and is converted as a whole.
+pub(crate) fn has_context_type(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Binary { op, .. } => matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ArithShiftRight
+                | BinaryOp::Power
+        ),
+        ExprKind::Unary {
+            op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
+            ..
+        }
+        | ExprKind::Conditional { .. } => true,
+        ExprKind::Paren(inner) => has_context_type(inner),
         _ => false,
     }
 }

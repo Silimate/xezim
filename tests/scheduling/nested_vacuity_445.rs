@@ -33,7 +33,15 @@ fn nested_vacuity_truth_table_and_action_controls() {
             ),
             (c && d && a && b, c && d && a && !b),
             (!pair_fail && ((a && b) || (c && d)), pair_fail),
-            ((a && b) || (c && d), (a && !b) && (c && !d)),
+            // `p or q` is nonvacuous iff either operand's evaluation is
+            // (§16.14.8), and an implication whose antecedent matched is
+            // nonvacuous even when it fails: `a |-> b` failing beside a
+            // vacuous `c |-> d` is a nonvacuous success, as on the
+            // reference simulator.
+            (
+                (a || c) && !((a && !b) && (c && !d)),
+                (a && !b) && (c && !d),
+            ),
         ];
         for control in [
             "$assertvacuousoff",

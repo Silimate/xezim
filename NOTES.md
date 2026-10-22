@@ -385,6 +385,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   specializations. Module instances bind their own type overrides (§6.20.3,
   §8.3). (#498, reported by Dragon-Git)
 
+* Class instance and static property assignments take the declared signing
+  even when the right-hand side already has the destination width. Hidden
+  base properties use their own declarations and type bindings (§10.7, §8.14).
+  (#499, reported by akashlevy)
+* Procedural bitwise `&`, `|`, `^` and `~^` results are signed when both
+  operands are signed, preserving arithmetic and comparison behavior
+  (§11.8.1). (#500, reported by akashlevy)
+* Arithmetic right shifts replicate X and Z sign bits in narrow values and
+  retain the left operand's signing for unknown amounts and overshifts
+  (§11.4.10).
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and

@@ -3209,7 +3209,11 @@ impl Simulator {
             return false;
         };
         // Borrowed names: the expression type probe asks this per read.
-        let mut cur = Some(inst.class_name.as_str());
+        let storage_prop = prop;
+        let (start, prop) = prop
+            .rsplit_once("::")
+            .unwrap_or((inst.class_name.as_str(), prop));
+        let mut cur = Some(start);
         while let Some(cn) = cur {
             let Some(cd) = self.module.classes.get(cn) else {
                 return false;
@@ -3224,7 +3228,7 @@ impl Simulator {
                     .is_some_and(|t| cd.type_param_names.contains(t))
                 {
                     if let Some(s) = self
-                        .class_prop_type_name(handle, prop)
+                        .class_prop_type_name(handle, storage_prop)
                         .and_then(|c| self.concrete_type_signed(&c))
                     {
                         return s;

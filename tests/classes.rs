@@ -776,3 +776,6 @@ mod static_class_members_382;
 
 #[path = "classes/foreach_array_of_collections_elem.rs"]
 mod foreach_array_of_collections_elem;
+
+#[path = "classes/class_assignment_types_499.rs"]
+mod class_assignment_types_499;

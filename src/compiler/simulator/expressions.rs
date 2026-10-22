@@ -4333,10 +4333,18 @@ impl Simulator {
                         let opw = self_det_w.max(wl.width);
                         wl.resize(opw).power(&wr)
                     }
-                    BinaryOp::BitAnd => wl.bitwise_and(&wr),
-                    BinaryOp::BitOr => wl.bitwise_or(&wr),
-                    BinaryOp::BitXor => wl.bitwise_xor(&wr),
-                    BinaryOp::BitXnor => wl.bitwise_xor(&wr).bitwise_not(),
+                    // §11.8.1: the integral result is signed when both
+                    // operands are signed. The bit-plane helpers clear it.
+                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor => {
+                        let mut value = match op {
+                            BinaryOp::BitAnd => wl.bitwise_and(&wr),
+                            BinaryOp::BitOr => wl.bitwise_or(&wr),
+                            BinaryOp::BitXor => wl.bitwise_xor(&wr),
+                            _ => wl.bitwise_xor(&wr).bitwise_not(),
+                        };
+                        value.is_signed = wl.is_signed && wr.is_signed;
+                        value
+                    }
                     BinaryOp::LogAnd => wl.logic_and(&wr),
                     BinaryOp::LogOr => wl.logic_or(&wr),
                     BinaryOp::LogImplies => wl.logic_impl(&wr),

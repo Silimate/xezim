@@ -525,6 +525,9 @@ impl Simulator {
     /// `T`'s default type in every derived class (§8.25, §6.20.2).
     pub(super) fn class_prop_type_name(&self, handle: usize, prop: &str) -> Option<String> {
         let inst = self.heap.get(handle)?.as_ref()?;
+        let (owner, prop) = prop
+            .rsplit_once("::")
+            .map_or((None, prop), |(owner, prop)| (Some(owner), prop));
         // The chain walked so far, on the stack: this runs on property
         // stores, and a heap Vec per call showed up in the UVM A/B.
         let first = self.module.classes.get(inst.class_name.as_str())?.as_ref();
@@ -535,7 +538,9 @@ impl Simulator {
             buf[n] = cd;
             n += 1;
             let chain = &buf[..n];
-            if let Some(sig) = cd.properties.get(prop) {
+            if owner.is_none_or(|owner| owner == cd.name)
+                && let Some(sig) = cd.properties.get(prop)
+            {
                 let tn = sig.type_name.as_ref()?;
                 if cd.type_param_names.iter().any(|t| t == tn) {
                     let k = chain.len() - 1;

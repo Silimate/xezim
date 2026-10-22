@@ -2914,6 +2914,30 @@ impl Simulator {
             .unwrap_or(false)
     }
 
+    /// Base name of a class, dropping one specialization.
+    ///
+    /// Entries made for a virtual-interface type argument are `base<sig>`
+    /// and `sig` may itself contain `#(...)`
+    /// (`uvm_resource<virtualmon_if#(32)>`). A split on `#` stops inside
+    /// that signature and the hierarchy walk no longer sees `base`.
+    fn class_key_base(s: &str) -> &str {
+        if let Some(i) = s.find('<') {
+            if s.ends_with('>') && i > 0 {
+                let head = &s[..i];
+                if head
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                {
+                    return head;
+                }
+            }
+        }
+        if let Some(i) = s.find("#(") {
+            return &s[..i];
+        }
+        s.split('#').next().unwrap_or(s)
+    }
+
     /// Is class `derived` the same as, or a subclass of, `base`? Walks the
     /// `extends` chain; compares parameter-stripped names (IEEE 1800-2023 §8.25).
     pub(super) fn typedef_unroll(&self, name: &str) -> String {
@@ -2930,13 +2954,19 @@ impl Simulator {
         let mut guard = 0;
         while guard < 16 {
             guard += 1;
-            let stripped = cur.split('#').next().unwrap_or(cur);
+            // A specialized entry (`base<sig>`) is itself a class. Keep
+            // that name so `class_origin` can map it back; splitting on
+            // `#` inside `sig` produces a key that is not a class.
+            if self.module.classes.contains_key(cur) {
+                return cur.to_string();
+            }
+            let stripped = Self::class_key_base(cur);
             if self.module.classes.contains_key(stripped) {
                 return stripped.to_string();
             }
             match self.module.typedef_types.get(cur) {
                 Some(DataType::TypeReference { name, .. }) => {
-                    let base = name.name.name.split('#').next().unwrap_or(&name.name.name);
+                    let base = Self::class_key_base(&name.name.name);
                     if self.module.classes.contains_key(base) {
                         return base.to_string();
                     }
@@ -2950,9 +2980,10 @@ impl Simulator {
 
     pub(super) fn class_is_a(&self, derived: &str, base: &str) -> bool {
         // Class names are keyed bare (the parser keeps only the leaf segment
-        // of a scoped name), so the comparison strips just the `#(params)`
-        // specialization suffix, not a package prefix.
-        let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
+        // of a scoped name), so the comparison strips just the specialization
+        // suffix, not a package prefix. `base<sig>` keeps `#(...)` inside
+        // sig; `class_key_base` does not split there.
+        let strip = |s: &str| Self::class_key_base(s).to_string();
         let base = strip(base);
         let mut cur = Some(self.typedef_unroll(derived));
         let mut guard = 0;
@@ -3545,7 +3576,18 @@ impl Simulator {
                 dfrag.to_string()
             };
             let dfrag_resolved = dfrag_resolved.trim().to_string();
-            if canon(&dfrag_resolved) != canon(sval) {
+            // `virtual mon_if` and `virtualmon_if#(32)` are one type when
+            // 32 is the interface's default parameter (§6.22.1). Compare
+            // the canonical spelling the specialization entry records.
+            let vif_canon = |s: &str| -> String {
+                match self.parse_vif_frag(s) {
+                    Some((name, args, modport)) => {
+                        self.canonical_vif_frag(&name, args, modport)
+                    }
+                    None => canon(s),
+                }
+            };
+            if vif_canon(&dfrag_resolved) != vif_canon(sval) {
                 return false;
             }
         }

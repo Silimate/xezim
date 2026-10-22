@@ -142,3 +142,60 @@ endmodule
         "virtual-interface and class type arguments"
     );
 }
+
+/// `$cast` back to `uvm_resource#(virtual mon_if)` must succeed when the
+/// resource has a property of that type. The integer parameter makes the
+/// specialization entry `uvm_resource<virtualmon_if#(32)>`. A `#` split
+/// of that name stopped inside the signature, so the cast no longer saw
+/// the object as a `uvm_resource`. UVM's get_highest_precedence does this
+/// cast for `instr_monitor_if`.
+#[test]
+fn cast_of_integer_parameter_virtual_interface() {
+    let src = r#"
+class uvm_resource_base;
+endclass
+
+class uvm_resource #(type T = int) extends uvm_resource_base;
+  typedef uvm_resource#(T) this_type;
+  T val;
+  static function uvm_resource_base make();
+    uvm_resource#(T) r = new;
+    return r;
+  endfunction
+  static function int from_q(uvm_resource_base q[$]);
+    this_type rsrc;
+    int first;
+    for (first = 0; first < q.size() && !$cast(rsrc, q[first]); first++) ;
+    return rsrc != null;
+  endfunction
+endclass
+
+interface clk_rst_if #(parameter string IfName = "main");
+endinterface
+
+interface plain_if;
+endinterface
+
+interface mon_if #(parameter DATA_WIDTH = 32);
+endinterface
+
+module top;
+  int clk_ok, plain_ok, mon_ok;
+  uvm_resource_base cq[$], pq[$], mq[$];
+  initial begin
+    cq.push_back(uvm_resource#(virtual clk_rst_if)::make());
+    pq.push_back(uvm_resource#(virtual plain_if)::make());
+    mq.push_back(uvm_resource#(virtual mon_if)::make());
+    clk_ok = uvm_resource#(virtual clk_rst_if)::from_q(cq);
+    plain_ok = uvm_resource#(virtual plain_if)::from_q(pq);
+    mon_ok = uvm_resource#(virtual mon_if)::from_q(mq);
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(
+        (u(&sim, "clk_ok"), u(&sim, "plain_ok"), u(&sim, "mon_ok")),
+        (1, 1, 1),
+        "string-param, plain, and integer-param virtual interfaces"
+    );
+}

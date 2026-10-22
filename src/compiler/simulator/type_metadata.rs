@@ -658,6 +658,14 @@ impl Simulator {
                     if let Some(c) = self.bound_prop_class(inst, vname, &tn) {
                         return Some(c);
                     }
+                    // The name is a property of `this`, and its type
+                    // parameter did not resolve to a class. Another
+                    // task's local of the same bare name lives in the
+                    // shared `var_class_types` map and must not become
+                    // this property's class (§8.14). Leave it unknown
+                    // so `$cast` stays permissive instead of reporting
+                    // a false mismatch.
+                    return None;
                 }
             }
         }

@@ -1552,18 +1552,61 @@ impl Simulator {
         k: usize,
         name: &str,
     ) -> Option<String> {
+        Self::carried_type_binding_rec(bindings, chain, k, name, 0)
+    }
+
+    /// `carried_type_binding`, with a hop limit so a default that names
+    /// another parameter of the same class (`type RSP = REQ`) cannot cycle.
+    fn carried_type_binding_rec(
+        bindings: &HashMap<String, String>,
+        chain: &[&super::elaborate::ElaboratedClass],
+        k: usize,
+        name: &str,
+        depth: u32,
+    ) -> Option<String> {
+        if depth > 8 {
+            return None;
+        }
         if k == 0 {
             return bindings.get(name).cloned();
         }
         let child = chain[k - 1];
-        let i = chain[k].param_order.iter().position(|p| p == name)?;
-        let a = child.extends_type_args.get(i)?.trim();
-        if Self::spec_projection(a).is_some() {
-            return Self::carry_extends_arg(a, &|p| {
-                Self::carried_type_binding(bindings, chain, k - 1, p)
+        let parent = chain[k];
+        let i = parent.param_order.iter().position(|p| p == name)?;
+        // An omitted `extends` argument uses the parameter's default.
+        // `type RSP_ITEM_T = ITEM_T` is not stored in `extends_type_args`
+        // when the child leaves it out, and the binding used to come back
+        // None. `$cast` of that property then read a same-named local from
+        // another task out of the global class-type map and rejected a
+        // compatible object.
+        let written = child
+            .extends_type_args
+            .get(i)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let a = match written {
+            Some(w) => w,
+            None => {
+                let def = parent
+                    .type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d.clone())?;
+                if parent.type_param_names.iter().any(|p| p == &def) {
+                    return Self::carried_type_binding_rec(bindings, chain, k, &def, depth + 1);
+                }
+                def
+            }
+        };
+        if Self::spec_projection(&a).is_some() {
+            return Self::carry_extends_arg(&a, &|p| {
+                Self::carried_type_binding_rec(bindings, chain, k - 1, p, depth + 1)
             });
         }
-        Some(Self::carried_type_binding(bindings, chain, k - 1, a).unwrap_or_else(|| a.to_string()))
+        Some(
+            Self::carried_type_binding_rec(bindings, chain, k - 1, &a, depth + 1)
+                .unwrap_or(a),
+        )
     }
 
     /// The per-instance part of `is_string_keyed_array` for `member` of an

@@ -524,6 +524,8 @@ mod nested_rand_inline_constraints;
 mod nested_rand_joint_solve;
 #[path = "classes/rand_typedef_handle.rs"]
 mod rand_typedef_handle;
+#[path = "classes/cast_defaulted_rsp.rs"]
+mod cast_defaulted_rsp;
 #[path = "classes/null_deref_fatal.rs"]
 mod null_deref_fatal;
 #[path = "classes/shadowed_property_initializers.rs"]

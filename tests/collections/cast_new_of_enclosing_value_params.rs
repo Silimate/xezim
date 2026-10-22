@@ -199,3 +199,84 @@ endmodule
         "string-param, plain, and integer-param virtual interfaces"
     );
 }
+
+/// `dv_base_seq#(.REQ(item#(H, D)))` leaves RSP at its default, which is
+/// REQ. `item#(H, D)` must stay this sequence's H and D. Those names are
+/// also item's own parameters, so the default substitution used to read
+/// them as omitted arguments and bind RSP to `item#(32, 32)`. put_response
+/// then rejected an `item#(32, 192)`.
+#[test]
+fn defaulted_rsp_keeps_the_outer_value_parameters() {
+    let src = r#"
+class uvm_sequence_item;
+endclass
+class uvm_object;
+endclass
+class uvm_sequencer;
+endclass
+
+class uvm_sequence #(type REQ = uvm_sequence_item, type RSP = REQ);
+  virtual function int put_response(uvm_sequence_item response_item);
+    RSP response;
+    return $cast(response, response_item);
+  endfunction
+endclass
+
+class item #(int H = 32, int D = H) extends uvm_sequence_item;
+  int tag;
+  function new();
+    tag = D;
+  endfunction
+endclass
+
+class dv_base_seq #(type REQ = uvm_sequence_item,
+                    type RSP = REQ,
+                    type CFG_T = uvm_object,
+                    type SEQUENCER_T = uvm_sequencer)
+  extends uvm_sequence#(REQ, RSP);
+endclass
+
+class base_seq #(int H = 32, int D = H)
+  extends dv_base_seq#(
+    .REQ(item#(H, D)),
+    .CFG_T(uvm_object),
+    .SEQUENCER_T(uvm_sequencer)
+  );
+endclass
+
+class dev_seq #(int H = 32, int D = H) extends base_seq#(H, D);
+  function int go();
+    item#(H, D) req;
+    req = new;
+    return put_response(req);
+  endfunction
+  function int seen_d();
+    item#(H, D) req;
+    req = new;
+    return req.tag;
+  endfunction
+  function int narrow();
+    item#(.H(7)) req;
+    req = new;
+    return req.tag;
+  endfunction
+endclass
+
+module top;
+  dev_seq#(32, 192) s;
+  int ok, got_d, got_narrow;
+  initial begin
+    s = new;
+    got_d = s.seen_d();
+    ok = s.go();
+    got_narrow = s.narrow();
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(
+        (u(&sim, "got_d"), u(&sim, "ok"), u(&sim, "got_narrow")),
+        (192, 1, 7),
+        "item width, put_response cast, and an omitted width stays the default"
+    );
+}

@@ -977,10 +977,18 @@ impl Simulator {
                 // never reaches here — it resolved above — so this only
                 // fires for type-parameter references.)
                 if let Some(resolved) = self.resolve_type_param_binding(nm) {
-                    if self.module.classes.contains_key(&resolved)
-                        || self.module.typedef_types.contains_key(&resolved)
-                    {
-                        return Some(resolved);
+                    let resolved = resolved.trim();
+                    // Any concrete binding, not only a class or typedef.
+                    // `virtual clk_rst_if` is not a class, so dropping it
+                    // left the bare parameter name. canonicalize_spec_sig
+                    // then replaced that name with the parameter's default
+                    // (`int`), and the new object recorded the default
+                    // specialization. uvm_config_db#(virtual clk_rst_if)
+                    // stored its resource under that default, and get
+                    // looked the virtual-interface specialization up and
+                    // missed.
+                    if !resolved.is_empty() && resolved != nm.as_str() {
+                        return Some(resolved.to_string());
                     }
                 }
                 // Otherwise keep the name verbatim (an enum member, resolved

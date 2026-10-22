@@ -94,3 +94,51 @@ endmodule
         "wide, narrow, swapped, explicit, lit, got_d"
     );
 }
+
+/// `resource#(T) r = new` inside `db#(virtual clk_rst_if)` must be that
+/// specialization. The type argument is not a class, so it used to
+/// canonicalize to the default `int`. The object's type handle then
+/// disagreed with `resource#(virtual clk_rst_if)::get_type()`, which is
+/// how uvm_config_db's get missed the resource set had just stored.
+#[test]
+fn nested_new_keeps_a_virtual_interface_type_argument() {
+    let src = r#"
+class resource #(type T = int);
+  static resource#(T) singleton;
+  static function resource#(T) get_type();
+    if (singleton == null) singleton = new;
+    return singleton;
+  endfunction
+  function resource#(T) type_handle();
+    return get_type();
+  endfunction
+endclass
+
+class db #(type T = int);
+  static function int same();
+    resource#(T) r = new;
+    return r.type_handle() == resource#(T)::get_type();
+  endfunction
+endclass
+
+interface clk_rst_if;
+endinterface
+
+class payload;
+endclass
+
+module top;
+  int vif_ok, cls_ok;
+  initial begin
+    vif_ok = db#(virtual clk_rst_if)::same();
+    cls_ok = db#(payload)::same();
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(
+        (u(&sim, "vif_ok"), u(&sim, "cls_ok")),
+        (1, 1),
+        "virtual-interface and class type arguments"
+    );
+}

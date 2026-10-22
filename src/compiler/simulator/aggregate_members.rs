@@ -525,6 +525,9 @@ impl Simulator {
     /// `T`'s default type in every derived class (§8.25, §6.20.2).
     pub(super) fn class_prop_type_name(&self, handle: usize, prop: &str) -> Option<String> {
         let inst = self.heap.get(handle)?.as_ref()?;
+        let (owner, prop) = prop
+            .rsplit_once("::")
+            .map_or((None, prop), |(owner, prop)| (Some(owner), prop));
         // The chain walked so far, on the stack: this runs on property
         // stores, and a heap Vec per call showed up in the UVM A/B.
         let first = self.module.classes.get(inst.class_name.as_str())?.as_ref();
@@ -535,7 +538,9 @@ impl Simulator {
             buf[n] = cd;
             n += 1;
             let chain = &buf[..n];
-            if let Some(sig) = cd.properties.get(prop) {
+            if owner.is_none_or(|owner| owner == cd.name)
+                && let Some(sig) = cd.properties.get(prop)
+            {
                 let tn = sig.type_name.as_ref()?;
                 if cd.type_param_names.iter().any(|t| t == tn) {
                     let k = chain.len() - 1;
@@ -2785,6 +2790,57 @@ impl Simulator {
             }
         }
         Some((name, rows))
+    }
+
+    /// §12.7.3/§7.4.5: the store and fixed outer shape of `foreach (a[i, j,
+    /// k])` over an array whose fixed dimensions end in a collection — a
+    /// variable (`int a[3][3][$]`) or a class property (`q`, `h.q`). The
+    /// variable after the fixed ones walks each element collection.
+    pub(super) fn fixed_dims_of_colls(
+        &mut self,
+        array: &Expression,
+    ) -> Option<(String, Vec<(i64, i64)>)> {
+        if let Some(r) = self.class_fixed_array_of_coll_base(array) {
+            return Some(r);
+        }
+        let flat;
+        let array = if matches!(array.kind, ExprKind::Ident(_)) {
+            array
+        } else {
+            flat = Self::member_chain_as_hier_ident(array)?;
+            &flat
+        };
+        let ExprKind::Ident(h) = &array.kind else {
+            return None;
+        };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.resolve_hier_name(h).into_owned();
+        // This arm requires fixed outer dimensions, not a collection's
+        // allocated backing range.
+        if self.module.dynamic_arrays.contains(&name)
+            || self.module.associative_arrays.contains_key(&name)
+        {
+            return None;
+        }
+        let shape = self.foreach_dims(&name)?;
+        let dims = self
+            .module
+            .unpacked_decl_dims
+            .get(&name)
+            .filter(|dims| dims.len() == shape.len())
+            .cloned()
+            .unwrap_or(shape);
+        let first = dims
+            .iter()
+            .fold(name.clone(), |n, d| Self::name_with_index(&n, d.0));
+        if !self.module.dynamic_arrays.contains(&first)
+            && !self.module.associative_arrays.contains_key(&first)
+        {
+            return None;
+        }
+        Some((name, dims))
     }
 
     /// Put the struct-member collection `name` on the §7.8 collection

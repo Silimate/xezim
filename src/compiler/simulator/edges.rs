@@ -1580,7 +1580,14 @@ impl Simulator {
         let clock_events = clock_site
             .map(|si| &self.sva_sites[si].events)
             .filter(|events| {
-                events.len() != 1 || events[0].signal.is_none() || events[0].event.iff.is_some()
+                // §16.9.3: a site can retain a resolvable clock expression
+                // even when its descriptive clock name has no physical ID
+                // (for example a clock reached through an interface port).
+                // Preserve that event instead of indexing the sentinel ID.
+                clk_id == usize::MAX
+                    || events.len() != 1
+                    || events[0].signal.is_none()
+                    || events[0].event.iff.is_some()
             })
             .cloned()
             .unwrap_or_default();
@@ -1636,7 +1643,10 @@ impl Simulator {
                 let w = &self.sampled_watches[i];
                 (w.clk_id, w.edge)
             };
-            let fired = if self.sampled_watches[i].clock_events.is_empty() {
+            let fired = if self.sampled_watches[i].clock_events.is_empty() && clk_id == usize::MAX {
+                // An unbound inferred clock has no ticks to sample.
+                false
+            } else if self.sampled_watches[i].clock_events.is_empty() {
                 self.check_edge_id(clk_id, edge)
             } else {
                 let mut events = std::mem::take(&mut self.sampled_watches[i].clock_events);

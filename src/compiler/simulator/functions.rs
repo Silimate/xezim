@@ -117,6 +117,9 @@ impl Simulator {
             .take()
             .or_else(|| self.module.func_decl_scope.get(&fd.name.name.name).cloned());
         let normalized = Self::normalize_call_args(&fd.ports, args);
+        let supplied = normalized
+            .as_ref()
+            .map(|_| Self::supplied_argument_mask(&fd.ports, args));
         // The formals' and return variable's metadata are written below.
         for port in fd.ports.iter() {
             self.meta_note(&port.name.name);
@@ -171,6 +174,12 @@ impl Simulator {
             }
         }
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
+        let arg_supplied = |i: usize| {
+            i < args.len()
+                && supplied
+                    .as_ref()
+                    .is_none_or(|mask| mask.get(i).copied().unwrap_or(false))
+        };
 
         // Dedup by borrowed name: the formal list is tiny, so a linear
         // scan beats a HashSet plus one String allocation per formal on
@@ -201,6 +210,7 @@ impl Simulator {
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+        let mut default_output_bindings = Vec::new();
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
         // a stale same-named formal from an earlier call can't leak).
@@ -214,7 +224,12 @@ impl Simulator {
             .iter()
             .enumerate()
             .filter(|(_, port)| Self::formal_may_carry_vif(&port.data_type))
-            .map(|(i, port)| (port.name.name.as_str(), args.get(i)))
+            .map(|(i, port)| {
+                (
+                    port.name.name.as_str(),
+                    args.get(i).filter(|_| arg_supplied(i)),
+                )
+            })
             .collect();
         let vif_saved = if vif_formals.is_empty() {
             Vec::new()
@@ -240,7 +255,10 @@ impl Simulator {
             // left an array / queue / associative default to the scalar path,
             // which stored it as one packed value, so `v[0]` became a bit
             // select of it.
-            let actual = args.get(i).or_else(|| Self::default_actual(port));
+            let actual = args
+                .get(i)
+                .filter(|_| arg_supplied(i))
+                .or_else(|| Self::default_actual(port));
             // An ASSOCIATIVE-array formal: functions bound nothing at all, so
             // `arr.size()` inside the body read 0.
             if let Some(actual) = actual {
@@ -344,20 +362,29 @@ impl Simulator {
             // default binds the default as its actual, so `output o = a`
             // copies `o` back to `a` on return.
             if is_out {
-                if let Some(actual) = actual.filter(|a| i < args.len() || Self::is_lvalue_expr(a)) {
-                    output_bindings.push((port.name.name.clone(), actual.clone()));
+                if let Some(actual) = actual.filter(|a| arg_supplied(i) || Self::is_lvalue_expr(a))
+                {
+                    if arg_supplied(i) {
+                        output_bindings.push((port.name.name.clone(), actual.clone()));
+                    } else {
+                        default_output_bindings.push((port.name.name.clone(), actual.clone()));
+                    }
                 }
             }
-            let mut val = if i < args.len() {
-                self.eval_expr(&args[i])
+            let mut val = if arg_supplied(i) {
+                let value = self.eval_expr(&args[i]);
+                self.vif_argument_value(port, &args[i], value)
             } else if let Some(def) = &port.default {
                 // §13.5.3: a default may reference EARLIER formals (`int b =
                 // a + 1`). Push the partially-bound frame so they resolve —
                 // evaluated bare, `a` was unknown and the default was x.
-                self.push_local_frame_typed(locals.clone(), frame_types.clone());
-                let v = self.eval_expr(def);
-                self.pop_local_frame();
-                v
+                self.in_subroutine_default_scope(None, None, |sim| {
+                    sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                    let value = sim.eval_expr(def);
+                    let value = sim.vif_argument_value(port, def, value);
+                    sim.pop_local_frame();
+                    value
+                })
             } else {
                 Value::zero(32)
             };
@@ -570,13 +597,24 @@ impl Simulator {
         // inside the body resolved to a phantom and every access read 0.
         let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
         for (i, port) in fd.ports.iter().enumerate() {
-            if i < args.len() {
+            // §13.5.3: an omitted argument binds the formal's DEFAULT (§10.9.1),
+            // so a virtual-interface formal with a default still aliases the
+            // interface the default names (a supplied actual wins; the default
+            // only fills an omitted slot).
+            let arg = args
+                .get(i)
+                .filter(|_| arg_supplied(i))
+                .or(port.default.as_ref());
+            if arg.is_some() {
                 if let Some((f, b)) =
-                    self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
+                    self.vif_formal_alias(port, args.get(i).filter(|_| arg_supplied(i)), &locals)
                 {
                     iface_alias_frame.insert(f, b);
                 }
             }
+        }
+        if !iface_alias_frame.is_empty() {
+            self.consume_vif_argument_return();
         }
         self.local_iface_aliases.push(iface_alias_frame);
         self.commit_formal_dyn(formal_dyn);
@@ -731,7 +769,8 @@ impl Simulator {
             }
         }
         self.sync_static_locals();
-        self.local_iface_aliases.pop();
+        self.apply_default_formal_outputs(&default_output_bindings);
+        let vif_alias_ended = self.local_iface_aliases.pop().unwrap_or_default();
         self.func_call_stack.pop();
         self.fn_ret_collection_stack.pop();
         self.fn_ret_assoc_stack.pop();
@@ -857,10 +896,14 @@ impl Simulator {
             self.vif_formals_exit(vif_saved, &vif_formals, &outs)
         };
         for (pn, v, caller) in writebacks {
-            if let Some(nm) = vif_ended.get(&pn) {
-                self.vif_bind_actual(&caller, nm);
-            }
-            self.assign_value(&caller, &v);
+            self.vif_writeback(
+                &caller,
+                &v,
+                vif_alias_ended
+                    .get(&pn)
+                    .or_else(|| vif_ended.get(&pn))
+                    .map(String::as_str),
+            );
         }
         for (caller_lval, v) in struct_wb {
             self.assign_value(&caller_lval, &v);
@@ -955,6 +998,9 @@ impl Simulator {
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
     pub(super) fn unwind_task_frame(&mut self, mut c: TaskCleanup) {
+        // §13.5.3: a default may name an earlier formal; update it before
+        // capturing supplied outputs or popping the declaration's scope.
+        self.apply_default_formal_outputs(&c.default_output_bindings);
         if c.frame_scope_hint.is_some() {
             *self.name_resolve_hint.borrow_mut() = c.prev_hint.clone();
         }
@@ -1025,7 +1071,9 @@ impl Simulator {
         }
         for (actual, bound) in vif_outputs {
             if bound.is_empty() {
-                self.try_bind_virtual_iface(&actual, &Expression::new(ExprKind::Null, actual.span));
+                let null = Expression::new(ExprKind::Null, actual.span);
+                self.bind_static_vif(&actual, &null);
+                self.try_bind_virtual_iface(&actual, &null);
                 self.assign_value(&actual, &Value::zero(32));
             } else {
                 self.vif_bind_actual(&actual, &bound);
@@ -1754,17 +1802,85 @@ impl Simulator {
         }
     }
 
-    /// `type_ctx` is `Some(spec)` for a class method task: `spec` is the
-    /// `current_spec` its body runs under (see `task_method_spec`).
+    fn apply_default_formal_outputs(&mut self, bindings: &[(String, Expression)]) {
+        let default_outputs: Vec<_> = bindings
+            .iter()
+            .map(|(name, actual)| {
+                let value = self
+                    .local_stack
+                    .last()
+                    .and_then(|locals| locals.get(name))
+                    .cloned();
+                let binding = self
+                    .local_iface_aliases
+                    .last()
+                    .and_then(|frame| frame.get(name))
+                    .cloned();
+                (actual.clone(), value, binding)
+            })
+            .collect();
+        for (actual, value, binding) in default_outputs {
+            if let Some(value) = value {
+                self.assign_value(&actual, &value);
+            }
+            if let Some(binding) = binding {
+                if binding.is_empty() {
+                    let null = Expression::new(ExprKind::Null, actual.span);
+                    self.bind_static_vif(&actual, &null);
+                    self.try_bind_virtual_iface(&actual, &null);
+                    self.assign_value(&actual, &Value::zero(32));
+                } else {
+                    self.vif_bind_actual(&actual, &binding);
+                }
+            }
+        }
+    }
+
+    /// §13.5.3: evaluate defaults in the declaration's receiver/specialization;
+    /// supplied actuals continue to evaluate in the caller's context.
+    fn in_subroutine_default_scope<R>(
+        &mut self,
+        receiver: Option<&(Option<usize>, String)>,
+        spec: Option<(String, String)>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.this_stack
+            .push(receiver.and_then(|(handle, _)| *handle));
+        self.class_context_stack
+            .push(receiver.map(|(_, class)| class.clone()));
+        let saved = std::mem::replace(&mut self.current_spec, spec);
+        let result = f(self);
+        self.current_spec = saved;
+        self.class_context_stack.pop();
+        self.this_stack.pop();
+        result
+    }
+
+    /// A method task supplies its specialization, receiver and declaring
+    /// class so defaults and formal types resolve in the declaration scope.
     pub(super) fn bind_task_frame(
         &mut self,
         td: &TaskDeclaration,
         args: &[Expression],
-        type_ctx: Option<Option<(String, String)>>,
+        method_ctx: Option<(Option<(String, String)>, Option<usize>, String)>,
     ) -> TaskCleanup {
         use crate::ast::types::PortDirection;
+        let type_ctx = method_ctx.as_ref().map(|(spec, _, _)| spec.clone());
+        let default_spec = type_ctx.clone().flatten();
+        let default_receiver = method_ctx
+            .as_ref()
+            .map(|(_, handle, class)| (*handle, class.clone()));
         let normalized = Self::normalize_call_args(&td.ports, args);
+        let supplied = normalized
+            .as_ref()
+            .map(|_| Self::supplied_argument_mask(&td.ports, args));
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
+        let arg_supplied = |i: usize| {
+            i < args.len()
+                && supplied
+                    .as_ref()
+                    .is_none_or(|mask| mask.get(i).copied().unwrap_or(false))
+        };
         // §8.25: a formal typed by one of the class's type parameters has
         // the type bound in the CALLEE's specialization. Resolve each under
         // it now — the arguments below evaluate in the caller's context,
@@ -1837,13 +1953,21 @@ impl Simulator {
         // The callee frame's type overlay, pushed together with `locals`.
         let mut frame_types = self.take_pooled_types();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
-        let bound_vifs: Vec<_> = td
+        let mut default_output_bindings = Vec::new();
+        let mut bound_vifs: Vec<_> = td
             .ports
             .iter()
             .enumerate()
             .filter_map(|(i, port)| {
                 if vif_formal_indices.contains(&i) && port.direction != PortDirection::Output {
+                    // §13.5.3: an omitted argument binds the formal's DEFAULT
+                    // (§10.9.1). A virtual-interface formal's default names the
+                    // interface instance the body must dispatch to; resolving
+                    // it alongside a supplied actual keeps the formal bound, so
+                    // `show()` reads the default's interface and an `inout`/
+                    // `output` default copies that binding back to the actual.
                     args.get(i)
+                        .filter(|_| arg_supplied(i))
                         .and_then(|a| self.resolve_vif_rhs_name_strict(a))
                         .map(|bound| (i, bound))
                 } else {
@@ -1944,7 +2068,10 @@ impl Simulator {
             // §13.5.3: an omitted argument binds the formal's DEFAULT through
             // the aggregate binders below, like a supplied actual (see
             // `exec_function_call_body`).
-            let actual = args.get(i).or_else(|| Self::default_actual(port));
+            let actual = args
+                .get(i)
+                .filter(|_| arg_supplied(i))
+                .or_else(|| Self::default_actual(port));
             // §13.5, §6.18: an associative formal declared through a typedef
             // (`output aa_t a`) is one too — as for functions. Checked first: the
             // struct and queue binders below would claim a typedef of struct
@@ -2049,15 +2176,33 @@ impl Simulator {
                     {
                         Value::zero(32)
                     } else {
-                        match actual {
-                            Some(a) => self.eval_expr(a),
-                            None => Value::zero(32),
+                        if arg_supplied(i) {
+                            let value = self.eval_expr(&args[i]);
+                            self.vif_argument_value(port, &args[i], value)
+                        } else if let Some(default) = &port.default {
+                            self.in_subroutine_default_scope(
+                                default_receiver.as_ref(),
+                                default_spec.clone(),
+                                |sim| {
+                                    sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                    let value = sim.eval_expr(default);
+                                    let value = sim.vif_argument_value(port, default, value);
+                                    sim.pop_local_frame();
+                                    value
+                                },
+                            )
+                        } else {
+                            Value::zero(32)
                         }
                     };
                     let val = self.fit_scalar_formal_seed(port, val);
                     locals.insert(port.name.name.clone(), val);
-                    if let Some(a) = actual.filter(|a| i < args.len() || Self::is_lvalue_expr(a)) {
-                        output_bindings.push((port.name.name.clone(), a.clone()));
+                    if let Some(a) = actual.filter(|a| arg_supplied(i) || Self::is_lvalue_expr(a)) {
+                        if arg_supplied(i) {
+                            output_bindings.push((port.name.name.clone(), a.clone()));
+                        } else {
+                            default_output_bindings.push((port.name.name.clone(), a.clone()));
+                        }
                     }
                 }
                 PortDirection::Ref => {
@@ -2095,24 +2240,37 @@ impl Simulator {
                         identity_formals.push(port.name.name.clone());
                         continue;
                     }
-                    let val = if i < args.len() {
-                        self.eval_expr(&args[i])
+                    let val = if arg_supplied(i) {
+                        let value = self.eval_expr(&args[i]);
+                        self.vif_argument_value(port, &args[i], value)
                     } else {
                         Value::zero(32)
                     };
                     locals.insert(port.name.name.clone(), val);
-                    if i < args.len() {
+                    if arg_supplied(i) {
                         output_bindings.push((port.name.name.clone(), args[i].clone()));
                     }
                 }
                 _ => {
-                    let mut val = if i < args.len() {
-                        self.eval_expr(&args[i])
+                    let mut val = if arg_supplied(i) {
+                        let value = self.eval_expr(&args[i]);
+                        self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's default
                         // value (was incorrectly using 0). E.g.
                         // `start(..., int priority = -1)`: a missing arg must be -1, not 0.
-                        self.eval_expr(def)
+                        // §13.5.3: a later default may use an earlier formal.
+                        self.in_subroutine_default_scope(
+                            default_receiver.as_ref(),
+                            default_spec.clone(),
+                            |sim| {
+                                sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                let value = sim.eval_expr(def);
+                                let value = sim.vif_argument_value(port, def, value);
+                                sim.pop_local_frame();
+                                value
+                            },
+                        )
                     } else {
                         Value::zero(32)
                     };
@@ -2126,6 +2284,37 @@ impl Simulator {
                     }
                     locals.insert(port.name.name.clone(), val);
                 }
+            }
+            if arg_supplied(i)
+                && let Some((_, bound)) = bound_vifs.iter().find(|(index, _)| *index == i)
+            {
+                locals.insert(
+                    port.name.name.clone(),
+                    Value::from_u64(Self::iface_handle_token(bound), 32),
+                );
+            }
+        }
+        // §13.5.3 / §25.9: defaults have been evaluated once in the
+        // declaration scope. Bind their resulting token, including null, and
+        // keep the task's identity store in step with its dispatch alias.
+        for (i, port) in td.ports.iter().enumerate() {
+            if args.get(i).filter(|_| arg_supplied(i)).is_some() || !vif_formal_indices.contains(&i)
+            {
+                continue;
+            }
+            let bound = locals
+                .get(&port.name.name)
+                .and_then(|v| v.to_u64())
+                .filter(|&token| token != 0)
+                .and_then(|token| self.iface_by_token(token))
+                .map(str::to_string);
+            let key = format!("__vif_local__{}", port.name.name);
+            if let Some(bound) = bound {
+                self.vif_local_names.insert(port.name.name.clone());
+                self.signals.insert(key, Value::from_string(&bound));
+                bound_vifs.push((i, bound));
+            } else {
+                self.signals.remove(&key);
             }
         }
         self.commit_formal_dyn(formal_dyn);
@@ -2168,7 +2357,7 @@ impl Simulator {
         // top frame as the caller when rejecting caller-local actuals.
         let mut alias_map: HashMap<String, String> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
-            if matches!(port.direction, crate::ast::types::PortDirection::Ref) && i < args.len() {
+            if matches!(port.direction, crate::ast::types::PortDirection::Ref) && arg_supplied(i) {
                 if let Some(frozen) = self.ref_alias_target(&args[i]) {
                     alias_map.insert(port.name.name.clone(), frozen);
                 }
@@ -2276,6 +2465,7 @@ impl Simulator {
             array_writebacks,
             queue_writebacks,
             output_bindings,
+            default_output_bindings,
             saved_vif_formals,
             assoc_params,
             array_params,

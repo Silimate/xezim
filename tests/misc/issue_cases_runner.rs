@@ -464,6 +464,19 @@ fn issue_430_static_vif_typedef_alias() {
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
 
+// ---------------------------------------------------------------------------
+// Static virtual-interface cells for qualified receivers (§8.9/§25.10/§26.3).
+//
+// A static property has ONE binding cell, keyed to its class (or
+// specialization) at handle 0 and held in `static_vif_bindings`. A class-scope
+// read resolved only through the per-object `virtual_iface_bindings` table,
+// which cannot hold a static cell, and the chain rewriter's entry gate never
+// consulted the static map at all — so a design whose only bound vifs are class
+// statics was rejected before its chain could be walked. Both the package
+// qualifier and the `#(spec)` qualifier then had no way to name the class.
+// Rename these to issueNNN_* once the GitHub numbers are assigned.
+// ---------------------------------------------------------------------------
+
 /// A static virtual-interface member read as a VALUE yielded a placeholder, not
 /// the bound interface handle. Member access through it worked
 /// (`S::sa.count` read the right interface), but `==`/`!=` and use as an actual
@@ -495,6 +508,68 @@ fn issue_428_static_vif_handle_value() {
 fn issue_432_static_vif_instance_method() {
     let msgs = outputs(
         include_str!("../issue_cases/static_vif_instance_method_432.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+
+/// #431: a static virtual-interface member of a PARAMETERIZED class never
+/// resolved through the specialization `C#(T)::svif`. Write and read agreed on
+/// the key (`a_pm_c#(int)::svif`), yet the qualified member read came back 0
+/// while the same class bound through a static method read back correctly
+/// through the very same spelling. `vif_prop_target` resolved a class-scope read
+/// (handle 0) only through the per-object table, and `vif_rebase_expr`'s entry
+/// gate tested `iface_alias_possible`, `virtual_iface_bindings` and
+/// `vif_tokens_stored` but never `static_vif_bindings`. Per-specialization cells
+/// (§8.26) must stay distinct, so the fix may not collapse the spec key.
+#[test]
+fn static_vif_param_class_431() {
+    let msgs = outputs(
+        include_str!("../issue_cases/static_vif_param_class_431.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+
+/// #431, the reporter's own case. A parameterized class keeps one static cell
+/// per specialization (§8.26) and the write side files the binding under the
+/// canonical spec key `C#(T)::p`; the class-scope reads went through `vif_slot`,
+/// which canonicalises via `vif_class_of_scope_name` and DISCARDS the signature,
+/// so they asked for `C::p` and read a bound static as null. The member-read
+/// path does resolve the spec, which is why a member read could succeed while
+/// `== null` on the same static still reported unbound — the comparison
+/// classifier and the member read disagreed about which cell a static occupies.
+/// Bare reads inside a static method are the other half: with no `this`, the
+/// name resolves through the executing class context, which must carry the
+/// specialization the call was made on. E is the check that stops the fix
+/// collapsing the two specialization cells into one.
+#[test]
+fn static_vif_param_null_bare_431() {
+    let msgs = outputs(
+        include_str!("../issue_cases/static_vif_param_null_bare_431.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+
+/// #433: a frame-local virtual interface failed to shadow the class static of
+/// the same name. A static property has one cell, keyed to the declaring class
+/// at handle 0, and a bare vif name inside a method resolved against it on
+/// BOTH sides without ever asking the executing frame (§6.21/§8.4). The read
+/// side fell back to the class cell, so A's never-assigned local read the
+/// bound static; the write side resolved a static method's missing `this` to
+/// handle 0 and CLEARED that cell, so a declaration's synthesised initializer
+/// assignment (`virtual counter_if svif = null;`) destroyed the binding for
+/// every later reader — which is why D, a method with no local at all, failed.
+/// The controls keep the fix honest: C and D must still reach the class
+/// static, so neither guard may widen to "a bare name never reaches a static".
+#[test]
+fn static_vif_local_shadow_433() {
+    let msgs = outputs(
+        include_str!("../issue_cases/static_vif_local_shadow_433.sv"),
         100_000,
     );
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);

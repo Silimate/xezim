@@ -259,6 +259,14 @@ impl<'a> Names<'a> {
             if self.insts.contains_key(key.as_str()) {
                 return Step::Scope(key);
             }
+            let bound = xezim_core::elaborate::interface_ports::resolve(
+                &key,
+                &self.elab.interface_port_aliases,
+                &self.elab.name,
+            );
+            if bound != key {
+                return Step::Scope(bound.into_owned());
+            }
         }
         if self.generate_scope(&bare) {
             return match &seg.sel {

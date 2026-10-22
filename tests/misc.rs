@@ -358,6 +358,8 @@ mod single_eval;
 mod size_test;
 #[path = "misc/spec_canonical_keying.rs"]
 mod spec_canonical_keying;
+#[path = "misc/specparam_in_parameter_init.rs"]
+mod specparam_in_parameter_init;
 #[path = "misc/static_collection_per_spec.rs"]
 mod static_collection_per_spec;
 #[path = "misc/static_init_sysfuncs.rs"]
@@ -528,3 +530,6 @@ mod relaxed_static_initializers_351;
 mod string_casts_391;
 #[path = "misc/undefined_macro_recovery.rs"]
 mod undefined_macro_recovery;
+
+#[path = "misc/constant_scopes_488.rs"]
+mod constant_scopes_488;

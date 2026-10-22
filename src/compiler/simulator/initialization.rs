@@ -2442,6 +2442,8 @@ impl Simulator {
 
         let n = names.len();
         let mut signal_name_to_id = NameMap::with_capacity(n);
+        signal_name_to_id
+            .set_interface_aliases(module.name.clone(), module.interface_port_aliases.clone());
         // Ports the elaborator left out as unobserved: a lookup that misses
         // is checked against them (see `names::ElidedPorts`).
         if module.elided_port_count > 0 {

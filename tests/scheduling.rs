@@ -368,3 +368,12 @@ mod sva_named_property_hier_sampling;
 mod array_port_connection_timing;
 #[path = "scheduling/sva_event_lists.rs"]
 mod sva_event_lists;
+
+#[path = "scheduling/nested_vacuity_445.rs"]
+mod nested_vacuity_445;
+
+#[path = "scheduling/sampled_action_468.rs"]
+mod sampled_action_468;
+
+#[path = "scheduling/sva_until_properties.rs"]
+mod sva_until_properties;

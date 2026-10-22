@@ -11,8 +11,12 @@ impl Simulator {
             return v;
         }
         match self.static_cell_width(key, prop) {
-            Some((w, signed)) if w != v.width => {
-                let mut out = v.resize_for_assign(w);
+            Some((w, signed)) => {
+                let mut out = if w != v.width {
+                    v.resize_for_assign(w)
+                } else {
+                    v
+                };
                 out.is_signed = signed;
                 out
             }
@@ -675,10 +679,7 @@ impl Simulator {
         // unsigned`, `b == 32'd300` into a `byte`, a `!=` re-pick drawn at the
         // other operand's 40 bits into a 1-bit `bit`), the check then compared
         // the oversized value and accepted an unsatisfiable set.
-        let mut val = self.fit_class_prop(handle, name, &val);
-        if !val.is_signed && !val.is_real && self.class_prop_signed_of(handle, name) {
-            val.is_signed = true;
-        }
+        let val = self.fit_class_prop(handle, name, &val);
         // §8.10: a STATIC property is one shared variable — a write through
         // `this.prop` / `handle.prop` must land in the class-static cell, not
         // create a per-instance copy (which then shadowed the static on every

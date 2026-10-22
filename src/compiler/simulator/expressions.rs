@@ -1888,46 +1888,24 @@ impl Simulator {
         }
         match &expr.kind {
             ExprKind::Number(n) => Some(self.eval_number(n).is_signed),
-            // A class property keeps the flag of the value last written to
-            // it, which can be unsigned for a signed property (a bitwise
-            // result is), so an unsigned one is checked against the
-            // declaration; a local is fitted to its type on every write.
-            ExprKind::Ident(h) => self
-                .plain_ident_read(h)
-                .map(|v| {
-                    let name = h.path[0].name.name.as_str();
-                    match self.this_stack.last().copied().flatten() {
-                        Some(handle)
-                            if !v.is_signed
-                                && !v.is_real
-                                && !self
-                                    .local_stack
-                                    .last()
-                                    .is_some_and(|l| l.contains_key(name)) =>
-                        {
-                            self.class_prop_signed_of(handle, name)
-                        }
-                        _ => v.is_signed,
-                    }
-                })
-                .or_else(|| {
-                    let name = self.resolve_hier_name(h);
-                    self.signal_name_to_id
-                        .get(name.as_ref())
-                        .map(|&id| self.signal_signed[id])
-                        .or_else(|| {
-                            self.module.var_decl_types.get(name.as_ref()).map(|dt| {
-                                super::elaborate::is_type_signed_resolved(
-                                    dt,
-                                    &self.module.typedef_types,
-                                )
-                            })
+            ExprKind::Ident(h) => self.plain_ident_read(h).map(|v| v.is_signed).or_else(|| {
+                let name = self.resolve_hier_name(h);
+                self.signal_name_to_id
+                    .get(name.as_ref())
+                    .map(|&id| self.signal_signed[id])
+                    .or_else(|| {
+                        self.module.var_decl_types.get(name.as_ref()).map(|dt| {
+                            super::elaborate::is_type_signed_resolved(
+                                dt,
+                                &self.module.typedef_types,
+                            )
                         })
-                        .or_else(|| {
-                            self.get_expr_type_name(expr)
-                                .and_then(|name| self.concrete_type_signed(&name))
-                        })
-                }),
+                    })
+                    .or_else(|| {
+                        self.get_expr_type_name(expr)
+                            .and_then(|name| self.concrete_type_signed(&name))
+                    })
+            }),
             ExprKind::Paren(e) => self.expression_signed_hint(e),
             ExprKind::Unary {
                 op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
@@ -2084,15 +2062,73 @@ impl Simulator {
         // prefix and re-enter, as the identifier spelling does below. Scalar
         // `pkg::x` reads keep their own arm (parameters of two packages must
         // not collide through the bare name).
+        //
+        // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package localparam
+        // keeps its QUALIFIED registration only (`pkg::LIM` plus per-element
+        // `pkg::LIM[i]`); stripping the head here resolved the element select
+        // to a bare `LIM` that exists nowhere and read 0. Keep the qualified
+        // spelling when it names a collection — the indexed arms below
+        // resolve the base through `resolve_hier_name`, which returns the
+        // qualified key (package variables still hoist bare as before).
+        let pkg_qual_collection = match &expr.kind {
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                // §26.3 / §7.4: every select belongs to the qualified
+                // collection, including the outer select of a nested index.
+                let mut base = base.as_ref();
+                while let ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::Paren(expr) = &base.kind
+                {
+                    base = expr;
+                }
+                match &base.kind {
+                    ExprKind::Ident(h)
+                        if h.path.len() == 2
+                            && h.path[0].selects.is_empty()
+                            && self.module.packages.contains(&h.path[0].name.name) =>
+                    {
+                        self.pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                            .is_some()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
         if !self.module.packages.is_empty()
             && matches!(
                 expr.kind,
                 ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
             )
+            && !pkg_qual_collection
         {
             if let Some(stripped) = self.strip_package_lvalue(expr) {
                 return self.eval_expr_ctx(&stripped, ctx_width);
             }
+        }
+        // §6.20.2/§26.3 (issue #425): `(pkg::LIM)[3]` — the Paren wrapper is
+        // semantically transparent, but it defeats every base-shape probe
+        // above and below (including the package strip), so the select fell
+        // through to a bit-select of the whole-array read and returned 0.
+        // Unwrap the wrapper for the package-collection shape and re-enter.
+        if let ExprKind::Index { expr: base, index } = &expr.kind
+            && let ExprKind::Paren(inner) = &base.kind
+            && let ExprKind::Ident(h) = &inner.kind
+            && h.path.len() == 2
+            && h.path[0].selects.is_empty()
+            && self.module.packages.contains(&h.path[0].name.name)
+            && self
+                .pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                .is_some()
+        {
+            let rewritten = Expression::new(
+                ExprKind::Index {
+                    expr: inner.clone(),
+                    index: index.clone(),
+                },
+                expr.span,
+            );
+            return self.eval_expr_ctx(&rewritten, ctx_width);
         }
         // §13.5.2: an indexed / part-selected read through a `ref` formal
         // reads the caller's actual (see `ref_formal_redirect_hier`).
@@ -3665,13 +3701,21 @@ impl Simulator {
                         _ => unreachable!(),
                     }
                 }
-                // Logical implication / equivalence (IEEE §11.4.7).
-                if matches!(op, BinaryOp::LogImplies | BinaryOp::LogEquiv) {
+                // Logical implication / equivalence (IEEE §11.4.7). The SVA
+                // `iff` (§16.12.8), `property_expr1 iff property_expr2`, is
+                // logical equivalence too: true iff both hold or both don't.
+                if matches!(
+                    op,
+                    BinaryOp::LogImplies | BinaryOp::LogEquiv | BinaryOp::Iff
+                ) {
                     let l = self.eval_expr_ctx(left, ctx_width);
                     let r = self.eval_expr_ctx(right, ctx_width);
                     return match op {
                         BinaryOp::LogImplies => l.logic_impl(&r),
                         BinaryOp::LogEquiv => l.logic_equiv(&r),
+                        // §16.12.8: iff compares PROPERTY truth values. An
+                        // unknown Boolean expression is a failed property.
+                        BinaryOp::Iff => Value::from_u64(u64::from(l.is_true() == r.is_true()), 1),
                         _ => unreachable!(),
                     };
                 }
@@ -4267,10 +4311,18 @@ impl Simulator {
                         let opw = self_det_w.max(wl.width);
                         wl.resize(opw).power(&wr)
                     }
-                    BinaryOp::BitAnd => wl.bitwise_and(&wr),
-                    BinaryOp::BitOr => wl.bitwise_or(&wr),
-                    BinaryOp::BitXor => wl.bitwise_xor(&wr),
-                    BinaryOp::BitXnor => wl.bitwise_xor(&wr).bitwise_not(),
+                    // §11.8.1: the integral result is signed when both
+                    // operands are signed. The bit-plane helpers clear it.
+                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor => {
+                        let mut value = match op {
+                            BinaryOp::BitAnd => wl.bitwise_and(&wr),
+                            BinaryOp::BitOr => wl.bitwise_or(&wr),
+                            BinaryOp::BitXor => wl.bitwise_xor(&wr),
+                            _ => wl.bitwise_xor(&wr).bitwise_not(),
+                        };
+                        value.is_signed = wl.is_signed && wr.is_signed;
+                        value
+                    }
                     BinaryOp::LogAnd => wl.logic_and(&wr),
                     BinaryOp::LogOr => wl.logic_or(&wr),
                     BinaryOp::LogImplies => wl.logic_impl(&wr),
@@ -5324,13 +5376,14 @@ impl Simulator {
                                     }
                                     return v;
                                 }
-                                // §7.4.6: out of range on a FIXED array reads
-                                // x at the element width. Falling through
-                                // reached the bit-select fallback, a 1-bit x
-                                // that the store then zero-extended.
+                                // §7.4.6 / Table 7-1: an invalid fixed-array
+                                // index yields the element type's default,
+                                // fitted to its width and signedness.
                                 if !self.module.dynamic_arrays.contains(&*name) {
                                     if let Some(ew) = self.module.arrays.get(&*name).map(|a| a.2) {
-                                        return Value::new(ew.max(1));
+                                        return self
+                                            .assoc_missing_elem_value(&name)
+                                            .unwrap_or_else(|| Value::new(ew.max(1)));
                                     }
                                 }
                             }

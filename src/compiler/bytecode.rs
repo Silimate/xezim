@@ -10535,6 +10535,10 @@ impl<'a> BytecodeCompiler<'a> {
                 || self.queue_vars.is_some_and(|m| m.contains(&elem))
                 || self.dynamic_arrays.is_some_and(|m| m.contains(&elem)))
         };
+        let canonical = self.signal_name_to_id.canonical_interface_name(&raw);
+        if canonical != raw && self.arrays.contains_key(canonical.as_ref()) {
+            return dense(&canonical).then(|| canonical.into_owned());
+        }
         if self.arrays.contains_key(&raw) {
             return dense(&raw).then_some(raw);
         }
@@ -10548,6 +10552,23 @@ impl<'a> BytecodeCompiler<'a> {
             let leaf = &hier.path[0].name.name;
             if self.arrays.contains_key(leaf) {
                 return dense(leaf).then_some(leaf.clone());
+            }
+        }
+        // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package localparam
+        // registers under its QUALIFIED key only (`pkg::LIM`, elements
+        // `pkg::LIM[i]`) — bare visibility stays with the import machinery,
+        // unlike package variables, which hoist bare. `hier_raw_name` joins
+        // with '.', so `pkg::LIM` probed as "pkg.LIM" and missed, and the
+        // element read degraded to a bit-select of a phantom scalar. Probe
+        // the '::'-joined two-segment spelling; a dotted hierarchical name
+        // never contains '::', so this cannot capture another name.
+        if hier.path.len() == 2
+            && hier.path.iter().all(|s| s.selects.is_empty())
+            && hier.root.is_none()
+        {
+            let q = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
+            if self.arrays.contains_key(&q) {
+                return dense(&q).then_some(q);
             }
         }
         // Top-prefix strip, as `resolve_signal_id` does for scalars: an

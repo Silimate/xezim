@@ -350,6 +350,24 @@ impl Simulator {
         }
     }
 
+    /// §6.20.2/§26.3 (issue #425): the qualified key `pkg::leaf` when it names
+    /// a COLLECTION. Unpacked-array package localparams keep their QUALIFIED
+    /// registration only — the `pkg::LIM` shape key plus per-element signals
+    /// `pkg::LIM[i]` — because a bare hoist would leak the name past the
+    /// import machinery (§26.2.2) and collide with a module's own same-named
+    /// array; contested package variables likewise get their own `pkg::name`
+    /// storage. `None` when the qualified spelling names no collection
+    /// (ordinary package variables hoist bare as before).
+    pub(super) fn pkg_qual_collection_key(&self, pkg: &str, leaf: &str) -> Option<String> {
+        let q = format!("{}::{}", pkg, leaf);
+        (self.module.arrays.contains_key(&q)
+            || self.module.arrays_2d.contains_key(&q)
+            || self.module.arrays_nd.contains_key(&q)
+            || self.module.dynamic_arrays.contains(&q)
+            || self.module.associative_arrays.contains_key(&q))
+        .then_some(q)
+    }
+
     pub(super) fn resolve_hier_name<'h>(
         &self,
         hier: &'h HierarchicalIdentifier,
@@ -626,7 +644,22 @@ impl Simulator {
             && !self.signals.contains_key(&hier.path[0].name.name)
         {
             // §26.3: a contested package variable has its own storage.
-            let qual = self.pkg_var_storage(&hier.path[0].name.name, &hier.path[1].name.name);
+            let mut qual = self.pkg_var_storage(&hier.path[0].name.name, &hier.path[1].name.name);
+            // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package
+            // localparam keeps its QUALIFIED registration only — the
+            // `pkg::LIM` shape key plus per-element signals `pkg::LIM[i]` —
+            // because a bare hoist would leak the name past the import
+            // machinery (§26.2.2) and collide with a module's own
+            // same-named array. Stripping the package prefix here resolved
+            // `pkg::LIM[3]` to a bare `LIM` that exists nowhere, so the
+            // element select fell through to a bit-select of a phantom
+            // scalar and read 0 at run time (the const paths were already
+            // fixed). Keep the qualified spelling when it names a
+            // collection; package VARIABLES still hoist bare as before.
+            if qual.is_none() {
+                qual =
+                    self.pkg_qual_collection_key(&hier.path[0].name.name, &hier.path[1].name.name);
+            }
             let stripped: String = qual
                 .as_deref()
                 .into_iter()
@@ -694,6 +727,79 @@ impl Simulator {
     }
 
     pub(super) fn resolve_hier_name_uncached(&self, hier: &HierarchicalIdentifier) -> String {
+        // §25.3 / §23.8: a hierarchical reference through an interface port
+        // names its connected instance, before ordinary suffix fallbacks.
+        if !self.module.interface_port_aliases.is_empty() {
+            let mut raw = String::new();
+            for (i, seg) in hier.path.iter().enumerate() {
+                if seg.name.name == "$root" && i == 0 {
+                    continue;
+                }
+                if !raw.is_empty() {
+                    raw.push('.');
+                }
+                raw.push_str(&seg.name.name);
+                if i + 1 < hier.path.len() {
+                    for select in &seg.selects {
+                        if let Some(index) = Self::try_const_u64(select) {
+                            use std::fmt::Write as _;
+                            let _ = write!(raw, "[{index}]");
+                        }
+                    }
+                }
+            }
+            let resolve = |name: &str| {
+                let bound = xezim_core::elaborate::interface_ports::resolve(
+                    name,
+                    &self.module.interface_port_aliases,
+                    &self.module.name,
+                );
+                // An enclosing hint can itself end in a port name. Rebasing
+                // a relative name headed by that same port would duplicate
+                // it (actual.port.member). Only accept a binding that names
+                // declared storage or a subroutine; otherwise ordinary scope
+                // lookup must continue (§23.8).
+                let known = bound != name
+                    && (self.signal_name_to_id.contains_key(bound.as_ref())
+                        || self.signals.contains_key(bound.as_ref())
+                        || self.module.parameters.contains_key(bound.as_ref())
+                        || self.module.arrays.contains_key(bound.as_ref())
+                        || self.module.arrays_2d.contains_key(bound.as_ref())
+                        || self.module.arrays_nd.contains_key(bound.as_ref())
+                        || self.module.dynamic_arrays.contains(bound.as_ref())
+                        || self.module.associative_arrays.contains_key(bound.as_ref())
+                        || self.module.struct_members.contains_key(bound.as_ref())
+                        || self.module.functions.contains_key(bound.as_ref())
+                        || self.module.tasks.contains_key(bound.as_ref())
+                        || self.instance_by_path(bound.as_ref()).is_some());
+                known.then(|| bound.into_owned())
+            };
+            if let Some(bound) = resolve(&raw) {
+                return bound;
+            }
+            // A rewritten absolute name such as `p.pv` already names its
+            // declaration. Prefixing the hint `p` again could turn it into
+            // `p.p.pv`, where `p.p` happens to be an interface-port alias.
+            let declared = raw.contains('.')
+                && (self.signal_name_to_id.contains_key(raw.as_str())
+                    || self.signals.contains_key(&raw)
+                    || self.module.arrays.contains_key(&raw)
+                    || self.module.arrays_2d.contains_key(&raw)
+                    || self.module.arrays_nd.contains_key(&raw)
+                    || self.module.dynamic_arrays.contains(&raw)
+                    || self.module.queue_vars.contains(&raw)
+                    || self.module.associative_arrays.contains_key(&raw)
+                    || self.module.struct_members.contains_key(&raw)
+                    || self.module.functions.contains_key(&raw)
+                    || self.module.tasks.contains_key(&raw));
+            if !declared
+                && hier.root.is_none()
+                && let Some(qualified) = self.hint_scoped(&raw)
+                && let Some(bound) = resolve(&qualified)
+            {
+                return bound;
+            }
+        }
         let common_prefix_len = |a: &str, b: &str| -> usize {
             let mut n = 0usize;
             for (sa, sb) in a.split('.').zip(b.split('.')) {
@@ -1484,5 +1590,44 @@ impl Simulator {
         self.table_modified = true;
         self.after_signal_write_premirrored(id);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §23.8 / §25.3: a port-scoped lookup hint cannot duplicate that port
+    /// in the physical interface path, including assertion clock lookups.
+    #[test]
+    fn interface_port_hint_resolves_declared_clock() {
+        let sim = crate::simulate(
+            r#"
+interface bus_if; logic clk; endinterface
+module agent(bus_if bus); endmodule
+module top; bus_if bus(); agent a(bus); initial #1 $finish; endmodule
+module control; endmodule
+"#,
+            2,
+        )
+        .unwrap();
+        let span = crate::ast::Span::new(0, 0);
+        let expression =
+            Simulator::hier_ident_expr(Simulator::iface_path_segs("bus.clk", span), span);
+        let ExprKind::Ident(hier) = expression.kind else {
+            unreachable!()
+        };
+        for hint in ["top.a.bus", "top.a", "top.bus"] {
+            *sim.name_resolve_hint.borrow_mut() = Some(hint.to_string());
+            let resolved = sim.resolve_hier_name_uncached(&hier);
+            // Both the formal port path and the physical path may remain
+            // valid names, but they must select the same signal storage.
+            assert_eq!(
+                sim.signal_name_to_id.get(resolved.as_str()),
+                sim.signal_name_to_id.get("top.bus.clk"),
+                "{hint}: {resolved}"
+            );
+            assert!(sim.signal_name_to_id.contains_key(resolved.as_str()));
+        }
     }
 }

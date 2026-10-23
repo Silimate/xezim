@@ -185,6 +185,8 @@ mod lrm_pattern_matching;
 mod macro_default_after_string_actual;
 #[path = "misc/mailbox_method_blocking.rs"]
 mod mailbox_method_blocking;
+#[path = "misc/mcp_server.rs"]
+mod mcp_server;
 #[path = "misc/method_call_chaining.rs"]
 mod method_call_chaining;
 #[path = "misc/min_typ_max_delays.rs"]

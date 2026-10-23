@@ -8,6 +8,8 @@ mod report;
 // Other simulators' command-line spellings (`-do`, `-g`, `-sv_seed`, ...).
 mod cli_compat;
 mod cli_files;
+// `--mcp`: a Model Context Protocol server for coding agents.
+mod mcp;
 mod uvm_dir;
 
 /// The library's `chatter!` for the CLI: internal lines (run banner, `[PHASE]`
@@ -195,6 +197,8 @@ fn print_usage() {
     eprintln!("  --simulate       Parse + elaborate + simulate (default)");
     eprintln!("Options:");
     eprintln!("  -V, --version    Print the version and git revision and exit (-version too)");
+    eprintln!("  --mcp            Serve the Model Context Protocol on stdin/stdout (alone; see");
+    eprintln!("                   docs/mcp.md): compile, simulate, coverage, assertions");
     eprintln!("  -I <dir>         Add directory to include search path");
     eprintln!("  -D <name>[=val]  Define a macro");
     eprintln!("  -uvm, --uvm      Add the UVM library named by XEZIM_UVM_DIR (its src include");
@@ -1945,6 +1949,11 @@ fn append_adopted_libs_to_merged(
 }
 
 fn main() {
+    // `xezim --mcp` serves tool calls on stdin and stdout; each call runs this
+    // executable again as a child, which takes the path below.
+    if env::args().nth(1).as_deref() == Some("--mcp") {
+        std::process::exit(mcp::serve());
+    }
     // `-xezim_env <file>` before anything reads an `XEZIM_*` variable (this
     // very function reads XEZIM_HUGEPAGE and XEZIM_STACK_MB). The process is
     // still single-threaded here, so setting the environment is sound.

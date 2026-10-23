@@ -180,6 +180,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Phase 2: minimum same-slot ratio for a fusion edge (default 0.9)",
     ),
     (
+        "XEZIM_COCOTB_VPI_FLAVOUR",
+        "MCP: the cocotb VPI library a cocotb run of --mcp loads (default vcs, cocotb's plain-VPI build), as for contrib/cocotb's runner",
+    ),
+    (
         "XEZIM_CODE_COVERAGE",
         "Coverage: collect code coverage, like --code-coverage=<kinds> (stmt,branch,cond,expr,toggle,all); the flag wins",
     ),

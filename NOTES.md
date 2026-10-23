@@ -504,6 +504,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Command line**
 
+* `xezim --mcp` serves the Model Context Protocol on stdin and stdout, so
+  coding agents can drive xezim through four tools: `compile` (diagnostics
+  with file, line and column), `simulate` (an SV top or a cocotb test module:
+  pass or fail, the end time, the run's errors, assertion failures, cocotb
+  test results and the log's end), `coverage` (code coverage per instance and
+  subtree, with the uncovered bins, by xezim's rules or the reference
+  simulator's default counting) and `assertions` (passes, failures and
+  vacuous passes per instance). `coverage` and `assertions` also read the
+  results file of an earlier run. Each call runs xezim as a child process
+  with a timeout, and can be cancelled. See [docs/mcp.md](docs/mcp.md).
 * `--tee <file>` copies stdout/stderr and DPI/VPI output to a transcript while
   retaining console output. `-vcd` and `-vcd dumpon` enable source-driven VCD
   dumping like `--wave`. (#347, reported by akashlevy)

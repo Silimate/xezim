@@ -194,6 +194,7 @@ with few, very hot blocks (Ibex CoreMark −23%), so measure it on yours.
 | [UVM guide](docs/uvm-guide.md) | Running UVM testbenches, supported features, UVM's DPI-C library |
 | [DPI and VPI guide](docs/dpi-guide.md) | Loading C and C++ libraries, the VPI surface |
 | [Coverage guide](docs/coverage-guide.md) | Functional, assertion and code coverage, `xezim_cov.json` |
+| [MCP server](docs/mcp.md) | `xezim --mcp`: compile, simulate, coverage and assertion tools for coding agents |
 | [UPF guide](docs/upf-guide.md) | IEEE 1801 power intent |
 | [Debugging guide](docs/DEBUGGING.md) | Tracing, diagnosing hangs, comparing against another simulator |
 | [Building from source](docs/building.md) | Requirements, profile-guided builds, working on xezim-core |

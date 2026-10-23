@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 const TIMEOUT: u64 = 600;
 /// The most diagnostics a result lists; the counts cover them all.
 const DIAGNOSTICS: usize = 50;
-/// The most of one log line kept in the log's end.
+/// The most of one log line read: the rest of a longer line is skipped.
 const LINE: usize = 4 << 10;
 
 /// One tool call: its request, and where its runs keep their files.
@@ -380,7 +380,35 @@ impl Scan {
     }
 }
 
-/// Read a log for its diagnostics, its end time and its last `n` lines.
+/// Read the next line of a log into `buf`, keeping at most `LINE` bytes of
+/// it, so that no line, however long, is held whole. False at the end.
+fn next(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> bool {
+    buf.clear();
+    let mut any = false;
+    loop {
+        let Ok(chunk) = reader.fill_buf() else {
+            return any;
+        };
+        if chunk.is_empty() {
+            return any;
+        }
+        any = true;
+        let (take, done) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        let room = LINE.saturating_sub(buf.len());
+        buf.extend_from_slice(&chunk[..take.min(room)]);
+        reader.consume(take);
+        if done {
+            return true;
+        }
+    }
+}
+
+/// Read a log for its diagnostics, its end time and its last `n` lines. It
+/// holds at most one line of `LINE` bytes, the first `DIAGNOSTICS`
+/// diagnostics and the tail's 16 KiB (plus a line) at a time.
 fn scan(path: &Path, n: usize) -> Scan {
     let mut s = Scan::default();
     let Ok(f) = std::fs::File::open(path) else {
@@ -388,25 +416,18 @@ fn scan(path: &Path, n: usize) -> Scan {
     };
     let mut reader = std::io::BufReader::new(f);
     let mut buf = Vec::new();
+    let mut kept = 0;
     // A `** Error:` message, until the line after it gives its time and scope.
     let mut pending: Option<Value> = None;
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
+    while next(&mut reader, &mut buf) {
         let text = String::from_utf8_lossy(&buf);
         let line = text.trim_end();
         if n > 0 {
-            if s.tail.len() == n {
-                s.tail.pop_front();
+            kept += line.len();
+            s.tail.push_back(line.to_string());
+            while s.tail.len() > n || (kept > 16 << 10 && s.tail.len() > 1) {
+                kept -= s.tail.pop_front().map_or(0, |l| l.len());
             }
-            let mut cut = line.len().min(LINE);
-            while !line.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            s.tail.push_back(line[..cut].to_string());
         }
         if let Some(mut d) = pending.take() {
             // `   Time: 25  Scope: tb.a_gnt`, or `   Time: 25 ns  Scope: ...`

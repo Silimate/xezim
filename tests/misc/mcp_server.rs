@@ -531,6 +531,28 @@ fn mcp_long_log() {
     s.finish();
 }
 
+/// A line of 1 MB is read in pieces: its first 4 KiB stand for it in the
+/// log's end, and the messages after it are found.
+#[test]
+fn mcp_long_line() {
+    let src = "module wide;\n  initial begin\n    repeat (100000) $write(\"yyyyyyyyyy\");\n    $display(\"\");\n    $error(\"after\");\n    $finish;\n  end\nendmodule\n";
+    let mut s = Server::start("long_line", &[("wide.sv", src)]);
+    let r = s
+        .call(
+            "simulate",
+            json!({ "sources": ["wide.sv"], "log_lines": 4 }),
+        )
+        .unwrap();
+    assert_eq!(r["diagnostics"][0]["message"], "after", "{r}");
+    let tail = r["log_tail"].as_str().unwrap();
+    let lines: Vec<&str> = tail.lines().collect();
+    assert_eq!(lines.len(), 4, "{tail}");
+    assert_eq!(lines[0], "y".repeat(4096));
+    assert_eq!(lines[1], "** Error: after");
+    assert_eq!(r["finished"], true);
+    s.finish();
+}
+
 /// A fatal message fails the run, though here xezim exits 0 after it.
 #[test]
 fn mcp_fatal_message() {

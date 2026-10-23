@@ -138,9 +138,14 @@ impl Simulator {
             // procedural assignment.
             // NOTE: Drive outputs BEFORE sampling inputs so that @(cb) waiters
             // see the new output values when they run in the Reactive region.
+            // Those nets are "driven this event". A later drive of the same
+            // net, from a waiter resumed at this edge, is the next event.
+            self.clocking_edge_driven.remove(&cb);
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
+                let mut driven: HashSet<String> = HashSet::default();
                 for (sig, val) in pending {
+                    driven.insert(sig.clone());
                     // §14.4 output skew for drives maturing at THIS edge.
                     let skew = self
                         .clocking_sig_out_skew
@@ -172,6 +177,9 @@ impl Simulator {
                         crate::ast::Span::dummy(),
                     );
                     self.assign_value(&lval, &val);
+                }
+                if !driven.is_empty() {
+                    self.clocking_edge_driven.insert(cb.clone(), driven);
                 }
             }
             // Refresh the input samples. IEEE 1800-2023 §14.4 input skew:

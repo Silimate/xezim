@@ -6617,6 +6617,11 @@ pub struct Simulator {
     /// slot's edge detection, and the next iteration's snapshot would
     /// otherwise absorb the change and swallow the `@(cb.sig)` event.
     clocking_mirror_dirty: bool,
+    /// Signals that already have an output value for the clocking event at
+    /// `clocking_last_edge`. A drive of one of these at that same time is the
+    /// next event (`cb.x <= 1; @(cb); cb.x <= 0` stays high for one cycle).
+    /// Cleared at each edge before the pre-edge queue is applied.
+    clocking_edge_driven: HashMap<String, HashSet<String>>,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
     /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.

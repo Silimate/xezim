@@ -3744,11 +3744,16 @@ impl Simulator {
                                         return;
                                     }
                                 }
-                                // §14.16.1: a drive executed AT the clocking
-                                // event matures at edge + OUTPUT SKEW (per-sig
-                                // override, else block default, else #0 =
-                                // Re-NBA of this timestep). Only a drive issued
-                                // BETWEEN events waits for the next edge.
+                                // §14.16.1: the first drive of a signal AT the
+                                // clocking event matures at edge + OUTPUT SKEW
+                                // (per-sig override, else block default, else
+                                // #0 = Re-NBA of this timestep). A drive issued
+                                // BETWEEN events waits for the next edge. A
+                                // second drive of a signal that already has a
+                                // value for this event also waits: `x <= 1;
+                                // @(cb); x <= 0` is a one-cycle pulse, and the
+                                // clear must not replace the set in the same
+                                // output slot.
                                 let skew = self
                                     .clocking_sig_out_skew
                                     .get(&cb)
@@ -3757,10 +3762,25 @@ impl Simulator {
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
                                 if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
-                                    if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
-                                        let w = self.signal_widths[id];
-                                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
-                                        return;
+                                    let already = self
+                                        .clocking_edge_driven
+                                        .get(&cb)
+                                        .is_some_and(|s| s.contains(&net));
+                                    if !already {
+                                        if let Some(&id) = self.signal_name_to_id.get(net.as_str())
+                                        {
+                                            self.clocking_edge_driven
+                                                .entry(cb)
+                                                .or_default()
+                                                .insert(net);
+                                            let w = self.signal_widths[id];
+                                            self.schedule_delayed_with_delay(
+                                                id,
+                                                val.resize(w),
+                                                skew,
+                                            );
+                                            return;
+                                        }
                                     }
                                 }
                                 self.clocking_output_pending

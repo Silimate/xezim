@@ -134,3 +134,21 @@ fn c14_clocking_blocks() {
         &[],
     );
 }
+
+// A drive queued before `@(cb)`, then cleared after it wakes, is one cycle
+// wide. The clear is the next event, not a second drive of the same slot.
+#[test]
+fn c14_clocking_drive_pulse_survives_the_clear() {
+    check(
+        "c14_pulse",
+        include_str!("sv/c14_pulse.sv"),
+        "c14p",
+        Order::Exact,
+        &[
+            "T|pulse|t=5000 br=0 addr=00 en=0",
+            "T|pulse|t=15000 br=1 addr=2a en=1",
+            "T|pulse|t=25000 br=0 addr=xx en=1",
+        ],
+        &[],
+    );
+}

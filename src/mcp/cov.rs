@@ -44,27 +44,21 @@ fn counting(profile: &str) -> Result<&'static [&'static str], String> {
     }
 }
 
-/// A results file, or the first `*.json` in a directory.
+/// A results file, or the `xezim_cov.json` in a directory.
 pub(crate) fn load(path: &Path) -> Result<Value, String> {
     let file = if path.is_dir() {
-        let mut files: Vec<_> = std::fs::read_dir(path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect();
-        files.sort();
-        files
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("no results file in {}", path.display()))?
+        path.join("xezim_cov.json")
     } else {
         path.to_path_buf()
     };
     let text = std::fs::read_to_string(&file)
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-    serde_json::from_str(&text)
-        .map_err(|e| format!("{} is not a results file: {e}", file.display()))
+    let db: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    // Every results file has the run's end time and its assertion list.
+    if db.get("sim_time").is_none() || db.get("assertions").is_none() {
+        return Err(format!("{} is not an xezim results file", file.display()));
+    }
+    Ok(db)
 }
 
 /// The results to report on: `db` when given, else a fresh run's, with that

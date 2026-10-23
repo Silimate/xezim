@@ -35,9 +35,11 @@ The tools run in the server's working directory unless a call names another
   so requests can be piped in. Killing the server stops its calls (on Linux,
   their children die with it).
 * The log, and the results file (`xezim_cov.json`) a run writes, go to a
-  directory of their own under the system's temporary directory. The result
-  gives the log's path and its last lines; the server removes the directory
-  when it exits.
+  directory of their own, in a scratch directory under the system's temporary
+  directory that the server makes at start: only its user can enter it, and
+  its name can't be guessed. The result gives the log's path and its last
+  lines; the server removes the scratch directory when it exits. The log is
+  read whole for its diagnostics, however long it is.
 * A failing design is a result, not an error: `passed` or `ok` is false and
   the diagnostics say why. A tool error (`isError`) means the call itself was
   wrong: a missing argument, a `cwd` that does not exist, a Python without
@@ -80,7 +82,7 @@ Parses and elaborates the design without simulating it (`--compile`).
 |---|---|
 | `ok` | The design compiled |
 | `exit_code` | xezim's exit status |
-| `errors`, `warnings` | How many of each the log has |
+| `errors`, `warnings` | How many error (fatal included) and warning messages the log has |
 | `diagnostics` | The errors and warnings: `severity` (`error`, `fatal` or `warning`), `message`, and `file`, `line` and `column` where the message gives them. At most 50 |
 | `log`, `log_tail` | The log's path, and its last lines |
 | `timed_out`, `signal` | Whether the run hit `timeout`; the signal that ended it, if one did |
@@ -92,7 +94,7 @@ does.
 
 | Result | Meaning |
 |---|---|
-| `passed` | The run exited 0 in time, no assertion failed, and for a cocotb run at least one test passed and none failed |
+| `passed` | The run exited 0 in time, its log has no fatal message, no assertion failed, and for a cocotb run at least one test passed and none failed |
 | `sim_time`, `finished` | The time the run ended, and whether `$finish` ended it (else the time limit or an empty event queue did) |
 | `diagnostics` | As for `compile`, plus each `** Error`, `** Fatal` and `** Warning` message of the run with its `time` and `scope` |
 | `assertions` | Counts by status (see [assertions](#assertions)) and the first 20 failing assertions; `null` when the design has none |
@@ -105,11 +107,11 @@ and `exit_code`, `errors`, `warnings`, `log`, `log_tail`, `timed_out` and
 
 Code coverage per instance, with the bins still uncovered. It simulates the
 design with `--code-coverage`, or reads the results file of an earlier run
-given as `db`: an `xezim_cov.json`, or a directory holding one.
+given as `db`: a results file, or the directory holding its `xezim_cov.json`.
 
 | Argument | Meaning |
 |---|---|
-| `db` | Read this results file instead of running |
+| `db` | Read this results file, or the `xezim_cov.json` in this directory, instead of running |
 | `counting` | `xezim` (default) counts by xezim's full rules. `reference` counts as the reference simulator does by default: no enum or generate-block toggles, no bits tied to constants, only `&&` and `\|\|` terms in conditions, straight-line blocks instead of statements, and no FSM reset transitions (see [Counting rules](coverage-guide.md#counting-rules)). Runs only: a results file keeps the rules its run used |
 | `coverage_scope` | Only instrument these instance subtrees, such as `tb.dut` (`--code-coverage-scope`) |
 | `instance` | Only report this instance and its subtree: a dotted path (`tb.dut`) or a leaf name (`dut`) |

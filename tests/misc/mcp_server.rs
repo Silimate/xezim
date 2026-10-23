@@ -277,7 +277,19 @@ fn mcp_compile() {
         r["log_tail"].as_str().unwrap().contains("assign y = a +;"),
         "{r}"
     );
-    assert!(std::path::Path::new(r["log"].as_str().unwrap()).is_file());
+    // The log is in the server's scratch directory, which only this user
+    // can enter and whose name another user can't predict.
+    let log = std::path::Path::new(r["log"].as_str().unwrap());
+    assert!(log.is_file());
+    let root = log.parent().unwrap().parent().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(root).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "{}", root.display());
+    let name = root.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.len() > format!("xezim-mcp-{}", s.child.id()).len() + 8,
+        "{name}"
+    );
 
     // A warning keeps the design compilable and names where it is.
     let r = s
@@ -489,6 +501,78 @@ fn mcp_answers_after_stdin_closes() {
         assert_eq!(m["result"]["structuredContent"]["passed"], true, "{m}");
         assert_eq!(m["result"]["structuredContent"]["sim_time"], 5, "{m}");
     }
+}
+
+/// The log is read whole for its diagnostics, however long: here an error
+/// in the middle of a 40 MB log.
+#[test]
+fn mcp_long_log() {
+    let line = "x".repeat(100);
+    let src = format!(
+        "module big;\n  initial begin\n    repeat (200000) $display(\"{line}\");\n    $error(\"in the middle\");\n    repeat (200000) $display(\"{line}\");\n    $finish;\n  end\nendmodule\n"
+    );
+    let mut s = Server::start("long_log", &[("big.sv", &src)]);
+    let r = s
+        .call("simulate", json!({ "sources": ["big.sv"], "log_lines": 2 }))
+        .unwrap();
+    let size = std::fs::metadata(r["log"].as_str().unwrap()).unwrap().len();
+    assert!(size > 32 << 20, "{size}");
+    assert_eq!(
+        (&r["errors"], &r["passed"]),
+        (&json!(1), &json!(false)),
+        "{r}"
+    );
+    assert_eq!(r["diagnostics"][0]["message"], "in the middle", "{r}");
+    assert_eq!(
+        r["log_tail"],
+        format!("{line}\nSimulation finished at time 0 ($finish called)")
+    );
+    assert_eq!(r["finished"], true);
+    s.finish();
+}
+
+/// A fatal message fails the run, though here xezim exits 0 after it.
+#[test]
+fn mcp_fatal_message() {
+    let src = "class C; int x; endclass\nmodule nd;\n  C c;\n  initial #1 $display(\"x=%0d\", c.x);\nendmodule\n";
+    let mut s = Server::start("fatal", &[("nd.sv", src)]);
+    let r = s.call("simulate", json!({ "sources": ["nd.sv"] })).unwrap();
+    let d = &r["diagnostics"][0];
+    assert_eq!(d["severity"], "fatal", "{r}");
+    assert!(
+        d["message"]
+            .as_str()
+            .unwrap()
+            .contains("null object dereference"),
+        "{r}"
+    );
+    assert_eq!(
+        (&r["errors"], &r["passed"]),
+        (&json!(1), &json!(false)),
+        "{r}"
+    );
+    s.finish();
+}
+
+/// cocotb's setup runs Python, which the call's timeout bounds too.
+#[test]
+fn mcp_cocotb_setup_times_out() {
+    let mut s = Server::start("cocotb_setup", &[("t.sv", "module t; endmodule\n")]);
+    let python = s.dir.join("slow.sh");
+    std::fs::write(&python, "#!/bin/sh\nexec sleep 600\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let start = Instant::now();
+    let e = s
+        .call(
+            "simulate",
+            json!({ "sources": ["t.sv"], "top": "t", "timeout": 1, "cocotb": { "module": "m", "python": python } }),
+        )
+        .unwrap_err();
+    assert!(e.contains("timed out"), "{e}");
+    assert!(start.elapsed() < Duration::from_secs(30));
+    assert!(children(s.child.id()).is_empty());
+    s.finish();
 }
 
 /// The holes of `instance` with `metric`.
@@ -713,6 +797,19 @@ fn mcp_coverage_from_db() {
     }
     let r = s.call("assertions", json!({ "db": "cov" })).unwrap();
     assert_eq!(r["summary"]["total"], 2, "{r}");
+
+    // A directory's results file is its xezim_cov.json, whatever else is
+    // there; a JSON file that holds no results is an error.
+    std::fs::write(s.dir.join("cov").join("a.json"), "{}").unwrap();
+    let r = s.call("coverage", json!({ "db": "cov" })).unwrap();
+    assert_eq!(r["instances"], ran["instances"]);
+    let e = s
+        .call("coverage", json!({ "db": "cov/a.json" }))
+        .unwrap_err();
+    assert!(e.contains("not an xezim results file"), "{e}");
+    std::fs::remove_file(&db).unwrap();
+    let e = s.call("assertions", json!({ "db": "cov" })).unwrap_err();
+    assert!(e.contains("xezim_cov.json"), "{e}");
     s.finish();
 }
 

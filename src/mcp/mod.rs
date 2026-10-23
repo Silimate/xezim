@@ -39,7 +39,13 @@ pub(crate) type Live = Arc<Mutex<HashMap<String, Option<u32>>>>;
 pub fn serve() -> i32 {
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let live: Live = Arc::default();
-    let root = run::root();
+    let root = match run::root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("xezim --mcp: {e}");
+            return 1;
+        }
+    };
     let mut calls: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -222,7 +228,7 @@ fn tools() -> Value {
     let compile = spec(false);
     let simulate = spec(true);
     let mut coverage = spec(true);
-    coverage.insert("db".into(), json!({ "type": "string", "description": "Read this results file (xezim_cov.json, or a directory holding one) instead of running" }));
+    coverage.insert("db".into(), json!({ "type": "string", "description": "Read this results file (an xezim_cov.json, or the directory holding one) instead of running" }));
     coverage.insert("counting".into(), json!({ "type": "string", "enum": ["xezim", "reference"], "description": "What a run counts: xezim's full rules, or the reference simulator's documented defaults (no enum or generate-block toggles, no bits tied to constants, only && and || terms, blocks instead of statements, no FSM reset transitions). Default: xezim" }));
     coverage.insert("coverage_scope".into(), json!({ "type": "array", "items": { "type": "string" }, "description": "Only cover these instance subtrees, such as tb.dut. Default: the whole design" }));
     coverage.insert("instance".into(), json!({ "type": "string", "description": "Only report this instance and its subtree: a dotted path or a leaf name" }));

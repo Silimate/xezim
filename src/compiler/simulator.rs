@@ -6621,10 +6621,13 @@ pub struct Simulator {
     /// at `clocking_last_edge`. A later drive of one of those nets waits for
     /// the next event so `x <= 1; @(cb); x <= 0` stays high for a cycle.
     clocking_edge_driven: HashMap<String, HashSet<String>>,
-    /// Set when a drive at the current edge had to wait for the next event.
-    /// Every later drive of that block in this time slot waits with it, so
-    /// `req <= 1; ready <= 1` after `@(cb)` cannot land on two different edges.
-    clocking_edge_defer: HashSet<String>,
+    /// Processes whose later drives of this clocking block, in this time slot,
+    /// wait for the next event. Keyed by block, then pid. A drive that had to
+    /// wait inserts its own pid; when that fork child finishes, the pid is
+    /// copied to a parent blocked in `join` / `join_any`. An unrelated process
+    /// on the same block does not inherit it, so a grant pulse cannot drag a
+    /// response that happens to run later in the slot.
+    clocking_edge_defer: HashMap<String, HashSet<usize>>,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
     /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.

@@ -138,8 +138,9 @@ impl Simulator {
             // procedural assignment.
             // NOTE: Drive outputs BEFORE sampling inputs so that @(cb) waiters
             // see the new output values when they run in the Reactive region.
-            // Pre-edge drives commit for this event. A drive after @(cb)
-            // of one of these nets waits; see `clocking_edge_defer`.
+            // Pre-edge drives commit for this event. A later drive of one of
+            // these nets waits, and so do later drives by that process; see
+            // `clocking_edge_defer`.
             self.clocking_edge_defer.remove(&cb);
             self.clocking_edge_driven.remove(&cb);
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {

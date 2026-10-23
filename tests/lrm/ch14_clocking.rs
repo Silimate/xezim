@@ -153,6 +153,30 @@ fn c14_clocking_drive_after_wait_keeps_siblings_together() {
     );
 }
 
+// Same-process siblings and a join parent stay with a deferred drive. A
+// second process, resumed only by an event the first triggers, does not.
+#[test]
+fn c14_clocking_drive_defer_stays_in_the_process() {
+    check(
+        "c14_scope",
+        include_str!("sv/c14_scope.sv"),
+        "c14s",
+        Order::Exact,
+        &[
+            "T|same|t=5000 br=0 adr=00 en=0",
+            "T|two|t=5000 pulse=0 gnt=0",
+            "T|fork|t=5000 req=0 ready=0",
+            "T|same|t=15000 br=1 adr=2a en=0",
+            "T|two|t=15000 pulse=1 gnt=1",
+            "T|fork|t=15000 req=0 ready=0",
+            "T|same|t=25000 br=0 adr=xx en=1",
+            "T|two|t=25000 pulse=0 gnt=1",
+            "T|fork|t=25000 req=1 ready=1",
+        ],
+        &[],
+    );
+}
+
 // A drive queued before `@(cb)`, then cleared after it wakes, is one cycle
 // wide. The clear is the next event, not a second drive of the same slot.
 #[test]

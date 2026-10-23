@@ -3750,10 +3750,12 @@ impl Simulator {
                                 // skew (`@(cb); cb.x <= v` is visible by the next
                                 // edge). A drive of a signal the queue did drive
                                 // waits for the next event, and so does every later
-                                // drive of this block in this time slot: `x <= 1;
-                                // @(cb); x <= 0` is a one-cycle pulse, and
-                                // `req <= 0; @(cb); req <= 1; ready <= 1` updates
-                                // req and ready together.
+                                // drive by that same process (and by a parent
+                                // `join` resumes from it): `x <= 1; @(cb); x <= 0`
+                                // is a one-cycle pulse, and `req <= 0; @(cb);
+                                // req <= 1; ready <= 1` updates req and ready
+                                // together. Another process on this block does not
+                                // wait with them.
                                 let skew = self
                                     .clocking_sig_out_skew
                                     .get(&cb)
@@ -3762,7 +3764,11 @@ impl Simulator {
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
                                 if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
-                                    let defer = self.clocking_edge_defer.contains(&cb)
+                                    let pid = self.current_pid;
+                                    let defer = self
+                                        .clocking_edge_defer
+                                        .get(&cb)
+                                        .is_some_and(|s| s.contains(&pid))
                                         || self
                                             .clocking_edge_driven
                                             .get(&cb)
@@ -3783,7 +3789,10 @@ impl Simulator {
                                             return;
                                         }
                                     }
-                                    self.clocking_edge_defer.insert(cb.clone());
+                                    self.clocking_edge_defer
+                                        .entry(cb.clone())
+                                        .or_default()
+                                        .insert(pid);
                                 }
                                 self.clocking_output_pending
                                     .entry(cb)

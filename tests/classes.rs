@@ -208,6 +208,8 @@ mod class_output_handle_copyback;
 mod class_packed_and_type_params;
 #[path = "classes/class_param_property_widths.rs"]
 mod class_param_property_widths;
+#[path = "classes/class_param_sized_method_widths.rs"]
+mod class_param_sized_method_widths;
 #[path = "classes/class_param_siblings.rs"]
 mod class_param_siblings;
 #[path = "classes/class_program_test.rs"]

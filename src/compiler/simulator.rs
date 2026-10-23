@@ -3391,6 +3391,10 @@ struct ClassMemberNames {
     /// Names that may prefix a class-scope reference without being a
     /// class: class parameters and typedef names.
     scope_prefixes: HashSet<String>,
+    /// Class-scope typedef names whose target is a packed vector with a
+    /// non-literal range (`typedef logic [W-1:0] w_t;`): their width follows
+    /// the specialization.
+    param_sized_typedefs: HashSet<String>,
     /// First bytes of the `params` names: a cheap prefilter.
     param_first: [bool; 256],
     /// Every class type/value parameter name.

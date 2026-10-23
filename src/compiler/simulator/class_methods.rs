@@ -308,6 +308,18 @@ impl Simulator {
             for cd in self.module.classes.values() {
                 scope_prefixes.extend(cd.typedef_targets.keys().cloned());
             }
+            let mut param_sized_typedefs: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                param_sized_typedefs.extend(
+                    cd.typedef_targets
+                        .iter()
+                        .filter(|(_, dt)| {
+                            matches!(dt, DataType::IntegerVector { dimensions, .. } if !dimensions.is_empty())
+                                && !Self::packed_dims_are_literal(dt)
+                        })
+                        .map(|(n, _)| n.clone()),
+                );
+            }
             let mut ident_slow: HashSet<String> = HashSet::default();
             ident_slow.extend(statics.iter().cloned());
             ident_slow.extend(vif_props.iter().cloned());
@@ -345,6 +357,7 @@ impl Simulator {
                 alias_typedefs,
                 scoped_typedefs,
                 scope_prefixes,
+                param_sized_typedefs,
                 param_first,
                 params,
                 assoc_props,
@@ -1005,6 +1018,37 @@ impl Simulator {
         }
     }
 
+    /// Width of formal type `dt` of method class `cname` called on `handle`,
+    /// when the type is sized by the class's parameters (see
+    /// `class_scoped_decl_width`). Formals bind before the callee's
+    /// specialization is installed, so it is seeded from the object here.
+    pub(super) fn class_formal_width(
+        &mut self,
+        handle: usize,
+        cname: &str,
+        dt: &DataType,
+    ) -> Option<u32> {
+        let candidate = match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                !dimensions.is_empty() && !Self::packed_dims_are_literal(dt)
+            }
+            DataType::TypeReference { name, .. } => self
+                .class_member_names()
+                .param_sized_typedefs
+                .contains(&name.name.name),
+            _ => false,
+        };
+        if !candidate {
+            return None;
+        }
+        let saved = self.seed_callee_spec_from_instance(handle, cname);
+        self.class_context_stack.push(Some(cname.to_string()));
+        let w = self.class_scoped_decl_width(dt);
+        self.class_context_stack.pop();
+        self.restore_spec_pooled(saved);
+        w
+    }
+
     /// §8.25: seed `current_spec` from a receiver instance (and, for a
     /// method declared in a parameterized ancestor, the receiver's derived
     /// ancestor spec) so the callee's BARE static member accesses key the
@@ -1635,7 +1679,24 @@ impl Simulator {
                     // derived from a CLASS type-param (not in module.parameters)
                     // isn't mis-resolved to `1` and truncates the caller's
                     // value.
-                    if matches!(&port.data_type, DataType::TypeReference { .. }) {
+                    let class_sized_w = if plain_class {
+                        None
+                    } else {
+                        self.class_formal_width(handle, &cname, &port.data_type)
+                    };
+                    if let Some(pw) = class_sized_w {
+                        // §8.25 / §6.20.2: sized by this class's parameters
+                        // (`logic [W-1:0] a`, or a class typedef of that),
+                        // in the receiving object's specialization.
+                        val = if val.is_real {
+                            Self::real_to_int(val.to_f64(), pw)
+                        } else if pw != val.width {
+                            val.resize_for_assign(pw)
+                        } else {
+                            val
+                        };
+                        val.is_signed = plan.ports[i].signed;
+                    } else if matches!(&port.data_type, DataType::TypeReference { .. }) {
                         if plain_class {
                             // A class handle is bound as passed.
                         } else if let Some((pw, signed)) =

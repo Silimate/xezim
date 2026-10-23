@@ -5,19 +5,24 @@
 #   release/run.sh smoke   run dist/'s release on a bare EL8 userland
 #   release/run.sh lock    refresh release/Cargo.lock for Cargo.toml
 #
-# The version is the tag's on a tag push (vVERSION), else $VERSION, else
-# Cargo.toml's version with -dev.<commit> (a dry run). It must be Cargo.toml's
-# version, or that version and a -label. RELEASE_DOCKER_ARGS adds `docker run`
-# options, such as --cpus 6 --memory 24g on a shared machine.
+# The version is $VERSION, else the release tag's (vVERSION) when the pushed
+# tag, or a checkout of one, is being built, else Cargo.toml's version with
+# -dev.<commit> (a dry run). It must be Cargo.toml's version, or that version
+# and a -label. RELEASE_DOCKER_ARGS adds `docker run` options, such as
+# --cpus 6 --memory 24g on a shared machine.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . release/pins.sh
 
 crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+if [ -n "${VERSION:-}" ]; then
+  version=$VERSION
+elif [ "${GITHUB_REF_TYPE:-}" = tag ]; then
   version=${GITHUB_REF_NAME#v}
+elif tag=$(git describe --exact-match --tags --match 'v*' HEAD 2> /dev/null); then
+  version=${tag#v}
 else
-  version=${VERSION:-$crate-dev.$(git rev-parse --short=12 HEAD)}
+  version=$crate-dev.$(git rev-parse --short=12 HEAD)
 fi
 case $version in
   "$crate" | "$crate"-*) ;;

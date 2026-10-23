@@ -83,7 +83,8 @@ The build stops at the first gate that fails:
 An exception to a gate goes in `release/deny.toml` or `release/osv-scanner.toml`
 with its reason and when to drop it, in a pull request of its own.
 
-Then the build packs the release reproducibly: the binary's debug info goes to
+The build works on a fresh clone of the checkout's commit, so an untracked or
+ignored file can't reach the release. Then it packs the release reproducibly: the binary's debug info goes to
 `xezim.debug`, linked from the binary by `.gnu_debuglink`; the tarballs are
 sorted, dated at the commit's time, owned by root and compressed without a
 timestamp. cargo-cyclonedx writes the SBOM, with no build or test
@@ -120,8 +121,9 @@ gh attestation verify xezim-VERSION-linux-x86_64.tar.gz --repo Silimate/xezim
 OpenSSL 1.1.1, as RHEL 8 ships it, is enough.
 
 To check that a release is what its tag builds, run the workflow manually on
-the tag, or `release/run.sh build` on a checkout of it, and compare the
-`SHA256SUMS` it writes with the release's. They match.
+the tag, or `release/run.sh build` on a checkout of it (which takes the
+version from the tag), and compare the `SHA256SUMS` it writes with the
+release's. They match.
 
 ## Cutting a release
 
@@ -171,7 +173,8 @@ publishes anything.
 * The workflow publishes nothing before its last step. If it fails before the
   archive step, delete the draft release it left, if any, and rerun the failed
   jobs; they reuse the build's files. If it fails after, upload what the bucket
-  lacks from the run's artifact by hand, then publish the draft.
+  lacks by hand: the signatures and the other release files from the draft
+  release, the debug info from the run's artifact. Then publish the draft.
 * Never move or reuse a tag. Supersede a bad release with a new label
   (`v0.11.2-s2`); the bad one stays downloadable.
 

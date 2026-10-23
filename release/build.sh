@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds a release inside the pinned builder (release/run.sh starts it there):
 # installs the pinned toolchain and tools, gates the source, builds, tests and
-# packs xezim, and writes the release files to dist/ (docs/release.md).
+# packs xezim from a fresh clone of the checkout's commit, and writes the
+# release files to dist/ (docs/release.md).
 #
 #   release/build.sh VERSION   the release
 #   release/build.sh lock      refresh release/Cargo.lock for Cargo.toml,
@@ -9,6 +10,7 @@
 set -euo pipefail
 export LC_ALL=C
 cd "$(dirname "$0")/.."
+src=$PWD
 . release/pins.sh
 
 fetch() { # URL SHA256 FILE
@@ -40,17 +42,24 @@ chmod +x "$tools/osv-scanner"
 fetch "$GITLEAKS_URL" "$GITLEAKS_SHA256" /tmp/gitleaks.tar.gz
 tar -xzf /tmp/gitleaks.tar.gz -C "$tools" gitleaks
 
-# The source: a clean checkout, and a lockfile that matches Cargo.toml
+# The source: a clean checkout, built from a fresh clone of its commit so that
+# nothing outside git (an ignored file, a local cargo config) reaches the
+# release; and a lockfile that matches Cargo.toml
 [ -z "$(git status --porcelain --untracked-files=no)" ] || {
   git status --short >&2
   echo 'the checkout has changes' >&2
   exit 1
 }
+commit=$(git rev-parse HEAD)
+rm -rf /tmp/src
+git clone -q --shared "$src" /tmp/src
+cd /tmp/src
+git checkout -q --detach "$commit"
+cp release/Cargo.lock Cargo.lock
 cargo metadata --locked --format-version 1 > /dev/null || {
   echo 'release/Cargo.lock is out of date: run release/run.sh lock' >&2
   exit 1
 }
-commit=$(git rev-parse HEAD)
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 
 # The gates: licenses, sources and advisories of what ships; known
@@ -83,7 +92,8 @@ glibc=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -u
 # Pack: the binary with its debug info split off, the cocotb runner, the
 # license, docs and notices
 name=xezim-$version-linux-x86_64
-rm -rf dist /tmp/stage && mkdir -p dist /tmp/stage/debug
+dist=$src/dist
+rm -rf "$dist" /tmp/stage && mkdir -p "$dist" /tmp/stage/debug
 root=/tmp/stage/$name
 mkdir -p "$root/bin" "$root/share/xezim/cocotb" "$root/share/doc/xezim/docs"
 objcopy --only-keep-debug "$bin" /tmp/stage/debug/xezim.debug
@@ -95,16 +105,15 @@ SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH cargo cyclonedx --format json --spec-versio
   --no-build-deps --target x86_64-unknown-linux-gnu --describe binaries -q
 cargo metadata --locked --format-version 1 > /tmp/metadata.json
 /opt/python/cp312-cp312/bin/python3 release/record.py sbom "$version" "$root/bin/xezim" \
-  xezim_bin.cdx.json /tmp/metadata.json dist/sbom.cdx.json dist/THIRD_PARTY_NOTICES
-rm -f ./*_bin.cdx.json
-cp dist/THIRD_PARTY_NOTICES "$root/share/doc/xezim/"
+  xezim_bin.cdx.json /tmp/metadata.json "$dist/sbom.cdx.json" "$dist/THIRD_PARTY_NOTICES"
+cp "$dist/THIRD_PARTY_NOTICES" "$root/share/doc/xezim/"
 pack() { # DIR ENTRY TARBALL
   tar -C "$1" --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
     --mode=u+rwX,go+rX,go-w --format=gnu -cf - "$2" | gzip -9n > "$3"
 }
-pack /tmp/stage "$name" "dist/$name.tar.gz"
-pack /tmp/stage/debug xezim.debug "dist/$name-debug.tar.gz"
-(cd dist && sha256sum "$name.tar.gz" "$name-debug.tar.gz" sbom.cdx.json THIRD_PARTY_NOTICES > SHA256SUMS)
+pack /tmp/stage "$name" "$dist/$name.tar.gz"
+pack /tmp/stage/debug xezim.debug "$dist/$name-debug.tar.gz"
+(cd "$dist" && sha256sum "$name.tar.gz" "$name-debug.tar.gz" sbom.cdx.json THIRD_PARTY_NOTICES > SHA256SUMS)
 
 # The record of how it was made
 {
@@ -119,5 +128,5 @@ pack /tmp/stage/debug xezim.debug "dist/$name-debug.tar.gz"
   echo "needed: $(tr '\n' ' ' < /tmp/needed)"
 } > /tmp/tools.txt
 /opt/python/cp312-cp312/bin/python3 release/record.py provenance "$version" "$commit" \
-  /tmp/tools.txt dist/SHA256SUMS dist/provenance.json
-cat dist/SHA256SUMS
+  /tmp/tools.txt "$dist/SHA256SUMS" "$dist/provenance.json"
+cat "$dist/SHA256SUMS"

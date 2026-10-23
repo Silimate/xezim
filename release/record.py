@@ -126,7 +126,7 @@ def provenance(version, commit, tools, sums, out):
         "smoke_test_image": pins["RUNNER"],
         "tools": dict(line.rstrip("\n").split(": ", 1) for line in open(tools) if ": " in line),
         "inputs": {p: digest(p) for p in ("Cargo.toml", "release/Cargo.lock", "release/pins.sh", "release/deny.toml")},
-        "build": "cargo build --release --locked --bin xezim, in the builder, at /src",
+        "build": "cargo build --release --locked --bin xezim, in the builder, in a fresh clone of the commit at /tmp/src",
         "gates": [
             "cargo deny check: licenses, sources, bans and advisories (release/deny.toml)",
             "osv-scanner on release/Cargo.lock (release/osv-scanner.toml)",

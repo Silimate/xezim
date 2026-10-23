@@ -6,7 +6,8 @@ x=$1/bin/xezim
 "$x" --version
 cd "$(mktemp -d)"
 printf 'module t;\n  initial begin\n    $display("smoke %%0d", 6 * 7);\n    $finish;\n  end\nendmodule\n' > t.sv
-"$x" t.sv | tee out.txt
+"$x" t.sv > out.txt
+cat out.txt
 grep -q 'smoke 42' out.txt
 if "$x" --help 2>&1 | grep -q -- '--mcp'; then
   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

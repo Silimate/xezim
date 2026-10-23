@@ -49,6 +49,8 @@ mod issue320_harness_mwe;
 mod vif_specialization_keys;
 #[path = "classes/package_param_spec_args.rs"]
 mod package_param_spec_args;
+#[path = "classes/package_scoped_type_args.rs"]
+mod package_scoped_type_args;
 #[path = "classes/x_default_neighbours.rs"]
 mod x_default_neighbours;
 #[path = "classes/x_default_open.rs"]

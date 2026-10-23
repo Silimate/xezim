@@ -1735,6 +1735,11 @@ impl Simulator {
 
     pub(super) fn canonicalize_spec_frag(&self, frag: &str) -> String {
         let frag_norm = frag.trim();
+        // §6.22.1: `pkg::T` and the imported `T` are one type, so they
+        // key one specialization.
+        if let Some(leaf) = self.package_type_leaf(frag_norm) {
+            return self.canonicalize_spec_frag(leaf);
+        }
         if let Some((inner_base, inner_sig)) = self.extract_spec_from_string(frag_norm) {
             let canon_inner_sig = self.canonicalize_spec_sig(&inner_base, &inner_sig);
             if !canon_inner_sig.is_empty() {
@@ -2043,6 +2048,37 @@ impl Simulator {
             return None;
         }
         super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
+    }
+
+    /// `T[#(...)]` of a type argument spelled `pkg::T[#(...)]`, when the bare
+    /// name `T` is tabled as that same package class or typedef (package
+    /// members also live in the flat design namespace under their bare
+    /// names). None when the bare name is some other declaration.
+    pub(super) fn package_type_leaf<'a>(&self, frag: &'a str) -> Option<&'a str> {
+        let (pkg, rest) = frag.split_once("::")?;
+        if !self.module.packages.contains(pkg.trim()) {
+            return None;
+        }
+        let rest = rest.trim();
+        let head = rest[..rest.find(['#', ' ']).unwrap_or(rest.len())].trim();
+        if head.is_empty() || !head.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+            return None;
+        }
+        let qualified = format!("{}::{}", pkg.trim(), head);
+        let same_class = match (self.module.classes.get(&qualified), self.module.classes.get(head)) {
+            (Some(q), Some(b)) => std::sync::Arc::ptr_eq(q, b),
+            _ => false,
+        };
+        let same_typedef = !same_class
+            && !rest.contains('#')
+            && match (
+                self.module.typedef_types.get(&qualified),
+                self.module.typedef_types.get(head),
+            ) {
+                (Some(q), Some(b)) => format!("{:?}", q) == format!("{:?}", b),
+                _ => false,
+            };
+        (same_class || same_typedef).then_some(rest)
     }
 
     /// `pkg::NAME` when `pkg` is a package of the design: the key

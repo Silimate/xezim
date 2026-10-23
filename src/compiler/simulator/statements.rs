@@ -4516,6 +4516,9 @@ impl Simulator {
                     let pid = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid, self.current_pid);
+                    // A child spawned after this process deferred a clocking
+                    // drive is the next beat of that drive, not a new one.
+                    self.copy_clocking_edge_defer(self.current_pid, pid);
                     // Same scope-hint inheritance as the run_process_stmts
                     // ParBlock arm — §9.3.2, additive.
                     if let Some(h) = self.process_scope_hint.get(&self.current_pid).cloned() {

@@ -40,6 +40,27 @@ module c14s;
     cb2.gnt <= 1'b1;
   end
 
+  // The process that defers ends, the parent forks a new child, and that
+  // child drives a signal that was not queued. It waits with the clear.
+  logic hold = 0, drop = 0;
+  clocking cb4 @(posedge clk);
+    default output #1;
+    output hold, drop;
+  endclocking
+  initial begin
+    #1;
+    cb4.hold <= 1'b1;
+    fork
+      begin
+        @(cb4);
+        cb4.hold <= 1'b0;
+      end
+    join
+    fork
+      cb4.drop <= 1'b1;
+    join_none
+  end
+
   logic req = 0, ready = 0;
   clocking cb3 @(posedge clk);
     default output #1;
@@ -61,6 +82,7 @@ module c14s;
     $display("T|same|t=%0t br=%b adr=%h en=%b", $time, br, adr, en);
     $display("T|two|t=%0t pulse=%b gnt=%b", $time, pulse, gnt);
     $display("T|fork|t=%0t req=%b ready=%b", $time, req, ready);
+    $display("T|next|t=%0t hold=%b drop=%b", $time, hold, drop);
   end
   initial begin
     @(posedge clk);

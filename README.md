@@ -198,6 +198,7 @@ with few, very hot blocks (Ibex CoreMark −23%), so measure it on yours.
 | [Debugging guide](docs/DEBUGGING.md) | Tracing, diagnosing hangs, comparing against another simulator |
 | [Building from source](docs/building.md) | Requirements, profile-guided builds, working on xezim-core |
 | [Release notes](NOTES.md) | Changes per release, verified workloads, compliance results |
+| [Releases](docs/release.md) | The binary releases: contents, how they are built and checked, verifying one |
 
 ## Support
 

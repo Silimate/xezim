@@ -197,3 +197,23 @@ fn c14_clocking_drive_pulse_survives_the_clear() {
         &[],
     );
 }
+
+// `@(cb); x <= 0; x <= 1` in one slot drives 1 at this event. A zero-delay
+// response queued in the slot of the previous response's clear is not a
+// cycle late.
+#[test]
+fn c14_clocking_drives_in_one_slot_last_wins() {
+    check(
+        "c14_lastwins",
+        include_str!("sv/c14_lastwins.sv"),
+        "c14l",
+        Order::Exact,
+        &[
+            "T|lastwins|t=5000 rvalid=0",
+            "T|lastwins|t=15000 rvalid=1",
+            "T|lastwins|t=25000 rvalid=1",
+            "T|lastwins|t=35000 rvalid=0",
+        ],
+        &[],
+    );
+}

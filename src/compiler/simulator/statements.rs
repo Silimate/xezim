@@ -3755,7 +3755,9 @@ impl Simulator {
                                 // is a one-cycle pulse, and `req <= 0; @(cb);
                                 // req <= 1; ready <= 1` updates req and ready
                                 // together. Another process on this block does not
-                                // wait with them.
+                                // wait with them. Two drives issued at the event are
+                                // both this event's and the last one wins
+                                // (`@(cb); x <= 0; x <= 1` drives 1 now).
                                 let skew = self
                                     .clocking_sig_out_skew
                                     .get(&cb)
@@ -3776,10 +3778,6 @@ impl Simulator {
                                     if !defer {
                                         if let Some(&id) = self.signal_name_to_id.get(net.as_str())
                                         {
-                                            self.clocking_edge_driven
-                                                .entry(cb)
-                                                .or_default()
-                                                .insert(net);
                                             let w = self.signal_widths[id];
                                             self.schedule_delayed_with_delay(
                                                 id,

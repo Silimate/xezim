@@ -135,6 +135,24 @@ fn c14_clocking_blocks() {
     );
 }
 
+// `req <= 0; ready <= 0; @(cb); req <= 1; ready <= 1` updates both signals
+// on the edge after the queued 0s. ready must not move a cycle before req.
+#[test]
+fn c14_clocking_drive_after_wait_keeps_siblings_together() {
+    check(
+        "c14_pair",
+        include_str!("sv/c14_pair.sv"),
+        "c14q",
+        Order::Exact,
+        &[
+            "T|q|t=5000 req=0 ready=0",
+            "T|q|t=15000 req=0 ready=0",
+            "T|q|t=25000 req=1 ready=1",
+        ],
+        &[],
+    );
+}
+
 // A drive queued before `@(cb)`, then cleared after it wakes, is one cycle
 // wide. The clear is the next event, not a second drive of the same slot.
 #[test]

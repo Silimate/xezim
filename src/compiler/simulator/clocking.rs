@@ -138,8 +138,9 @@ impl Simulator {
             // procedural assignment.
             // NOTE: Drive outputs BEFORE sampling inputs so that @(cb) waiters
             // see the new output values when they run in the Reactive region.
-            // Those nets are "driven this event". A later drive of the same
-            // net, from a waiter resumed at this edge, is the next event.
+            // Pre-edge drives commit for this event. A drive after @(cb)
+            // of one of these nets waits; see `clocking_edge_defer`.
+            self.clocking_edge_defer.remove(&cb);
             self.clocking_edge_driven.remove(&cb);
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);

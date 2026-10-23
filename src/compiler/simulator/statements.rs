@@ -3744,16 +3744,16 @@ impl Simulator {
                                         return;
                                     }
                                 }
-                                // §14.16.1: the first drive of a signal AT the
-                                // clocking event matures at edge + OUTPUT SKEW
-                                // (per-sig override, else block default, else
-                                // #0 = Re-NBA of this timestep). A drive issued
-                                // BETWEEN events waits for the next edge. A
-                                // second drive of a signal that already has a
-                                // value for this event also waits: `x <= 1;
-                                // @(cb); x <= 0` is a one-cycle pulse, and the
-                                // clear must not replace the set in the same
-                                // output slot.
+                                // A drive at the clocking event, after tick has committed
+                                // the pre-edge queue. A signal that queue did not
+                                // already drive matures at this edge plus its output
+                                // skew (`@(cb); cb.x <= v` is visible by the next
+                                // edge). A drive of a signal the queue did drive
+                                // waits for the next event, and so does every later
+                                // drive of this block in this time slot: `x <= 1;
+                                // @(cb); x <= 0` is a one-cycle pulse, and
+                                // `req <= 0; @(cb); req <= 1; ready <= 1` updates
+                                // req and ready together.
                                 let skew = self
                                     .clocking_sig_out_skew
                                     .get(&cb)
@@ -3762,11 +3762,12 @@ impl Simulator {
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
                                 if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
-                                    let already = self
-                                        .clocking_edge_driven
-                                        .get(&cb)
-                                        .is_some_and(|s| s.contains(&net));
-                                    if !already {
+                                    let defer = self.clocking_edge_defer.contains(&cb)
+                                        || self
+                                            .clocking_edge_driven
+                                            .get(&cb)
+                                            .is_some_and(|s| s.contains(&net));
+                                    if !defer {
                                         if let Some(&id) = self.signal_name_to_id.get(net.as_str())
                                         {
                                             self.clocking_edge_driven
@@ -3782,6 +3783,7 @@ impl Simulator {
                                             return;
                                         }
                                     }
+                                    self.clocking_edge_defer.insert(cb.clone());
                                 }
                                 self.clocking_output_pending
                                     .entry(cb)

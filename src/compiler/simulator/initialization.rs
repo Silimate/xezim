@@ -3771,6 +3771,7 @@ impl Simulator {
             clocking_sig_in_skew: HashMap::default(),
             clocking_last_edge: HashMap::default(),
             clocking_edge_driven: HashMap::default(),
+            clocking_edge_defer: HashSet::default(),
             default_clocking_cb: None,
             clocking_preponed: HashMap::default(),
             clocking_preponed_slot: None,

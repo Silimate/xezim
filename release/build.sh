@@ -55,6 +55,11 @@ rm -rf /tmp/src
 git clone -q --shared "$src" /tmp/src
 cd /tmp/src
 git checkout -q --detach "$commit"
+# The binary embeds `git describe` and an abbreviated hash (src/build.rs):
+# make them independent of the checkout's other tags and object count
+git tag -l | xargs -r git tag -d > /dev/null
+git tag "v$version"
+git config core.abbrev 12
 cp release/Cargo.lock Cargo.lock
 cargo metadata --locked --format-version 1 > /dev/null || {
   echo 'release/Cargo.lock is out of date: run release/run.sh lock' >&2

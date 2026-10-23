@@ -1,3 +1,4 @@
+# shellcheck shell=bash disable=SC2034  # sourced: the other scripts use these
 # Pinned inputs of a release build (docs/release.md), sourced by the scripts
 # here. Bump a pin in a pull request of its own: the release dry run it starts
 # must pass.

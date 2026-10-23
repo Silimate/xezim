@@ -2324,6 +2324,21 @@ impl Simulator {
                         return true;
                     }
                 }
+                // An imported DPI function declared `string` (§35.5.5), e.g.
+                // `$display(riscv_cosim_get_error(h, i))`.
+                if let Some(spec) = self.module.dpi_imports.get(&seg.name.name) {
+                    if let crate::ast::decl::DPIProto::Function(fd) = &spec.proto {
+                        if matches!(
+                            self.dpi_resolve_typedef(&fd.return_type),
+                            DataType::Simple {
+                                kind: SimpleType::String,
+                                ..
+                            }
+                        ) {
+                            return true;
+                        }
+                    }
+                }
             }
         }
         // The class walk below answers true only for a name some class

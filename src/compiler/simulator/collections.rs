@@ -915,6 +915,25 @@ impl Simulator {
                     None
                 }
             }
+            // §8.25: a value argument matches by value. A constant expression
+            // of literals and package parameters (`pkg::N + pkg::K`) is
+            // keyed by the number it folds to, like the literal itself.
+            ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Paren(_)
+            | ExprKind::Conditional { .. }
+            | ExprKind::MemberAccess { .. } => self.fold_package_const_expr(e),
+            ExprKind::Ident(hier)
+                if hier.path.len() == 2
+                    && self
+                        .package_param_key(&format!(
+                            "{}::{}",
+                            hier.path[0].name.name, hier.path[1].name.name
+                        ))
+                        .is_some_and(|k| self.module.parameters.contains_key(k)) =>
+            {
+                self.fold_package_const_expr(e)
+            }
             ExprKind::Ident(hier) => {
                 let nm = &hier.path.last()?.name.name;
                 // Resolve a type/class alias (e.g. `this_type`) to the

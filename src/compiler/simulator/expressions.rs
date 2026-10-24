@@ -2696,9 +2696,18 @@ impl Simulator {
                     }
                 }
                 if hier.path.len() >= 2 {
-                    let segs: Vec<&str> = hier.path.iter().map(|s| s.name.name.as_str()).collect();
-                    if let Some(v) = self.try_clocking_signal_read(&segs) {
-                        return v;
+                    if hier.path.last().is_some_and(|s| !s.selects.is_empty()) {
+                        // `cb.arr[i]` is one element. The scalar clocking
+                        // read ignores the select and would return 0.
+                        if let Some(v) = self.try_clocking_array_read(hier) {
+                            return v;
+                        }
+                    } else {
+                        let segs: Vec<&str> =
+                            hier.path.iter().map(|s| s.name.name.as_str()).collect();
+                        if let Some(v) = self.try_clocking_signal_read(&segs) {
+                            return v;
+                        }
                     }
                 }
                 // LRM §15.5.3: `e.triggered` on a named event.
@@ -4653,6 +4662,13 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // `ifc.cb.arr[i]` / `vif.cb.arr[i]`: the bracket is an Index
+                // around the clockvar, not a select the Ident clocking arm
+                // sees. Read the sampled element before any bit-select of
+                // the missing scalar array.
+                if let Some(v) = self.try_clocking_indexed_input(expr, index) {
+                    return v;
+                }
                 // Element select on a packed multi-dimensional CLASS property.
                 if let Some((h, prop, idx_exprs)) = self.prop_index_chain_parts(expr, index) {
                     // §7.4: an element of an unpacked array property of

@@ -320,3 +320,6 @@ mod package_array_params;
 
 #[path = "hierarchy/vif_defaults_469.rs"]
 mod vif_defaults_469;
+
+#[path = "hierarchy/clocking_unpacked_array_input.rs"]
+mod clocking_unpacked_array_input;

@@ -377,3 +377,5 @@ mod sampled_action_468;
 
 #[path = "scheduling/sva_until_properties.rs"]
 mod sva_until_properties;
+#[path = "scheduling/always_property.rs"]
+mod always_property;

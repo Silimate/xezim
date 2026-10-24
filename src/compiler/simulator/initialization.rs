@@ -3666,6 +3666,7 @@ impl Simulator {
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
+            cg_with_segs_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
             force_epoch_gen: 0,
             force_refresh_done_gen: 0,

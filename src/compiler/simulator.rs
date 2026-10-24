@@ -6158,6 +6158,11 @@ pub struct Simulator {
     typedef_target_cache:
         std::cell::RefCell<HashMap<String, HashMap<String, Option<crate::ast::types::DataType>>>>,
     collection_dim_cache: std::cell::RefCell<HashMap<String, bool>>,
+    /// §19.5.1.1: the value ranges a `bins ... with (expr)` filter keeps,
+    /// per bin declaration (its address) and the bin scope's values. The
+    /// filter is constant for a given scope, and fixed-size array bins
+    /// consult the ranges on every sample.
+    cg_with_segs_cache: std::cell::RefCell<HashMap<(usize, Vec<i64>), std::rc::Rc<[(i64, i64)]>>>,
     /// Sticky: set the first time a `<base>.` frame marker is created (an
     /// unpacked-struct formal binding, or a struct-return variable via
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval

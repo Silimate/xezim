@@ -1411,6 +1411,13 @@ impl Simulator {
                     // the frame-bound value: seed width 0 (keep source),
                     // exactly like a string formal but scalar-typed.
                     0
+                } else if let Some(pw) = (handle != 0)
+                    .then(|| self.class_formal_width(handle, cname, &port.data_type))
+                    .flatten()
+                {
+                    // §8.25: sized by the receiver's class parameters, as the
+                    // interpreter's binding loop sizes it.
+                    pw
                 } else {
                     // Scalar-integral GATE (bail to AST if not): the type must be
                     // a compile-able integer vector/atom. (String formals are
@@ -2713,10 +2720,18 @@ impl Simulator {
         // the declared width and stamp; other packed formals keep width.
         use crate::ast::types::DataType as DT;
         let mut coerce: Vec<(Box<str>, u32, Option<bool>)> = Vec::with_capacity(f.ports.len());
-        for port in f.ports.iter() {
+        for (i, port) in f.ports.iter().enumerate() {
             let dt = &port.data_type;
+            let plan_w = pre.formal_widths.get(i).copied().unwrap_or(0);
             let c = if self.typeref_names_class(dt) || Self::is_string_data_type(dt) {
                 (0, None)
+            } else if plan_w > 0 && self.may_be_class_param_sized(dt) {
+                // The plan holds this specialization's width (§8.25).
+                let signed = self
+                    .scalar_formal_integral(dt)
+                    .map(|(_, s)| s)
+                    .unwrap_or_else(|| super::elaborate::is_type_signed(dt));
+                (plan_w, Some(signed))
             } else if matches!(dt, DT::TypeReference { .. }) {
                 if let Some((pw, signed)) = self.scalar_formal_integral(dt) {
                     (pw, Some(signed))

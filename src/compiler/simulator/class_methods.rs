@@ -1028,17 +1028,7 @@ impl Simulator {
         cname: &str,
         dt: &DataType,
     ) -> Option<u32> {
-        let candidate = match dt {
-            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
-                !dimensions.is_empty() && !Self::packed_dims_are_literal(dt)
-            }
-            DataType::TypeReference { name, .. } => self
-                .class_member_names()
-                .param_sized_typedefs
-                .contains(&name.name.name),
-            _ => false,
-        };
-        if !candidate {
+        if !self.may_be_class_param_sized(dt) {
             return None;
         }
         let saved = self.seed_callee_spec_from_instance(handle, cname);
@@ -1047,6 +1037,21 @@ impl Simulator {
         self.class_context_stack.pop();
         self.restore_spec_pooled(saved);
         w
+    }
+
+    /// A packed type whose width may come from class parameters: non-literal
+    /// packed dimensions, or a class typedef of such a range.
+    pub(super) fn may_be_class_param_sized(&mut self, dt: &DataType) -> bool {
+        match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                !dimensions.is_empty() && !Self::packed_dims_are_literal(dt)
+            }
+            DataType::TypeReference { name, .. } => self
+                .class_member_names()
+                .param_sized_typedefs
+                .contains(&name.name.name),
+            _ => false,
+        }
     }
 
     /// §8.25: seed `current_spec` from a receiver instance (and, for a

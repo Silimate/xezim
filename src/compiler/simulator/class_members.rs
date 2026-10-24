@@ -2758,8 +2758,12 @@ impl Simulator {
             ExprKind::Index { expr: base, index } => match &base.kind {
                 ExprKind::Ident(bh) if bh.path.len() == 1 => {
                     let bname = bh.path[0].name.name.as_str();
+                    // A subroutine-local collection or a collection formal
+                    // lives under its per-call key (`@lq#7`).
                     let scoped = self
-                        .instance_assoc_member(bname)
+                        .dyn_name_lookup(bname)
+                        .map(str::to_string)
+                        .or_else(|| self.instance_assoc_member(bname))
                         .unwrap_or_else(|| bname.to_string());
                     self.coll_elem_handle(&scoped, bname, index)
                 }

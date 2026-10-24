@@ -804,3 +804,5 @@ mod class_scoped_static_queue_copy;
 mod class_scoped_assoc_queue_elem;
 #[path = "classes/ref_formal_array_of_coll_row.rs"]
 mod ref_formal_array_of_coll_row;
+#[path = "classes/output_formal_local_array_elem_member.rs"]
+mod output_formal_local_array_elem_member;

@@ -798,3 +798,5 @@ mod class_queue_empty_pattern;
 mod class_queue_struct_pattern_init;
 #[path = "classes/class_queue_struct_prop_copy.rs"]
 mod class_queue_struct_prop_copy;
+#[path = "classes/class_scoped_static_queue_copy.rs"]
+mod class_scoped_static_queue_copy;

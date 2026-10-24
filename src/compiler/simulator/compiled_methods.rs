@@ -1510,9 +1510,19 @@ impl Simulator {
         // Effective result width: instance-resolved for param-bounded packed
         // returns, else the static width from the plan.
         let result_width = if pre.param_able_result {
-            let scope = self.instance_param_scope(handle);
-            let w = resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs));
-            if w > 0 { w } else { pre.static_result_width }
+            if let Some(w) = (handle != 0)
+                .then(|| self.class_formal_width(handle, cname, &pre.return_type))
+                .flatten()
+            {
+                // §8.25: a class typedef or range over the receiver's class
+                // parameters, sized as the interpreter sizes the return.
+                w
+            } else {
+                let scope = self.instance_param_scope(handle);
+                let w =
+                    resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs));
+                if w > 0 { w } else { pre.static_result_width }
+            }
         } else {
             pre.static_result_width
         };

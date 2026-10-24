@@ -36,6 +36,15 @@ fn class_param_sized_formals_locals_and_keys() {
 }
 
 #[test]
+fn class_param_sized_compiled_return_width() {
+    let expected = ["T|hot_pass|0 0"];
+    assert_eq!(
+        t_lines(include_str!("class_param_sized_compiled_return.sv")),
+        expected
+    );
+}
+
+#[test]
 fn class_param_sized_formals_after_method_compiles() {
     let expected = ["T|m32|3000 0", "T|m40|3000 0", "T|mask|6000 01 03"];
     assert_eq!(

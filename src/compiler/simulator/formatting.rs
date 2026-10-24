@@ -1182,7 +1182,7 @@ impl Simulator {
         );
         self.record_output(m.clone());
         self.stdout_writeln(&m);
-        self.finished = true;
+        self.abort_run();
         true
     }
 

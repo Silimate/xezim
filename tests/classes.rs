@@ -524,6 +524,8 @@ mod interface_array_handle_new;
 mod nested_rand_inline_constraints;
 #[path = "classes/nested_rand_joint_solve.rs"]
 mod nested_rand_joint_solve;
+#[path = "classes/cast_defaulted_extends_type_argument.rs"]
+mod cast_defaulted_extends_type_argument;
 #[path = "classes/null_deref_fatal.rs"]
 mod null_deref_fatal;
 #[path = "classes/shadowed_property_initializers.rs"]

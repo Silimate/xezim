@@ -10,6 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A run that ends on a run-time error exits 1, as one that ends on `$fatal`
+  does (§20.10): a read or a task call through a null handle in a process
+  body, or a wait on a mailbox that was never constructed (§8.4); a `forever`
+  with no timing control, or a zero-delay loop, that can never let time
+  advance; a nonblocking-assignment cascade that does not converge; a
+  `foreach` that makes no progress; an SDF file `$sdf_annotate` cannot read or
+  parse; and a failed internal consistency check. Each printed its error and
+  stopped the run, but the exit status was 0, so a script or harness that
+  checks it took the run for a pass.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick
@@ -135,6 +144,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `xezim_cov.json` gains a `type`, the data type the signal was declared with
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
+
+**Maintenance**
+
+* Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned
+  AlmaLinux 8 container against glibc 2.28, with every other dependency linked
+  in, and publishes it with a CycloneDX SBOM, the third-party notices, a
+  provenance record and signed checksums. The build fails on a dependency
+  license outside a permissive allowlist (no GPL or LGPL), a RustSec advisory,
+  a known vulnerability (OSV), a secret in the history (gitleaks), a failing
+  test or a smoke test on bare EL8, and the same tag rebuilds to the same bytes.
+  See [docs/release.md](docs/release.md).
 
 ### 0.11.3 — hierarchy, interfaces, assertions and collection correctness (October 2026)
 

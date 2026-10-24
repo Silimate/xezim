@@ -810,3 +810,5 @@ mod output_formal_local_array_elem_member;
 mod unique_multi_dyn_array;
 #[path = "classes/foreach_indexed_elem_member_array.rs"]
 mod foreach_indexed_elem_member_array;
+#[path = "classes/scalar_formal_shadows_caller_local_coll.rs"]
+mod scalar_formal_shadows_caller_local_coll;

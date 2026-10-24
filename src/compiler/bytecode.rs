@@ -1709,6 +1709,9 @@ pub struct BytecodeCompiler<'a> {
     /// the chain. A bare name here compiles to LoadClassMember(this_reg,
     /// name) instead of bailing.
     bare_member_names: HashSet<String>,
+    /// Declared widths of the `bare_member_names` whose width is the same
+    /// for every instance (not sized by a class parameter).
+    bare_member_widths: HashMap<String, u32>,
     /// Instance properties of the extends chain whose declared type IS a
     /// class (through typedefs/forward typedefs). Only these may be
     /// method-DISPATCH bases in method mode: `value.rand_mode()` on an
@@ -2139,6 +2142,7 @@ impl<'a> BytecodeCompiler<'a> {
             pkg_enum_consts: HashMap::default(),
             class_shadow_names: HashSet::default(),
             bare_member_names: HashSet::default(),
+            bare_member_widths: HashMap::default(),
             member_class_names: HashSet::default(),
             member_safe_names: HashSet::default(),
             class_local_names: HashSet::default(),
@@ -2668,6 +2672,10 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_method_return_type(&mut self, dt: &'a crate::ast::types::DataType) {
         self.method_return_type = Some(dt);
+    }
+
+    pub fn set_bare_member_widths(&mut self, widths: HashMap<String, u32>) {
+        self.bare_member_widths = widths;
     }
 
     pub fn set_unresolved_type_names(&mut self, names: HashSet<String>) {
@@ -13831,8 +13839,12 @@ impl<'a> BytecodeCompiler<'a> {
                         // operation width — ctx joined with the operand's own
                         // LRM width (never the carry-aware estimate, which
                         // shifted dropped carries back into range).
-                        let opw = ctx_width.max(self.lrm_self_width(left)).max(1);
-                        self.emit(Insn::Resize(l, opw));
+                        // An operand of unknown width (0) in a self-determined
+                        // context keeps the width its load produced.
+                        let opw = ctx_width.max(self.lrm_self_width(left));
+                        if opw > 0 {
+                            self.emit(Insn::Resize(l, opw));
+                        }
                         self.emit(Insn::Shl(dest, l, r));
                     }
                     BinaryOp::ShiftRight | BinaryOp::ArithShiftRight => {
@@ -13842,8 +13854,10 @@ impl<'a> BytecodeCompiler<'a> {
                         // shifted at 8 bits then zero-extended (00000013 for
                         // 1ffffff3), and `(a+a) >> 1` shifted the carry back
                         // in (0xa3 for 0x23).
-                        let opw = ctx_width.max(self.lrm_self_width(left)).max(1);
-                        self.emit(Insn::Resize(l, opw));
+                        let opw = ctx_width.max(self.lrm_self_width(left));
+                        if opw > 0 {
+                            self.emit(Insn::Resize(l, opw));
+                        }
                         if matches!(op, BinaryOp::ShiftRight) {
                             self.emit(Insn::Shr(dest, l, r));
                         } else {
@@ -18055,11 +18069,12 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 // Step 9e: in method mode, a BARE class member store
-                // (`m_address = addr`) must evaluate its RHS self-determined
-                // (0), exactly like the interpreter's heap store — the module
-                // widths fallback said 32 and truncated
-                // uvm_tlm_generic_payload::set_address's 64-bit `bit [63:0]`
-                // actual to 32 (20extfunc printed 'h90abcdef).
+                // (`m_address = addr`) takes the member's declared width, or
+                // evaluates its RHS self-determined (0) when that width
+                // depends on the instance — the module widths fallback said
+                // 32 and truncated uvm_tlm_generic_payload::set_address's
+                // 64-bit `bit [63:0]` actual to 32 (20extfunc printed
+                // 'h90abcdef).
                 if self.method_mode
                     && hier.root.is_none()
                     && hier.path.len() == 1
@@ -18069,7 +18084,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if !self.local_var_regs.contains_key(bare)
                         && self.bare_member_names.contains(bare)
                     {
-                        return 0;
+                        return self.this_member_width(lhs).unwrap_or(0);
                     }
                     // Step 9g: a bare STATIC-property store evaluates its
                     // RHS self-determined — class_static_set stores the
@@ -18200,8 +18215,7 @@ impl<'a> BytecodeCompiler<'a> {
             },
             ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
             // Step 9e: a `this.member = rhs` store inside a compiled method
-            // evaluates its RHS self-determined, exactly like the bare-member
-            // rule above — the 32-bit default truncated
+            // follows the bare-member rule above — the 32-bit default truncated
             // uvm_reg_item::set_offset's 64-bit actual (6976).
             ExprKind::MemberAccess { expr, member } if self.method_mode => {
                 let is_this = matches!(&expr.kind, ExprKind::This)
@@ -18214,7 +18228,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 && h.path[0].name.name.as_str() == "this"
                     );
                 if is_this && self.bare_member_names.contains(member.name.as_str()) {
-                    0
+                    self.this_member_width(lhs).unwrap_or(0)
                 } else if is_this && self.string_member_names.contains(member.name.as_str()) {
                     // class-perf P2: a string member leaf is self-determined.
                     0
@@ -18576,11 +18590,55 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Declared width of a `this` property read in method mode, bare (`imm`)
+    /// or as `this.imm`. Such a property is neither a signal nor a register,
+    /// so `expr_max_width` reports 0 for it, and a shift or divide operand
+    /// sized from that 0 was cut to one bit: `imm = imm << 4` stored 0.
+    fn this_member_width(&self, e: &Expression) -> Option<u32> {
+        if !self.method_mode {
+            return None;
+        }
+        let plain = |h: &crate::ast::expr::HierarchicalIdentifier| {
+            h.root.is_none() && h.path.iter().all(|p| p.selects.is_empty())
+        };
+        let name = match &e.kind {
+            ExprKind::Ident(h) if plain(h) && h.path.len() == 1 => {
+                let n = h.path[0].name.name.as_str();
+                if self.local_var_regs.contains_key(n) {
+                    return None;
+                }
+                n
+            }
+            ExprKind::Ident(h)
+                if plain(h) && h.path.len() == 2 && h.path[0].name.name == "this" =>
+            {
+                h.path[1].name.name.as_str()
+            }
+            ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                ExprKind::This => member.name.as_str(),
+                ExprKind::Ident(h)
+                    if plain(h) && h.path.len() == 1 && h.path[0].name.name == "this" =>
+                {
+                    member.name.as_str()
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !self.bare_member_names.contains(name) {
+            return None;
+        }
+        self.bare_member_widths.get(name).copied()
+    }
+
     /// LRM §11.6.1 SELF-determined width — max-of-operands with NO carry
     /// headroom (expr_max_width deliberately over-reports so temporaries
     /// never truncate; a shift/divide OPERAND must take the LRM width or the
     /// dropped carry returns: `(a<<4)>>2` at 8 bits read 0x8c for 0x0c).
     fn lrm_self_width(&mut self, e: &Expression) -> u32 {
+        if let Some(w) = self.this_member_width(e) {
+            return w;
+        }
         match &e.kind {
             ExprKind::Paren(i) => self.lrm_self_width(i),
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => *sz,

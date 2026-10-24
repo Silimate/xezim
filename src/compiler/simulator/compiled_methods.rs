@@ -2126,6 +2126,15 @@ impl Simulator {
                         compiler.set_method_return_type(&function.return_type);
                     }
                     compiler.set_local_typedef_types(local_typedef_types);
+                    compiler.set_bare_member_widths(
+                        bare_members
+                            .iter()
+                            .filter_map(|m| {
+                                let w = self.class_prop_width_fixed(cname, m).flatten()?;
+                                Some((m.clone(), w))
+                            })
+                            .collect(),
+                    );
                     compiler.set_unresolved_type_names(unresolved_type_names);
                     compiler.method_admission = Some(admission);
                     // issue-301 plan fact: multi-dim packed coll elements.

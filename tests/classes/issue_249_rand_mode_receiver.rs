@@ -3,9 +3,10 @@
 //! first. When the value equalled a live object's handle, that whole other
 //! object was switched off and `prop` stayed random. A bare name that
 //! declares a non-class or rand class-handle property of `this` names that
-//! variable (§8.11, §18.8), whatever it holds; for a handle only its own
-//! mode changes. Non-rand handle properties, locals and constraint names
-//! keep their meaning.
+//! variable (IEEE 1800-2017 §8.11, §18.8), whatever it holds; for a handle
+//! only its own mode changes. For a handle that is an interpretation of
+//! §18.8, which also reads the call as the object form. Non-rand handle
+//! properties, locals and constraint names keep their meaning.
 
 use xezim::simulate;
 

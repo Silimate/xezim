@@ -1,7 +1,9 @@
-//! §18.8: inside a class, `sub.rand_mode(0)` on a `rand` class-handle
-//! property names the random variable `sub` of `this`. "If the random
-//! variable is an object handle, only the mode of the variable is changed,
-//! not the mode of random variables within that object." With the handle
+//! IEEE 1800-2017 §18.8, taking `sub` as a random variable of `this` (an
+//! interpretation; the object-form reading turns off every variable in
+//! `sub`): inside a class, `sub.rand_mode(0)` on a `rand` class-handle
+//! property names that variable. "If the random variable is an object
+//! handle, only the mode of the variable is changed, not the mode of random
+//! variables within that object." With the handle
 //! inactive the object it holds is not randomized and its constraints are
 //! not solved (§18.5.9 covers only active rand handles). Every random
 //! variable inside the object used to be switched off instead, so its

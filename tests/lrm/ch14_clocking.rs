@@ -135,69 +135,6 @@ fn c14_clocking_blocks() {
     );
 }
 
-// `req <= 0; ready <= 0; @(cb); req <= 1; ready <= 1` updates both signals
-// on the edge after the queued 0s. ready must not move a cycle before req.
-#[test]
-fn c14_clocking_drive_after_wait_keeps_siblings_together() {
-    check(
-        "c14_pair",
-        include_str!("sv/c14_pair.sv"),
-        "c14q",
-        Order::Exact,
-        &[
-            "T|q|t=5000 req=0 ready=0",
-            "T|q|t=15000 req=0 ready=0",
-            "T|q|t=25000 req=1 ready=1",
-        ],
-        &[],
-    );
-}
-
-// Same-process siblings and a join parent stay with a deferred drive. A
-// second process, resumed only by an event the first triggers, does not.
-#[test]
-fn c14_clocking_drive_defer_stays_in_the_process() {
-    check(
-        "c14_scope",
-        include_str!("sv/c14_scope.sv"),
-        "c14s",
-        Order::Exact,
-        &[
-            "T|same|t=5000 br=0 adr=00 en=0",
-            "T|two|t=5000 pulse=0 gnt=0",
-            "T|fork|t=5000 req=0 ready=0",
-            "T|next|t=5000 hold=0 drop=0",
-            "T|same|t=15000 br=1 adr=2a en=0",
-            "T|two|t=15000 pulse=1 gnt=1",
-            "T|fork|t=15000 req=0 ready=0",
-            "T|next|t=15000 hold=1 drop=0",
-            "T|same|t=25000 br=0 adr=xx en=1",
-            "T|two|t=25000 pulse=0 gnt=1",
-            "T|fork|t=25000 req=1 ready=1",
-            "T|next|t=25000 hold=0 drop=1",
-        ],
-        &[],
-    );
-}
-
-// A drive queued before `@(cb)`, then cleared after it wakes, is one cycle
-// wide. The clear is the next event, not a second drive of the same slot.
-#[test]
-fn c14_clocking_drive_pulse_survives_the_clear() {
-    check(
-        "c14_pulse",
-        include_str!("sv/c14_pulse.sv"),
-        "c14p",
-        Order::Exact,
-        &[
-            "T|pulse|t=5000 br=0 addr=00 en=0",
-            "T|pulse|t=15000 br=1 addr=2a en=1",
-            "T|pulse|t=25000 br=0 addr=xx en=1",
-        ],
-        &[],
-    );
-}
-
 // `@(cb); x <= 0; x <= 1` in one slot drives 1 at this event. A zero-delay
 // response queued in the slot of the previous response's clear is not a
 // cycle late.

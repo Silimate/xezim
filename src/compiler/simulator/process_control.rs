@@ -447,41 +447,7 @@ impl Simulator {
         }
     }
 
-    /// Copy a process's clocking-drive defer set onto another process. Used when
-    /// a `join` parent resumes after the child, and when that parent then forks
-    /// the next child in the same time slot.
-    pub(super) fn copy_clocking_edge_defer(&mut self, from_pid: usize, to_pid: usize) {
-        if self.clocking_edge_defer.is_empty() {
-            return;
-        }
-        let cbs: Vec<String> = self
-            .clocking_edge_defer
-            .iter()
-            .filter(|(_, pids)| pids.contains(&from_pid))
-            .map(|(cb, _)| cb.clone())
-            .collect();
-        for cb in cbs {
-            self.clocking_edge_defer.entry(cb).or_default().insert(to_pid);
-        }
-    }
-
-    /// A fork child that deferred a clocking drive hands that defer to a parent
-    /// blocked in `join` / `join_any`, so the statements after the join stay on
-    /// the same edge as the child's drive. `join_none` and processes that are
-    /// merely siblings do not inherit: they were not waiting on this child.
-    pub(super) fn inherit_clocking_edge_defer(&mut self, child_pid: usize, parent_pid: usize) {
-        let waiting = self.join_waiters.iter().any(|w| {
-            !w.wait_fork && w.parent_pid == parent_pid && w.child_pids.contains(&child_pid)
-        });
-        if waiting {
-            self.copy_clocking_edge_defer(child_pid, parent_pid);
-        }
-    }
-
     pub(super) fn child_finished(&mut self, child_pid: usize) {
-        if let Some(&parent_pid) = self.process_parents.get(&child_pid) {
-            self.inherit_clocking_edge_defer(child_pid, parent_pid);
-        }
         self.finished_pids.insert(child_pid);
         // A fork child's inherited `%m` chain (`inherit_fork_m_scope`) is
         // never unwound by its own statements.

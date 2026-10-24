@@ -3805,20 +3805,11 @@ impl Simulator {
                                         return;
                                     }
                                 }
-                                // A drive at the clocking event, after tick has committed
-                                // the pre-edge queue. A signal that queue did not
-                                // already drive matures at this edge plus its output
-                                // skew (`@(cb); cb.x <= v` is visible by the next
-                                // edge). A drive of a signal the queue did drive
-                                // waits for the next event, and so does every later
-                                // drive by that same process (and by a parent
-                                // `join` resumes from it): `x <= 1; @(cb); x <= 0`
-                                // is a one-cycle pulse, and `req <= 0; @(cb);
-                                // req <= 1; ready <= 1` updates req and ready
-                                // together. Another process on this block does not
-                                // wait with them. Two drives issued at the event are
-                                // both this event's and the last one wins
-                                // (`@(cb); x <= 0; x <= 1` drives 1 now).
+                                // §14.16.1: a drive executed AT the clocking
+                                // event matures at edge + OUTPUT SKEW (per-sig
+                                // override, else block default, else #0 =
+                                // Re-NBA of this timestep). Only a drive issued
+                                // BETWEEN events waits for the next edge.
                                 let skew = self
                                     .clocking_sig_out_skew
                                     .get(&cb)
@@ -3827,31 +3818,11 @@ impl Simulator {
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
                                 if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
-                                    let pid = self.current_pid;
-                                    let defer = self
-                                        .clocking_edge_defer
-                                        .get(&cb)
-                                        .is_some_and(|s| s.contains(&pid))
-                                        || self
-                                            .clocking_edge_driven
-                                            .get(&cb)
-                                            .is_some_and(|s| s.contains(&net));
-                                    if !defer {
-                                        if let Some(&id) = self.signal_name_to_id.get(net.as_str())
-                                        {
-                                            let w = self.signal_widths[id];
-                                            self.schedule_delayed_with_delay(
-                                                id,
-                                                val.resize(w),
-                                                skew,
-                                            );
-                                            return;
-                                        }
+                                    if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
+                                        let w = self.signal_widths[id];
+                                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                                        return;
                                     }
-                                    self.clocking_edge_defer
-                                        .entry(cb.clone())
-                                        .or_default()
-                                        .insert(pid);
                                 }
                                 self.clocking_output_pending
                                     .entry(cb)
@@ -4575,9 +4546,6 @@ impl Simulator {
                     let pid = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid, self.current_pid);
-                    // A child spawned after this process deferred a clocking
-                    // drive is the next beat of that drive, not a new one.
-                    self.copy_clocking_edge_defer(self.current_pid, pid);
                     // Same scope-hint inheritance as the run_process_stmts
                     // ParBlock arm — §9.3.2, additive.
                     if let Some(h) = self.process_scope_hint.get(&self.current_pid).cloned() {

@@ -6626,17 +6626,6 @@ pub struct Simulator {
     /// slot's edge detection, and the next iteration's snapshot would
     /// otherwise absorb the change and swallow the `@(cb.sig)` event.
     clocking_mirror_dirty: bool,
-    /// Nets whose pre-edge drive is already committed for the clocking event
-    /// at `clocking_last_edge`. A later drive of one of those nets waits for
-    /// the next event so `x <= 1; @(cb); x <= 0` stays high for a cycle.
-    clocking_edge_driven: HashMap<String, HashSet<String>>,
-    /// Processes whose later drives of this clocking block, in this time slot,
-    /// wait for the next event. Keyed by block, then pid. A drive that had to
-    /// wait inserts its own pid. The pid is copied to a parent blocked in
-    /// `join` / `join_any`, and from a process to a child it forks afterward
-    /// in the same slot. An unrelated process on the same block does not
-    /// inherit it, so a grant pulse cannot drag a response.
-    clocking_edge_defer: HashMap<String, HashSet<usize>>,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
     /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.

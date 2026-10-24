@@ -4809,8 +4809,6 @@ impl Simulator {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid_child, pid);
-                    // Same-slot continuation: see `copy_clocking_edge_defer`.
-                    self.copy_clocking_edge_defer(pid, pid_child);
                     self.note_fork_spawn(pid_child, pc);
                     // §9.3.2: a fork child executes in the forking process's
                     // scope, so it inherits the parent's instance-scope hint

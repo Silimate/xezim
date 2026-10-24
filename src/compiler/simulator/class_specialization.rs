@@ -2186,6 +2186,10 @@ impl Simulator {
             .into_iter()
             .map(|s| s.trim().to_string())
             .collect();
+        // A slot filled with the parameter's own name because the named
+        // list omitted it. That spelling is the default, not a reference
+        // to an enclosing parameter of the same name.
+        let mut omitted_slot = vec![false; frags.len()];
         // §8.25 named assignments (`.W(5)`) bind by NAME: move each to its
         // parameter's slot. A slot no argument names keeps its default,
         // spelled as the parameter's own name for the loop below to fill; a
@@ -2207,6 +2211,7 @@ impl Simulator {
                 }
             }
             let used = slots.iter().rposition(|s| s.is_some()).map_or(0, |i| i + 1);
+            omitted_slot = slots.iter().take(used).map(|s| s.is_none()).collect();
             frags = slots
                 .into_iter()
                 .take(used)
@@ -2219,7 +2224,20 @@ impl Simulator {
         // substitute the default.
         for i in 0..frags.len() {
             if order.get(i).is_some_and(|p| frags[i] == *p) {
-                if let Some(d) = self.param_default_fragment(cd, i, &frags[..i]) {
+                // The fragment is this parameter's own name. An omitted
+                // argument is recorded that way and takes the default.
+                // The same spelling is a real argument when an enclosing
+                // specialization binds the name (`item#(H, D)` inside
+                // `seq#(int H, int D)`). That binding wins over the default,
+                // which would otherwise collapse `D` to `H` (32).
+                let enclosing = if omitted_slot.get(i).copied().unwrap_or(false) {
+                    None
+                } else {
+                    self.enclosing_value_param_fragment(class_name, &frags[i])
+                };
+                if let Some(v) = enclosing {
+                    frags[i] = v;
+                } else if let Some(d) = self.param_default_fragment(cd, i, &frags[..i]) {
                     frags[i] = d;
                 }
             }
@@ -2262,6 +2280,48 @@ impl Simulator {
             })
             .collect();
         canon_frags.join(",")
+    }
+
+    /// A value-parameter binding of `name` in an enclosing specialization,
+    /// when that specialization is not `class_name` itself.
+    ///
+    /// `canonicalize_spec_sig` treats a fragment equal to the parameter's
+    /// own name as an omitted argument. `item#(H, D)` written inside
+    /// `seq#(int H, int D)` is that same spelling and means the outer
+    /// parameter, not item's default.
+    pub(super) fn enclosing_value_param_fragment(
+        &self,
+        class_name: &str,
+        pname: &str,
+    ) -> Option<String> {
+        let mut specs: Vec<(String, String)> = Vec::new();
+        if let Some(cs) = &self.current_spec {
+            specs.push(cs.clone());
+        }
+        specs.extend(self.spec_scope_stack.iter().rev().cloned());
+        for (base, sig) in specs {
+            if base == class_name {
+                continue;
+            }
+            let Some(cd) = self.module.classes.get(&base) else {
+                continue;
+            };
+            if cd.type_param_names.iter().any(|t| t == pname) {
+                continue;
+            }
+            let Some(idx) = cd.param_order.iter().position(|p| p == pname) else {
+                continue;
+            };
+            let Some(v) = Self::spec_arg_at(&sig, idx) else {
+                continue;
+            };
+            let v = v.trim();
+            if v.is_empty() || v == pname {
+                continue;
+            }
+            return Some(v.to_string());
+        }
+        None
     }
 
     /// For a STATIC queue/associative/dynamic-array property of a

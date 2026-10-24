@@ -203,3 +203,5 @@ mod collection_returns_387;
 
 #[path = "collections/assoc_queue_elem_whole_copy.rs"]
 mod assoc_queue_elem_whole_copy;
+#[path = "collections/concat_actual_splices_queue.rs"]
+mod concat_actual_splices_queue;

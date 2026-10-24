@@ -45,6 +45,20 @@ fn c19_bins_with_filter() {
     );
 }
 
+// §19.6: a cross of hierarchical variable references gives each an implicit
+// coverpoint; `mie` crosses only while its `iff` guard holds.
+#[test]
+fn c19_cross_hierarchical_items() {
+    check(
+        "c19_cross_hier",
+        include_str!("sv/c19_cross_hier.sv"),
+        "c19_cross_hier",
+        Order::Exact,
+        &["T|ab|100.00", "T|mie|50.00", "T|ign|66.67", "T|cg|88.10"],
+        &[],
+    );
+}
+
 // §19.5.3, §19.5.6, §19.6: covergroups, coverpoints, bins, auto bins
 #[test]
 fn c19_coverage_basic() {

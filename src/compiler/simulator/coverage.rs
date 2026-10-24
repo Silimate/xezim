@@ -2183,10 +2183,17 @@ impl Simulator {
                                 let e = Expression::new(
                                     ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                                         root: None,
-                                        path: vec![crate::ast::expr::HierPathSegment {
-                                            name: id.clone(),
-                                            selects: Vec::new(),
-                                        }],
+                                        path: id
+                                            .name
+                                            .split('.')
+                                            .map(|seg| crate::ast::expr::HierPathSegment {
+                                                name: crate::ast::Identifier {
+                                                    name: seg.to_string(),
+                                                    span: id.span,
+                                                },
+                                                selects: Vec::new(),
+                                            })
+                                            .collect(),
                                         span: id.span,
                                         cached_signal_id: std::cell::Cell::new(None),
                                         cached_resolved_name: std::cell::OnceCell::new(),

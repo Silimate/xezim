@@ -443,6 +443,26 @@ impl Simulator {
         self.record_ast_loop_heat(iterations);
     }
 
+    /// `a[i].m` / `o.a[i].m`: a member reached through an element select.
+    fn member_of_indexed_elem(e: &Expression) -> bool {
+        fn has_index(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Index { .. } => true,
+                ExprKind::MemberAccess { expr, .. } => has_index(expr),
+                ExprKind::Ident(h) => h.path.iter().any(|s| !s.selects.is_empty()),
+                _ => false,
+            }
+        }
+        match &e.kind {
+            ExprKind::MemberAccess { expr, .. } => has_index(expr),
+            ExprKind::Ident(h) => h
+                .path
+                .split_last()
+                .is_some_and(|(_, head)| head.iter().any(|s| !s.selects.is_empty())),
+            _ => false,
+        }
+    }
+
     pub(super) fn exec_stmt_foreach_inner(
         &mut self,
         _stmt: &Statement,
@@ -615,6 +635,44 @@ impl Simulator {
                     }
                     self.continue_flag = false;
                 }
+            }
+            self.auto_loop_vars.truncate(fe_auto_len);
+            self.restore_loop_vars(&fe_saved);
+            if !self.return_flag && self.disable_target.is_none() {
+                self.break_flag = false;
+            }
+            return;
+        }
+        // §12.7.3: `foreach (g.ph[i].ids[j])` walks the queue or dynamic
+        // array property of that one element.
+        if vars.len() == 1
+            && Self::member_of_indexed_elem(array)
+            && let Some(cn) = (match &array.kind {
+                ExprKind::Ident(h) => {
+                    self.queue_actual_storage(&Self::hier_select_chain(h, array.span))
+                }
+                _ => self.queue_actual_storage(array),
+            })
+            .filter(|n| self.module.dynamic_arrays.contains(n))
+        {
+            let jv = vars[0].as_ref().map(|v| v.name.clone());
+            if let Some(n) = &jv {
+                self.widths.insert(n.clone(), 32);
+            }
+            for j in 0..self.get_queue_size(&cn) {
+                if self.finished {
+                    break;
+                }
+                if let Some(n) = &jv {
+                    self.set_loop_var(n, Self::signed_loop_val(j as i64));
+                }
+                self.continue_flag = false;
+                *iterations = iterations.saturating_add(1);
+                self.exec_statement(body);
+                if self.break_flag {
+                    break;
+                }
+                self.continue_flag = false;
             }
             self.auto_loop_vars.truncate(fe_auto_len);
             self.restore_loop_vars(&fe_saved);

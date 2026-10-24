@@ -808,3 +808,5 @@ mod ref_formal_array_of_coll_row;
 mod output_formal_local_array_elem_member;
 #[path = "classes/unique_multi_dyn_array.rs"]
 mod unique_multi_dyn_array;
+#[path = "classes/foreach_indexed_elem_member_array.rs"]
+mod foreach_indexed_elem_member_array;

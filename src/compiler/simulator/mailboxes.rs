@@ -245,9 +245,10 @@ impl Simulator {
     }
 
     /// `items` with every leaf expression replaced by a literal of its value
-    /// now (§15.4.2: `put` copies the message at the call). Nested patterns
-    /// keep their shape and `name:` / `default:` keys, so the copy can still
-    /// be spread by member name into whatever type receives it.
+    /// now (IEEE 1800-2017 §15.4.3, §13.5.1: `put` takes the message by value
+    /// at the call). Nested patterns keep their shape and `name:` /
+    /// `default:` keys, so the copy can still be spread by member name into
+    /// whatever type receives it.
     fn snapshot_pattern_items(
         &mut self,
         items: &[AssignmentPatternItem],

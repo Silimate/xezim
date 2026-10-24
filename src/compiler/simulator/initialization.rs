@@ -3670,6 +3670,8 @@ impl Simulator {
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
+            pattern_scratch_seq: 0,
+            pattern_scratch_free: Vec::new(),
             force_epoch_gen: 0,
             force_refresh_done_gen: 0,
             class_coll_index: std::cell::RefCell::new(HashMap::default()),

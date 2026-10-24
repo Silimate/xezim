@@ -816,3 +816,5 @@ mod scalar_formal_shadows_caller_local_coll;
 mod rand_dyn_array_of_unpacked_structs;
 #[path = "classes/dollar_index_handle_member_write.rs"]
 mod dollar_index_handle_member_write;
+#[path = "classes/rand_masked_eq_variable_mask.rs"]
+mod rand_masked_eq_variable_mask;

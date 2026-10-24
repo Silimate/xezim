@@ -7086,6 +7086,11 @@ pub struct Simulator {
     /// rather than growing with every message put.
     mbx_msg_seq: u64,
     mbx_free_ids: Vec<u64>,
+    /// Scratch structs a pattern actual is spread into before its leaves bind
+    /// to an unpacked-struct formal (`struct_pattern_leaf_values`). Recycled
+    /// like the mailbox shadows.
+    pattern_scratch_seq: u64,
+    pattern_scratch_free: Vec<u64>,
     /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 means
     /// UNBOUNDED — `try_put` never fails and `put` never blocks. `new(N)` with
     /// N>0 records N here; a full box rejects `try_put` and parks `put`.

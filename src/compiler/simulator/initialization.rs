@@ -3931,6 +3931,8 @@ impl Simulator {
             mailboxes: HashMap::default(),
             mbx_msg_seq: 0,
             mbx_free_ids: Vec::new(),
+            pattern_scratch_seq: 0,
+            pattern_scratch_free: Vec::new(),
             mailbox_bound: HashMap::default(),
             mailbox_put_waiters: HashMap::default(),
             rand_mode_disabled: HashMap::default(),

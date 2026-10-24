@@ -5,6 +5,32 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// `(lo, hi)` of a fixed unpacked array named `name`, or None.
+    /// The span is capped so a clocking sample cannot walk a huge array.
+    pub(super) fn unpacked_array_bounds(&self, name: &str) -> Option<(i64, i64)> {
+        let &(lo, hi, _) = self.module.arrays.get(name)?;
+        if hi < lo || hi - lo > 4096 {
+            return None;
+        }
+        Some((lo, hi))
+    }
+
+    /// The value a clocking input named `sig` contributes to this edge's
+    /// snapshot, under the block's input skew.
+    fn clocking_input_value(&self, sig: &str, skew: u64) -> Option<Value> {
+        if skew == CB_SKEW_1STEP {
+            self.clocking_preponed
+                .get(sig)
+                .cloned()
+                .or_else(|| self.get_signal_value_by_name(sig))
+        } else if skew == 0 {
+            self.get_signal_value_by_name(sig)
+        } else {
+            self.clocking_hist_value(sig, self.time.saturating_sub(skew))
+                .or_else(|| self.get_signal_value_by_name(sig))
+        }
+    }
+
     /// LRM §14.3 clocking-block input snapshot. Each registered cb
     /// has a clock signal; on every posedge transition of that clock
     /// we snapshot the current values of input-direction signals. The
@@ -176,18 +202,27 @@ impl Simulator {
                         .and_then(|m| m.get(vis))
                         .copied()
                         .unwrap_or(in_dskew);
-                    let v = if skew == CB_SKEW_1STEP {
-                        self.clocking_preponed
-                            .get(sig)
-                            .cloned()
-                            .or_else(|| self.get_signal_value_by_name(sig))
-                    } else if skew == 0 {
-                        self.get_signal_value_by_name(sig)
+                    // An unpacked-array clockvar (`input arr`) has no scalar
+                    // signal. Sample each element under `name[i]`, or a read
+                    // of `cb.arr[i]` finds the missing scalar and returns 0.
+                    // The registered array may be the resolved net or the
+                    // clocking-visible name when those differ.
+                    let array_name = if self.unpacked_array_bounds(sig).is_some() {
+                        sig.as_str()
+                    } else if self.unpacked_array_bounds(vis).is_some() {
+                        vis.as_str()
                     } else {
-                        self.clocking_hist_value(sig, self.time.saturating_sub(skew))
-                            .or_else(|| self.get_signal_value_by_name(sig))
+                        ""
                     };
-                    if let Some(v) = v {
+                    if let Some((lo, hi)) = self.unpacked_array_bounds(array_name) {
+                        for idx in lo..=hi {
+                            let elem = format!("{array_name}[{idx}]");
+                            let v = self.clocking_input_value(&elem, skew);
+                            if let Some(v) = v {
+                                snap.insert(format!("{vis}[{idx}]"), v);
+                            }
+                        }
+                    } else if let Some(v) = self.clocking_input_value(sig, skew) {
                         snap.insert(vis.clone(), v);
                     }
                 }

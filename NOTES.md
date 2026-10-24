@@ -566,6 +566,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Maintenance**
 
+* Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned
+  AlmaLinux 8 container against glibc 2.28, with every other dependency linked
+  in, and publishes it with a CycloneDX SBOM, the third-party notices, a
+  provenance record and signed checksums. The build fails on a dependency
+  license outside a permissive allowlist (no GPL or LGPL), a RustSec advisory,
+  a known vulnerability (OSV), a secret in the history (gitleaks), a failing
+  test or a smoke test on bare EL8, and the same tag rebuilds to the same bytes.
+  See [docs/release.md](docs/release.md).
+
 * Core CI runs the parser crate's unit, integration and documentation tests,
   and verifies its minimum supported Rust version explicitly.
   (#455, reported by lwflwf1)

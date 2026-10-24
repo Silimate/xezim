@@ -80,3 +80,17 @@ fn c19_coverage_options() {
         &[],
     );
 }
+
+// §19.6: a cross of hierarchical variable references gives each an implicit
+// coverpoint; `ie` crosses only while its `iff` guard holds.
+#[test]
+fn c19_cross_hierarchical_items() {
+    check(
+        "c19_cross_hier",
+        include_str!("sv/c19_cross_hier.sv"),
+        "c19_cross_hier",
+        Order::Exact,
+        &["T|ab|100.00", "T|ie|50.00", "T|ign|66.67", "T|cg|88.10"],
+        &[],
+    );
+}

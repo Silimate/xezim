@@ -2600,8 +2600,15 @@ impl Simulator {
                     for i in sz..old_sz {
                         self.signals.remove(&format!("{}[{}]", dst, i));
                     }
+                    // An unpacked-struct element has no `<src>[i]` signal,
+                    // only its member leaves.
+                    let member_wise = self.queue_elem_struct(&src).is_some();
                     for i in 0..sz {
-                        if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", src, i)) {
+                        if member_wise {
+                            self.queue_copy_elem(&src, i, &dst, i);
+                        } else if let Some(v) =
+                            self.get_signal_value_by_name(&format!("{}[{}]", src, i))
+                        {
                             self.set_signal_value_by_name(&format!("{}[{}]", dst, i), v);
                         }
                     }

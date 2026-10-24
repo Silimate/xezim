@@ -206,8 +206,9 @@ fn c18_constraint_inheritance() {
     );
 }
 
-// §18.5.4, §11.4.13: an `inside` / `dist` item `~k` is sized with the other
-// operands; `!k` and reductions are 1-bit. None of them drops out of the set.
+// IEEE 1800-2017 §18.5.4, §11.4.13, Table 11-21: an `inside` / `dist` item
+// `~k` is sized with the other operands; `!k` and reductions are 1-bit. None
+// of them drops out of the set.
 #[test]
 fn c18_inside_unary_items() {
     check(

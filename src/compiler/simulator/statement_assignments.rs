@@ -2579,7 +2579,10 @@ impl Simulator {
             // elements render as strings), but `q = {...}` on it is a
             // QUEUE assignment — `q = {}` clears it — not a byte concat.
             let lhs_is_queue = self.module.dynamic_arrays.contains(&*lname)
-                || self.module.arrays.contains_key(&*lname);
+                || self.module.arrays.contains_key(&*lname)
+                || self
+                    .instance_assoc_member(&lname)
+                    .is_some_and(|scoped| self.class_queue_prop(&scoped));
             if !lhs_is_queue
                 && (self.string_signals.contains(&*lname)
                     || self.string_signals.contains(

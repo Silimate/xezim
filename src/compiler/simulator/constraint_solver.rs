@@ -1153,7 +1153,9 @@ impl Simulator {
         if csp_ok
             && rand_obj_props.is_empty()
             && !rand_colls.iter().any(|c| c.kind == CollKind::Dyn)
-            && (has_soft || self.rand_order_sensitive(&constraints))
+            && (has_soft
+                || self.rand_order_sensitive(&constraints)
+                || self.rand_dist_weight_reads_rand(&constraints, &csp_rand_props))
         {
             csp_runs += 1;
             let saved = self

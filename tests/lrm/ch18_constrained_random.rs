@@ -228,3 +228,21 @@ fn c18_inside_unary_items() {
         &[],
     );
 }
+
+// §18.5.4: a dist weight that reads rand variables is the weight of the
+// solution drawn, so an item whose weight comes out zero is never picked.
+#[test]
+fn c18_dist_weight_reads_rand_variables() {
+    check(
+        "c18_dist_rand_weight",
+        include_str!("sv/c18_dist_rand_weight.sv"),
+        "c18dw",
+        Order::Exact,
+        &[
+            "T|dist_rand_weight|bad=0",
+            "T|dist_rand_weight|disabled draws a seed some=1",
+            "T|dist_rand_weight|enabled without stale some=1",
+        ],
+        &[],
+    );
+}

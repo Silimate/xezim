@@ -2394,6 +2394,55 @@ impl Simulator {
         dist.iter().any(|d| other.contains(d))
     }
 
+    /// §18.5.4: a `dist` weight that reads a rand variable (`[1:$] :/ (en ? 0
+    /// : 1)`) is the weight of the solution, so it cannot be judged before
+    /// that variable is drawn. The per-variable trials read whatever value it
+    /// held when the dist's target came up; the joint solver draws it first.
+    pub(super) fn rand_dist_weight_reads_rand(
+        &self,
+        constraints: &[ClassConstraint],
+        rand_props: &[(String, u32)],
+    ) -> bool {
+        fn walk(me: &Simulator, it: &ConstraintItem, out: &mut HashSet<String>) {
+            match it {
+                ConstraintItem::Inside {
+                    is_dist: true,
+                    dist_weights,
+                    ..
+                } => {
+                    use crate::ast::decl::DistWeight;
+                    for w in dist_weights.iter().flatten() {
+                        let (DistWeight::Each(e) | DistWeight::Total(e)) = w;
+                        me.collect_expr_idents(e, out);
+                    }
+                }
+                ConstraintItem::Implication { constraint, .. } => walk(me, constraint, out),
+                ConstraintItem::IfElse {
+                    then_item,
+                    else_item,
+                    ..
+                } => {
+                    walk(me, then_item, out);
+                    if let Some(e) = else_item {
+                        walk(me, e, out);
+                    }
+                }
+                ConstraintItem::Foreach { item, .. } | ConstraintItem::Soft(item) => {
+                    walk(me, item, out)
+                }
+                ConstraintItem::Block(items) => items.iter().for_each(|i| walk(me, i, out)),
+                _ => {}
+            }
+        }
+        let mut read = HashSet::default();
+        for con in constraints {
+            for it in &con.items {
+                walk(self, it, &mut read);
+            }
+        }
+        !read.is_empty() && rand_props.iter().any(|(p, _)| read.contains(p))
+    }
+
     /// `root.m1.m2` for a member chain (flat ident or `MemberAccess`, index
     /// and part selects dropped), `root` for a bare or indexed name.
     pub(super) fn member_path_key(e: &Expression) -> Option<String> {

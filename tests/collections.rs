@@ -198,3 +198,6 @@ mod next_rest_whole_array_nba_381;
 
 #[path = "collections/collection_returns_387.rs"]
 mod collection_returns_387;
+
+#[path = "collections/enclosing_value_parameter_specialization.rs"]
+mod enclosing_value_parameter_specialization;

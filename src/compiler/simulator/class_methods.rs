@@ -1707,7 +1707,7 @@ impl Simulator {
                         self.class_formal_width(handle, &cname, &port.data_type)
                     };
                     if let Some(pw) = class_sized_w {
-                        // §8.25 / §6.20.2: sized by this class's parameters
+                        // IEEE 1800-2017 §8.25: sized by this class's parameters
                         // (`logic [W-1:0] a`, or a class typedef of that),
                         // in the receiving object's specialization.
                         val = if val.is_real {

@@ -344,7 +344,7 @@ impl Simulator {
     }
 
     /// Width of a method local or formal whose type is sized by the executing
-    /// class's parameters (§8.25, §6.20.2): a packed range over a class
+    /// class's parameters (IEEE 1800-2017 §8.25): a packed range over a class
     /// value parameter or localparam, written directly (`logic [W-1:0]`) or
     /// through a class-local typedef (`typedef logic [W-1:0] w_t;`). `None`
     /// for any other type, or outside a class.

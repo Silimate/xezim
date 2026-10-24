@@ -7091,6 +7091,11 @@ pub struct Simulator {
     /// rather than growing with every message put.
     mbx_msg_seq: u64,
     mbx_free_ids: Vec<u64>,
+    /// A message `put` as an assignment pattern (`m.put('{a: 1, b: 2})`),
+    /// keyed by the tagged token queued in its place. The box does not know
+    /// its element type, so the pattern is kept with every item already
+    /// evaluated and assigned to the `get`/`peek` destination on delivery.
+    mbx_patterns: HashMap<u64, Vec<AssignmentPatternItem>>,
     /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 means
     /// UNBOUNDED — `try_put` never fails and `put` never blocks. `new(N)` with
     /// N>0 records N here; a full box rejects `try_put` and parks `put`.

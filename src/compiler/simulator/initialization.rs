@@ -3930,6 +3930,7 @@ impl Simulator {
             mailboxes: HashMap::default(),
             mbx_msg_seq: 0,
             mbx_free_ids: Vec::new(),
+            mbx_patterns: HashMap::default(),
             mailbox_bound: HashMap::default(),
             mailbox_put_waiters: HashMap::default(),
             rand_mode_disabled: HashMap::default(),

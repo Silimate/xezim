@@ -202,7 +202,7 @@ impl Simulator {
                         tn = Some(r);
                     }
                 }
-                return tn.filter(|t| self.module.classes.contains_key(t));
+                return tn.and_then(|t| self.resolved_class_key(&t));
             }
             cur = cd.extends.clone();
         }
@@ -232,7 +232,7 @@ impl Simulator {
                         tn = Some(r);
                     }
                 }
-                return tn.filter(|t| self.module.classes.contains_key(t));
+                return tn.and_then(|t| self.resolved_class_key(&t));
             }
             cur = cd.extends.as_deref();
         }
@@ -372,7 +372,7 @@ impl Simulator {
                     .properties
                     .get(prop)
                     .and_then(|s| s.type_name.clone())
-                    .is_some_and(|tn| self.module.classes.contains_key(&tn));
+                    .is_some_and(|tn| self.resolved_class_key(&tn).is_some());
                 if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
                     let (lo, hi) = self.inst_fixed_bounds(cd, handle, prop, (lo, hi));
                     out.push(RandColl {

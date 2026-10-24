@@ -41,6 +41,8 @@ mod class_method_named_put_from_function;
 mod compiled_method_static_locals;
 #[path = "classes/class_param_default_scope.rs"]
 mod class_param_default_scope;
+#[path = "classes/class_queue_struct_prop_copy.rs"]
+mod class_queue_struct_prop_copy;
 #[path = "classes/class_property_x_default.rs"]
 mod class_property_x_default;
 #[path = "classes/issue320_harness_mwe.rs"]

@@ -1,6 +1,6 @@
-// IEEE 1800-2017 §19.6, extended to hierarchical variable references as
-// Questa also accepts: crossing them, each with an implicit coverpoint, from
-// an interface bound into the module that holds them.
+// IEEE 1800-2017 §19.6, extended to hierarchical variable references as a
+// reference simulator also accepts: crossing them, each with an implicit
+// coverpoint, from an interface bound into the module that holds them.
 module stage (input logic a, input logic b);
 endmodule
 module regs;

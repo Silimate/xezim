@@ -81,9 +81,9 @@ fn c19_coverage_options() {
     );
 }
 
-// IEEE 1800-2017 §19.6, extended to hierarchical variable references as
-// Questa also accepts: each cross item gets an implicit coverpoint; `ie`
-// crosses only while its `iff` guard holds.
+// IEEE 1800-2017 §19.6, extended to hierarchical variable references as a
+// reference simulator also accepts: each cross item gets an implicit
+// coverpoint; `ie` crosses only while its `iff` guard holds.
 #[test]
 fn c19_cross_hierarchical_items() {
     check(

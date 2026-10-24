@@ -7086,6 +7086,11 @@ pub struct Simulator {
     /// rather than growing with every message put.
     mbx_msg_seq: u64,
     mbx_free_ids: Vec<u64>,
+    /// A message `put` as an assignment pattern (`m.put('{a: 1, b: 2})`),
+    /// keyed by the tagged token queued in its place. The box does not know
+    /// its element type, so the pattern is kept with every item already
+    /// evaluated and assigned to the `get`/`peek` destination on delivery.
+    mbx_patterns: HashMap<u64, Vec<AssignmentPatternItem>>,
     /// Scratch structs a pattern actual is spread into before its leaves bind
     /// to an unpacked-struct formal (`struct_pattern_leaf_values`). Recycled
     /// like the mailbox shadows.

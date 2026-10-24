@@ -3613,8 +3613,9 @@ impl Simulator {
                 .typedef_alias_frag(sval)
                 .unwrap_or_else(|| sval.to_string());
             // `virtual mon_if` and `virtualmon_if#(32)` are one type when
-            // 32 is the interface's default parameter (§6.22.1). Compare
-            // the canonical spelling the specialization entry records.
+            // 32 is the interface's default parameter (IEEE 1800-2017
+            // §25.9). Compare the canonical spelling the specialization entry
+            // records.
             let vif_canon = |s: &str| -> String {
                 match self.parse_vif_frag(s) {
                     Some((name, args, modport)) => self.canonical_vif_frag(&name, args, modport),

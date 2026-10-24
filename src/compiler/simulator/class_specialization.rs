@@ -609,8 +609,11 @@ impl Simulator {
             let Some(frag) = frags.get(idx) else {
                 continue;
             };
-            if let Some(rest) = frag.strip_prefix("virtual").filter(|r| !r.is_empty()) {
-                out.push((prop.clone(), (rest.to_string(), None)));
+            // The fragment is the canonical virtual-interface spelling,
+            // which includes default parameters (`virtualmon_if#(32)`).
+            // The interface name is the identifier before `#`.
+            if let Some((iname, _, modport)) = self.parse_vif_frag(frag) {
+                out.push((prop.clone(), (iname, modport)));
             }
         }
         out

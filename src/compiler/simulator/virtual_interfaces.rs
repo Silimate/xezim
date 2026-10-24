@@ -2185,8 +2185,9 @@ impl Simulator {
     /// `vif.cb.arr[i]`). The bracket is not a select on the hierarchical
     /// identifier, so the Ident clocking arm never sees it and the index
     /// falls through to a bit-select of the missing scalar array. The
-    /// snapshot holds each element; return that element, or the element
-    /// type's default before the first clocking event (§14.13).
+    /// snapshot holds each element; return that element (IEEE 1800-2017
+    /// §14.13: the value sampled at the most recent clocking event), or the
+    /// element type's default before the first clocking event.
     /// `None` when `base` is not an unpacked-array clockvar, so a bit-select
     /// of a scalar clockvar (`cb.sig[k]`) stays on the bit-select path.
     pub(super) fn try_clocking_indexed_input(

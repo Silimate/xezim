@@ -4530,9 +4530,10 @@ impl Simulator {
         }
     }
 
-    /// §18.5.4: `x dist {…}` whose weights read rand variables (`[1:$] :/
-    /// (en ? 0 : 1)`). A weight is the one of the solution being drawn, not
-    /// of the variables' values before `randomize()`: an item holds only where
+    /// `x dist {…}` whose weights read rand variables (`[1:$] :/ (en ? 0 :
+    /// 1)`). A weight is taken as the one of the solution being drawn
+    /// (xezim's reading of IEEE 1800-2017 §18.5.4), not of the variables'
+    /// values before `randomize()`: an item holds only where
     /// its weight is nonzero, and a weight that is a `?:` chain over constant
     /// weights becomes one dist per combination of arms, guarded by their
     /// conditions, so `x` is drawn after the variables they read. None for

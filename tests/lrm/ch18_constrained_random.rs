@@ -173,8 +173,9 @@ fn c18_constrained_random_more() {
     );
 }
 
-// §18.5.4: a dist weight that reads rand variables is the weight of the
-// solution drawn, so an item whose weight comes out zero is never picked.
+// A dist weight that reads rand variables is taken as the weight of the
+// solution drawn (xezim's reading of IEEE 1800-2017 §18.5.4), so an item
+// whose weight comes out zero is never picked.
 #[test]
 fn c18_dist_weight_reads_rand_variables() {
     check(

@@ -2441,9 +2441,10 @@ impl Simulator {
         dist.iter().any(|d| other.contains(d))
     }
 
-    /// §18.5.4: a `dist` weight that reads a rand variable (`[1:$] :/ (en ? 0
-    /// : 1)`) is the weight of the solution, so it cannot be judged before
-    /// that variable is drawn. The per-variable trials read whatever value it
+    /// A `dist` weight that reads a rand variable (`[1:$] :/ (en ? 0 : 1)`)
+    /// is taken as the weight of the solution (xezim's reading of IEEE
+    /// 1800-2017 §18.5.4), so it cannot be judged before that variable is
+    /// drawn. The per-variable trials read whatever value it
     /// held when the dist's target came up; the joint solver draws it first.
     pub(super) fn rand_dist_weight_reads_rand(
         &self,

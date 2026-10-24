@@ -753,8 +753,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "sv-parser"
-version = "0.11.2"
-source = "git+https://github.com/aionhw/xezim-core.git?rev=d15cdc39e27a4c0a8a55f7e1d46369181307ead9#d15cdc39e27a4c0a8a55f7e1d46369181307ead9"
+version = "0.11.3"
+source = "git+https://github.com/aionhw/xezim-core.git?rev=48820a89e113df68687a10831e7051fbeb97340e#48820a89e113df68687a10831e7051fbeb97340e"
 dependencies = [
  "serde",
  "serde_json",
@@ -998,7 +998,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xezim"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "ahash",
  "bincode",
@@ -1024,8 +1024,8 @@ dependencies = [
 
 [[package]]
 name = "xezim-core"
-version = "0.11.2"
-source = "git+https://github.com/aionhw/xezim-core.git?rev=d15cdc39e27a4c0a8a55f7e1d46369181307ead9#d15cdc39e27a4c0a8a55f7e1d46369181307ead9"
+version = "0.11.3"
+source = "git+https://github.com/aionhw/xezim-core.git?rev=48820a89e113df68687a10831e7051fbeb97340e#48820a89e113df68687a10831e7051fbeb97340e"
 dependencies = [
  "ahash",
  "bincode",

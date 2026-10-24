@@ -2837,6 +2837,205 @@ impl Simulator {
         None
     }
 
+    /// §8.3.2/§6.20.2 (issue #388): resolve a WHOLE-COLLECTION reference to a
+    /// class-scope ARRAY constant — `pkg::Cls::T`, `Cls::T` from a foreign
+    /// class, or bare `T` inside a method of the declaring class — for the
+    /// `$size` / `inside` / `foreach` / whole-array-copy contexts. The
+    /// element-read arm (`class_param_array_element`) handles one index at a
+    /// time; these contexts need the bounds and an element source up front.
+    /// Returns None when `expr` does not name such a constant.
+    pub(super) fn resolve_class_scope_array_const(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<ClassScopeArrayConst> {
+        let mut expr = expr;
+        while let ExprKind::Paren(inner) = &expr.kind {
+            expr = inner;
+        }
+        let Some(leaf) = Self::receiver_prop_name(expr) else {
+            return None;
+        };
+        if !self.class_member_names().constant_arrays.contains(leaf) {
+            // Qualified package arrays also use this path inside methods.
+            // Ordinary literals, ranges, and bare scalar names return here.
+            let ExprKind::MemberAccess { .. } = &expr.kind else {
+                return None;
+            };
+        }
+        // Peel a `C#(args)` wrapper first, exactly as the element-read arm
+        // does, so a qualified `C#(..)::TBL` binds the specialization's cell.
+        let (spec, stripped) = if Self::expr_has_specialization(expr) {
+            let saved = self.current_spec.clone();
+            let sp = self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
+            if let Some((ref b, ref s)) = sp {
+                self.ensure_spec_statics(b, s);
+            }
+            (sp, Self::strip_spec_shape(expr))
+        } else {
+            (None, expr.clone())
+        };
+        let segs = Self::flatten_member_path(&stripped)?;
+        let n = segs.len();
+        if n == 0 {
+            return None;
+        }
+        let leaf = segs[n - 1].clone();
+        // The class the prefix denotes — longest class part first, so a
+        // nested `outer::inner::LP` prefers the scoped key while a
+        // package-qualified `pkg::Cls::LP` falls through to `Cls`.
+        let mut start: Option<(String, Option<String>)> = None;
+        if n >= 2 {
+            for k in 0..n - 1 {
+                if let Some(r) = self.resolve_class_scope_prefix(&segs[k..n - 1].join("::")) {
+                    start = Some(r);
+                    break;
+                }
+            }
+        }
+        if start.is_none() && n == 1 {
+            // Bare `T`: the enclosing specialization (a method of the
+            // specialization set it) or class context names the scope. A
+            // bare name that resolves to a module-scope array or signal is
+            // not class-scope — leave it to the ordinary arms.
+            if self.module.arrays.contains_key(&leaf) || self.signal_name_to_id.contains_key(&leaf)
+            {
+                return None;
+            }
+            if let Some((b, s)) = self.current_spec.clone() {
+                start = Some((b, Some(s)));
+            } else if let Some(cls) = self.class_context_stack.last().cloned().flatten() {
+                start = Some((cls, None));
+            }
+        }
+        // §6.20.2/§26.3 (issue #388): a PACKAGE-scope array localparam —
+        // `pkg::T`. Inside a class-method body that spelling parses as
+        // MemberAccess, so the flat-Ident arms (`array_operand_name`, the
+        // Ident/Ident fixed-to-fixed copy) never see it and the whole-array
+        // contexts collapsed to zero. The shape row and per-element signals
+        // live under the qualified name `pkg::T` exactly like a module
+        // array, so mirror the static-fixed element source.
+        if start.is_none() && n >= 2 && self.module.packages.contains(&segs[0]) {
+            let joined = segs.join("::");
+            if !self.module.dynamic_arrays.contains(&joined) {
+                if let Some(&(lo, hi, _)) = self.module.arrays.get(&joined) {
+                    // Declared order for `$left`/`$right`/`$increment` and the
+                    // `foreach` visit order: the `arrays` row is normalized,
+                    // so a descending `[5:4]` package array would otherwise
+                    // report its bounds flipped.
+                    let (left, right) = self
+                        .module
+                        .unpacked_decl_dims
+                        .get(&joined)
+                        .and_then(|d| d.first())
+                        .copied()
+                        .unwrap_or((lo, hi));
+                    return Some(ClassScopeArrayConst {
+                        key: joined,
+                        lo,
+                        hi,
+                        left,
+                        right,
+                        param_cell: false,
+                    });
+                }
+            }
+        }
+        let (start_class, _) = start?;
+        // The active spec: the peeled `#(...)` wrapper wins; else the
+        // enclosing one when it denotes the same class.
+        let spec = spec.or_else(|| self.current_spec.clone().filter(|(b, _)| *b == start_class));
+        // Walk the chain for the DECLARING class.
+        let mut cur: Option<String> = Some(start_class);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            let (param_arr, static_fixed, extends, reg_name) = {
+                let Some(cd) = self.module.classes.get(&cn) else {
+                    return None;
+                };
+                (
+                    cd.array_properties.contains_key(&leaf)
+                        && (cd.properties.get(&leaf).is_some_and(|s| s.is_const)
+                            || cd.param_order.iter().any(|p| *p == leaf)),
+                    cd.static_fixed_arrays.iter().any(|(nm, ..)| *nm == leaf),
+                    cd.extends.clone(),
+                    cd.name.clone(),
+                )
+            };
+            if param_arr {
+                let key = self.materialize_class_param_array(&cn, &leaf, spec.as_ref())?;
+                let (lo, hi, descending) = self
+                    .class_param_arrays
+                    .get(&key)
+                    .map(|arr| (arr.lo, arr.hi, arr.descending))
+                    .unwrap_or((0, -1, false));
+                // The materialized cell has this specialization's bounds;
+                // the declaration metadata can still carry default parameters.
+                let (left, right) = if descending { (hi, lo) } else { (lo, hi) };
+                return Some(ClassScopeArrayConst {
+                    key,
+                    lo,
+                    hi,
+                    left,
+                    right,
+                    param_cell: true,
+                });
+            }
+            if static_fixed {
+                // Static fixed-array property: per-element signals
+                // `Cls::name[i]`, shape row in `module.arrays` under
+                // `Cls::name` — the class's REGISTERED name. For a class
+                // declared inside a package the `classes` map key is
+                // package-qualified (`pkg::Cls`) while the shared store
+                // (see the registration in compilation.rs) is keyed by the
+                // bare `cd.name`, so building the key from `cn` would miss.
+                let key = format!("{}::{}", reg_name, leaf);
+                let (lo, hi) = self.module.arrays.get(&key).map(|&(lo, hi, _)| (lo, hi))?;
+                let (left, right) = self
+                    .module
+                    .unpacked_decl_dims
+                    .get(&key)
+                    .and_then(|d| d.first())
+                    .copied()
+                    .unwrap_or((lo, hi));
+                return Some(ClassScopeArrayConst {
+                    key,
+                    lo,
+                    hi,
+                    left,
+                    right,
+                    param_cell: false,
+                });
+            }
+            cur = extends;
+        }
+        None
+    }
+
+    /// One element of a resolved class-scope array constant (issue #388):
+    /// the materialized `class_param_arrays` cell for a param/localparam
+    /// constant, the per-element signal for a static fixed-array property.
+    /// None when the index is out of range or the cell is missing.
+    pub(super) fn class_scope_array_const_elem(
+        &self,
+        c: &ClassScopeArrayConst,
+        idx: i64,
+    ) -> Option<Value> {
+        if idx < c.lo || idx > c.hi {
+            return None;
+        }
+        if c.param_cell {
+            self.class_param_arrays
+                .get(&c.key)
+                .and_then(|arr| arr.elems.get((idx - c.lo) as usize).cloned())
+        } else {
+            self.get_signal_value_by_name(&format!("{}[{}]", c.key, idx))
+        }
+    }
+
     /// Read a static class property, lazily seeding its shared cell from
     /// the declaring class's initial value on first access.
     /// For a class that is NOT parameterized itself, the specialization of

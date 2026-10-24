@@ -523,9 +523,43 @@ impl Simulator {
                 *n >= 2
                     || module.wildcard_shadowed.contains(*base)
                     || module.foreign_displaced.contains(*base)
+                    // A package first hoisted after the local declaration
+                    // never needed to displace its signal during elaboration.
+                    || module.foreign_package_names.contains(*base)
             })
             .map(|(b, _)| b.to_string())
             .collect();
+        // §15.5 / §26.3: package events have the same synchronization identity
+        // through scoped and imported spellings. Prefer owner-specific type
+        // metadata; old artifacts can safely use the bare type only if unique.
+        let mut package_events = Vec::new();
+        for qualified in module.pkg_var_decls.keys() {
+            let Some((_, leaf)) = qualified.split_once("::") else {
+                continue;
+            };
+            let dt = module.var_decl_types.get(qualified).or_else(|| {
+                (!contested.contains(leaf))
+                    .then(|| module.var_decl_types.get(leaf))
+                    .flatten()
+            });
+            if dt.is_some_and(|dt| {
+                matches!(
+                    super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Event,
+                        ..
+                    }
+                )
+            }) {
+                package_events.push((qualified.clone(), leaf.to_string()));
+            }
+        }
+        for (qualified, leaf) in package_events {
+            module.events.insert(qualified.clone());
+            if !contested.contains(&leaf) {
+                module.events.insert(leaf);
+            }
+        }
         if contested.is_empty() {
             return contested;
         }
@@ -3860,6 +3894,7 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             rand_elem_ranges: HashMap::default(),
             class_statics: StaticMap::default(),
+            class_param_arrays: HashMap::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
             spec_scope_stack: Vec::new(),
@@ -3918,6 +3953,7 @@ impl Simulator {
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
             construct_init_depth: 0,
+            pending_class_initializers: HashMap::default(),
             var_class_types: HashMap::default(),
             var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),

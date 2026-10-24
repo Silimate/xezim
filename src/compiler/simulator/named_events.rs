@@ -44,6 +44,16 @@ impl Simulator {
         {
             return q;
         }
+        if self.contested_pkg_vars.contains(raw) {
+            let qualified = match self.pkg_scope_stack.last().and_then(|p| p.as_deref()) {
+                Some(pkg) => self.pkg_var_storage(pkg, raw),
+                None if !self.module.events.contains(raw) => self.contested_pkg_var_in_scope(raw),
+                None => None,
+            };
+            if let Some(key) = qualified.filter(|key| self.module.events.contains(key)) {
+                return key;
+            }
+        }
         let hint = self.name_resolve_hint.borrow().clone();
         if let Some(hint) = hint.filter(|h| !h.is_empty()) {
             for q in [
@@ -195,6 +205,9 @@ impl Simulator {
     /// selectors are evaluated only by the process arming the wait.
     pub(super) fn event_ref_key_static(&self, e: &Expression) -> Option<String> {
         let name = self.hier_expr_to_string(e)?;
+        if let Some(key) = self.package_event_key(&name) {
+            return Some(key);
+        }
         let declared = |key: &str| {
             self.module.events.contains(key)
                 || (key.ends_with(']')
@@ -208,6 +221,14 @@ impl Simulator {
             && declared(&scoped)
         {
             return Some(scoped);
+        }
+        // §26.3: package subroutines retain their declaration scope even
+        // when the calling module declares a same-named event.
+        if !self.contested_pkg_vars.is_empty() && self.contested_pkg_vars.contains(name.as_ref()) {
+            let lexical = self.lexical_event_name(&name);
+            if lexical != name && declared(&lexical) {
+                return Some(lexical);
+            }
         }
         if declared(&name) {
             return Some(name.into_owned());
@@ -226,11 +247,39 @@ impl Simulator {
                 return Some(scoped);
             }
         }
+        if self.contested_pkg_vars.contains(name.as_ref())
+            && let ExprKind::Ident(h) = &e.kind
+        {
+            let resolved = self.resolve_hier_name(h);
+            if declared(&resolved) {
+                return Some(resolved.into_owned());
+            }
+        }
         let canon = Self::resolve_event_key_ref(&self.event_aliases, name.as_ref());
         if declared(canon) {
             return Some(canon.to_string());
         }
         None
+    }
+
+    /// §26.3: package spelling to the package event's actual storage cell.
+    pub(super) fn package_event_key(&self, name: &str) -> Option<String> {
+        let (pkg, leaf) = name.split_once("::").or_else(|| name.split_once('.'))?;
+        if leaf.contains('.') || leaf.contains("::") || !self.module.packages.contains(pkg) {
+            return None;
+        }
+        let qualified = format!("{pkg}::{leaf}");
+        if !self.module.events.contains(&qualified)
+            || !self.module.pkg_var_decls.contains_key(&qualified)
+        {
+            return None;
+        }
+        let key = self
+            .pkg_var_storage(pkg, leaf)
+            .unwrap_or_else(|| leaf.to_string());
+        self.signal_name_to_id
+            .contains_key(key.as_str())
+            .then_some(key)
     }
 
     /// §15.5.5 handle-assignment interception for `lhs = rhs` where `lhs`
@@ -296,11 +345,20 @@ impl Simulator {
     /// `e` is not recognizably an event reference.
     pub(super) fn event_triggered_now(&mut self, e: &Expression) -> Option<bool> {
         let now = self.time;
+        // `h.ce.triggered` / `this.ce.triggered` — a per-instance class event.
+        if let Some(k) = self.expr_handle_event_field(e) {
+            let stamp = Self::instance_event_stamp_key(&k);
+            return Some(self.event_triggered_time.get(stamp.as_str()) == Some(&now));
+        }
+        // `ev.triggered` / `C::ev.triggered` on a static class event.
+        if let Some(k) = self.static_class_event_key(e) {
+            let stamp = Self::instance_event_stamp_key(&k);
+            return Some(self.event_triggered_time.get(stamp.as_str()) == Some(&now));
+        }
         let mut keys: Vec<String> = Vec::new();
         if let Some(k) = self.event_ref_key(e) {
             keys.push(k);
-        }
-        if let ExprKind::Ident(h) = &e.kind {
+        } else if let ExprKind::Ident(h) = &e.kind {
             if let Some(seg) = h.path.last() {
                 if seg.selects.is_empty() {
                     keys.push(seg.name.name.clone());
@@ -321,19 +379,6 @@ impl Simulator {
                     keys.push(sv);
                 }
             }
-        }
-        // `h.ce.triggered` / `this.ce.triggered` — a per-instance class event.
-        if let Some(k) = self.expr_handle_event_field(e) {
-            let stamp = Self::instance_event_stamp_key(&k);
-            if self.event_triggered_time.get(stamp.as_str()) == Some(&now) {
-                return Some(true);
-            }
-            keys.push(stamp);
-        }
-        // `ev.triggered` / `C::ev.triggered` on a static class event.
-        if let Some(k) = self.static_class_event_key(e) {
-            let stamp = Self::instance_event_stamp_key(&k);
-            return Some(self.event_triggered_time.get(stamp.as_str()) == Some(&now));
         }
         if keys.is_empty() {
             return None;

@@ -707,6 +707,57 @@ impl Simulator {
         }
     }
 
+    /// §16.14.8: whether a body operand's attempt is nonvacuous, given how
+    /// far it has resolved. `SvaOutcome` only separates a vacuous success
+    /// from a nonvacuous one; a failure must be judged from the node/state
+    /// itself, because `not` of a vacuous success fails vacuously while a
+    /// failing sequence or implication whose antecedent matched is nonvacuous.
+    pub(super) fn sva_op_nonvacuous(
+        resolved: &Option<SvaOutcome>,
+        node: &SvaNode,
+        st: &SvaState,
+    ) -> bool {
+        match resolved {
+            Some(SvaOutcome::Pass) => true,
+            Some(SvaOutcome::Vacuous) => false,
+            Some(SvaOutcome::Fail) | None => Self::sva_attempt_nonvacuous(node, st),
+        }
+    }
+
+    /// §16.14.8: the nonvacuity of an attempt in its current state, whether
+    /// or not it has resolved. A sequence attempt is always nonvacuous; an
+    /// implication is nonvacuous iff some consequent started by a match was
+    /// nonvacuous; each compound operator keeps a recursive rule. For a
+    /// pending operand the value is how far the attempt has established
+    /// nonvacuity, which is enough because a compound body only resolves an
+    /// operand once it has resolved.
+    fn sva_attempt_nonvacuous(node: &SvaNode, st: &SvaState) -> bool {
+        match (node, st) {
+            // §16.14.8: an evaluation attempt of a sequence expression is
+            // always nonvacuous, whether the sequence matched or failed.
+            (SvaNode::Seq(..), SvaState::Seq(_)) => true,
+            (
+                SvaNode::Impl { .. } | SvaNode::Followed { .. },
+                SvaState::Impl { nonvacuous, .. } | SvaState::Followed { nonvacuous, .. },
+            ) => *nonvacuous,
+            (SvaNode::Not(inner), SvaState::Not(ist)) => Self::sva_attempt_nonvacuous(inner, ist),
+            (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
+            }
+            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb }) => {
+                Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
+            }
+            // §16.14.8: either operand makes `iff` nonvacuous.
+            (SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb }) => {
+                Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
+            }
+            (SvaNode::Until { .. }, SvaState::Until { nonvacuous, .. }) => *nonvacuous,
+            (SvaNode::Eventually(_), SvaState::Leaf(_))
+            | (SvaNode::Always(_), SvaState::Leaf(_)) => true,
+            _ => false,
+        }
+    }
+
     /// Whether a pending property fails at the end of simulation (§16.12.2–3).
     /// A weak sequence holds when the clock stops; property `not` inverts
     /// that result just as it inverts a completed operand's result.
@@ -900,6 +951,7 @@ impl Simulator {
             SvaNode::Followed { .. } => SvaState::Followed {
                 ante: SvaRun::with_env(env.clone()),
                 ante_alive: true,
+                nonvacuous: false,
                 cons: Vec::new(),
             },
             SvaNode::And(a, b) | SvaNode::Iff(a, b) => SvaState::And {
@@ -916,7 +968,8 @@ impl Simulator {
             },
             SvaNode::Until { .. } => SvaState::Until {
                 env: env.clone(),
-                ticks: Vec::new(),
+                ticks: VecDeque::new(),
+                nonvacuous: false,
                 closed: false,
             },
             SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf(env.clone()),
@@ -1305,7 +1358,16 @@ impl Simulator {
                         continue;
                     }
                     match self.sva_advance(cons_node, &mut cst) {
-                        Some(SvaOutcome::Fail) => failed = true,
+                        Some(SvaOutcome::Fail) => {
+                            failed = true;
+                            // §16.14.8: a nonvacuous consequent keeps the
+                            // implication's attempt nonvacuous even when it
+                            // fails (`a |-> b` with `a` matched is nonvacuous,
+                            // and it decides the vacuity of an enclosing `or`).
+                            if Self::sva_attempt_nonvacuous(cons_node, &cst) {
+                                *nonvacuous = true;
+                            }
+                        }
                         Some(SvaOutcome::Pass) => *nonvacuous = true,
                         Some(SvaOutcome::Vacuous) => {}
                         None => keep.push((0, cst)),
@@ -1314,7 +1376,12 @@ impl Simulator {
                 for mut cst in fresh {
                     if *overlap {
                         match self.sva_advance(cons_node, &mut cst) {
-                            Some(SvaOutcome::Fail) => failed = true,
+                            Some(SvaOutcome::Fail) => {
+                                failed = true;
+                                if Self::sva_attempt_nonvacuous(cons_node, &cst) {
+                                    *nonvacuous = true;
+                                }
+                            }
                             Some(SvaOutcome::Pass) => *nonvacuous = true,
                             Some(SvaOutcome::Vacuous) => {}
                             None => keep.push((0, cst)),
@@ -1348,6 +1415,7 @@ impl Simulator {
                 SvaState::Followed {
                     ante: arun,
                     ante_alive,
+                    nonvacuous,
                     cons,
                 },
             ) => {
@@ -1375,7 +1443,14 @@ impl Simulator {
                     match self.sva_advance(cons_node, &mut cst) {
                         Some(SvaOutcome::Pass) => return Some(SvaOutcome::Pass),
                         Some(SvaOutcome::Vacuous) => vacuous = true,
-                        Some(SvaOutcome::Fail) => {}
+                        Some(SvaOutcome::Fail) => {
+                            // §16.14.8: a subsequent compound that resolves
+                            // this `Followed` needs to know whether a failing
+                            // consequent's attempt was nonvacuous.
+                            if Self::sva_attempt_nonvacuous(cons_node, &cst) {
+                                *nonvacuous = true;
+                            }
+                        }
                         None => keep.push((0, cst)),
                     }
                 }
@@ -1384,7 +1459,11 @@ impl Simulator {
                         match self.sva_advance(cons_node, &mut cst) {
                             Some(SvaOutcome::Pass) => return Some(SvaOutcome::Pass),
                             Some(SvaOutcome::Vacuous) => vacuous = true,
-                            Some(SvaOutcome::Fail) => {}
+                            Some(SvaOutcome::Fail) => {
+                                if Self::sva_attempt_nonvacuous(cons_node, &cst) {
+                                    *nonvacuous = true;
+                                }
+                            }
                             None => keep.push((0, cst)),
                         }
                     } else {
@@ -1451,11 +1530,13 @@ impl Simulator {
                 if rb.is_none() {
                     *rb = self.sva_advance(nb, b);
                 }
+                let nonvacuous =
+                    Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b);
                 match (*ra, *rb) {
                     (Some(a), Some(b)) => {
                         Some(if (a == SvaOutcome::Fail) != (b == SvaOutcome::Fail) {
                             SvaOutcome::Fail
-                        } else if a == SvaOutcome::Vacuous && b == SvaOutcome::Vacuous {
+                        } else if !nonvacuous {
                             SvaOutcome::Vacuous
                         } else {
                             SvaOutcome::Pass
@@ -1464,9 +1545,15 @@ impl Simulator {
                     _ => None,
                 }
             }
-            (SvaNode::Until { left, right, .. }, SvaState::Until { env, ticks, closed }) => {
-                self.sva_advance_until(left, right, env, ticks, closed)
-            }
+            (
+                SvaNode::Until { left, right, .. },
+                SvaState::Until {
+                    env,
+                    ticks,
+                    nonvacuous,
+                    closed,
+                },
+            ) => self.sva_advance_until(left, right, env, nonvacuous, ticks, closed),
             (SvaNode::Eventually(e), SvaState::Leaf(env)) => {
                 if self.sva_eval_env(e, env).is_true() {
                     Some(SvaOutcome::Pass)
@@ -1577,6 +1664,21 @@ impl Simulator {
         // cell of its array.
         let mut sels = Vec::new();
         self.collect_sva_sels(&body_expanded, &mut sels);
+        // §16.9.3 / §16.5.1: `$sampled(e)` in an action block reads the
+        // Preponed (slot-entry) value of `e`, whether or not the property
+        // reads `e`. Collect the operands of the action blocks' `$sampled`
+        // calls (their signal ids AND their unpacked-array selects) with the
+        // body's sampled signals BEFORE `fixed` is recorded, so the scalar
+        // operands fall in the retained `[0, fixed)` region and the array
+        // selects flow through the sels pipeline below (issue #509):
+        // `sva_sel_cells` truncates `sampled_ids` to `fixed` and only re-adds
+        // the variable selects' own cells, so anything collected afterwards is
+        // silently dropped on the first Preponed refresh. An unpacked-array
+        // element bypasses collect_sva_signal_ids entirely (its base is not a
+        // signal), so its cells must arrive through the sels pipeline too.
+        for action in [&a.action, &a.else_action].into_iter().flatten() {
+            self.sva_collect_action_sampled(action, &mut sampled_ids, &mut sels);
+        }
         let mut var_sels = Vec::new();
         for mut e in sels {
             match Self::sva_sel_kind(&e) {
@@ -1599,14 +1701,6 @@ impl Simulator {
         let fixed = sampled_ids.len();
         for (e, _) in &var_sels {
             self.sva_cells(e, &mut sampled_ids);
-        }
-        // §16.9.3 / §16.5.1: `$sampled(e)` in an action block reads the
-        // Preponed (slot-entry) value of `e`, whether or not the property
-        // reads `e`. Collect the operands of the action blocks' `$sampled`
-        // calls with the body's sampled signals, so `refresh_sva_preponed`
-        // captures their Preponed snapshots like the property's own operands.
-        for action in [&a.action, &a.else_action].into_iter().flatten() {
-            self.sva_collect_action_sampled(action, &mut sampled_ids);
         }
         // A site registered mid-slot (a procedural assertion, while its
         // procedure runs in the Active region) has no slot-entry samples yet:
@@ -2239,12 +2333,17 @@ impl Simulator {
     /// Collect the signal ids referenced by the `$sampled(...)` calls inside
     /// an assertion action block, so their Preponed snapshots are captured
     /// with the site's other sampled signals (§16.9.3, §16.5.1).
-    pub(super) fn sva_collect_action_sampled(&self, st: &Statement, out: &mut Vec<usize>) {
+    pub(super) fn sva_collect_action_sampled(
+        &self,
+        st: &Statement,
+        out: &mut Vec<usize>,
+        sels: &mut Vec<Expression>,
+    ) {
         use crate::ast::stmt::StatementKind as SK;
         match &st.kind {
             SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
                 for s in stmts {
-                    self.sva_collect_action_sampled(s, out);
+                    self.sva_collect_action_sampled(s, out, sels);
                 }
             }
             SK::If {
@@ -2253,13 +2352,13 @@ impl Simulator {
                 else_stmt,
                 ..
             } => {
-                self.sva_collect_action_sampled_expr(condition, out);
-                self.sva_collect_action_sampled(then_stmt, out);
+                self.sva_collect_action_sampled_expr(condition, out, sels);
+                self.sva_collect_action_sampled(then_stmt, out, sels);
                 if let Some(e) = else_stmt {
-                    self.sva_collect_action_sampled(e, out);
+                    self.sva_collect_action_sampled(e, out, sels);
                 }
             }
-            SK::TimingControl { stmt, .. } => self.sva_collect_action_sampled(stmt, out),
+            SK::TimingControl { stmt, .. } => self.sva_collect_action_sampled(stmt, out, sels),
             SK::For {
                 init,
                 condition,
@@ -2269,78 +2368,92 @@ impl Simulator {
                 for init in init {
                     match init {
                         crate::ast::stmt::ForInit::VarDecl { init, .. } => {
-                            self.sva_collect_action_sampled_expr(init, out)
+                            self.sva_collect_action_sampled_expr(init, out, sels)
                         }
                         crate::ast::stmt::ForInit::Assign { lvalue, rvalue } => {
-                            self.sva_collect_action_sampled_expr(lvalue, out);
-                            self.sva_collect_action_sampled_expr(rvalue, out);
+                            self.sva_collect_action_sampled_expr(lvalue, out, sels);
+                            self.sva_collect_action_sampled_expr(rvalue, out, sels);
                         }
                     }
                 }
                 if let Some(condition) = condition {
-                    self.sva_collect_action_sampled_expr(condition, out);
+                    self.sva_collect_action_sampled_expr(condition, out, sels);
                 }
                 for expr in step {
-                    self.sva_collect_action_sampled_expr(expr, out);
+                    self.sva_collect_action_sampled_expr(expr, out, sels);
                 }
-                self.sva_collect_action_sampled(body, out);
+                self.sva_collect_action_sampled(body, out, sels);
             }
             SK::While { condition, body } | SK::DoWhile { body, condition } => {
-                self.sva_collect_action_sampled_expr(condition, out);
-                self.sva_collect_action_sampled(body, out);
+                self.sva_collect_action_sampled_expr(condition, out, sels);
+                self.sva_collect_action_sampled(body, out, sels);
             }
             SK::Repeat { count, body } => {
-                self.sva_collect_action_sampled_expr(count, out);
-                self.sva_collect_action_sampled(body, out);
+                self.sva_collect_action_sampled_expr(count, out, sels);
+                self.sva_collect_action_sampled(body, out, sels);
             }
             SK::Forever { body } | SK::Foreach { body, .. } => {
-                self.sva_collect_action_sampled(body, out)
+                self.sva_collect_action_sampled(body, out, sels)
             }
             SK::Case { expr, items, .. } => {
-                self.sva_collect_action_sampled_expr(expr, out);
+                self.sva_collect_action_sampled_expr(expr, out, sels);
                 for it in items {
                     for pattern in &it.patterns {
-                        self.sva_collect_action_sampled_expr(pattern, out);
+                        self.sva_collect_action_sampled_expr(pattern, out, sels);
                     }
                     if let Some(guard) = &it.guard {
-                        self.sva_collect_action_sampled_expr(guard, out);
+                        self.sva_collect_action_sampled_expr(guard, out, sels);
                     }
-                    self.sva_collect_action_sampled(&it.stmt, out);
+                    self.sva_collect_action_sampled(&it.stmt, out, sels);
                 }
             }
             SK::BlockingAssign { lvalue, rvalue }
             | SK::NonblockingAssign { lvalue, rvalue, .. } => {
-                self.sva_collect_action_sampled_expr(lvalue, out);
-                self.sva_collect_action_sampled_expr(rvalue, out);
+                self.sva_collect_action_sampled_expr(lvalue, out, sels);
+                self.sva_collect_action_sampled_expr(rvalue, out, sels);
             }
             SK::VarDecl { declarators, .. } => {
                 for d in declarators {
                     if let Some(init) = &d.init {
-                        self.sva_collect_action_sampled_expr(init, out);
+                        self.sva_collect_action_sampled_expr(init, out, sels);
                     }
                 }
             }
-            SK::Return(Some(expr)) => self.sva_collect_action_sampled_expr(expr, out),
+            SK::Return(Some(expr)) => self.sva_collect_action_sampled_expr(expr, out, sels),
             SK::Wait { condition, stmt } => {
-                self.sva_collect_action_sampled_expr(condition, out);
-                self.sva_collect_action_sampled(stmt, out);
+                self.sva_collect_action_sampled_expr(condition, out, sels);
+                self.sva_collect_action_sampled(stmt, out, sels);
             }
-            SK::Expr(e) => self.sva_collect_action_sampled_expr(e, out),
+            SK::Expr(e) => self.sva_collect_action_sampled_expr(e, out, sels),
             _ => {}
         }
     }
 
-    fn sva_collect_action_sampled_expr(&self, e: &Expression, out: &mut Vec<usize>) {
+    fn sva_collect_action_sampled_expr(
+        &self,
+        e: &Expression,
+        out: &mut Vec<usize>,
+        sels: &mut Vec<Expression>,
+    ) {
         match &e.kind {
             // §16.9.3: `$sampled(e)` — the operand's signals are sampled.
+            // §16.5.1: an element of an unpacked array is sampled too. A
+            // $sampled array element has no resolvable "signal id" (an
+            // unpacked array base is not in signal_name_to_id), so its cells
+            // are collected as selects — exactly like the property body's
+            // array reads — and fed into the sels pipeline (sva_cells for
+            // constant indices, var_sels for variable ones). Without this the
+            // operand's cells are never sampled and $sampled reads the live,
+            // not the Preponed, value.
             ExprKind::SystemCall { name, args } if name == "$sampled" => {
                 for a in args {
                     self.collect_sva_signal_ids(a, out);
+                    self.collect_sva_sels(a, sels);
                 }
             }
             ExprKind::SystemCall { args, .. } | ExprKind::Call { args, .. } => {
                 for a in args {
-                    self.sva_collect_action_sampled_expr(a, out);
+                    self.sva_collect_action_sampled_expr(a, out, sels);
                 }
             }
             ExprKind::Binary { left, right, .. }
@@ -2348,26 +2461,26 @@ impl Simulator {
                 lvalue: left,
                 rvalue: right,
             } => {
-                self.sva_collect_action_sampled_expr(left, out);
-                self.sva_collect_action_sampled_expr(right, out);
+                self.sva_collect_action_sampled_expr(left, out, sels);
+                self.sva_collect_action_sampled_expr(right, out, sels);
             }
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
             | ExprKind::MemberAccess { expr: operand, .. } => {
-                self.sva_collect_action_sampled_expr(operand, out)
+                self.sva_collect_action_sampled_expr(operand, out, sels)
             }
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                self.sva_collect_action_sampled_expr(condition, out);
-                self.sva_collect_action_sampled_expr(then_expr, out);
-                self.sva_collect_action_sampled_expr(else_expr, out);
+                self.sva_collect_action_sampled_expr(condition, out, sels);
+                self.sva_collect_action_sampled_expr(then_expr, out, sels);
+                self.sva_collect_action_sampled_expr(else_expr, out, sels);
             }
             ExprKind::Index { expr: base, index } => {
-                self.sva_collect_action_sampled_expr(base, out);
-                self.sva_collect_action_sampled_expr(index, out);
+                self.sva_collect_action_sampled_expr(base, out, sels);
+                self.sva_collect_action_sampled_expr(index, out, sels);
             }
             ExprKind::RangeSelect {
                 expr: base,
@@ -2375,33 +2488,33 @@ impl Simulator {
                 right,
                 ..
             } => {
-                self.sva_collect_action_sampled_expr(base, out);
-                self.sva_collect_action_sampled_expr(left, out);
-                self.sva_collect_action_sampled_expr(right, out);
+                self.sva_collect_action_sampled_expr(base, out, sels);
+                self.sva_collect_action_sampled_expr(left, out, sels);
+                self.sva_collect_action_sampled_expr(right, out, sels);
             }
             ExprKind::Replication { count, exprs } => {
-                self.sva_collect_action_sampled_expr(count, out);
+                self.sva_collect_action_sampled_expr(count, out, sels);
                 for a in exprs {
-                    self.sva_collect_action_sampled_expr(a, out);
+                    self.sva_collect_action_sampled_expr(a, out, sels);
                 }
             }
             ExprKind::Concatenation(exprs) | ExprKind::StreamOp { exprs, .. } => {
                 for a in exprs {
-                    self.sva_collect_action_sampled_expr(a, out);
+                    self.sva_collect_action_sampled_expr(a, out, sels);
                 }
             }
             ExprKind::AssignmentPattern(items) => {
                 for item in items {
-                    self.sva_collect_action_sampled_expr(item.expr(), out);
+                    self.sva_collect_action_sampled_expr(item.expr(), out, sels);
                 }
             }
             ExprKind::NamedArg {
                 expr: Some(expr), ..
-            } => self.sva_collect_action_sampled_expr(expr, out),
+            } => self.sva_collect_action_sampled_expr(expr, out, sels),
             ExprKind::Inside { expr, ranges } => {
-                self.sva_collect_action_sampled_expr(expr, out);
+                self.sva_collect_action_sampled_expr(expr, out, sels);
                 for range in ranges {
-                    self.sva_collect_action_sampled_expr(range, out);
+                    self.sva_collect_action_sampled_expr(range, out, sels);
                 }
             }
             _ => {}

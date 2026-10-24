@@ -24,7 +24,7 @@ module m import pk::*; #(parameter int unsigned W = 8) (
   localparam int N6 = $bits({addr_i, req_i, data_i, crash_o, en_i, busy_d, 1'b0});
   initial $display("%0d %0d %0d %0d", N1, N3, N5, N6);
 endmodule
-module top; cd_t c; m u(.addr_i(32'h0), .req_i(1'b0), .data_i(8'h0), .crash_o(c), .en_i(4'h5)); endmodule
+module top; pk::cd_t c; m u(.addr_i(32'h0), .req_i(1'b0), .data_i(8'h0), .crash_o(c), .en_i(4'h5)); endmodule
 "#;
 
 #[test]

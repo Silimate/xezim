@@ -1,6 +1,7 @@
-//! §10.9: an empty assignment pattern written through an object handle
-//! (`o.q = '{}`) leaves a queue or dynamic array property with no elements,
-//! own or inherited, of any element type.
+//! `o.q = '{}` through an object handle leaves a queue or dynamic array
+//! property with no elements, own or inherited, of any element type, as it
+//! does inside a method. `'{}` is an extension Questa also accepts; IEEE
+//! 1800-2017 spells the empty value `{}` (§7.10).
 
 #[test]
 fn empty_pattern_through_a_handle_clears_the_property() {

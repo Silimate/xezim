@@ -806,3 +806,5 @@ mod class_scoped_assoc_queue_elem;
 mod ref_formal_array_of_coll_row;
 #[path = "classes/output_formal_local_array_elem_member.rs"]
 mod output_formal_local_array_elem_member;
+#[path = "classes/unique_multi_dyn_array.rs"]
+mod unique_multi_dyn_array;

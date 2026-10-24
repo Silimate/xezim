@@ -1978,50 +1978,58 @@ impl Simulator {
         Some((sub, field))
     }
 
-    /// §18.5.5 / §18.5.9 — `unique {c}` over a rand collection: make every
-    /// element pairwise distinct. Elements pinned by an equality constraint
-    /// keep their value; the rest are re-picked from the element's legal
+    /// §18.5.5 / §18.5.9 — `unique {c}` over a rand collection, or
+    /// `unique {a, b}` over several: make every element of the group
+    /// pairwise distinct. Elements pinned by an equality constraint keep
+    /// their value; the rest are re-picked from their own collection's legal
     /// domain (the `foreach … inside {…}` ranges, when any).
     pub(super) fn enforce_unique_coll(
         &mut self,
-        c: &RandColl,
+        cs: &[RandColl],
         constraints: &[ClassConstraint],
         pinned: &HashSet<String>,
     ) {
         use rand::Rng;
-        let keys = self.coll_elem_keys(c);
+        let mut keys: Vec<(String, usize)> = Vec::new();
+        let mut domains: Vec<Vec<(u64, u64)>> = Vec::new();
+        for (ci, c) in cs.iter().enumerate() {
+            let ck = self.coll_elem_keys(c);
+            let allowed = self.elem_allowed_ranges(&c.prop, constraints);
+            let domain: Vec<(u64, u64)> = if allowed.is_empty() {
+                let hi = if c.width >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << c.width) - 1
+                };
+                vec![(0, hi)]
+            } else {
+                allowed
+            };
+            let total: u64 = domain.iter().map(|(l, h)| h - l + 1).sum();
+            if total < ck.len() as u64 {
+                return; // provably impossible — leave for the checker to reject
+            }
+            keys.extend(ck.into_iter().map(|k| (k, ci)));
+            domains.push(domain);
+        }
         if keys.len() < 2 {
             return;
-        }
-        let allowed = self.elem_allowed_ranges(&c.prop, constraints);
-        let domain: Vec<(u64, u64)> = if allowed.is_empty() {
-            let hi = if c.width >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << c.width) - 1
-            };
-            vec![(0, hi)]
-        } else {
-            allowed
-        };
-        let total: u64 = domain.iter().map(|(l, h)| h - l + 1).sum();
-        if total < keys.len() as u64 {
-            return; // provably impossible — leave for the checker to reject
         }
         let mut used: HashSet<u64> = HashSet::default();
         // Pinned elements claim their value first, so a free element never
         // steals it and forces the pinned one to move.
-        for k in &keys {
+        for (k, _) in &keys {
             if pinned.contains(k) {
                 if let Some(v) = self.read_coll_elem(k).and_then(|v| v.to_u64()) {
                     used.insert(v);
                 }
             }
         }
-        for k in &keys {
+        for (k, ci) in &keys {
             if pinned.contains(k) {
                 continue;
             }
+            let domain = &domains[*ci];
             let cur = self.read_coll_elem(k).and_then(|v| v.to_u64());
             let in_domain = cur.is_some_and(|v| domain.iter().any(|(l, h)| v >= *l && v <= *h));
             if let Some(v) = cur {
@@ -2041,7 +2049,7 @@ impl Simulator {
                 }
             }
             if pick.is_none() {
-                'sweep: for (l, h) in &domain {
+                'sweep: for (l, h) in domain {
                     let mut v = *l;
                     loop {
                         if !used.contains(&v) {
@@ -2057,8 +2065,51 @@ impl Simulator {
             }
             if let Some(v) = pick {
                 used.insert(v);
-                self.write_coll_elem(k, Value::from_u64(v, c.width));
+                self.write_coll_elem(k, Value::from_u64(v, cs[*ci].width));
             }
+        }
+    }
+
+    /// §18.5.5: the parser spells `unique {a, b}` as pairwise `a != b`. A
+    /// `!=` between two whole rand dynamic arrays or queues can only come
+    /// from there (§18.3 admits only integral operands), so turn it back
+    /// into a `unique` group over both collections' elements.
+    pub(super) fn regroup_unique_colls(constraints: &mut [ClassConstraint], colls: &[RandColl]) {
+        fn coll_name<'a>(e: &'a Expression, colls: &[RandColl]) -> Option<&'a str> {
+            let ExprKind::Ident(h) = &e.kind else {
+                return None;
+            };
+            let [seg] = h.path.as_slice() else {
+                return None;
+            };
+            let n = seg.name.name.as_str();
+            (seg.selects.is_empty() && colls.iter().any(|c| c.prop == n && c.kind == CollKind::Dyn))
+                .then_some(n)
+        }
+        fn walk(item: &mut ConstraintItem, colls: &[RandColl]) {
+            match item {
+                ConstraintItem::Block(items) => items.iter_mut().for_each(|i| walk(i, colls)),
+                ConstraintItem::Expr(e) => {
+                    let ExprKind::Binary {
+                        op: BinaryOp::Neq,
+                        left,
+                        right,
+                    } = &e.kind
+                    else {
+                        return;
+                    };
+                    if coll_name(left, colls).is_some() && coll_name(right, colls).is_some() {
+                        *item = ConstraintItem::Unique {
+                            exprs: vec![(**left).clone(), (**right).clone()],
+                            span: e.span,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        for con in constraints.iter_mut() {
+            con.items.iter_mut().for_each(|i| walk(i, colls));
         }
     }
 
@@ -2079,12 +2130,15 @@ impl Simulator {
     ) -> Option<bool> {
         match item {
             ConstraintItem::Unique { exprs, .. } => {
-                let name = match exprs.first().map(|e| &e.kind) {
-                    Some(ExprKind::Ident(h)) => h.path.last().map(|s| s.name.name.clone())?,
-                    _ => return None,
-                };
-                let c = colls.iter().find(|c| c.prop == name)?.clone();
-                Some(self.coll_is_unique(&c))
+                let mut cs = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    let ExprKind::Ident(h) = &e.kind else {
+                        return None;
+                    };
+                    let name = &h.path.last()?.name.name;
+                    cs.push(colls.iter().find(|c| &c.prop == name)?.clone());
+                }
+                Some(self.coll_is_unique(&cs))
             }
             ConstraintItem::Foreach {
                 array,
@@ -2674,8 +2728,8 @@ impl Simulator {
     }
 
     /// True when every element of the collection holds a distinct value.
-    pub(super) fn coll_is_unique(&mut self, c: &RandColl) -> bool {
-        let keys = self.coll_elem_keys(c);
+    pub(super) fn coll_is_unique(&mut self, cs: &[RandColl]) -> bool {
+        let keys: Vec<String> = cs.iter().flat_map(|c| self.coll_elem_keys(c)).collect();
         let mut seen: HashSet<u64> = HashSet::default();
         for k in keys {
             let v = self

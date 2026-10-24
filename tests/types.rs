@@ -523,3 +523,5 @@ mod procedural_bitwise_sign_500;
 
 #[path = "types/arithmetic_shift_xz.rs"]
 mod arithmetic_shift_xz;
+#[path = "types/bits_of_concatenation_localparam.rs"]
+mod bits_of_concatenation_localparam;

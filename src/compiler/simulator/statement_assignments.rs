@@ -3719,7 +3719,14 @@ impl Simulator {
                 .map(|an| (an, true))
         };
         let l_res = resolve_coll(self, lvalue);
-        let r_res = resolve_coll(self, rvalue);
+        let mut r_res = resolve_coll(self, rvalue);
+        // `q = aq[k]`: a queue element of an associative array (§7.8, §7.6).
+        if r_res.is_none() && l_res.is_some() && matches!(rvalue.kind, ExprKind::Index { .. }) {
+            r_res = self
+                .nested_index_name(rvalue)
+                .filter(|n| self.module.dynamic_arrays.contains(n))
+                .map(|n| (n, false));
+        }
         // Extract the resolved names now — the both-collection `if let`
         // below consumes `l_res`/`r_res`. Used by the mixed
         // dynamic↔fixed path after it.

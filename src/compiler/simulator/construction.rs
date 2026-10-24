@@ -3196,6 +3196,23 @@ impl Simulator {
                 };
                 if is_queue_init {
                     let scoped_q = format!("{}#{}", handle, pname);
+                    // An unpacked-struct element (one with a string member,
+                    // say) is stored member-wise as `<prop>[i].<m>`, like the
+                    // fixed-array case below; one packed value per element
+                    // left every member 0.
+                    if let ExprKind::AssignmentPattern(items) = &init.kind
+                        && let Some(su) = self
+                            .collection_elem_struct(handle, &pname)
+                            .filter(Self::spreads_member_wise)
+                    {
+                        self.set_queue_size(&scoped_q, items.len() as u64);
+                        let base = prop_ident_expr(&pname);
+                        for (i, item) in items.iter().enumerate() {
+                            let elem = Self::index_expr(&base, i as i64);
+                            self.assign_class_unpacked_elem(&elem, item.expr(), &su);
+                        }
+                        continue;
+                    }
                     self.populate_queue_from_init(&scoped_q, &init);
                     continue;
                 }
@@ -3228,22 +3245,7 @@ impl Simulator {
                         // write now uses.
                         if let Some(su) = self.class_prop_struct(handle, &pname) {
                             if Self::spreads_member_wise(&su) {
-                                let base = Expression::new(
-                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                                        root: None,
-                                        path: vec![crate::ast::expr::HierPathSegment {
-                                            name: crate::ast::Identifier {
-                                                name: pname.clone(),
-                                                span: crate::ast::Span::dummy(),
-                                            },
-                                            selects: Vec::new(),
-                                        }],
-                                        span: crate::ast::Span::dummy(),
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
-                                    }),
-                                    crate::ast::Span::dummy(),
-                                );
+                                let base = prop_ident_expr(&pname);
                                 let elems = self.pattern_elems(items, &indices);
                                 let owned: Vec<(usize, Option<Expression>)> =
                                     elems.into_iter().map(|e| e.cloned()).enumerate().collect();
@@ -3733,4 +3735,23 @@ impl Simulator {
         }
         self.exec_method_in_class_hierarchy(handle, &class_name, method_name, args)
     }
+}
+
+fn prop_ident_expr(name: &str) -> Expression {
+    Expression::new(
+        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path: vec![crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: name.to_string(),
+                    span: crate::ast::Span::dummy(),
+                },
+                selects: Vec::new(),
+            }],
+            span: crate::ast::Span::dummy(),
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        }),
+        crate::ast::Span::dummy(),
+    )
 }

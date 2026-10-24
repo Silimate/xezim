@@ -790,3 +790,5 @@ mod static_class_members_382;
 
 #[path = "classes/class_queue_empty_pattern.rs"]
 mod class_queue_empty_pattern;
+#[path = "classes/class_queue_struct_pattern_init.rs"]
+mod class_queue_struct_pattern_init;

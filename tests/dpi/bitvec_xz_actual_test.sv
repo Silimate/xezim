@@ -1,5 +1,6 @@
 // A logic actual with x / z bits bound to a two-state `bit [N]` DPI formal
-// converts as by a cast (§6.24.1, H.7.4): the unknown bits reach C as 0.
+// converts as by assignment (IEEE 1800-2017 §35.6.1, §6.11.2): the unknown
+// bits reach C as 0.
 module bitvec_xz_actual;
   import "DPI-C" function void bxz_in(input bit [31:0] v);
   import "DPI-C" function void bxz_in_wide(input bit [69:0] v);

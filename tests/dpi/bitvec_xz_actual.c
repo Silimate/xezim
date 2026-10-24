@@ -1,6 +1,6 @@
-/* A 4-state actual bound to a two-state `bit [N]` formal converts as by a
- * cast (IEEE 1800 §6.24.1, Annex H.7.4): x and z bits reach C as 0, so the
- * svBitVecVal words hold only the actual's known 1 bits. */
+/* A 4-state actual bound to a two-state `bit [N]` formal converts as by
+ * assignment (IEEE 1800-2017 §35.6.1, §6.11.2): x and z bits reach C as 0,
+ * so the svBitVecVal words hold only the actual's known 1 bits. */
 #include "svdpi.h"
 
 static svBitVecVal seen[3];

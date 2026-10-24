@@ -519,8 +519,8 @@ fn dpi_issue_306_enum_shapes_test() {
 
 #[test]
 fn dpi_bitvec_xz_actual_test() {
-    // §6.24.1 / H.7.4: x and z bits of a logic actual bound to a `bit [N]`
-    // formal reach C as 0 in the svBitVecVal words.
+    // IEEE 1800-2017 §35.6.1 / §6.11.2: x and z bits of a logic actual bound
+    // to a `bit [N]` formal reach C as 0 in the svBitVecVal words.
     assert_dpi_pass(
         "tests/dpi/bitvec_xz_actual.c",
         "bitvec_xz_actual",

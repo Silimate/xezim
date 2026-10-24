@@ -788,8 +788,8 @@ impl Simulator {
     }
 
     /// Value -> svBitVecVal words for a two-state `bit [N]` formal: the actual
-    /// converts as by a cast (§6.24.1, H.7.4), so X and Z bits read as 0.
-    /// The aval plane alone carries X as 1.
+    /// converts as by assignment (IEEE 1800-2017 §35.6.1, §6.11.2), so X and Z
+    /// bits read as 0. The aval plane alone carries X as 1.
     pub(super) fn dpi_value_to_bit_words(v: &Value, width: u32) -> Vec<u32> {
         let (aval, bval) = Self::dpi_value_to_logic_words(v, width);
         aval.iter().zip(&bval).map(|(a, b)| a & !b).collect()

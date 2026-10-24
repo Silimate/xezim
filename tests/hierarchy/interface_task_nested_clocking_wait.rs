@@ -1,7 +1,8 @@
-//! §14.3: `@cb` inside an interface task that another task of the same
-//! interface calls waits for the clocking block's clock edge. The block
-//! resolved only from the innermost task frame, so a nested call (`outer`
-//! -> `wait_clks` -> `repeat (n) @cb`) found no block and returned at once.
+//! IEEE 1800-2017 §14.10: `@cb` inside an interface task that another task
+//! of the same interface calls waits for the clocking block's clock edge.
+//! The block resolved only from the innermost task frame, so a nested call
+//! (`outer` -> `wait_clks` -> `repeat (n) @cb`) found no block and returned
+//! at once.
 
 use xezim::simulate;
 

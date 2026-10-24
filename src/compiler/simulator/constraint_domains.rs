@@ -343,6 +343,51 @@ impl Simulator {
         .filter(|w| *w > 0)
     }
 
+    /// Width of a method local or formal whose type is sized by the executing
+    /// class's parameters (IEEE 1800-2017 §8.25): a packed range over a class
+    /// value parameter or localparam, written directly (`logic [W-1:0]`) or
+    /// through a class-local typedef (`typedef logic [W-1:0] w_t;`). `None`
+    /// for any other type, or outside a class.
+    pub(super) fn class_scoped_decl_width(&mut self, dt: &DataType) -> Option<u32> {
+        let Some(Some(ctx)) = self.class_context_stack.last() else {
+            return None;
+        };
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return self.class_param_sized_width(dt);
+        };
+        if !dimensions.is_empty()
+            || !type_args.is_empty()
+            || name.has_scope()
+            || !self
+                .class_member_names()
+                .param_sized_typedefs
+                .contains(&name.name.name)
+        {
+            return None;
+        }
+        let mut cur = Some(ctx.clone());
+        let mut target = None;
+        let mut hops = 0;
+        while let Some(cn) = cur {
+            hops += 1;
+            let Some(cd) = self.module.classes.get(&cn).filter(|_| hops < 64) else {
+                break;
+            };
+            if let Some(t) = cd.typedef_targets.get(&name.name.name) {
+                target = Some(t.clone());
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        self.class_param_sized_width(&target?)
+    }
+
     /// Whether the type named by a type-parameter binding is 2-state.
     pub(super) fn concrete_type_two_state(&self, name: &str) -> bool {
         let base = name

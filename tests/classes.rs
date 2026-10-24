@@ -210,6 +210,8 @@ mod class_packed_and_type_params;
 mod class_param_property_widths;
 #[path = "classes/class_param_siblings.rs"]
 mod class_param_siblings;
+#[path = "classes/class_param_sized_method_widths.rs"]
+mod class_param_sized_method_widths;
 #[path = "classes/class_program_test.rs"]
 mod class_program_test;
 #[path = "classes/class_property_packed_selects.rs"]

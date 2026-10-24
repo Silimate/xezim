@@ -85,6 +85,54 @@ impl Simulator {
         Some(out)
     }
 
+    pub(super) fn resolve_type_width_in_process_scope(
+        &mut self,
+        dt: &crate::ast::types::DataType,
+    ) -> u32 {
+        use crate::compiler::scoped_arrays;
+        let mut view = HashMap::default();
+        for arg in scoped_arrays::query_operands(dt) {
+            let Some(name) = scoped_arrays::operand_name(arg) else {
+                continue;
+            };
+            let lexical = self.dyn_name_lookup(&name).map(str::to_string);
+            let scope = self
+                .name_resolve_hint
+                .borrow()
+                .clone()
+                .or_else(|| self.process_scope_hint.get(&self.current_pid).cloned());
+            let canonical = lexical
+                .or_else(|| {
+                    scope.as_ref().and_then(|scope| {
+                        let key = format!("{scope}.{name}");
+                        self.module.arrays.contains_key(&key).then_some(key)
+                    })
+                })
+                .or_else(|| self.array_operand_name(arg))
+                .or_else(|| self.module.arrays.contains_key(&name).then(|| name.clone()))
+                .or_else(|| {
+                    let key = name.replace('.', "::");
+                    self.module.arrays.contains_key(&key).then_some(key)
+                });
+            if let Some((key, shape)) = canonical.and_then(|key| {
+                self.module
+                    .arrays
+                    .get(&key)
+                    .copied()
+                    .map(|shape| (key, shape))
+            }) {
+                view.insert(name, shape);
+                view.insert(key, shape);
+            }
+        }
+        scoped_arrays::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+            &view,
+        )
+    }
+
     /// `format!("{}{}", base, suffix)` without the formatting machinery.
     pub(super) fn name_with_suffix(base: &str, suffix: &str) -> String {
         let mut out = String::with_capacity(base.len() + suffix.len());
@@ -1931,6 +1979,37 @@ impl Simulator {
     ) -> bool {
         if let Some(r) = self.try_string_index_char_write(expr, index, val) {
             return r;
+        }
+        // §11.5.1: a hierarchical class property's selected element lives
+        // in the heap/shared static cell, rather than a synthesized signal.
+        if let ExprKind::Ident(hier) = &expr.kind
+            && let Some(h) = self.hier_parent_handle(hier)
+        {
+            let prop = &hier.path.last().unwrap().name.name;
+            let cur = self
+                .static_read_via_handle(h, None, None, prop)
+                .or_else(|| self.read_member_value(h, prop));
+            if let Some(mut cur) = cur {
+                let idx = self.eval_expr(index);
+                if idx.has_xz() {
+                    return false;
+                }
+                let range = if let Some(dims) = self.class_prop_packed_dims(h, prop) {
+                    Self::packed_chain_slice(cur.width as u64, &dims, &[idx])
+                } else {
+                    idx.to_i64()
+                        .filter(|&i| i >= 0 && i < cur.width as i64)
+                        .map(|i| (i as u64, 1))
+                };
+                let Some((lo, width)) = range else {
+                    return false;
+                };
+                let rhs = val.resize_for_assign(width as u32);
+                for bit in 0..width as usize {
+                    cur.set_bit(lo as usize + bit, rhs.get_bit(bit));
+                }
+                return self.set_prop_if_changed(h, prop, cur);
+            }
         }
         // §7.4.1 / §11.5.1: BIT write into an ELEMENT of an unpacked
         // array/queue/assoc whose declared packed range needs label
@@ -4024,6 +4103,38 @@ impl Simulator {
         }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
+                // §7.2.1/§23.7: preserve the full registered struct path
+                // before leaf-name fallback can select an unrelated observer.
+                if !self.module.classes.is_empty()
+                    && !self.module.packed_struct_fields.is_empty()
+                    && hier.path.len() > 2
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                {
+                    let dotted = hier
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let name = dotted
+                        .strip_prefix(&format!("{}.", self.module.name))
+                        .unwrap_or(&dotted);
+                    if let Some((base, off, width)) = self.packed_leaf_of_hier(name)
+                        && let Some(cur) = self.get_signal_value_by_name(&base)
+                    {
+                        let mut next = cur.clone();
+                        let rhs =
+                            self.packed_member_piece(&base, name, val.resize_for_assign(width));
+                        for bit in 0..width as usize {
+                            next.set_bit(off as usize + bit, rhs.get_bit(bit));
+                        }
+                        if next == cur {
+                            return false;
+                        }
+                        self.set_signal_value_by_name(&base, next);
+                        return true;
+                    }
+                }
                 // LRM §25.9: virtual-interface alias (task/function
                 // formal frame, or a plain `virtual <iface>` variable) —
                 // rewrite `vif.member` to `<bound>.member`. Must fire
@@ -4090,6 +4201,34 @@ impl Simulator {
                             };
                             self.local_stack[last_idx].insert(joined, fitted);
                             return true;
+                        }
+                    }
+                }
+                // §8.4: `tb.u_leaf.obj.field = v` writes the OBJECT.  The dotted
+                // name used to fall through to the signal table, which resolves
+                // the leaf flat and landed on tb's own `field` — the object kept
+                // its old value while a read through a handle showed the new one.
+                // Only taken when the parent really is a live object that declares
+                // the member, so struct/net lvalues are untouched.
+                if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    if let Some(h) = self.hier_parent_handle(hier) {
+                        let member_name = hier.path[hier.path.len() - 1].name.name.as_str();
+                        if self.read_member_value(h, member_name).is_some()
+                            || self
+                                .static_member_target(h, None, None, member_name)
+                                .is_some()
+                        {
+                            if let Some(ok) = self.static_write_via_handle(
+                                h,
+                                None,
+                                None,
+                                member_name,
+                                val.clone(),
+                            ) {
+                                return ok;
+                            }
+                            let fitted = self.fit_class_prop(h, member_name, &val);
+                            return self.set_prop_if_changed(h, member_name, fitted);
                         }
                     }
                 }
@@ -4905,6 +5044,26 @@ impl Simulator {
                             }
                             return changed;
                         }
+                    }
+                }
+                // §11.5.1: splice a selected class property back into the
+                // object, including static and nested hierarchical receivers.
+                if let ExprKind::Ident(hier) = &expr.kind
+                    && let Some(h) = self.hier_parent_handle(hier)
+                {
+                    let member = &hier.path.last().unwrap().name.name;
+                    if let Some(mut cur) = self
+                        .static_read_via_handle(h, None, None, member)
+                        .or_else(|| self.read_member_value(h, member))
+                    {
+                        if oob_write_discard(msb_i, src_base, cur.width) {
+                            return false;
+                        }
+                        let rhs = val.resize_for_assign((msb_i - src_base + 1).max(1) as u32);
+                        for bit in lsb..=msb.min(cur.width.saturating_sub(1) as usize) {
+                            cur.set_bit(bit, rhs.get_bit((bit as i64 - src_base) as usize));
+                        }
+                        return self.set_prop_if_changed(h, member, cur);
                     }
                 }
                 // Fast path: resolve target signal_id directly (avoids format!

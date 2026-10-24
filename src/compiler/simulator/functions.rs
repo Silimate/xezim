@@ -341,6 +341,11 @@ impl Simulator {
                     || self.module.arrays_2d.contains_key(&port.name.name)
                     || self.module.arrays_nd.contains_key(&port.name.name);
                 if let Some(info) = self.bind_array_arg(port, actual) {
+                    // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                    locals.insert(
+                        format!("\u{1}array_formal:{}", port.name.name),
+                        Value::zero(1),
+                    );
                     // §7.4.1 / §13.5 / §21.2.1.7: every unpacked formal
                     // retains its element type, including packed geometry.
                     self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
@@ -2091,6 +2096,11 @@ impl Simulator {
             // caller's elements in, and copy them back for an out/inout/ref.
             if let Some(actual) = actual {
                 if let Some(info) = self.bind_array_arg(port, actual) {
+                    // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                    locals.insert(
+                        format!("\u{1}array_formal:{}", port.name.name),
+                        Value::zero(1),
+                    );
                     if matches!(
                         port.direction,
                         PortDirection::Output | PortDirection::Inout | PortDirection::Ref

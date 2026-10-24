@@ -7119,6 +7119,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// it; enclosing inline frames are tried otherwise.
     fn decl_width_in(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> u32 {
         use crate::ast::types::DataType;
+        let inst_scope = self.scope_hint.as_deref().or(scope);
         let mut cur = dt;
         let mut owner = scope;
         let mut factor = 1u32;
@@ -7130,11 +7131,7 @@ impl<'a> BytecodeCompiler<'a> {
                 span,
             } = cur
             else {
-                return factor.saturating_mul(crate::compiler::elaborate::resolve_type_width(
-                    cur,
-                    self.params,
-                    self.typedefs,
-                ));
+                return factor.saturating_mul(self.decl_width_with_arrays(cur, inst_scope));
             };
             if !type_args.is_empty() || name.has_specialized_scope() {
                 break;
@@ -7146,11 +7143,7 @@ impl<'a> BytecodeCompiler<'a> {
                 dimensions: dimensions.clone(),
                 span: *span,
             };
-            factor = factor.saturating_mul(crate::compiler::elaborate::resolve_type_width(
-                &dims,
-                self.params,
-                self.typedefs,
-            ));
+            factor = factor.saturating_mul(self.decl_width_with_arrays(&dims, inst_scope));
             if self.runtime_type_param(name, owner) {
                 return crate::compiler::elaborate::resolve_type_width(dt, self.params, None);
             }
@@ -7169,7 +7162,36 @@ impl<'a> BytecodeCompiler<'a> {
                 break;
             }
         }
-        crate::compiler::elaborate::resolve_type_width(dt, self.params, self.typedefs)
+        self.decl_width_with_arrays(dt, inst_scope)
+    }
+
+    fn decl_width_with_arrays(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> u32 {
+        use crate::compiler::scoped_arrays;
+        let mut view = HashMap::default();
+        for arg in scoped_arrays::query_operands(dt) {
+            let Some(name) = scoped_arrays::operand_name(arg) else {
+                continue;
+            };
+            let shape = if let Some(local) = self.local_var_array.get(&name) {
+                Some((
+                    local.lo,
+                    local.lo + local.regs.len() as i64 - 1,
+                    local.elem_w,
+                ))
+            } else if let Some(&(_, width, len, lo)) = self.local_array_regs.get(&name) {
+                Some((lo, lo + len as i64 - 1, width))
+            } else {
+                scope
+                    .and_then(|scope| self.arrays.get(&cat_dot(scope, &name)))
+                    .or_else(|| self.arrays.get(&name))
+                    .or_else(|| self.arrays.get(&name.replace('.', "::")))
+                    .copied()
+            };
+            if let Some(shape) = shape {
+                view.insert(name, shape);
+            }
+        }
+        scoped_arrays::resolve_type_width(dt, self.params, self.typedefs, &view)
     }
 
     /// Packed ELEMENT width of a declared type, for register-backed locals:
@@ -13660,13 +13682,10 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     sub_ctx
                 };
-                // §11.8.2: a comparison's operands take each other's type, so
-                // an unsigned side makes a division or sign extension on the
-                // other side unsigned too (`(a / b) > u` divides unsigned).
-                let left_unsigned =
-                    joint_unsigned && (!is_self_determined || has_context_type(left));
-                let right_unsigned =
-                    joint_unsigned && (!is_self_determined || has_context_type(right));
+                // §11.8.2: comparison operands determine each other's type
+                // before evaluation, including nested arithmetic, not only shifts.
+                let left_unsigned = joint_unsigned;
+                let right_unsigned = joint_unsigned;
                 let l = self.compile_expr_typed(left, sub_ctx, left_unsigned)?;
                 // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
                 // width never affects the result, so it keeps its own.
@@ -18705,7 +18724,6 @@ impl<'a> BytecodeCompiler<'a> {
     fn expr_signedness(&mut self, e: &Expression) -> Option<bool> {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
-            // §5.7.1: an unsized unbased literal ('0, '1, 'x, 'z) is unsigned.
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(false),
             ExprKind::Paren(i) => self.expr_signedness(i),
             // §20/§21: an `int`/`integer`-valued system function is SIGNED
@@ -18735,8 +18753,21 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // Part-selects, concatenations and replications are UNSIGNED
             // regardless of their operands (§11.8.1).
-            ExprKind::Index { .. }
-            | ExprKind::RangeSelect { .. }
+            ExprKind::Index { expr, .. } => {
+                // §7.4: an unpacked element retains its declared type; only
+                // a packed bit-select is necessarily unsigned (§11.8.1).
+                if let Some(id) = self.const_multi_dim_array_elem_signal_id(e) {
+                    return self.signal_signed.get(id).copied();
+                }
+                if let ExprKind::Ident(h) = &expr.kind
+                    && let Some(name) = self.lookup_array_name(h)
+                {
+                    let first = self.array_first_id?.get(name.as_str())?.0;
+                    return self.signal_signed.get(first).copied();
+                }
+                self.operand_scrub_is_noop(e).then_some(false)
+            }
+            ExprKind::RangeSelect { .. }
             | ExprKind::Concatenation(_)
             | ExprKind::Replication { .. } => Some(false),
             ExprKind::SystemCall { name, args } => match name.as_str() {
@@ -18747,7 +18778,13 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => None,
             },
             ExprKind::Unary { op, operand } => match op {
-                UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.expr_signedness(operand),
+                UnaryOp::Plus
+                | UnaryOp::Minus
+                | UnaryOp::BitNot
+                | UnaryOp::PreIncr
+                | UnaryOp::PreDecr
+                | UnaryOp::PostIncr
+                | UnaryOp::PostDecr => self.expr_signedness(operand),
                 // Reductions and ! are 1-bit unsigned.
                 _ => Some(false),
             },
@@ -28068,43 +28105,6 @@ pub(crate) fn has_context_shift(e: &Expression) -> bool {
             else_expr,
             ..
         } => has_context_shift(then_expr) || has_context_shift(else_expr),
-        _ => false,
-    }
-}
-
-/// An operand whose value depends on the type of the expression around it:
-/// an operator whose operands are context-determined (§11.6.1), so §11.8.2
-/// converts them to the expression's type before they are extended or
-/// combined. A division, an arithmetic shift or a sign extension inside it
-/// gives a different result once the expression is unsigned, so the type
-/// must reach it before it is evaluated; clearing the sign of its result
-/// afterwards is too late. A leaf (a name, a literal, a call, a select or a
-/// concatenation) is self-determined and is converted as a whole.
-pub(crate) fn has_context_type(e: &Expression) -> bool {
-    match &e.kind {
-        ExprKind::Binary { op, .. } => matches!(
-            op,
-            BinaryOp::Add
-                | BinaryOp::Sub
-                | BinaryOp::Mul
-                | BinaryOp::Div
-                | BinaryOp::Mod
-                | BinaryOp::BitAnd
-                | BinaryOp::BitOr
-                | BinaryOp::BitXor
-                | BinaryOp::BitXnor
-                | BinaryOp::ShiftLeft
-                | BinaryOp::ShiftRight
-                | BinaryOp::ArithShiftLeft
-                | BinaryOp::ArithShiftRight
-                | BinaryOp::Power
-        ),
-        ExprKind::Unary {
-            op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
-            ..
-        }
-        | ExprKind::Conditional { .. } => true,
-        ExprKind::Paren(inner) => has_context_type(inner),
         _ => false,
     }
 }

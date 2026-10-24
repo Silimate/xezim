@@ -37,6 +37,8 @@ mod class_interface_same_name;
 mod class_member_name_clash;
 #[path = "classes/class_method_named_put_from_function.rs"]
 mod class_method_named_put_from_function;
+#[path = "classes/class_scope_array_const_whole_refs.rs"]
+mod class_scope_array_const_whole_refs;
 #[path = "classes/compiled_method_static_locals.rs"]
 mod compiled_method_static_locals;
 #[path = "classes/class_param_default_scope.rs"]
@@ -388,6 +390,8 @@ mod randomize_wide_open;
 mod randomize_shift_mask_wide_peer;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
+#[path = "classes/randomize_std_failed_restores_arrays.rs"]
+mod randomize_std_failed_restores_arrays;
 #[path = "classes/randomize_object_arrays.rs"]
 mod randomize_object_arrays;
 #[path = "classes/randomize_issue_255_full.rs"]
@@ -779,3 +783,20 @@ mod foreach_array_of_collections_elem;
 
 #[path = "classes/class_assignment_types_499.rs"]
 mod class_assignment_types_499;
+
+#[path = "classes/class_param_array_reads_503.rs"]
+mod class_param_array_reads_503;
+
+#[path = "classes/randomize_std_static_subroutine_locals_513.rs"]
+mod randomize_std_static_subroutine_locals;
+
+#[path = "classes/class_field_dependency_order.rs"]
+mod class_field_dependency_order;
+#[path = "classes/hier_class_member_access.rs"]
+mod hier_class_member_access;
+
+#[path = "classes/review_array_constants.rs"]
+mod review_array_constants;
+
+#[path = "classes/review_randomize_rollback.rs"]
+mod review_randomize_rollback;

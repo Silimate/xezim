@@ -1109,7 +1109,27 @@ impl Simulator {
                     return None;
                 }
                 let dt = self.module.var_decl_types.get(&name)?;
-                let (element_type, dimensions, width) = self.declared_packed_type(dt)?;
+                let (element_type, mut dimensions, mut width) = self.declared_packed_type(dt)?;
+                // §23.10: a declaration inside an instantiated module sizes its
+                // dimensions with THAT instance's parameters. The declaration
+                // above was evaluated against the design-wide table, where a
+                // child's `N` is stored as `<inst>.N`: a bare `N` misses (the
+                // shape collapses to a plain 2-bit vector, so `mv[1][0]` read
+                // one bit) or hits an unrelated top-level `N`. Elaboration
+                // recorded this signal's dimensions per instance; use them.
+                if let Some(recorded) = self.module.packed_full_dims.get(&name)
+                    && matches!(
+                        element_type,
+                        DataType::IntegerVector { .. } | DataType::Implicit { .. }
+                    )
+                {
+                    let mut total: u32 = 1;
+                    for &(l, r) in recorded {
+                        total = total.checked_mul(u32::try_from(l.abs_diff(r) + 1).ok()?)?;
+                    }
+                    dimensions = recorded.clone();
+                    width = total;
+                }
                 let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(&name) {
                     dims.len()
                 } else if self.module.arrays_2d.contains_key(&name) {
@@ -1842,30 +1862,48 @@ impl Simulator {
                 arrays.push((written, nm, idx, w.max(1), signed, ev));
                 continue;
             }
-            if let Some((root, _)) = name.split_once('.') {
+            if let Some((parent, _)) = name.rsplit_once('.') {
                 // A field of a packed struct that is itself a target: a view
-                // of that variable, not a variable of its own.
-                if targets.iter().any(|(n, _)| n == root) {
+                // of that variable, not a variable of its own.  Compare the
+                // IMMEDIATE parent: a static subroutine local's resolved name
+                // is dotted the same way (`<fn>.<var>`), and matching only the
+                // FIRST segment never matched `<fn>.<var>`'s parent, so every
+                // static local was mistaken for a field view and dropped the
+                // whole call out of the joint solver.
+                if targets.iter().any(|(n, _)| n == parent) {
                     continue;
                 }
-                return Err(rand_csp::CspOutcome::NotApplicable);
             }
             if !matches!(lv.kind, ExprKind::Ident(_)) {
+                // `obj.f` / `s.g.h` — a field access this solve does not model.
+                // A plain identifier is only *scope*-qualified (`<fn>.<var>`),
+                // which is a real variable of the call and joins below.
                 return Err(rand_csp::CspOutcome::NotApplicable);
             }
             let cur = self.eval_expr(lv);
             if cur.is_real {
                 return Err(rand_csp::CspOutcome::NotApplicable);
             }
+            // The name the constraints write this variable by.  A static
+            // subroutine local resolves to `<fn>.<var>`, but the `with {…}`
+            // block names it `<var>`; the solve matches operands by the name
+            // as written (`csp_solve_path`) and reads and writes through `lv`
+            // (`csp.scope`), so it registers under the written name — exactly
+            // as the array path above does.
+            let written = match &lv.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name != *name =>
+                {
+                    h.path[0].name.name.clone()
+                }
+                _ => name.clone(),
+            };
             // A local wider than 64 bits joins as segments (`csp_scope`).
             let ev = enum_vals(self, name);
-            scalars.push((
-                name.clone(),
-                lv.clone(),
-                cur.width.max(1),
-                cur.is_signed,
-                ev,
-            ));
+            scalars.push((written, lv.clone(), cur.width.max(1), cur.is_signed, ev));
         }
         Ok((scalars, arrays))
     }
@@ -3789,6 +3827,42 @@ impl Simulator {
                     if let Some(rv) = self.member_array_query(&sn, arg, dim) {
                         return rv;
                     }
+                    // §8.3.2/§6.20.2 (issue #388): the query on a class-scope
+                    // ARRAY constant — `$size(pkg::Cls::T)`, `$size(Cls::T)`
+                    // (which parses as a MemberAccess when the prefix is a
+                    // plain class), bare `$size(T)` in a method of the
+                    // declaring class. The constant has no module-scope shape
+                    // row, so the query fell through to the operand's packed
+                    // width (32) while the element reads were right.
+                    if dim == 1 {
+                        if let Some(c) = self.resolve_class_scope_array_const(arg) {
+                            let size = (c.hi - c.lo + 1).max(0) as u64;
+                            // Declared bounds in source order: a descending
+                            // `[5:4]` constant reports `$left` 5 / `$right` 4
+                            // and `$increment` 1 (§20.7); the normalized
+                            // (lo, hi) pair covers `$low`/`$high`/`$size`.
+                            // Falls back to the normalized pair (ascending)
+                            // when no declared-dimension row was recorded.
+                            let result = match sn.as_str() {
+                                "$left" => c.left as u64,
+                                "$right" => c.right as u64,
+                                "$high" => c.hi as u64,
+                                "$low" => c.lo as u64,
+                                "$size" => size,
+                                "$increment" => {
+                                    if c.left >= c.right {
+                                        1
+                                    } else {
+                                        0u64.wrapping_sub(1)
+                                    }
+                                }
+                                _ => 0,
+                            };
+                            let mut rv = Value::from_u64(result & 0xFFFF_FFFF, 32);
+                            rv.is_signed = true;
+                            return rv;
+                        }
+                    }
                     // Resolve the operand to the name its declared bounds
                     // are registered under. A plain / hierarchical Ident
                     // resolves as it always did; a HANDLE-QUALIFIED member
@@ -4278,9 +4352,21 @@ impl Simulator {
                         self.collect_sva_signal_ids(&e, &mut ids);
                         ids.sort_unstable();
                         ids.dedup();
+                        let index_saved = self.install_preponed(&ids);
+                        // §16.5.1: an element of an unpacked array has no
+                        // "signal id" through collect_sva_signal_ids, but its
+                        // Preponed sample lives at the cell's id in
+                        // `sva_preponed`. Collect the cell ids too (sva_cells
+                        // resolves `mem[k]` to its cell id) so install_preponed
+                        // swaps in the Preponed values during the eval below,
+                        // immune to any in-slot writes to that cell.
+                        self.sva_cells(&e, &mut ids);
+                        ids.sort_unstable();
+                        ids.dedup();
                         let saved = self.install_preponed(&ids);
                         let v = self.eval_expr(&e);
                         self.restore_preponed(saved);
+                        self.restore_preponed(index_saved);
                         v
                     }
                     None => Value::zero(32),

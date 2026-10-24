@@ -1574,7 +1574,7 @@ impl Simulator {
             if c.is_object_elem && !c.nested && c.kind != CollKind::Assoc {
                 continue;
             }
-            if c.is_object_elem || c.nested || c.kind == CollKind::Assoc {
+            if c.is_object_elem || c.nested {
                 return None;
             }
             if sized.contains(&c.prop) {
@@ -1599,7 +1599,24 @@ impl Simulator {
             }
             let idx: Vec<i64> = match c.kind {
                 CollKind::Fixed => (c.lo..=c.hi).collect(),
-                _ => (0..self.get_queue_size(&c.scoped) as i64).collect(),
+                // §18.4: randomize() keeps an associative array's keys and
+                // draws a value for each element, so with integral keys its
+                // elements are variables indexed by the stored keys.
+                CollKind::Assoc => {
+                    if self.is_string_keyed_array(&c.scoped) {
+                        return None;
+                    }
+                    let mut keys = Vec::new();
+                    for k in self.assoc_key_strs(&c.scoped) {
+                        let i = k.parse::<i64>().ok()?;
+                        if i.to_string() != k {
+                            return None;
+                        }
+                        keys.push(i);
+                    }
+                    keys
+                }
+                CollKind::Dyn => (0..self.get_queue_size(&c.scoped) as i64).collect(),
             };
             let wide = c.width > 64;
             if wide && unread_wide.contains(&c.prop) {

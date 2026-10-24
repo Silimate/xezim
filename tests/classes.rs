@@ -633,6 +633,8 @@ mod issue_246_struct_member_randomize;
 mod issue_249_rand_mode_receiver;
 #[path = "classes/rand_mode_handle_property.rs"]
 mod rand_mode_handle_property;
+#[path = "classes/randomize_assoc_joint_solve.rs"]
+mod randomize_assoc_joint_solve;
 #[path = "classes/lrm_chained_handle_writes.rs"]
 mod lrm_chained_handle_writes;
 #[path = "classes/lrm_class_queue_locator_in_expr.rs"]

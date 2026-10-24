@@ -16,28 +16,44 @@
 //! and no `--error-exit`, still exits 0.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-/// Run `src` in a fresh directory; return the exit code and the output.
+/// Run `src` in a fresh directory; return the exit code and the output. A
+/// run that is still going after a minute (a livelock check that no longer
+/// fires) is killed, and the test fails with what it printed.
 fn run(tag: &str, src: &str, args: &[&str]) -> (Option<i32>, String) {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("runtime_error_exit_{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("t.sv"), src).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+    let log = std::fs::File::create(dir.join("out.txt")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .current_dir(&dir)
         // Stall limits small enough that the livelocks trip in milliseconds.
         .env("XEZIM_STALL_LIMIT", "2000")
         .args(args)
         .arg("t.sv")
-        .output()
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .stdin(Stdio::null())
+        .spawn()
         .expect("run xezim");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.code(), text)
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let text = std::fs::read_to_string(dir.join("out.txt")).unwrap_or_default();
+    let status = status.unwrap_or_else(|| panic!("{tag}: still running after 60 s:\n{text}"));
+    (status.code(), text)
 }
 
 /// The run reports `message`, stops before `post`, and exits 1.

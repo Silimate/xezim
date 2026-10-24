@@ -385,6 +385,10 @@ struct Dist {
     /// the item as a whole.
     items: Vec<(i128, i128, f64)>,
     guards: Vec<Node>,
+    /// One arm of a weight that reads rand variables
+    /// (`csp_dist_rand_weights`): the arms' guards cover every case, so the
+    /// variable is always drawn by one of them.
+    arm: bool,
 }
 
 /// Per-solve search tables derived from the translated problem.
@@ -2199,10 +2203,12 @@ impl Simulator {
         // A variable drawn by a dist in force counts no values; one whose
         // dist still waits on its guard does (`if (!cfg) total dist {…}`:
         // `cfg == 0` leaves `total` five values, `cfg == 1` all of them).
+        // The arms of a rand-variable weight leave no case without a dist.
         let mut drawn = vec![false; csp.vars.len()];
         for (u, ds) in aux.dists.iter().enumerate() {
             if !ds.is_empty() {
-                drawn[u] = self.csp_dist_state(csp, aux, st, u).0.is_some();
+                drawn[u] = ds.iter().any(|&di| csp.dists[di].arm)
+                    || self.csp_dist_state(csp, aux, st, u).0.is_some();
             }
         }
         let vals: Vec<i128> = st.d[v].iter().flat_map(|&(l, h)| l..=h).collect();
@@ -3999,7 +4005,7 @@ impl Simulator {
                 range,
                 is_dist,
                 dist_weights,
-                ..
+                span,
             } => {
                 // The weights of a wide operand are modelled only on one
                 // segment (a field, an aligned select). Over a whole wide
@@ -4010,6 +4016,15 @@ impl Simulator {
                     && !csp.wide.is_empty()
                     && self.csp_wide_touch(csp, expr, env)
                     && !matches!(self.csp_ae(csp, expr, env), Some(Ae::Var(..)));
+                let rand_weight = |w: &Option<DistWeight>| match w {
+                    Some(DistWeight::Each(e)) | Some(DistWeight::Total(e)) => {
+                        !self.csp_free(csp, e, env)
+                    }
+                    None => false,
+                };
+                if *is_dist && !unweighted && dist_weights.iter().any(rand_weight) {
+                    return self.csp_dist_rand_weights(csp, expr, range, dist_weights, env, *span);
+                }
                 let set: Vec<ConstraintRange> = if *is_dist {
                     // §18.5.4: a zero weight removes the value.
                     let mut kept = Vec::new();
@@ -4430,6 +4445,33 @@ impl Simulator {
         weights: &[Option<DistWeight>],
         env: &Env,
     ) {
+        let mut wts = Vec::with_capacity(ranges.len());
+        for k in 0..ranges.len() {
+            let (wt, per_value) = match weights.get(k).and_then(|w| w.as_ref()) {
+                Some(DistWeight::Each(e)) => (self.csp_const(e, env), true),
+                Some(DistWeight::Total(e)) => (self.csp_const(e, env), false),
+                None => (Some(Value::from_u64(1, 32)), true),
+            };
+            let Some(wt) = wt.and_then(|x| x.to_u64()) else {
+                return;
+            };
+            wts.push((wt, per_value));
+        }
+        self.csp_dist_weighted(csp, expr, ranges, &wts, env, false);
+    }
+
+    /// `csp_dist` with each item's weight already known: (weight, whether it
+    /// weighs every value of the item). The dist is in force under
+    /// `env.guards`; `arm` marks it as one arm of a rand-variable weight.
+    fn csp_dist_weighted(
+        &mut self,
+        csp: &mut Csp,
+        expr: &Expression,
+        ranges: &[ConstraintRange],
+        wts: &[(u64, bool)],
+        env: &Env,
+        arm: bool,
+    ) {
         let Some(Ae::Var(v, w, s)) = self.csp_ae(csp, expr, env) else {
             return;
         };
@@ -4438,16 +4480,7 @@ impl Simulator {
         self.push_local_frame(frame);
         let mut items = Vec::with_capacity(ranges.len());
         let mut ok = true;
-        for (k, r) in ranges.iter().enumerate() {
-            let (wt, per_value) = match weights.get(k).and_then(|w| w.as_ref()) {
-                Some(DistWeight::Each(e)) => (self.csp_const(e, env), true),
-                Some(DistWeight::Total(e)) => (self.csp_const(e, env), false),
-                None => (Some(Value::from_u64(1, 32)), true),
-            };
-            let Some(wt) = wt.and_then(|x| x.to_u64()) else {
-                ok = false;
-                break;
-            };
+        for (r, &(wt, per_value)) in ranges.iter().zip(wts) {
             let bound = |me: &mut Self, e: &Expression, dollar: i128| -> Option<i128> {
                 if matches!(e.kind, ExprKind::Dollar) {
                     return Some(dollar);
@@ -4492,8 +4525,123 @@ impl Simulator {
                 var: v,
                 items,
                 guards: env.guards.clone(),
+                arm,
             });
         }
+    }
+
+    /// §18.5.4: `x dist {…}` whose weights read rand variables (`[1:$] :/
+    /// (en ? 0 : 1)`). A weight is the one of the solution being drawn, not
+    /// of the variables' values before `randomize()`: an item holds only where
+    /// its weight is nonzero, and a weight that is a `?:` chain over constant
+    /// weights becomes one dist per combination of arms, guarded by their
+    /// conditions, so `x` is drawn after the variables they read. None for
+    /// any other weight.
+    fn csp_dist_rand_weights(
+        &mut self,
+        csp: &mut Csp,
+        expr: &Expression,
+        ranges: &[ConstraintRange],
+        weights: &[Option<DistWeight>],
+        env: &Env,
+        span: crate::ast::Span,
+    ) -> Option<Node> {
+        let mut cases = Vec::with_capacity(ranges.len());
+        for k in 0..ranges.len() {
+            cases.push(match weights.get(k).and_then(|w| w.as_ref()) {
+                Some(DistWeight::Each(e)) => (self.csp_weight_cases(csp, e, env)?, true),
+                Some(DistWeight::Total(e)) => (self.csp_weight_cases(csp, e, env)?, false),
+                None => (vec![(Vec::new(), 1)], true),
+            });
+        }
+        let mut alts = Vec::new();
+        for (r, (arms, _)) in ranges.iter().zip(&cases) {
+            let member = ConstraintItem::Inside {
+                expr: expr.clone(),
+                range: vec![r.clone()],
+                is_dist: false,
+                dist_weights: Vec::new(),
+                span,
+            };
+            let mut inside = None;
+            for (conds, w) in arms {
+                if *w == 0 {
+                    continue;
+                }
+                if inside.is_none() {
+                    inside = Some(self.csp_item_inner(csp, &member, env)?);
+                }
+                let mut parts = vec![inside.clone()?];
+                for (c, neg) in conds {
+                    parts.push(self.csp_bool(csp, c, env, *neg)?);
+                }
+                alts.push(Node::And(parts));
+            }
+        }
+        // Each item contributes one arm to a combination.
+        let mut combos: Vec<(Vec<(Expression, bool)>, Vec<(u64, bool)>)> =
+            vec![(Vec::new(), Vec::new())];
+        for (arms, per_value) in &cases {
+            let mut next = Vec::with_capacity(combos.len() * arms.len());
+            for (conds, wts) in &combos {
+                for (c, w) in arms {
+                    let mut conds = conds.clone();
+                    conds.extend(c.iter().cloned());
+                    let mut wts = wts.clone();
+                    wts.push((*w, *per_value));
+                    next.push((conds, wts));
+                }
+            }
+            combos = next;
+            if combos.len() > 64 {
+                return None;
+            }
+        }
+        for (conds, wts) in combos {
+            let mut genv = env.clone();
+            for (c, neg) in &conds {
+                let g = self.csp_bool(csp, c, env, *neg)?;
+                genv = genv.guarded(&g);
+            }
+            self.csp_dist_weighted(csp, expr, ranges, &wts, &genv, true);
+        }
+        Some(match alts.len() {
+            0 => Node::False,
+            1 => alts.pop()?,
+            _ => Node::Or(alts),
+        })
+    }
+
+    /// The arms of a dist weight: (conditions, each `true` or negated, and
+    /// the weight) for every leaf of a `?:` chain whose leaves read no rand
+    /// variable. None for any other weight.
+    #[allow(clippy::type_complexity)]
+    fn csp_weight_cases(
+        &mut self,
+        csp: &Csp,
+        e: &Expression,
+        env: &Env,
+    ) -> Option<Vec<(Vec<(Expression, bool)>, u64)>> {
+        let e = Self::unparen(e);
+        if self.csp_free(csp, e, env) {
+            return Some(vec![(Vec::new(), self.csp_const(e, env)?.to_u64()?)]);
+        }
+        let ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } = &e.kind
+        else {
+            return None;
+        };
+        let mut out = Vec::new();
+        for (arm, neg) in [(then_expr, false), (else_expr, true)] {
+            for (mut conds, w) in self.csp_weight_cases(csp, arm, env)? {
+                conds.insert(0, ((**condition).clone(), neg));
+                out.push((conds, w));
+            }
+        }
+        Some(out)
     }
 
     /// §18.5.4: `x dist {…}` over a wide `x`. Its items are not values of
@@ -4587,6 +4735,7 @@ impl Simulator {
                 .map(|(i, (_, m))| (i as i128, i as i128, *m))
                 .collect(),
             guards: env.guards.clone(),
+            arm: false,
         });
         Some(Self::csp_wide_or(alts))
     }

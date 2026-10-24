@@ -866,3 +866,6 @@ mod randomize_fill_literal;
 mod randomize_nested_dyn_scope;
 #[path = "classes/shadowed_member_same_named_formal.rs"]
 mod shadowed_member_same_named_formal;
+
+#[path = "classes/class_queue_empty_pattern_through_handle.rs"]
+mod class_queue_empty_pattern_through_handle;

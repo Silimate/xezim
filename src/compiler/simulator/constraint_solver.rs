@@ -3347,6 +3347,41 @@ impl Simulator {
             .collect()
     }
 
+    /// §8.25: packed width of the key type `dt` under the parameter
+    /// bindings `instance` carries; `None` when a range does not evaluate.
+    pub(super) fn param_sized_key_width(
+        &self,
+        dt: &DataType,
+        instance: &ClassInstance,
+        chain: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>],
+    ) -> Option<u32> {
+        let (DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }) = dt
+        else {
+            return None;
+        };
+        let mut m = self.module.parameters.clone();
+        let mut bound: HashSet<&str> = HashSet::default();
+        for c in chain {
+            for (pn, _) in &c.param_defaults {
+                if let Some(v) = instance.properties.get(pn)
+                    && bound.insert(pn.as_str())
+                {
+                    m.insert(pn.clone(), v.clone());
+                }
+            }
+        }
+        let mut w: u64 = 1;
+        for d in dimensions {
+            let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
+                return None;
+            };
+            let l = super::elaborate::const_eval_i64_with_params(left, Some(&m))?;
+            let r = super::elaborate::const_eval_i64_with_params(right, Some(&m))?;
+            w = w.checked_mul(l.abs_diff(r) + 1)?;
+        }
+        u32::try_from(w).ok().filter(|&w| w > 0)
+    }
+
     /// §8.25: bounds of the 1-D fixed-array member `prop` of the object
     /// `handle`. A member sized by a class value parameter has its own size
     /// per object (registered at construction); everything else has the

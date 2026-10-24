@@ -2541,6 +2541,16 @@ impl Simulator {
                     .associative_arrays
                     .insert(format!("{}#{}", handle, prop), is_str);
             }
+            // §8.25: a key sized by a class parameter takes this object's
+            // specialization, not the default `assoc_index_props` holds.
+            for (prop, kdt) in &cdef.assoc_key_decl_types {
+                if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
+                    let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
+                    self.module
+                        .assoc_index_widths
+                        .insert(format!("{}#{}", handle, prop), (kw, signed));
+                }
+            }
             // Per-instance queue / dynamic-array members. Register the instance-
             // scoped name `<handle>#<member>` in the array tables (mirroring the
             // package/module array path) so push_back/size/index/foreach resolve

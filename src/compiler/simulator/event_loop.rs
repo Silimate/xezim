@@ -1782,8 +1782,14 @@ impl Simulator {
         // value (`#1step` input skew).
         self.tick_clocking_blocks();
         // §14.13: deliver `@(cb.sig)` events for samples just published. The
-        // publish happens after this slot's edge pass, so run one more.
-        if self.clocking_mirror_dirty {
+        // publish happens after this slot's edge pass, so run one more. An
+        // edge-skew drive made there (§14.4) needs the same pass, after its
+        // combinational fan-out settles.
+        let edge_drove = std::mem::take(&mut self.clocking_edge_drive_dirty);
+        if edge_drove && self.dirty_any {
+            self.settle_combinatorial();
+        }
+        if self.clocking_mirror_dirty || edge_drove {
             self.clocking_mirror_dirty = false;
             self.edge_dispatch_phase = "clocking-mirror";
             self.check_edges();

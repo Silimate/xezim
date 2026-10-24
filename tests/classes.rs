@@ -802,3 +802,5 @@ mod class_queue_struct_prop_copy;
 mod class_scoped_static_queue_copy;
 #[path = "classes/class_scoped_assoc_queue_elem.rs"]
 mod class_scoped_assoc_queue_elem;
+#[path = "classes/ref_formal_array_of_coll_row.rs"]
+mod ref_formal_array_of_coll_row;

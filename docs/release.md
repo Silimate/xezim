@@ -109,7 +109,8 @@ workflow artifact, and signs, archives and publishes nothing.
 
 ## Verifying a release
 
-With the release's files and `release/signing.pub.pem` from this repository:
+With the release's files and `release/signing.pub.pem` from this repository
+at the release's tag:
 
 ```bash
 openssl dgst -sha256 -verify signing.pub.pem -signature SHA256SUMS.sig SHA256SUMS
@@ -164,8 +165,13 @@ The publish job needs these, made once by a GCP admin of the project:
 * A tag ruleset that lets only maintainers create `v*` tags, and immutable
   releases turned on in the repository's settings.
 
-Until the public key is in the repository, the publish job fails before it
-publishes anything.
+`release/signing.pub.pem` is the public key of version 1 of the signing key. Its
+SHA-256 fingerprint, of the DER-encoded key (`openssl pkey -pubin -in
+release/signing.pub.pem -outform DER | sha256sum`), is
+`6e41f746dbae35449c1ee2f5705902c7791641fed68fc7bdc6d7c6665f1b48bd`. If the
+key is rotated, the new version's public key replaces it in a pull request,
+and `RELEASE_SIGNING_KEY` moves to the new version; a release still verifies
+against the file at its own tag.
 
 ## Recovering
 

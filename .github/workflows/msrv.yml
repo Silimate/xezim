@@ -1,8 +1,17 @@
 name: MSRV
 
+# Fork-only CI policy, kept at upstream syncs: main, and pull requests that
+# change the manifests, the toolchain or this workflow.
 on:
   push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
   pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", "rust-toolchain*", ".github/workflows/msrv.yml"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_BUILD_JOBS: 1

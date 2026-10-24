@@ -217,3 +217,25 @@ fn c14_clocking_drives_in_one_slot_last_wins() {
         &[],
     );
 }
+
+// `cb.ready <= 0` then `cb.ready <= 1` at one event, split by a zero-cycle
+// `fork ... join_any; disable fork`, with a negedge output skew: the second
+// drive wins at this event's negedge, so ready does not dip for a cycle.
+#[test]
+fn c14_clocking_drives_in_one_slot_last_wins_negedge_skew() {
+    check(
+        "c14_lastwins_negedge",
+        include_str!("sv/c14_lastwins_negedge.sv"),
+        "c14ln",
+        Order::Exact,
+        &[
+            "T|lastwins_neg|t=5000 ready=x",
+            "T|lastwins_neg|t=15000 ready=0",
+            "T|lastwins_neg|t=25000 ready=1",
+            "T|lastwins_neg|t=35000 ready=1",
+            "T|lastwins_neg|t=45000 ready=1",
+            "T|lastwins_neg|t=55000 ready=0",
+        ],
+        &[],
+    );
+}

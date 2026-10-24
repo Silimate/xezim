@@ -2181,6 +2181,181 @@ impl Simulator {
                 .any(|k| k == last || k.strip_suffix(last).is_some_and(|p| p.ends_with('.')))
     }
 
+    /// `cb.arr[i]` parsed as `Index` of a member chain (`ifc.cb.arr[i]`,
+    /// `vif.cb.arr[i]`). The bracket is not a select on the hierarchical
+    /// identifier, so the Ident clocking arm never sees it and the index
+    /// falls through to a bit-select of the missing scalar array. The
+    /// snapshot holds each element; return that element, or the element
+    /// type's default before the first clocking event (§14.13).
+    /// `None` when `base` is not an unpacked-array clockvar, so a bit-select
+    /// of a scalar clockvar (`cb.sig[k]`) stays on the bit-select path.
+    pub(super) fn try_clocking_indexed_input(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<Value> {
+        if self.clocking_meta.is_empty() {
+            return None;
+        }
+        let cb_leaf = Self::clocking_index_cb_leaf(base)?;
+        if !self
+            .clocking_meta
+            .keys()
+            .any(|k| k.rsplit('.').next() == Some(cb_leaf))
+        {
+            return None;
+        }
+        let segs = Self::flatten_member_path(base)?;
+        if segs.len() < 2 {
+            return None;
+        }
+        let refs: Vec<&str> = segs[..segs.len() - 1].iter().map(|s| s.as_str()).collect();
+        let cb = self.resolve_clocking_key(&refs)?;
+        let leaf = segs.last()?.as_str();
+        let (net, vis) = self.clocking_array_input(&cb, leaf)?;
+        let iv = self.eval_expr(index);
+        if iv.has_xz() && !iv.is_real {
+            return Some(self.clocking_array_default(&net, &vis));
+        }
+        let idx = iv.to_i64()?;
+        Some(self.clocking_array_element(&cb, &net, &vis, idx))
+    }
+
+    /// Second-to-last name of a select-free chain: the clocking block in
+    /// `cb.arr`, `ifc.cb.arr`, and `vif.cb.arr`. No allocation; ordinary
+    /// `mem[i]` indexes fail here.
+    fn clocking_index_cb_leaf(base: &Expression) -> Option<&str> {
+        match &base.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                Some(h.path[h.path.len() - 2].name.name.as_str())
+            }
+            ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    h.path.last().map(|s| s.name.name.as_str())
+                }
+                ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `(net, visible name)` when `leaf` is an unpacked-array input of `cb`.
+    fn clocking_array_input(&self, cb: &str, leaf: &str) -> Option<(String, String)> {
+        let (_, sigs) = self.clocking_meta.get(cb)?;
+        let vis_list = self.clocking_vis.get(cb);
+        let matches = |n: &str| n == leaf || n.rsplit('.').next() == Some(leaf);
+        for (i, (net, is_in)) in sigs.iter().enumerate() {
+            if !*is_in {
+                continue;
+            }
+            let vis = vis_list
+                .and_then(|l| l.get(i))
+                .map(|s| s.as_str())
+                .unwrap_or(net.as_str());
+            if !matches(net) && !matches(vis) {
+                continue;
+            }
+            if self.unpacked_array_bounds(net).is_some()
+                || self.unpacked_array_bounds(vis).is_some()
+            {
+                return Some((net.clone(), vis.to_string()));
+            }
+            // A scalar clockvar of this name: `[k]` is a bit select.
+            return None;
+        }
+        None
+    }
+
+    fn clocking_array_default(&self, net: &str, vis: &str) -> Value {
+        let name = if self.module.arrays.contains_key(net) {
+            net
+        } else {
+            vis
+        };
+        let w = self
+            .module
+            .arrays
+            .get(name)
+            .map(|a| a.2)
+            .unwrap_or(1)
+            .max(1);
+        if self.module.two_state_signals.contains(name) {
+            Value::zero(w)
+        } else {
+            Value::all_x(w)
+        }
+    }
+
+    /// Sampled element, or the type default when this edge has not stored one.
+    fn clocking_array_element(&self, cb: &str, net: &str, vis: &str, idx: i64) -> Value {
+        if let Some((lo, hi)) = self
+            .unpacked_array_bounds(net)
+            .or_else(|| self.unpacked_array_bounds(vis))
+        {
+            if idx < lo || idx > hi {
+                return self.clocking_array_default(net, vis);
+            }
+        }
+        if let Some(snap) = self.clocking_snapshots.get(cb) {
+            let vis_key = format!("{vis}[{idx}]");
+            if let Some(v) = snap.get(&vis_key) {
+                return v.clone();
+            }
+            if vis != net {
+                let net_key = format!("{net}[{idx}]");
+                if let Some(v) = snap.get(&net_key) {
+                    return v.clone();
+                }
+            }
+            let leaf = vis.rsplit('.').next().unwrap_or(vis);
+            let suffix = format!(".{leaf}[{idx}]");
+            let bare = format!("{leaf}[{idx}]");
+            if let Some((_, v)) = snap
+                .iter()
+                .find(|(k, _)| *k == &bare || k.ends_with(&suffix))
+            {
+                return v.clone();
+            }
+        }
+        self.clocking_array_default(net, vis)
+    }
+
+    /// `cb.arr[i]` / `ifc.cb.arr[i]`: the snapshot stores each element of an
+    /// unpacked-array clockvar as `name[i]`. A scalar lookup of `arr` has
+    /// no signal and used to return the type default.
+    pub(super) fn try_clocking_array_read(
+        &mut self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<Value> {
+        let last = hier.path.last()?;
+        if last.selects.is_empty() || hier.path.len() < 2 {
+            return None;
+        }
+        let cb_segs: Vec<String> = hier.path[..hier.path.len() - 1]
+            .iter()
+            .map(|s| s.name.name.clone())
+            .collect();
+        let mut key = last.name.name.clone();
+        for sel in &last.selects {
+            let idx = self.eval_expr(sel).to_i64()?;
+            use std::fmt::Write as _;
+            let _ = write!(key, "[{idx}]");
+        }
+        let cb_refs: Vec<&str> = cb_segs.iter().map(|s| s.as_str()).collect();
+        let cb = self.resolve_clocking_key(&cb_refs)?;
+        let snap = self.clocking_snapshots.get(&cb)?;
+        if let Some(v) = snap.get(&key) {
+            return Some(v.clone());
+        }
+        let suffix = format!(".{key}");
+        snap.iter()
+            .find(|(k, _)| k.ends_with(suffix.as_str()))
+            .map(|(_, v)| v.clone())
+    }
+
     pub(super) fn try_clocking_signal_read(&self, segs: &[&str]) -> Option<Value> {
         if segs.len() < 2 {
             return None;

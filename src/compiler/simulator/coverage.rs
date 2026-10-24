@@ -870,11 +870,7 @@ impl Simulator {
         let mut bins = Vec::new();
         for b in &explicit {
             let key = format!("{}.{}", cp_name, b.name.name);
-            let ranges: Vec<(i64, i64)> = b
-                .values
-                .iter()
-                .filter_map(|r| self.cg_range_bounds(r, ctor))
-                .collect();
+            let ranges = self.cg_bin_segs(b, ctor);
             if b.array_form && !b.transitions.is_empty() {
                 // §19.5.2 `name[] = (...)`: one bin per value sequence.
                 for (label, _) in self.cg_trans_sequences(b, ctor) {
@@ -921,7 +917,7 @@ impl Simulator {
                     }
                 }
             } else if b.values.is_empty()
-                || ranges.len() < b.values.len()
+                || (b.with_filter.is_none() && ranges.len() < b.values.len())
                 || ranges
                     .iter()
                     .any(|&(l, h)| Self::cg_count_outside(l, h, &excl) > 0)
@@ -1529,6 +1525,283 @@ impl Simulator {
         matched
     }
 
+    /// The value ranges of `bin`, in the order written, keeping only the
+    /// values its §19.5.1.1 `with` filter accepts.
+    pub(super) fn cg_bin_segs(
+        &self,
+        bin: &crate::ast::decl::CoverBin,
+        ctor: &[(String, Value)],
+    ) -> Vec<(i64, i64)> {
+        let Some(f) = &bin.with_filter else {
+            return bin
+                .values
+                .iter()
+                .filter_map(|r| self.cg_range_bounds(r, ctor))
+                .collect();
+        };
+        let key = (
+            bin as *const crate::ast::decl::CoverBin as usize,
+            ctor.iter().map(|(_, v)| v.to_i64().unwrap_or(i64::MIN)).collect(),
+        );
+        if let Some(hit) = self.cg_with_segs_cache.borrow().get(&key) {
+            return hit.to_vec();
+        }
+        let segs: Vec<(i64, i64)> = bin
+            .values
+            .iter()
+            .filter_map(|r| self.cg_range_bounds(r, ctor))
+            .collect();
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        let mut keep = |a: i64, b: i64| match out.last_mut() {
+            Some(last) if last.1.checked_add(1) == Some(a) => last.1 = b,
+            _ => out.push((a, b)),
+        };
+        let mut cuts = Vec::new();
+        if Self::cg_with_cuts(f, ctor, self, &mut cuts) {
+            // The filter only compares `item` with constants, so its value
+            // can change only at a cut: test one value per piece.
+            cuts.sort_unstable();
+            cuts.dedup();
+            for &(l, h) in &segs {
+                let mut a = l;
+                for &c in cuts.iter().filter(|&&c| c > l && c <= h) {
+                    if self.cg_with_accepts(f, a, ctor) {
+                        keep(a, c - 1);
+                    }
+                    a = c;
+                }
+                if self.cg_with_accepts(f, a, ctor) {
+                    keep(a, h);
+                }
+            }
+        } else {
+            const MAX_VALUES: u64 = 1 << 20;
+            let mut n = 0u64;
+            for &(l, h) in &segs {
+                for v in l..=h {
+                    n += 1;
+                    if n > MAX_VALUES {
+                        eprintln!(
+                            "[xezim][warning] bins '{}': the with filter is applied to the \
+                             first {} values only",
+                            bin.name.name, MAX_VALUES
+                        );
+                        keep(v, h);
+                        break;
+                    }
+                    if self.cg_with_accepts(f, v, ctor) {
+                        keep(v, v);
+                    }
+                }
+            }
+        }
+        self.cg_with_segs_cache
+            .borrow_mut()
+            .insert(key, out.as_slice().into());
+        out
+    }
+
+    /// Whether `with` filter `f` uses `item` only as an operand compared
+    /// with constants (`==`, `<`, `inside`, ...) under logical operators.
+    /// Pushes the values where its result can change onto `cuts`.
+    fn cg_with_cuts(
+        f: &Expression,
+        ctor: &[(String, Value)],
+        sim: &Self,
+        cuts: &mut Vec<i64>,
+    ) -> bool {
+        use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+        let point = |c: i64, cuts: &mut Vec<i64>| {
+            cuts.push(c);
+            cuts.extend(c.checked_add(1));
+        };
+        if !Self::cg_mentions_item(f) {
+            return true;
+        }
+        match &f.kind {
+            _ if Self::cg_is_item(f) => {
+                point(0, cuts);
+                true
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { op: U::LogNot, operand: x } => {
+                Self::cg_with_cuts(x, ctor, sim, cuts)
+            }
+            ExprKind::Binary {
+                op: B::LogAnd | B::LogOr | B::LogImplies | B::LogEquiv,
+                left,
+                right,
+            } => {
+                Self::cg_with_cuts(left, ctor, sim, cuts) && Self::cg_with_cuts(right, ctor, sim, cuts)
+            }
+            ExprKind::Binary {
+                op: B::Eq | B::Neq | B::CaseEq | B::CaseNeq | B::Lt | B::Leq | B::Gt | B::Geq,
+                left,
+                right,
+            } => {
+                let other = match (Self::cg_is_item(left), Self::cg_is_item(right)) {
+                    (true, false) => right,
+                    (false, true) => left,
+                    _ => return false,
+                };
+                match sim.cg_const_i64(other, ctor) {
+                    Some(c) if !Self::cg_mentions_item(other) => {
+                        point(c, cuts);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            ExprKind::Inside { expr, ranges } if Self::cg_is_item(expr) => {
+                ranges.iter().all(|r| match &r.kind {
+                    ExprKind::Range(lo, hi) => match (sim.cg_const_i64(lo, ctor), sim.cg_const_i64(hi, ctor)) {
+                        (Some(l), Some(h)) => {
+                            point(l.min(h), cuts);
+                            point(l.max(h), cuts);
+                            true
+                        }
+                        _ => false,
+                    },
+                    _ => match sim.cg_const_i64(r, ctor) {
+                        Some(c) => {
+                            point(c, cuts);
+                            true
+                        }
+                        None => false,
+                    },
+                })
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::cg_with_cuts(condition, ctor, sim, cuts)
+                    && Self::cg_with_cuts(then_expr, ctor, sim, cuts)
+                    && Self::cg_with_cuts(else_expr, ctor, sim, cuts)
+            }
+            _ => false,
+        }
+    }
+
+    fn cg_is_item(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(x) => Self::cg_is_item(x),
+            ExprKind::Ident(h) => {
+                h.path.len() == 1 && h.path[0].selects.is_empty() && h.path[0].name.name == "item"
+            }
+            _ => false,
+        }
+    }
+
+    fn cg_mentions_item(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == "item",
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::cg_mentions_item(x),
+            ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
+                Self::cg_mentions_item(left) || Self::cg_mentions_item(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => [condition, then_expr, else_expr]
+                .iter()
+                .any(|x| Self::cg_mentions_item(x)),
+            ExprKind::Inside { expr, ranges } => {
+                Self::cg_mentions_item(expr) || ranges.iter().any(Self::cg_mentions_item)
+            }
+            ExprKind::Concatenation(xs) => xs.iter().any(Self::cg_mentions_item),
+            ExprKind::Index { expr, index } => {
+                Self::cg_mentions_item(expr) || Self::cg_mentions_item(index)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether §19.5.1.1 `with` filter `f` accepts the value `v` bound to
+    /// `item`. A filter this cannot evaluate accepts every value.
+    pub(super) fn cg_with_accepts(&self, f: &Expression, v: i64, ctor: &[(String, Value)]) -> bool {
+        self.cg_item_eval(f, v, ctor).is_none_or(|r| r != 0)
+    }
+
+    fn cg_item_eval(&self, e: &Expression, v: i64, ctor: &[(String, Value)]) -> Option<i64> {
+        use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+        if !Self::cg_mentions_item(e) {
+            return self.cg_const_i64(e, ctor);
+        }
+        let b = |x: bool| Some(x as i64);
+        match &e.kind {
+            _ if Self::cg_is_item(e) => Some(v),
+            ExprKind::Paren(x) => self.cg_item_eval(x, v, ctor),
+            ExprKind::Unary { op, operand } => {
+                let x = self.cg_item_eval(operand, v, ctor)?;
+                match op {
+                    U::LogNot => b(x == 0),
+                    U::Minus => x.checked_neg(),
+                    U::Plus => Some(x),
+                    _ => None,
+                }
+            }
+            ExprKind::Binary { op, left, right } => {
+                let l = self.cg_item_eval(left, v, ctor)?;
+                let r = self.cg_item_eval(right, v, ctor)?;
+                match op {
+                    B::Add => l.checked_add(r),
+                    B::Sub => l.checked_sub(r),
+                    B::Mul => l.checked_mul(r),
+                    B::Div => l.checked_div(r),
+                    B::Mod => l.checked_rem(r),
+                    B::BitAnd => Some(l & r),
+                    B::BitOr => Some(l | r),
+                    B::BitXor => Some(l ^ r),
+                    B::ShiftLeft => u32::try_from(r).ok().and_then(|r| l.checked_shl(r)),
+                    B::ShiftRight => u32::try_from(r).ok().and_then(|r| l.checked_shr(r)),
+                    B::Eq | B::CaseEq => b(l == r),
+                    B::Neq | B::CaseNeq => b(l != r),
+                    B::Lt => b(l < r),
+                    B::Leq => b(l <= r),
+                    B::Gt => b(l > r),
+                    B::Geq => b(l >= r),
+                    B::LogAnd => b(l != 0 && r != 0),
+                    B::LogOr => b(l != 0 || r != 0),
+                    B::LogImplies => b(l == 0 || r != 0),
+                    B::LogEquiv => b((l != 0) == (r != 0)),
+                    _ => None,
+                }
+            }
+            ExprKind::Index { expr, index } if Self::cg_is_item(expr) => {
+                let i = u32::try_from(self.cg_item_eval(index, v, ctor)?).ok()?;
+                Some(v.checked_shr(i).unwrap_or(0) & 1)
+            }
+            ExprKind::Inside { expr, ranges } => {
+                let x = self.cg_item_eval(expr, v, ctor)?;
+                let mut hit = false;
+                for r in ranges {
+                    hit |= match &r.kind {
+                        ExprKind::Range(lo, hi) => {
+                            let (l, h) = (self.cg_item_eval(lo, v, ctor)?, self.cg_item_eval(hi, v, ctor)?);
+                            x >= l.min(h) && x <= l.max(h)
+                        }
+                        _ => x == self.cg_item_eval(r, v, ctor)?,
+                    };
+                }
+                b(hit)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                if self.cg_item_eval(condition, v, ctor)? != 0 {
+                    self.cg_item_eval(then_expr, v, ctor)
+                } else {
+                    self.cg_item_eval(else_expr, v, ctor)
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// §19.5.1 `name[N]`: the bin's values, in the order written, spread
     /// over N bins, each taking `len / N` of them and the last one also the
     /// remainder (one value per bin when there are fewer values than bins).
@@ -1539,11 +1812,7 @@ impl Simulator {
         ctor: &[(String, Value)],
     ) -> Option<(u64, u64, Vec<(i64, i64)>)> {
         let n = self.cg_const_i64(bin.array_size.as_ref()?, ctor)?.max(0) as u64;
-        let segs: Vec<(i64, i64)> = bin
-            .values
-            .iter()
-            .filter_map(|r| self.cg_range_bounds(r, ctor))
-            .collect();
+        let segs = self.cg_bin_segs(bin, ctor);
         let m: u64 = segs.iter().map(|&(l, h)| (h - l) as u64 + 1).sum();
         Some((n, m / n.max(1), segs))
     }
@@ -1839,6 +2108,9 @@ impl Simulator {
                             })
                         } else {
                             self.value_in_ranges(&val, &bin.values)
+                                && bin.with_filter.as_ref().is_none_or(|f| {
+                                    vi.is_some_and(|v| self.cg_with_accepts(f, v, &ctor))
+                                })
                         };
                         if !matched {
                             continue;

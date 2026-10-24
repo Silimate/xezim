@@ -6237,6 +6237,11 @@ pub struct Simulator {
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
     /// probe.
     any_struct_formal_markers: bool,
+    /// Scratch structs a pattern actual is spread into before its leaves bind
+    /// to an unpacked-struct formal (`struct_pattern_leaf_values`). Recycled
+    /// like the mailbox shadows.
+    pattern_scratch_seq: u64,
+    pattern_scratch_free: Vec<u64>,
     /// Recycled subroutine-frame maps: every call built a fresh
     /// `HashMap<String, Value>` and dropped it on return — at UVM call rates
     /// the table alloc/free was pure allocator churn. `clear()` keeps the

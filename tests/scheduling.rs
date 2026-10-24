@@ -384,6 +384,9 @@ mod sva_until_properties;
 #[path = "scheduling/or_vacuity_508.rs"]
 mod or_vacuity_508;
 
+#[path = "scheduling/or_settles_early_533.rs"]
+mod or_settles_early_533;
+
 #[path = "scheduling/until_folding_510.rs"]
 mod until_folding_510;
 

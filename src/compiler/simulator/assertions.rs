@@ -729,17 +729,31 @@ impl Simulator {
     /// implication is nonvacuous iff some consequent started by a match was
     /// nonvacuous; each compound operator keeps a recursive rule. For a
     /// pending operand the value is how far the attempt has established
-    /// nonvacuity, which is enough because a compound body only resolves an
-    /// operand once it has resolved.
+    /// nonvacuity; an `or` that already holds settles on it without waiting
+    /// for the operand to resolve.
     fn sva_attempt_nonvacuous(node: &SvaNode, st: &SvaState) -> bool {
         match (node, st) {
             // §16.14.8: an evaluation attempt of a sequence expression is
             // always nonvacuous, whether the sequence matched or failed.
             (SvaNode::Seq(..), SvaState::Seq(_)) => true,
+            // A match that started a consequent whose attempt is nonvacuous
+            // (a sequence always is) makes the implication nonvacuous before
+            // that consequent resolves. A nonoverlapped consequent still
+            // waiting for its first clock tick has not started yet.
             (
-                SvaNode::Impl { .. } | SvaNode::Followed { .. },
-                SvaState::Impl { nonvacuous, .. } | SvaState::Followed { nonvacuous, .. },
-            ) => *nonvacuous,
+                SvaNode::Impl { cons: cn, .. } | SvaNode::Followed { cons: cn, .. },
+                SvaState::Impl {
+                    nonvacuous, cons, ..
+                }
+                | SvaState::Followed {
+                    nonvacuous, cons, ..
+                },
+            ) => {
+                *nonvacuous
+                    || cons
+                        .iter()
+                        .any(|(delay, cs)| *delay == 0 && Self::sva_attempt_nonvacuous(cn, cs))
+            }
             (SvaNode::Not(inner), SvaState::Not(ist)) => Self::sva_attempt_nonvacuous(inner, ist),
             (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
                 Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
@@ -1474,10 +1488,18 @@ impl Simulator {
                 if rb.is_none() {
                     *rb = self.sva_advance(nb, b);
                 }
-                // §16.14.8: a nonvacuous success of either operand already
-                // decides a nonvacuous success for the `or`, regardless of the
-                // other operand.
-                if *ra == Some(SvaOutcome::Pass) || *rb == Some(SvaOutcome::Pass) {
+                // §16.12.6: `p or q` holds as soon as either operand holds,
+                // whatever the other still owes. §16.14.8: it is nonvacuous if
+                // either operand's attempt is, so once an operand holds and
+                // either attempt has established nonvacuity, the `or` is a
+                // nonvacuous success even while the other operand is pending
+                // (say a strong obligation that may never resolve).
+                let holds = |r: &Option<SvaOutcome>| {
+                    matches!(r, Some(SvaOutcome::Pass | SvaOutcome::Vacuous))
+                };
+                if (holds(ra) || holds(rb))
+                    && (Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b))
+                {
                     return Some(SvaOutcome::Pass);
                 }
                 // Otherwise the `or` succeeds unless both operands fail, and

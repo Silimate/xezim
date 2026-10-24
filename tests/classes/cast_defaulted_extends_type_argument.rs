@@ -1,5 +1,6 @@
-//! §8.25: a type parameter omitted from a named `extends` list takes its
-//! default, and a default may name another parameter of the same class.
+//! IEEE 1800-2017 §8.25: a type parameter omitted from a named `extends`
+//! list takes its default. Here that default names another parameter of
+//! the same class (`RSP_ITEM_T = ITEM_T`).
 //!
 //! `drv` extends `mid` without passing `RSP_ITEM_T`, so that parameter
 //! stays `ITEM_T` and `base.rsp` is an `item`. Its class came back unknown,

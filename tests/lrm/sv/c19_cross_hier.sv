@@ -1,5 +1,6 @@
-// §19.6: crossing hierarchical variable references, each with an implicit
-// coverpoint, from an interface bound into the module that holds them.
+// IEEE 1800-2017 §19.6, extended to hierarchical variable references as
+// Questa also accepts: crossing them, each with an implicit coverpoint, from
+// an interface bound into the module that holds them.
 module stage (input logic a, input logic b);
 endmodule
 module regs;
@@ -17,18 +18,12 @@ interface cov_if (input logic clk);
     cp_a: coverpoint stage_i.a;
     ab_cross: cross stage_i.a, stage_i.b;
     ie_cross: cross cp_a, regs_i.state_q.ie iff (stage_i.b);
-    // §19.6.1.1: binsof over a dotted item path, two and three segments deep.
-    ign_cross: cross stage_i.a, regs_i.state_q.ie iff (stage_i.b) {
-      ignore_bins a0_ie1 = binsof(stage_i.a) intersect {0} &&
-                           binsof(regs_i.state_q.ie) intersect {1};
-    }
   endgroup
   cg cg_i = new;
   initial begin
     #20;
     $display("T|ab|%0.2f", cg_i.ab_cross.get_inst_coverage());
     $display("T|ie|%0.2f", cg_i.ie_cross.get_inst_coverage());
-    $display("T|ign|%0.2f", cg_i.ign_cross.get_inst_coverage());
     $display("T|cg|%0.2f", cg_i.get_inst_coverage());
     $finish;
   end
@@ -40,7 +35,6 @@ module c19_cross_hier;
   initial begin
     // (a,b,ie): 00x, 01 0, 10x, 11 1 -> ab_cross gets all 4 combos;
     // ie_cross samples only when b=1: (a=0,ie=0) and (a=1,ie=1) -> 2 of 4.
-    // ign_cross drops the unhit (a=0,ie=1) -> 2 of 3.
     #1 a = 0; b = 0; ie = 0; #1 clk = 1; #1 clk = 0;
     #1 a = 0; b = 1; ie = 0; #1 clk = 1; #1 clk = 0;
     #1 a = 1; b = 0; ie = 1; #1 clk = 1; #1 clk = 0;

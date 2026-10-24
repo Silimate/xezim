@@ -1819,7 +1819,10 @@ impl Simulator {
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
-        let w0 = match tp_width.or_else(|| self.bound_agg_width(data_type)) {
+        let w0 = match tp_width
+            .or_else(|| self.bound_agg_width(data_type))
+            .or_else(|| self.class_scoped_decl_width(data_type))
+        {
             Some(w) => w,
             None => super::elaborate::resolve_type_width(
                 data_type,

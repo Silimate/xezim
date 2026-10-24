@@ -320,3 +320,5 @@ mod package_array_params;
 
 #[path = "hierarchy/vif_defaults_469.rs"]
 mod vif_defaults_469;
+#[path = "hierarchy/generate_nested_instance_port.rs"]
+mod generate_nested_instance_port;

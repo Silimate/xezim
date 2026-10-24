@@ -811,6 +811,16 @@ impl Simulator {
                     &cd.param_order
                 };
                 if let Some(idx) = order.iter().position(|p| p == tn) {
+                    // `param_order` interleaves value parameters so a TYPE
+                    // parameter's fragment index is right. The name itself
+                    // still has to be a type parameter. A value parameter's
+                    // fragment is a number (`H` -> `32` on `my_seq #(32, 194)`).
+                    // Returning it made `is_definite_type_arg` treat
+                    // `item #(H, D)` as a type-argument list, the values were
+                    // dropped, and `new` built the default specialization.
+                    if !cd.type_param_names.iter().any(|t| t == tn) {
+                        return None;
+                    }
                     if let Some(v) = Self::spec_arg_at(sig, idx) {
                         let v = v.trim();
                         if !v.is_empty() {
@@ -1859,6 +1869,31 @@ impl Simulator {
         out
     }
 
+    /// Value parameters of the running instance, for a specialization
+    /// argument evaluated in that instance's scope (`item #(H, D)` inside
+    /// `my_seq #(32, 194)`). The leaf class's own parameters win over an
+    /// ancestor's of the same name.
+    pub(super) fn enclosing_value_params(&self) -> Option<HashMap<String, Value>> {
+        let handle = self.this_stack.iter().rev().find_map(|h| *h)?;
+        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
+        let mut map: HashMap<String, Value> = HashMap::default();
+        let mut cn: Option<&str> = Some(inst.class_name.as_str());
+        for _ in 0..64 {
+            let c = cn?;
+            let cd = self.module.classes.get(c)?;
+            for (n, _) in &cd.param_defaults {
+                if cd.type_param_names.iter().any(|t| t == n) {
+                    continue;
+                }
+                if let Some(v) = inst.properties.get(n) {
+                    map.entry(n.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            cn = cd.extends.as_deref();
+        }
+        Some(map)
+    }
+
     /// IEEE 1800-2017 §6.20.2 / §8.25: the value of the declared default `e`
     /// of a parameter of `chain[0]` (the declaring class, `chain[1..]` its
     /// ancestors) for an object under construction. A default belongs to the
@@ -2189,13 +2224,22 @@ impl Simulator {
         let ancestor_value_args: HashMap<String, HashMap<String, Value>> = if !chain_has_params {
             HashMap::default()
         } else {
+            // An actual `#(...)` argument is an expression in the
+            // specialization site's scope. Inside a method that is the
+            // running instance, so `item #(H, D)` sees this object's
+            // value parameters. Evaluating it with an empty map used the
+            // global default (32) and the new object's properties
+            // disagreed with the specialization `$cast` checks.
+            let enclosing_params = self.enclosing_value_params();
             let mut leaf_params: HashMap<String, Value> = HashMap::default();
             for (pname, pdefault) in class_def.param_defaults.iter() {
                 // An actual argument belongs to the specialization site's
                 // scope; a default to the class's, where the parameters
                 // before it are visible (§6.20.2, `int B = A*2`).
                 let v = match (arg_map.get(pname), pdefault) {
-                    (Some(e), _) => crate::elaborate::const_eval_i64_with_params(e, None),
+                    (Some(e), _) => {
+                        crate::elaborate::const_eval_i64_with_params(e, enclosing_params.as_ref())
+                    }
                     (None, Some(e)) => {
                         crate::elaborate::const_eval_i64_with_params(e, Some(&leaf_params))
                     }

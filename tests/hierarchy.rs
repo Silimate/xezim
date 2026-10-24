@@ -346,3 +346,6 @@ mod vif_nested_instance_570;
 
 #[path = "hierarchy/nonansi_child_port_width_572.rs"]
 mod nonansi_child_port_width_572;
+
+#[path = "hierarchy/generate_nested_instance_port.rs"]
+mod generate_nested_instance_port;

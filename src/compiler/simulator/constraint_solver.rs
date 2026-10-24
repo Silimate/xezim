@@ -651,11 +651,13 @@ impl Simulator {
                         .filter(|tn| self.module.enum_members.contains_key(tn));
                     // A member typed by a class (a handle, or a collection of
                     // handles) holds object references, not random values.
+                    // The type may be a typedef of a class
+                    // (`typedef inner#(.W(194)) inner_t`).
                     let is_handle = class_def
                         .properties
                         .get(prop)
                         .and_then(|s| s.type_name.clone())
-                        .is_some_and(|tn| self.module.classes.contains_key(&tn));
+                        .is_some_and(|tn| self.resolved_class_key(&tn).is_some());
                     // §18.4: the elements of a fixed `rand obj arr[N]` are
                     // randomized recursively like any rand handle; drawing
                     // them as integers overwrote every handle with a random

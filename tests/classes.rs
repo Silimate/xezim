@@ -814,3 +814,5 @@ mod foreach_indexed_elem_member_array;
 mod scalar_formal_shadows_caller_local_coll;
 #[path = "classes/rand_dyn_array_of_unpacked_structs.rs"]
 mod rand_dyn_array_of_unpacked_structs;
+#[path = "classes/dollar_index_handle_member_write.rs"]
+mod dollar_index_handle_member_write;

@@ -2466,9 +2466,33 @@ impl Simulator {
     /// collection, in which case there is no bound to install.
     pub(super) fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
         let n = match &base.kind {
+            // A subroutine-local collection, then a property of `this`, as the
+            // element-handle read resolves the same name.
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let bare = h.path[0].name.name.as_str();
+                match self.dyn_name_lookup(bare) {
+                    Some(s) => Some(std::borrow::Cow::Owned(s.to_string())),
+                    None => match self.instance_assoc_member(bare) {
+                        Some(s) => Some(std::borrow::Cow::Owned(s)),
+                        None => Some(self.resolve_hier_name(h)),
+                    },
+                }
+            }
             ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
             _ => self.flat_member_name(base).map(std::borrow::Cow::Owned),
-        }?;
+        };
+        let n = match n {
+            Some(n)
+                if self.module.dynamic_arrays.contains(&*n)
+                    || self.module.arrays.contains_key(&*n) =>
+            {
+                n
+            }
+            n => match self.expr_assoc_name(base) {
+                Some(s) => std::borrow::Cow::Owned(s),
+                None => n?,
+            },
+        };
         if self.module.dynamic_arrays.contains(&*n) {
             Some(self.get_queue_size(&n) as i64 - 1)
         } else {
@@ -2493,6 +2517,10 @@ impl Simulator {
             }
             ExprKind::Paren(i) => Self::lvalue_mentions_dollar(i),
             ExprKind::MemberAccess { expr, .. } => Self::lvalue_mentions_dollar(expr),
+            ExprKind::Ident(h) if h.path.len() >= 2 => h
+                .path
+                .iter()
+                .any(|s| s.selects.iter().any(Self::expr_contains_dollar)),
             _ => false,
         }
     }
@@ -2579,6 +2607,44 @@ impl Simulator {
                     },
                     e.span,
                 )
+            }
+            // `q[$].m = v`: the select sits below the member.
+            ExprKind::MemberAccess { expr, member } => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.resolve_dollar_in_lvalue(expr)),
+                    member: member.clone(),
+                },
+                e.span,
+            ),
+            ExprKind::Paren(i) => {
+                Expression::new(ExprKind::Paren(Box::new(self.resolve_dollar_in_lvalue(i))), e.span)
+            }
+            // The flattened `c.q[$].m`: a segment's first select indexes the
+            // collection named by the path up to that segment.
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mut out = h.clone();
+                out.cached_signal_id = Cell::new(None);
+                out.cached_resolved_name = std::cell::OnceCell::new();
+                for i in 0..out.path.len() {
+                    let Some(sel) = out.path[i].selects.first() else {
+                        continue;
+                    };
+                    if !Self::expr_contains_dollar(sel) {
+                        continue;
+                    }
+                    let mut prefix = out.clone();
+                    prefix.path.truncate(i + 1);
+                    prefix.path[i].selects.clear();
+                    let pe = Expression::new(ExprKind::Ident(prefix), e.span);
+                    if let Some(b) = self.dollar_bound_for_base(&pe) {
+                        let sel = sel.clone();
+                        self.dollar_bound.push(b);
+                        let v = self.eval_expr(&sel).to_i64().unwrap_or(0);
+                        self.dollar_bound.pop();
+                        out.path[i].selects[0] = lit(v, sel.span);
+                    }
+                }
+                Expression::new(ExprKind::Ident(out), e.span)
             }
             _ => e.clone(),
         }

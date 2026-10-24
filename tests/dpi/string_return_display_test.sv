@@ -1,6 +1,6 @@
-// §21.2.1.2 / §35.5.5: a call to an import declared `string` is a string
-// expression, so as an unformatted display-family argument it prints as
-// text, not as the integer value of its bytes.
+// IEEE 1800-2017 §21.2.1 / §35.5.5: a call to an import declared `string`
+// is a string expression, so as an unformatted display-family argument it
+// prints as text, not as the integer value of its bytes.
 module top;
   import "DPI-C" function string srd_msg(int i);
   string a, b, c;

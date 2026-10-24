@@ -553,8 +553,9 @@ fn dpi_audit_binding_test() {
 
 #[test]
 fn dpi_string_return_display_test() {
-    // §21.2.1.2 / §35.5.5: `$display(f())` with `f` an import declared
-    // `string` printed a decimal integer instead of the returned text.
+    // IEEE 1800-2017 §21.2.1 / §35.5.5: `$display(f())` with `f` an import
+    // declared `string` printed a decimal integer instead of the returned
+    // text.
     let so = compile_dpi_lib(
         "tests/dpi/string_return_display.c",
         "string_return_display",

@@ -779,3 +779,6 @@ mod foreach_array_of_collections_elem;
 
 #[path = "classes/class_assignment_types_499.rs"]
 mod class_assignment_types_499;
+
+#[path = "classes/randomize_countones_wide.rs"]
+mod randomize_countones_wide;

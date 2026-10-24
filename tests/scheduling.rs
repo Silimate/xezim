@@ -285,6 +285,8 @@ mod intra_assignment_delay_in_always;
 mod labeled_block_local_hier_ref;
 #[path = "scheduling/lrm_audit_clocking_skew.rs"]
 mod lrm_audit_clocking_skew;
+#[path = "scheduling/procedural_one_step_delay.rs"]
+mod procedural_one_step_delay;
 #[path = "scheduling/lrm_audit_disable_from_fork.rs"]
 mod lrm_audit_disable_from_fork;
 #[path = "scheduling/lrm_audit_sva.rs"]

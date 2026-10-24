@@ -327,3 +327,193 @@ endmodule
     assert_eq!(u(&sim, "t_nb"), 50, "->> rt::ev wakes @(rt::ev)");
     assert_eq!(u(&sim, "trig_seen"), 1, "-> rt::ev sets ev.triggered");
 }
+
+/// §15.5.5: assigning one class-property event to another merges the two
+/// handles. A waiter parked on the left resumes when the right is triggered,
+/// `.triggered` and `==` see one object, and triggering the alias wakes a
+/// waiter on the target. §15.5.5.1: a waiter already blocked on the left
+/// before the assignment stays on the old object and never resumes.
+#[test]
+fn class_event_handle_assignment_merges_identities() {
+    let src = r#"
+`timescale 1ns/1ns
+module top;
+  class holder;
+    event ce;
+    task trig(); -> ce; endtask
+  endclass
+  holder h1, h2;
+  int eq_before, eq_after, w1, w2, w_target, t_trig, armed_early;
+  initial begin
+    h1 = new(); h2 = new();
+    eq_before = (h1.ce == h2.ce);
+    fork begin @(h1.ce); armed_early = $time; end join_none
+    #5 h1.ce = h2.ce;
+    eq_after = (h1.ce == h2.ce);
+    fork
+      begin @(h1.ce); w1 = $time; end
+      begin @(h2.ce); w2 = $time; end
+      begin wait(h1.ce.triggered); t_trig = $time; end
+    join_none
+    #5 -> h2.ce;
+    #10;
+    fork begin @(h2.ce); w_target = $time; end join_none
+    #5 h1.trig();
+    #5 $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    assert_eq!(u(&sim, "eq_before"), 0, "distinct instances start distinct");
+    assert_eq!(u(&sim, "eq_after"), 1, "assignment merges the handles");
+    assert_eq!(
+        u(&sim, "armed_early"),
+        0,
+        "a waiter blocked before the assign never resumes"
+    );
+    assert_eq!(u(&sim, "w1"), 10, "the alias resumes when the target fires");
+    assert_eq!(u(&sim, "w2"), 10, "the target resumes too");
+    assert_eq!(u(&sim, "t_trig"), 10, ".triggered follows the alias");
+    assert_eq!(
+        u(&sim, "w_target"),
+        25,
+        "triggering the alias wakes the target"
+    );
+}
+
+/// A monitor triggers its own event, a sequence waits on the sequencer's
+/// copy, and a connect function assigns one to the other. Without the alias
+/// the sequence waits forever.
+#[test]
+fn class_event_alias_across_monitor_and_sequencer() {
+    let src = r#"
+`timescale 1ns/1ns
+module top;
+  class mon;
+    event tick;
+    task pulse(); -> tick; endtask
+  endclass
+  class seqr;
+    event tick;
+  endclass
+  class agent;
+    mon m;
+    seqr s;
+    function void connect();
+      s.tick = m.tick;
+    endfunction
+  endclass
+  class seq;
+    seqr p_sequencer;
+    int woke;
+    task body();
+      @p_sequencer.tick;
+      woke = $time;
+    endtask
+  endclass
+  agent a;
+  seq q;
+  int merged, got;
+  initial begin
+    a = new(); a.m = new(); a.s = new();
+    a.connect();
+    merged = (a.s.tick == a.m.tick);
+    q = new(); q.p_sequencer = a.s;
+    fork q.body(); join_none
+    #20 a.m.pulse();
+    #1 got = q.woke;
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    assert_eq!(u(&sim, "merged"), 1, "connect merges the two events");
+    assert_eq!(
+        u(&sim, "got"),
+        20,
+        "the sequence resumes when the monitor pulses"
+    );
+}
+
+/// An integral class property must still be copied. The event-handle probe
+/// runs before the member-value assign and must miss this.
+#[test]
+fn class_int_member_assign_is_not_an_event_alias() {
+    let src = r#"
+module top;
+  class c;
+    int x;
+  endclass
+  c obj;
+  int got;
+  initial begin
+    obj = new();
+    obj.x = 7;
+    got = obj.x;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "got"), 7, "int member assignment still copies");
+}
+
+/// `h.ce = null` drops the alias. Triggering the old target must not wake a
+/// waiter on the nulled handle, and the nulled handle compares equal to null.
+#[test]
+fn class_event_null_assignment_breaks_the_alias() {
+    let src = r#"
+`timescale 1ns/1ns
+module top;
+  class holder;
+    event ce;
+  endclass
+  holder h1, h2;
+  int is_null, w1_woke, w2;
+  initial begin
+    h1 = new(); h2 = new();
+    h1.ce = h2.ce;
+    h1.ce = null;
+    is_null = (h1.ce == null);
+    fork
+      begin @(h1.ce); w1_woke = 1; end
+      begin @(h2.ce); w2 = $time; end
+    join_none
+    #10 -> h2.ce;
+    #5 $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    assert_eq!(u(&sim, "is_null"), 1, "the handle compares equal to null");
+    assert_eq!(u(&sim, "w1_woke"), 0, "the nulled handle does not wake");
+    assert_eq!(u(&sim, "w2"), 10, "the target is still its own event");
+}
+
+/// §15.5.5: an event handle names the object it was assigned, not the other
+/// property. Reassigning the right-hand property afterwards (here to null)
+/// does not move the left-hand one.
+#[test]
+fn class_event_alias_keeps_its_object_after_the_source_is_reassigned() {
+    let src = r#"
+`timescale 1ns/1ns
+module top;
+  class holder;
+    event ce;
+  endclass
+  holder h1, h3;
+  int w3, trig3;
+  initial begin
+    h1 = new(); h3 = new();
+    h3.ce = h1.ce;
+    h1.ce = null;
+    fork begin @(h3.ce); w3 = $time; end join_none
+    #10 -> h3.ce;
+    trig3 = h3.ce.triggered;
+    #5 $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 200).expect("simulate failed");
+    assert_eq!(u(&sim, "w3"), 10, "h3.ce still names h1's original event");
+    assert_eq!(u(&sim, "trig3"), 1, "and its .triggered state");
+}

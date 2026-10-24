@@ -4931,11 +4931,11 @@ impl Simulator {
                             }
                         }
                         if let Some(key) = key {
-                            self.instance_event_waiters.push(InstanceEventWaiter {
-                                key: InstanceEventKeys::One(key),
-                                pid: wpid,
-                                continuation: wake,
-                            });
+                            self.park_instance_event_waiter(
+                                InstanceEventKeys::One(key),
+                                wpid,
+                                wake,
+                            );
                         } else {
                             let sens = self.event_to_sens(e);
                             let is_clk_ev = self.is_clocking_event(e);
@@ -4954,11 +4954,11 @@ impl Simulator {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
                                 let cont = vec![*stmt.clone()];
                                 let pid = self.current_pid;
-                                self.instance_event_waiters.push(InstanceEventWaiter {
-                                    key: InstanceEventKeys::One(key),
+                                self.park_instance_event_waiter(
+                                    InstanceEventKeys::One(key),
                                     pid,
-                                    continuation: cont.into(),
-                                });
+                                    cont.into(),
+                                );
                                 self.break_flag = true;
                                 return;
                             }
@@ -4975,11 +4975,11 @@ impl Simulator {
                             {
                                 let cont = vec![*stmt.clone()];
                                 let pid = self.current_pid;
-                                self.instance_event_waiters.push(InstanceEventWaiter {
-                                    key: InstanceEventKeys::One(key),
+                                self.park_instance_event_waiter(
+                                    InstanceEventKeys::One(key),
                                     pid,
-                                    continuation: cont.into(),
-                                });
+                                    cont.into(),
+                                );
                                 self.break_flag = true;
                                 return;
                             }

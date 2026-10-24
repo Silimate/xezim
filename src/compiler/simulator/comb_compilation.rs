@@ -1275,7 +1275,11 @@ impl Simulator {
                 if !is_always_comb {
                     SKIP_FN_BODY_READS.with(|c| c.set(true));
                 }
+                PACKED_ACCESS.with(|p| *p.borrow_mut() = Some(HashMap::default()));
                 Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
+                let packed_access: HashMap<String, PackedAccess> = PACKED_ACCESS
+                    .with(|p| p.borrow_mut().take())
+                    .unwrap_or_default();
                 SKIP_FN_BODY_READS.with(|c| c.set(false));
                 // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
                 // to resolve hierarchical refs whose path includes the
@@ -1339,11 +1343,38 @@ impl Simulator {
                 // then the field write commit two different values per eval), which
                 // churns to the settle limit. Strip a read whose '.'-base prefix is
                 // in the write set.
+                // A packed multi-dimensional vector is the exception (§9.2.2.2.1
+                // longest static prefix): the block reads one element and writes
+                // another (`ds[1] = f(ds[0])`), both named `ds`, and the element
+                // it reads is driven from outside. Dropping `ds` left the block
+                // deaf to that driver. Only a block whose reads and writes of the
+                // vector hit disjoint constant elements qualifies. One that reads
+                // an element it also writes (`v[0] = a; v[0] ^= b`) or assigns the
+                // whole vector (`v = '0; v[i] = ...`) sees its own transient
+                // values and re-queues itself to the settle limit, so the guard
+                // above still drops those.
+                let is_packed_multi = |r: &str| -> bool {
+                    let multi = |k: &str| {
+                        self.module
+                            .packed_full_dims
+                            .get(k)
+                            .is_some_and(|d| d.len() > 1)
+                    };
+                    let disjoint = packed_access.get(r).is_some_and(|a| {
+                        !a.irregular && !a.writes.is_empty() && a.reads.is_disjoint(&a.writes)
+                    });
+                    disjoint
+                        && (multi(r)
+                            || (!ab.scope.is_empty() && multi(&format!("{}.{}", ab.scope, r)))
+                            || scope_hint
+                                .as_ref()
+                                .is_some_and(|sc| multi(&format!("{}.{}", sc, r))))
+                };
                 let sens_reads: HashSet<String> = reads
                     .iter()
                     .filter(|r| {
                         if writes.contains(*r) {
-                            return false;
+                            return is_packed_multi(r.as_str());
                         }
                         let mut base: &str = r.as_str();
                         while let Some(pos) = base.rfind('.') {

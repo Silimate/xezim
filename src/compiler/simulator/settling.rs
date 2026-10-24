@@ -481,6 +481,9 @@ impl Simulator {
                             let hi = self.comb_dep_offsets[id + 1] as usize;
                             for k in lo..hi {
                                 let dep = self.comb_dep_entries[k] as usize;
+                                if dep == eidx && self.comb_self_exempt[eidx] {
+                                    continue;
+                                }
                                 if !self.settle_triggered[dep] {
                                     self.settle_triggered[dep] = true;
                                     let dl = self.comb_level[dep] as usize;

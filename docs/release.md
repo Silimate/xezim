@@ -77,8 +77,7 @@ The build stops at the first gate that fails:
    libgcc_s.
 7. **The smoke test** ([`release/smoke.sh`](../release/smoke.sh)) runs the
    packed release on a bare AlmaLinux 8 image, which has no compiler or
-   Python: the binary starts and simulates a design, and its MCP server
-   answers a tool call.
+   Python: the binary starts and simulates a design.
 
 An exception to a gate goes in `release/deny.toml` or `release/osv-scanner.toml`
 with its reason and when to drop it, in a pull request of its own.

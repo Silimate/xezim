@@ -812,3 +812,5 @@ mod unique_multi_dyn_array;
 mod foreach_indexed_elem_member_array;
 #[path = "classes/scalar_formal_shadows_caller_local_coll.rs"]
 mod scalar_formal_shadows_caller_local_coll;
+#[path = "classes/rand_dyn_array_of_unpacked_structs.rs"]
+mod rand_dyn_array_of_unpacked_structs;

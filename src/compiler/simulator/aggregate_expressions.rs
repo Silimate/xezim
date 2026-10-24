@@ -1757,6 +1757,7 @@ impl Simulator {
             hi: 0,
             nested: false,
             is_object_elem: false,
+            member: None,
         };
         Self::csp_size_solved(&c, &wrapper)
     }

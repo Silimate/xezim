@@ -831,6 +831,17 @@ impl Simulator {
 
         // Rand collection members (dynamic arrays, queues, associative arrays).
         let rand_colls = self.collect_rand_colls(handle, &rand_disabled, &constraints);
+        // An array of unpacked structs is solved through its member
+        // collections, never as one scalar or one struct.
+        let struct_coll_bases: HashSet<String> = rand_colls
+            .iter()
+            .filter(|c| c.member.is_some())
+            .filter_map(|c| c.prop.split_once('.').map(|(b, _)| b.to_string()))
+            .collect();
+        if !struct_coll_bases.is_empty() {
+            rand_props.retain(|(n, _)| !struct_coll_bases.contains(n));
+            prop_type_names.retain(|n, _| !struct_coll_bases.contains(n));
+        }
         Self::regroup_unique_colls(&mut constraints, &rand_colls);
         // `unique {c}` / `unique {a, b}` items naming those collections
         // (§18.5.5), one group per item.

@@ -12636,6 +12636,26 @@ struct RandColl {
     /// a fresh random draw would overwrite the handle with junk, destroying
     /// the object reference and any aliasing (`arr[1]==arr[2]`).
     is_object_elem: bool,
+    /// §18.4: one rand member of an array of unpacked structs, solved as a
+    /// collection of its own (`prop` is `arr.m`, elements `arr[i].m`).
+    member: Option<StructElemMember>,
+}
+
+#[derive(Clone, Debug)]
+struct StructElemMember {
+    name: String,
+    signed: bool,
+    enum_type: Option<String>,
+}
+
+impl RandColl {
+    /// Storage key of element `i` (`<h>#arr[i]`, or `<h>#arr[i].m`).
+    fn elem_key(&self, i: impl std::fmt::Display) -> String {
+        match &self.member {
+            Some(m) => format!("{}[{}].{}", self.scoped, i, m.name),
+            None => format!("{}[{}]", self.scoped, i),
+        }
+    }
 }
 
 /// A `.size()` constraint on a rand dynamic array (§18.4): the array must be

@@ -818,3 +818,5 @@ mod rand_dyn_array_of_unpacked_structs;
 mod dollar_index_handle_member_write;
 #[path = "classes/rand_masked_eq_variable_mask.rs"]
 mod rand_masked_eq_variable_mask;
+#[path = "classes/rand_unread_sub_object_joint_solve.rs"]
+mod rand_unread_sub_object_joint_solve;

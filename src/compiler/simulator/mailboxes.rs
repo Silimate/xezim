@@ -4,6 +4,10 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// Marks a queued `mbx_patterns` token so it is not taken for a struct
+/// shadow id or for a small scalar message.
+const MBX_PATTERN_TAG: u64 = 0x5a50_0000_0000_0000;
+
 impl Simulator {
     /// Hand a put/try_put value to a parked mailbox get/peek waiter. The assign
     /// to the waiter's destination MUST run in the WAITER's process context
@@ -222,12 +226,105 @@ impl Simulator {
     }
 
     /// The value a mailbox `put` queues for `arg`: an unpacked struct is
-    /// stashed member-wise and queued as its shadow id.
+    /// stashed member-wise and queued as its shadow id, and an assignment
+    /// pattern is queued as a `mbx_patterns` token.
     pub(super) fn mbx_message(&mut self, arg: &Expression) -> Value {
+        if let ExprKind::AssignmentPattern(items) = &arg.kind {
+            if !items.is_empty() {
+                let items = self.snapshot_pattern_items(items, arg.span);
+                self.mbx_msg_seq += 1;
+                let tok = MBX_PATTERN_TAG | self.mbx_msg_seq;
+                self.mbx_patterns.insert(tok, items);
+                return Value::from_u64(tok, 64);
+            }
+        }
         match self.mbx_struct_arg(arg) {
             Some((src, su)) => self.mbx_stash_struct(&src, &su),
             None => self.eval_expr(arg),
         }
+    }
+
+    /// `items` with every leaf expression replaced by a literal of its value
+    /// now (IEEE 1800-2017 §15.4.3, §13.5.1: `put` takes the message by value
+    /// at the call). Nested patterns keep their shape and `name:` /
+    /// `default:` keys, so the copy can still be spread by member name into
+    /// whatever type receives it.
+    fn snapshot_pattern_items(
+        &mut self,
+        items: &[AssignmentPatternItem],
+        span: crate::ast::Span,
+    ) -> Vec<AssignmentPatternItem> {
+        items
+            .iter()
+            .map(|item| match item {
+                AssignmentPatternItem::Ordered(e) => {
+                    AssignmentPatternItem::Ordered(self.snapshot_pattern_leaf(e, span))
+                }
+                AssignmentPatternItem::Named(n, e) => {
+                    AssignmentPatternItem::Named(n.clone(), self.snapshot_pattern_leaf(e, span))
+                }
+                AssignmentPatternItem::Typed(t, e) => {
+                    AssignmentPatternItem::Typed(t.clone(), self.snapshot_pattern_leaf(e, span))
+                }
+                AssignmentPatternItem::Default(e) => {
+                    AssignmentPatternItem::Default(self.snapshot_pattern_leaf(e, span))
+                }
+                AssignmentPatternItem::Keyed(k, e) => AssignmentPatternItem::Keyed(
+                    self.snapshot_pattern_leaf(k, span),
+                    self.snapshot_pattern_leaf(e, span),
+                ),
+            })
+            .collect()
+    }
+
+    fn snapshot_pattern_leaf(&mut self, e: &Expression, span: crate::ast::Span) -> Expression {
+        if let ExprKind::AssignmentPattern(sub) = &e.kind {
+            return Expression::new(
+                ExprKind::AssignmentPattern(self.snapshot_pattern_items(sub, span)),
+                span,
+            );
+        }
+        let v = self.eval_expr(e);
+        let lit = if v.is_real {
+            NumberLiteral::Real(v.to_f64())
+        } else {
+            NumberLiteral::Integer {
+                size: Some(v.width.max(1)),
+                signed: v.is_signed,
+                base: NumberBase::Binary,
+                value: v.to_bin(),
+                cached_val: Cell::new(None),
+            }
+        };
+        Expression::new(ExprKind::Number(lit), span)
+    }
+
+    /// Deliver a pattern message (see `mbx_message`) as `lvalue = '{...}`, so
+    /// the destination's type gives the pattern its context. `false` when `v`
+    /// is not a pattern token.
+    fn mbx_deliver_pattern(&mut self, lvalue: &Expression, v: &Value, consume: bool) -> bool {
+        if v.width != 64 {
+            return false;
+        }
+        let Some(tok) = v.to_u64() else {
+            return false;
+        };
+        let Some(items) = (if consume {
+            self.mbx_patterns.remove(&tok)
+        } else {
+            self.mbx_patterns.get(&tok).cloned()
+        }) else {
+            return false;
+        };
+        let span = lvalue.span;
+        self.exec_statement(&Statement::new(
+            StatementKind::BlockingAssign {
+                lvalue: lvalue.clone(),
+                rvalue: Expression::new(ExprKind::AssignmentPattern(items), span),
+            },
+            span,
+        ));
+        true
     }
 
     /// Write one delivered message into a parked waiter's lvalue, taking the
@@ -237,6 +334,9 @@ impl Simulator {
     /// `peek`) struct message frees its stash id; only a struct destination
     /// says the value IS one — a scalar message's value is not an id.
     pub(super) fn mbx_assign_delivered(&mut self, lvalue: &Expression, v: &Value, consume: bool) {
+        if self.mbx_deliver_pattern(lvalue, v, consume) {
+            return;
+        }
         if let Some((dst, su)) = self.mbx_struct_arg(lvalue) {
             self.mbx_unstash_struct(&dst, &su, v);
             if consume {

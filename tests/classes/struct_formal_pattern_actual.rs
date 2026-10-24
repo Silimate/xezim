@@ -1,5 +1,5 @@
-//! §10.9.2 / §13.5 — an assignment pattern passed straight to an
-//! unpacked-struct formal: `f('{a: 1, b: 2})`.
+//! IEEE 1800-2017 §10.8 / §10.9.2: an assignment pattern passed straight to
+//! an unpacked-struct formal: `f('{a: 1, b: 2})`.
 //!
 //! The member-wise binding only took a flat POSITIONAL pattern whose item
 //! count matched the leaves. A `name:` item, `default:`, or a nested member

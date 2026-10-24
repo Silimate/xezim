@@ -448,6 +448,8 @@ mod this_chain_edge_sensitivity;
 mod type_param_struct_formal;
 #[path = "classes/struct_formal_pattern_actual.rs"]
 mod struct_formal_pattern_actual;
+#[path = "classes/struct_prop_nested_member_copy.rs"]
+mod struct_prop_nested_member_copy;
 #[path = "classes/typedef_extends_cast.rs"]
 mod typedef_extends_cast;
 #[path = "classes/typedef_param_base_inherits_spec_arg.rs"]

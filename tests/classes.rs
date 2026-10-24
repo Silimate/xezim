@@ -115,6 +115,8 @@ mod randomize_failure_diag;
 mod static_fixed_array_storage;
 #[path = "classes/static_param_class_collection_reuse.rs"]
 mod static_param_class_collection_reuse;
+#[path = "classes/package_param_spec_args.rs"]
+mod package_param_spec_args;
 #[path = "classes/struct_member_bitselect_frame_local.rs"]
 mod struct_member_bitselect_frame_local;
 #[path = "classes/struct_member_class_handle_new.rs"]

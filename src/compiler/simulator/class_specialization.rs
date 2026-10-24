@@ -1809,6 +1809,12 @@ impl Simulator {
             }
             return v.to_i64().map(|n| n.to_string());
         }
+        // A package parameter named through its package (`P#(pkg::W)`) is
+        // the same value as the imported `P#(W)`; a package type or enum
+        // name keeps its spelling.
+        if let Some(key) = self.package_param_key(frag) {
+            return self.module.parameters.get(key)?.to_i64().map(|n| n.to_string());
+        }
         // Already canonical: a plain decimal.
         let digits = b.strip_prefix(b"-").unwrap_or(b);
         if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
@@ -1836,12 +1842,10 @@ impl Simulator {
         {
             return None;
         }
-        if b.iter().any(|&c| {
-            matches!(
-                c,
-                b'.' | b'"' | b'$' | b'x' | b'X' | b'z' | b'Z' | b'?' | b'#' | b'[' | b'{'
-            )
-        }) {
+        if b.iter()
+            .any(|&c| matches!(c, b'.' | b'"' | b'$' | b'?' | b'#' | b'[' | b'{'))
+            || Self::has_xz_literal(b)
+        {
             return None;
         }
         if !typed {
@@ -1912,11 +1916,8 @@ impl Simulator {
                 match &e.kind {
                     ExprKind::Number(NumberLiteral::Integer { .. })
                     | ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => true,
-                    ExprKind::Ident(h) => {
-                        h.root.is_none()
-                            && h.path.len() == 1
-                            && h.path[0].selects.is_empty()
-                            && ok_name(&h.path[0].name.name)
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                        spec_operand_name(e).is_some_and(|n| ok_name(&n))
                     }
                     ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => walk(x, ok_name),
                     ExprKind::Binary { left, right, .. } => {
@@ -1934,10 +1935,35 @@ impl Simulator {
                     _ => false,
                 }
             }
-            walk(e, &|n: &str| {
-                !names.params.contains(n) && self.scoped_param_value(n).is_some()
+            walk(e, &|n: &str| match self.package_param_key(n) {
+                Some(key) => self.module.parameters.contains_key(key),
+                None => !names.params.contains(n) && self.scoped_param_value(n).is_some(),
             })
         };
+        // `W`, or `pkg::W` (an identifier path or, in some contexts, a
+        // member access); a longer path is rejected by `package_param_key`.
+        fn spec_operand_name(e: &Expression) -> Option<String> {
+            match &e.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    Some(
+                        h.path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::"),
+                    )
+                }
+                ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                    ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                        Some(format!("{}::{}", h.path[0].name.name, member.name))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
         let src = format!(
             "module __xezim_spec_arg; localparam __xezim_v = {};\nendmodule\n",
             text
@@ -1972,7 +1998,9 @@ impl Simulator {
         let mut ptab: HashMap<String, Value> = HashMap::default();
         fn names_in(e: &Expression, out: &mut Vec<String>) {
             match &e.kind {
-                ExprKind::Ident(h) => out.push(h.path[0].name.name.clone()),
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                    out.extend(spec_operand_name(e))
+                }
                 ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => names_in(x, out),
                 ExprKind::Binary { left, right, .. } => {
                     names_in(left, out);
@@ -1993,10 +2021,69 @@ impl Simulator {
         let mut ids = Vec::new();
         names_in(&init, &mut ids);
         for n in ids {
-            ptab.insert(n.clone(), self.scoped_param_value(&n)?);
+            let v = match self.package_param_key(&n) {
+                Some(key) => self.module.parameters.get(key)?.clone(),
+                None => self.scoped_param_value(&n)?,
+            };
+            ptab.insert(n, v);
         }
         let v = super::elaborate::const_eval_i64_with_params(&init, Some(&ptab))?;
         Some(v.to_string())
+    }
+
+    /// The decimal value of a constant expression whose only names are
+    /// package parameters (`pkg::N + pkg::K`); None when it reads anything
+    /// else.
+    pub(super) fn fold_package_const_expr(&self, e: &Expression) -> Option<String> {
+        let mut ptab: HashMap<String, Value> = HashMap::default();
+        if !self.bind_default_operands(e, &[], &[], &mut ptab) {
+            return None;
+        }
+        super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
+    }
+
+    /// `pkg::NAME` when `pkg` is a package of the design: the key
+    /// `module.parameters` holds that package's parameter under. None for a
+    /// bare name or any other scope.
+    pub(super) fn package_param_key<'a>(&self, text: &'a str) -> Option<&'a str> {
+        let (pkg, leaf) = text.split_once("::")?;
+        let ident = |s: &str| {
+            s.as_bytes()
+                .first()
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        };
+        (ident(pkg) && ident(leaf) && self.module.packages.contains(pkg)).then_some(text)
+    }
+
+    /// Whether specialization-argument text holds an x/z/? digit: a based
+    /// literal (`4'bx01`, `'hz`) or an unbased unsized `'x`/`'z`. Letters
+    /// of names (`cfg_pkg::W`) are not digits.
+    pub(super) fn has_xz_literal(b: &[u8]) -> bool {
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'\'' {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if i < b.len() && matches!(b[i], b's' | b'S') {
+                i += 1;
+            }
+            if i < b.len() && matches!(b[i], b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H') {
+                i += 1;
+                while i < b.len() && b[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'?') {
+                if matches!(b[i], b'x' | b'X' | b'z' | b'Z' | b'?') {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
     }
 
     /// IEEE 1800-2017 §6.20.2: the DECLARED DEFAULT of parameter
@@ -2155,6 +2242,20 @@ impl Simulator {
                     _ => false,
                 }
             }
+            // `pkg::P` in a type's argument list parses as a member access.
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    let key = format!("{}::{}", h.path[0].name.name, member.name);
+                    match self.module.parameters.get(&key) {
+                        Some(v) => {
+                            ptab.insert(key, v.clone());
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            },
             _ => false,
         }
     }

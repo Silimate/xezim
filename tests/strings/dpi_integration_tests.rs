@@ -552,6 +552,23 @@ fn dpi_audit_binding_test() {
 }
 
 #[test]
+fn dpi_string_return_display_test() {
+    // IEEE 1800-2017 §21.2.1 / §35.5.5: `$display(f())` with `f` an import
+    // declared `string` printed a decimal integer instead of the returned
+    // text.
+    let so = compile_dpi_lib(
+        "tests/dpi/string_return_display.c",
+        "string_return_display",
+    );
+    let log = run_xezim_with_dpi(&so, "tests/dpi/string_return_display_test.sv");
+    assert!(log.contains("TEST_PASS"), "missing TEST_PASS:\n{log}");
+    assert!(
+        log.lines().any(|l| l == "hello from C"),
+        "bare $display of the import did not print its text:\n{log}"
+    );
+}
+
+#[test]
 fn dpi_audit_types_test() {
     // §35.5.6 / H.7 (DPI audit, family B): integer / time formals are
     // svLogicVecVal*, unpacked structs pass as C structs.

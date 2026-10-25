@@ -3800,6 +3800,7 @@ impl Simulator {
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
             clocking_edge_drive_dirty: false,
+            clocking_drive_next_edge: clocking_drive() == ClockingDrive::NextEdge,
             clocking_cycle_pending: HashMap::default(),
             clocking_sig_alias: HashMap::default(),
             clocking_out_skew: HashMap::default(),

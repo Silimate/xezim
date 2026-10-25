@@ -154,6 +154,28 @@ pub fn check(name: &str, src: &str, top: &str, order: Order, expected: &[&str], 
     compare(name, actual, order, expected, skip);
 }
 
+/// As `check`, simulated under `--clocking-drive=<mode>`.
+pub fn check_clocking(
+    mode: xezim::compiler::simulator::ClockingDrive,
+    name: &str,
+    src: &str,
+    top: &str,
+    order: Order,
+    expected: &[&str],
+    skip: &[&str],
+) {
+    xezim::compiler::simulator::with_clocking_drive(mode, || {
+        check(
+            &format!("{name} ({mode:?})"),
+            src,
+            top,
+            order,
+            expected,
+            skip,
+        )
+    });
+}
+
 /// Run `src` through the command-line binary in a fresh temporary
 /// directory, as the DPI/VPI tests in `tests/strings/` do. `setup` prepares
 /// the directory and returns extra command-line arguments.

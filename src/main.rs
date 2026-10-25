@@ -232,6 +232,12 @@ fn print_usage() {
                    static, --relax-driver-conflicts and --error-exit. Also
                    enabled by XEZIM_COMPAT=1."
     );
+    eprintln!("  --clocking-drive=<lrm|next-edge>  Where a clocking output drive made between");
+    eprintln!("                   clocking events lands when its output skew is an edge");
+    eprintln!("                   (`output negedge`): at the next clocking event, then the");
+    eprintln!("                   skew (lrm, the default, IEEE 1800-2017 14.16), or on the");
+    eprintln!("                   next such edge of the clock (next-edge).");
+    eprintln!("                   XEZIM_CLOCKING_DRIVE=<lrm|next-edge> too.");
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
     eprintln!("                   stmt, branch, cond, expr, toggle, fsm (or all, the default).");
     eprintln!("                   Counts go to xezim_cov.json (XEZIM_COV_DB) with the");
@@ -2097,6 +2103,7 @@ fn run_main() -> i32 {
     // `--[no-]toggle-integers`.
     let mut code_cov_integers: Option<bool> = None;
     let mut code_cov_keep: Option<bool> = None;
+    let mut clocking_drive: Option<xezim::compiler::simulator::ClockingDrive> = None;
     // `--[no-]toggle-enums`, `--[no-]toggle-generate`, `--[no-]toggle-tied`,
     // `--code-coverage-expressions`, `--code-coverage-granularity`,
     // `--[no-]fsm-reset-transitions`.
@@ -2808,6 +2815,22 @@ fn run_main() -> i32 {
                     }
                 }
             }
+            _ if arg == "--clocking-drive" || arg.starts_with("--clocking-drive=") => {
+                let mode = match arg.strip_prefix("--clocking-drive=") {
+                    Some(m) => m.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i).cloned().unwrap_or_default()
+                    }
+                };
+                match xezim::compiler::simulator::parse_clocking_drive(&mode) {
+                    Ok(m) => clocking_drive = Some(m),
+                    Err(e) => {
+                        eprintln!("Error: --clocking-drive: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "--fst" => {
                 i += 1;
                 if i < args.len() {
@@ -3224,6 +3247,21 @@ fn run_main() -> i32 {
             _ => false,
         },
     };
+    // `--clocking-drive` wins over XEZIM_CLOCKING_DRIVE.
+    let clocking_drive = match clocking_drive {
+        Some(m) => m,
+        None => match env::var("XEZIM_CLOCKING_DRIVE") {
+            Ok(v) if !v.is_empty() => match xezim::compiler::simulator::parse_clocking_drive(&v) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: XEZIM_CLOCKING_DRIVE: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            _ => xezim::compiler::simulator::ClockingDrive::Lrm,
+        },
+    };
+    xezim::compiler::simulator::set_clocking_drive(clocking_drive);
     // The other counting rules: the flag wins over its environment
     // variable, which takes 0 or 1 (a mode for the two with values).
     let switch = |flag: Option<bool>, var: &str, default: bool| -> bool {

@@ -7,6 +7,7 @@ how to use them together, see the [user guide](user-guide.md).
 
 * [Options](#options)
 * [Environment variables](#environment-variables)
+* [Clocking drives between clocking events](#clocking-drives-between-clocking-events)
 * [Command lines from other simulators](#command-lines-from-other-simulators)
 
 ## Options
@@ -59,6 +60,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for third-party sources you cannot edit |
 | `--relax-driver-conflicts` | Report a variable with conflicting drivers — two continuous assigns, a continuous assign plus procedural writes, or an `always_comb`/`always_latch`/`always_ff` variable also written by another process (§6.5, §9.2.2) — as a warning instead of an error, so existing designs (e.g. an `initial` block that initializes an `always_ff` register) still run |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
+| `--clocking-drive=<lrm\|next-edge>` | Where a clocking block output drive made between clocking events lands when its output skew is an edge (`output negedge`): at the next clocking event, then the skew (`lrm`, the default), or on the next such edge of the clock (`next-edge`). See [below](#clocking-drives-between-clocking-events) |
 | `--code-coverage[=<kinds>]` | Collect code coverage: `stmt`, `branch`, `cond`, `expr`, `toggle`, `fsm` (comma-separated) or `all` (the default). Results go to `xezim_cov.json` next to the functional coverage; `--verbose` adds a per-instance summary. See the [coverage guide](coverage-guide.md#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees (`tb.dut`) and packages (repeatable) |
 | `--no-toggle-input-ports` | Leave input and inout ports out of toggle coverage: the signal that drives one carries its toggles. By default each instance counts its own ports, as commercial simulators do (`--toggle-input-ports`). See the [coverage guide](coverage-guide.md#toggles) |
@@ -105,6 +107,7 @@ unless noted.
 | `XEZIM_ALLOW_IMPLICIT_STATIC=1` | Same as `--relax-implicit-static` |
 | `XEZIM_RELAX_DRIVER_CONFLICTS=1` | Same as `--relax-driver-conflicts` |
 | `XEZIM_COMPAT=1` | Same as `--compat` |
+| `XEZIM_CLOCKING_DRIVE=<lrm\|next-edge>` | Same as `--clocking-drive=<mode>`; the flag wins |
 | `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
 | `XEZIM_VERBOSE=1` | Same as `--verbose` (for scripts that grep `[PHASE]`/`[PROF]` lines without adding a flag) |
 | `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |
@@ -120,6 +123,34 @@ unless noted.
 | `XEZIM_UVM_VERSION=<release>` | With a multi-release `XEZIM_UVM_DIR`, the release subdirectory to use (default: the newest present) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |
 | `XEZIM_VALUE_TRACE_LIMIT=N` | Cap value-trace output lines (default 20000) |
+
+## Clocking drives between clocking events
+
+A synchronous drive (`cb.sig <= v`) can execute between two clocking events
+of its block. `--clocking-drive` picks where it lands when the output skew is
+an edge, as in `default output negedge`:
+
+```systemverilog
+clocking cb @(posedge clk);  // posedge clk at 5, 15, 25 ns
+  default output negedge;    // negedge clk at 10, 20, 30 ns
+  output branch;
+endclocking
+initial begin @(posedge clk); #1ps cb.branch <= 1;  // 5.001 ns, between events
+  @(cb); cb.branch <= 0; end                         // 15 ns, at the event
+```
+
+* `lrm` (the default) follows IEEE 1800-2017 14.16: "It is possible for a
+  drive statement to execute at a time that is not coincident with its
+  clocking event. Such drive statements shall execute without blocking, but
+  shall perform their drive action as if they had executed at the time of the
+  next clocking event." Both drives act at the event at 15 ns and mature on
+  the negedge at 20 ns. Per 14.16.2 the last value wins, so `branch` stays 0.
+* `next-edge` lands the first drive on the next negedge after it executes, so
+  `branch` rises at 10 ns and falls at 20 ns. This matches what some
+  simulators do; the LRM text does not describe it.
+
+Drives made at a clocking event, and drives through a delay skew
+(`output #2`), behave the same in both modes.
 
 ## Command lines from other simulators
 

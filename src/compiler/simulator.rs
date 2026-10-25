@@ -2609,6 +2609,9 @@ mod vpi_api;
 mod vpi_cb;
 mod vpi_model;
 use assert_ctl::{AssertCtl, CtlIdent, CtlSite};
+pub use clocking::{
+    ClockingDrive, clocking_drive, parse_clocking_drive, set_clocking_drive, with_clocking_drive,
+};
 pub(crate) use code_cov::{
     COND_FN as COV_COND_FN, EXPR_FN as COV_EXPR_FN, HIT_TASK as COV_HIT_TASK,
     marker_id as cov_marker_id,
@@ -6697,6 +6700,9 @@ pub struct Simulator {
     /// caller settles and runs one more edge pass: the drive lands after this
     /// slot's edge detection, and its fan-out must still wake in this slot.
     clocking_edge_drive_dirty: bool,
+    /// `--clocking-drive=next-edge`: a drive between clocking events through
+    /// an edge-skew output lands on the next such edge (see `ClockingDrive`).
+    clocking_drive_next_edge: bool,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
     /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.

@@ -7,7 +7,9 @@
 // times coincident with clocking events, or at times in between clocking
 // events (within the same clock cycle)."
 // `branch <= 1` at 5.001 and `branch <= 0` at the event at 15 both mature on
-// the negedge at 20; 0 wins, so branch never goes high.
+// the negedge at 20; 0 wins, so branch never goes high. With
+// --clocking-drive=next-edge, branch is 1 from the negedge at 10 to the one
+// at 20.
 `timescale 1ns/1ps
 module c14on;
   logic clk = 0;

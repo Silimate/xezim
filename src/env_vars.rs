@@ -148,6 +148,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Clock tree: print dedup statistics for derived clock signals",
     ),
     (
+        "XEZIM_CLOCKING_DRIVE",
+        "Clocking: lrm (default) or next-edge, like --clocking-drive; where a drive made between clocking events lands through an edge output skew; the flag wins",
+    ),
+    (
         "XEZIM_CLOCK_TREE",
         "Cycle engine: set to 0 to disable the eager clock-tree pass",
     ),

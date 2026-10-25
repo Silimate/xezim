@@ -6,6 +6,7 @@
 // u: drive at the event at 15, changes on the negedge at 20.
 // w: `##1` drive at 15, matures at the event at 25, changes at 30.
 // v: drive at 17 (between events), acts at the event at 25, changes at 30.
+// With --clocking-drive=next-edge, v changes on the negedge at 20 instead.
 `timescale 1ns/1ps
 module c14nt;
   logic clk = 0;

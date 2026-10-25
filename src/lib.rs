@@ -1004,35 +1004,39 @@ pub fn simulate_multi(
     struct SendResult(Result<compiler::Simulator, String>);
     // SAFETY: see above — transfer-once of a self-contained value.
     unsafe impl Send for SendResult {}
+    // The worker builds the simulator under the caller's clocking drive mode.
+    let clocking_drive = compiler::simulator::clocking_drive();
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("xezim-sim".to_string())
             .stack_size(stack_mb * 1024 * 1024)
             .spawn_scoped(scope, || {
-                SendResult(simulate_multi_inner(
-                    sources,
-                    max_time,
-                    top_module_name,
-                    include_dirs,
-                    source_paths,
-                    settle_limit,
-                    activity_mon,
-                    sdf_file,
-                    sdf_select,
-                    defines,
-                    plusargs,
-                    xtrace_file,
-                    xtrace_scopes,
-                    xtrace_from_ns,
-                    xtrace_to_ns,
-                    fst_file,
-                    fst_scopes,
-                    emit_hypergraph,
-                    load_partition,
-                    write_profile,
-                    profile_input,
-                    collapse_islands,
-                ))
+                compiler::simulator::with_clocking_drive(clocking_drive, || {
+                    SendResult(simulate_multi_inner(
+                        sources,
+                        max_time,
+                        top_module_name,
+                        include_dirs,
+                        source_paths,
+                        settle_limit,
+                        activity_mon,
+                        sdf_file,
+                        sdf_select,
+                        defines,
+                        plusargs,
+                        xtrace_file,
+                        xtrace_scopes,
+                        xtrace_from_ns,
+                        xtrace_to_ns,
+                        fst_file,
+                        fst_scopes,
+                        emit_hypergraph,
+                        load_partition,
+                        write_profile,
+                        profile_input,
+                        collapse_islands,
+                    ))
+                })
             })
             .expect("spawn simulation worker")
             .join()

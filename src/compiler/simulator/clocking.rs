@@ -4,6 +4,119 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// `--clocking-drive=<mode>`: where a synchronous drive executed between
+/// clocking events, through an output with an edge skew, takes effect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClockingDrive {
+    /// IEEE 1800-2017 14.16: it acts as if executed at the next clocking
+    /// event, and the output skew applies from there.
+    #[default]
+    Lrm,
+    /// It lands on the next such edge of the clock.
+    NextEdge,
+}
+
+/// `--clocking-drive=<mode>`: `lrm` (the default) or `next-edge`.
+pub fn parse_clocking_drive(spec: &str) -> Result<ClockingDrive, String> {
+    match spec.trim() {
+        "lrm" => Ok(ClockingDrive::Lrm),
+        "next-edge" => Ok(ClockingDrive::NextEdge),
+        other => Err(format!(
+            "unknown clocking drive mode '{}' (want lrm or next-edge)",
+            other
+        )),
+    }
+}
+
+/// Process-wide mode from the command line; 0 unset, 1 lrm, 2 next-edge.
+static CLOCKING_DRIVE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+thread_local! {
+    static THREAD_CLOCKING_DRIVE: std::cell::Cell<Option<ClockingDrive>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Select the clocking drive mode for the simulators built after this call.
+pub fn set_clocking_drive(mode: ClockingDrive) {
+    let v = match mode {
+        ClockingDrive::Lrm => 1,
+        ClockingDrive::NextEdge => 2,
+    };
+    CLOCKING_DRIVE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The mode a simulator built on this thread uses: the thread's
+/// `with_clocking_drive`, else `set_clocking_drive`, else
+/// `XEZIM_CLOCKING_DRIVE`, else `lrm`.
+pub fn clocking_drive() -> ClockingDrive {
+    if let Some(m) = THREAD_CLOCKING_DRIVE.with(|c| c.get()) {
+        return m;
+    }
+    match CLOCKING_DRIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ClockingDrive::Lrm,
+        2 => ClockingDrive::NextEdge,
+        _ => {
+            static FROM_ENV: std::sync::OnceLock<ClockingDrive> = std::sync::OnceLock::new();
+            *FROM_ENV.get_or_init(|| match std::env::var("XEZIM_CLOCKING_DRIVE") {
+                Ok(v) if !v.is_empty() => parse_clocking_drive(&v)
+                    .unwrap_or_else(|e| panic!("XEZIM_CLOCKING_DRIVE: {}", e)),
+                _ => ClockingDrive::Lrm,
+            })
+        }
+    }
+}
+
+/// Run `f` with simulators built on this thread using `mode`. Concurrent
+/// simulations in one process (`cargo test`) can each pick their own.
+pub fn with_clocking_drive<R>(mode: ClockingDrive, f: impl FnOnce() -> R) -> R {
+    let prev = THREAD_CLOCKING_DRIVE.with(|c| c.replace(Some(mode)));
+    struct Restore(Option<ClockingDrive>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            THREAD_CLOCKING_DRIVE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+#[cfg(test)]
+mod clocking_drive_tests {
+    use super::{ClockingDrive, clocking_drive, parse_clocking_drive, with_clocking_drive};
+
+    #[test]
+    fn parses_the_two_modes() {
+        assert_eq!(parse_clocking_drive("lrm"), Ok(ClockingDrive::Lrm));
+        assert_eq!(
+            parse_clocking_drive("next-edge"),
+            Ok(ClockingDrive::NextEdge)
+        );
+        assert_eq!(
+            parse_clocking_drive(" next-edge "),
+            Ok(ClockingDrive::NextEdge)
+        );
+    }
+
+    #[test]
+    fn rejects_other_values() {
+        for bad in ["", "LRM", "next_edge", "nextedge", "edge"] {
+            let e = parse_clocking_drive(bad).unwrap_err();
+            assert!(e.contains("want lrm or next-edge"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn thread_mode_applies_inside_and_is_restored() {
+        let outer = clocking_drive();
+        let inner = with_clocking_drive(ClockingDrive::NextEdge, || {
+            let nested = with_clocking_drive(ClockingDrive::Lrm, clocking_drive);
+            (clocking_drive(), nested)
+        });
+        assert_eq!(inner, (ClockingDrive::NextEdge, ClockingDrive::Lrm));
+        assert_eq!(clocking_drive(), outer);
+    }
+}
+
 impl Simulator {
     /// `(lo, hi)` of a fixed unpacked array named `name`, or None.
     /// The span is capped so a clocking sample cannot walk a huge array.

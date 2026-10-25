@@ -3817,9 +3817,13 @@ impl Simulator {
                                     .copied()
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
-                                if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
-                                    // §14.4: an edge skew drives on the next
-                                    // such edge of the clock after the event.
+                                let at_event =
+                                    self.clocking_last_edge.get(&cb).copied() == Some(self.time);
+                                // §14.4: an edge skew drives on the next such
+                                // edge of the clock after the event;
+                                // `--clocking-drive=next-edge` also sends a
+                                // drive made between events to that edge.
+                                if at_event || self.clocking_drive_next_edge {
                                     if let Some((edge, d)) =
                                         self.clocking_drive_edge(&cb, raw_sig, &net)
                                     {
@@ -3829,6 +3833,8 @@ impl Simulator {
                                             .push((net, val, edge, d));
                                         return;
                                     }
+                                }
+                                if at_event {
                                     if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
                                         let w = self.signal_widths[id];
                                         self.schedule_delayed_with_delay(id, val.resize(w), skew);

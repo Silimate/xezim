@@ -1,11 +1,20 @@
 //! IEEE 1800-2023 clause 14: clocking blocks.
 
-use crate::harness::{Order, check};
+use crate::harness::{Order, check_clocking};
+use xezim::compiler::simulator::ClockingDrive::{self, Lrm, NextEdge};
+
+/// `check` under both `--clocking-drive` modes, for a fixture whose drives
+/// both modes place alike.
+fn check_both(name: &str, src: &str, top: &str, order: Order, expected: &[&str], skip: &[&str]) {
+    for mode in [Lrm, NextEdge] {
+        check_clocking(mode, name, src, top, order, expected, skip);
+    }
+}
 
 // §14.10: clocking block events
 #[test]
 fn c14_10_clocking_block_events() {
-    check(
+    check_both(
         "c14_more",
         include_str!("sv/c14_more.sv"),
         "c14x",
@@ -23,7 +32,7 @@ fn c14_10_clocking_block_events() {
 // §14.14, §6.24.2: global clocking, $cast on enums
 #[test]
 fn c14_14_global_clocking_and_6_24_2_cast() {
-    check(
+    check_both(
         "c_left",
         include_str!("sv/c_left.sv"),
         "cleft",
@@ -36,7 +45,7 @@ fn c14_14_global_clocking_and_6_24_2_cast() {
 // §14.16.2: Driving an inout clockvar that is a net inside an interface
 #[test]
 fn c14_16_clocking_inout_iface_net() {
-    check(
+    check_both(
         "14.16_clocking_inout_iface_net",
         include_str!("sv/14.16_clocking_inout_iface_net.sv"),
         "rvd",
@@ -49,7 +58,7 @@ fn c14_16_clocking_inout_iface_net() {
 // §14.4: Output skew (default output #2)
 #[test]
 fn c14_16_clocking_output_skew() {
-    check(
+    check_both(
         "14.16_clocking_output_skew",
         include_str!("sv/14.16_clocking_output_skew.sv"),
         "rcb",
@@ -71,7 +80,7 @@ fn c14_16_clocking_output_skew() {
 // §14.3: clocking block inout signals
 #[test]
 fn c14_3_clocking_inout_signals() {
-    check(
+    check_both(
         "r_cbinout",
         include_str!("sv/r_cbinout.sv"),
         "rci",
@@ -88,7 +97,7 @@ fn c14_3_clocking_inout_signals() {
 // §14.4, §14.13: Input and output skews: input sampling (#1step, #N)
 #[test]
 fn c14_4_clocking_input_sampling() {
-    check(
+    check_both(
         "14.4_clocking_input_sampling",
         include_str!("sv/14.4_clocking_input_sampling.sv"),
         "rcb",
@@ -110,7 +119,7 @@ fn c14_4_clocking_input_sampling() {
 // §14.3, §14.4, §14.11, §14.12, §14.16: clocking blocks: skews, cycle delays, default clocking, ## drives
 #[test]
 fn c14_clocking_blocks() {
-    check(
+    check_both(
         "c14_clk",
         include_str!("sv/c14_clk.sv"),
         "c14",
@@ -139,7 +148,7 @@ fn c14_clocking_blocks() {
 // clocking event.
 #[test]
 fn c14_4_clocking_edge_output_skew() {
-    check(
+    check_both(
         "c14_edge_skew",
         include_str!("sv/c14_edge_skew.sv"),
         "c14e",
@@ -156,27 +165,61 @@ fn c14_4_clocking_edge_output_skew() {
 
 // §14.16: drives at, after `##1`, and between clocking events through a
 // negedge skew.
-#[test]
-fn c14_16_clocking_negedge_skew_timing() {
-    check(
+fn negedge_skew_timing(mode: ClockingDrive, expected: &[&str]) {
+    check_clocking(
+        mode,
         "c14_negedge_timing",
         include_str!("sv/c14_negedge_timing.sv"),
         "c14nt",
         Order::Multiset,
-        &["T|chg|t=20000 u=1", "T|chg|t=30000 w=1", "T|chg|t=30000 v=1"],
+        expected,
         &[],
+    );
+}
+
+#[test]
+fn c14_16_clocking_negedge_skew_timing() {
+    negedge_skew_timing(
+        Lrm,
+        &[
+            "T|chg|t=20000 u=1",
+            "T|chg|t=30000 w=1",
+            "T|chg|t=30000 v=1",
+        ],
+    );
+}
+
+// `next-edge`: the drive between events at 17 lands on the negedge at 20.
+#[test]
+fn c14_16_clocking_negedge_skew_timing_next_edge() {
+    negedge_skew_timing(
+        NextEdge,
+        &[
+            "T|chg|t=20000 u=1",
+            "T|chg|t=30000 w=1",
+            "T|chg|t=20000 v=1",
+        ],
     );
 }
 
 // §14.16 / §14.16.2: a between-event drive and the next event's drive mature
 // together and the last one wins.
-#[test]
-fn c14_16_2_clocking_offedge_negedge_last_wins() {
-    check(
+fn offedge_negedge(mode: ClockingDrive, expected: &[&str]) {
+    check_clocking(
+        mode,
         "c14_offedge_negedge",
         include_str!("sv/c14_offedge_negedge.sv"),
         "c14on",
         Order::Exact,
+        expected,
+        &[],
+    );
+}
+
+#[test]
+fn c14_16_2_clocking_offedge_negedge_last_wins() {
+    offedge_negedge(
+        Lrm,
         &[
             "T|pos|t=5000 branch=0",
             "T|pos|t=15000 branch=0",
@@ -184,7 +227,23 @@ fn c14_16_2_clocking_offedge_negedge_last_wins() {
             "T|pos|t=25000 branch=0",
             "T|pos|t=35000 branch=0",
         ],
-        &[],
+    );
+}
+
+// `next-edge`: the drive at 5.001 lands on the negedge at 10, and the drive
+// at the event at 15 on the negedge at 20.
+#[test]
+fn c14_16_2_clocking_offedge_negedge_next_edge() {
+    offedge_negedge(
+        NextEdge,
+        &[
+            "T|pos|t=5000 branch=0",
+            "T|chg|t=10000 branch=1",
+            "T|pos|t=15000 branch=1",
+            "T|chg|t=20000 branch=0",
+            "T|pos|t=25000 branch=0",
+            "T|pos|t=35000 branch=0",
+        ],
     );
 }
 
@@ -193,7 +252,7 @@ fn c14_16_2_clocking_offedge_negedge_last_wins() {
 // cycle late.
 #[test]
 fn c14_clocking_drives_in_one_slot_last_wins() {
-    check(
+    check_both(
         "c14_lastwins",
         include_str!("sv/c14_lastwins.sv"),
         "c14l",
@@ -213,7 +272,7 @@ fn c14_clocking_drives_in_one_slot_last_wins() {
 // drive wins at this event's negedge, so ready does not dip for a cycle.
 #[test]
 fn c14_clocking_drives_in_one_slot_last_wins_negedge_skew() {
-    check(
+    check_both(
         "c14_lastwins_negedge",
         include_str!("sv/c14_lastwins_negedge.sv"),
         "c14ln",

@@ -39,6 +39,8 @@ fn c19_bins_with_filter() {
             "T|even|12.50",
             "T|odd_2|0.00",
             "T|odd_3|50.00",
+            "T|ign|50.00",
+            "T|red|33.33",
         ],
         &[],
     );

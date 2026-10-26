@@ -30,6 +30,13 @@ class byte_mem #(int AddrWidth = 32, int DataWidth = 32);
   function addr_t pass(addr_t a);
     return a;
   endfunction
+  function addr_t pass_by_name(addr_t a);
+    pass_by_name = a;
+  endfunction
+  typedef bit [DataWidth-1:0] word_t;
+  function bit known(word_t w);
+    return !$isunknown(w);
+  endfunction
 
   function void widths(string tag, mask_t m, logic [MaskWidth-1:0] dm, data_t d);
     mask_t lm;
@@ -47,7 +54,7 @@ module top;
   byte_mem #(32, 64) m64;
   byte_mem #(40) m40;
   logic [31:0] r;
-  int bad32, bad40;
+  int bad32, bad40, bad40n;
   initial begin
     m32 = new;
     m64 = new;
@@ -60,8 +67,9 @@ module top;
     for (int i = 0; i < 1500; i++) begin
       if (m32.pass(32'h8000_0000 + i) !== 32'h8000_0000 + i) bad32++;
       if (m40.pass(40'h80_0000_0000 + i) !== 40'h80_0000_0000 + i) bad40++;
+      if (m40.pass_by_name(40'h80_0000_0000 + i) !== 40'h80_0000_0000 + i) bad40n++;
     end
-    $display("T|hot_pass|%0d %0d", bad32, bad40);
+    $display("T|hot_pass|%0d %0d %0d %0d", bad32, bad40, bad40n, m32.known(32'hx));
     for (int i = 0; i < 1500; i++) m32.write(32'h9000_0000 + 4 * i, 32'h0403_0201, 4'b0101);
     $display("T|hot_write|%0d %h %h", m32.bytes.size(),
              m32.bytes[32'h9000_176c], m32.bytes[32'h9000_176e]);

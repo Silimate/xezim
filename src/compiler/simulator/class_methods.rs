@@ -1718,6 +1718,14 @@ impl Simulator {
                             val
                         };
                         val.is_signed = plan.ports[i].signed;
+                        if val.has_xz()
+                            && super::elaborate::is_type_two_state_resolved(
+                                &port.data_type,
+                                &self.module.typedef_types,
+                            )
+                        {
+                            val = val.to_two_state();
+                        }
                     } else if matches!(&port.data_type, DataType::TypeReference { .. }) {
                         if plain_class {
                             // A class handle is bound as passed.
@@ -1921,7 +1929,11 @@ impl Simulator {
                             // cell dropped the upper half. Register the width
                             // too so a later `retname = <narrow>` zero-extends
                             // back, mirroring a typed VarDecl.
-                            let rw = if plan.type_gen == self.type_tables_gen {
+                            let rw = if let Some(w) =
+                                self.class_formal_width(handle, &cname, &f.return_type)
+                            {
+                                w
+                            } else if plan.type_gen == self.type_tables_gen {
                                 rp.width
                             } else {
                                 super::elaborate::resolve_type_width(

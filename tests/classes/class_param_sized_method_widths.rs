@@ -22,7 +22,7 @@ fn class_param_sized_formals_and_locals() {
         "T|d64_formal|8 8 64",
         "T|d64_local|8 8 64 64",
         "T|d64_formal_val|ff ff",
-        "T|hot_pass|0 0",
+        "T|hot_pass|0 0 0 1",
         "T|hot_write|3004 01 03",
     ];
     assert_eq!(

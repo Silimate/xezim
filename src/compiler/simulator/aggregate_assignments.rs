@@ -1428,6 +1428,12 @@ impl Simulator {
                 return None;
             }
         }
+        let mut total: u64 = 1;
+        for &(l, r) in &dims[k..] {
+            total = total
+                .checked_mul(l.abs_diff(r) + 1)
+                .filter(|&t| t <= 1 << 16)?;
+        }
         let mut suffixes = vec![String::new()];
         for &(l, r) in &dims[k..] {
             let idx: Vec<i64> = if l <= r {
@@ -1439,9 +1445,6 @@ impl Simulator {
                 .iter()
                 .flat_map(|p| idx.iter().map(move |i| format!("{}[{}]", p, i)))
                 .collect();
-            if suffixes.len() > 1 << 16 {
-                return None;
-            }
         }
         Some(suffixes)
     }
@@ -1464,12 +1467,16 @@ impl Simulator {
         let mut values: Vec<Value> = Vec::with_capacity(targets.len());
         if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
             // A flat pattern over a single remaining dimension: element i is
-            // the i-th positional item, or the default.
+            // the i-th positional item, the item keyed by its declared index,
+            // or the default.
             let first = targets.first()?;
             if first.matches('[').count() != 1 {
                 return None;
             }
-            let indices: Vec<i64> = (0..targets.len() as i64).collect();
+            let indices: Vec<i64> = targets
+                .iter()
+                .map(|s| s.trim_matches(['[', ']']).parse().ok())
+                .collect::<Option<_>>()?;
             let elems = self.pattern_elems(items, &indices);
             for e in elems {
                 values.push(self.eval_expr(e?));

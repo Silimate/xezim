@@ -689,8 +689,9 @@ impl Simulator {
             let Some(cd) = self.module.classes.get(&cn) else {
                 return false;
             };
-            if cd.random_properties.contains(prop) {
-                return true;
+            // §8.14: the nearest declaration of `prop` decides.
+            if cd.random_properties.contains(prop) || cd.properties.contains_key(prop) {
+                return cd.random_properties.contains(prop);
             }
             cur = cd.extends.clone();
         }

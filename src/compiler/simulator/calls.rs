@@ -583,7 +583,7 @@ impl Simulator {
                                 .is_some_and(|f| f.contains_key(name))
                                 && self.object_declares_property(th, name)
                                 && (self.prop_class_type(th, name).is_none()
-                                    || self.prop_is_rand(th, name))
+                                    || (mname == "rand_mode" && self.prop_is_rand(th, name)))
                         });
                         let h_val = if this_rand_var {
                             0

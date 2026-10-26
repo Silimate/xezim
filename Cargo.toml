@@ -22,10 +22,6 @@ rand = "0.8"
 # See "Modifying xezim-core" in README.md.
 xezim-core = { git = "https://github.com/Silimate/xezim-core.git", rev = "851f3bc05a76aa08ddbd5cae23b43efa58147744" }
 sv-parser = { git = "https://github.com/Silimate/xezim-core.git", rev = "851f3bc05a76aa08ddbd5cae23b43efa58147744" }
-xezim-core = { git = "https://github.com/Silimate/xezim-core.git", rev = "851f3bc05a76aa08ddbd5cae23b43efa58147744" }
-sv-parser = { git = "https://github.com/Silimate/xezim-core.git", rev = "851f3bc05a76aa08ddbd5cae23b43efa58147744" }
-xezim-core = { git = "https://github.com/Silimate/xezim-core.git", rev = "851f3bc05a76aa08ddbd5cae23b43efa58147744" }
-sv-parser = { git = "https://github.com/Silimate/xezim-core.git", rev = "851f3bc05a76aa08ddbd5cae23b43efa58147744" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"

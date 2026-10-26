@@ -338,3 +338,6 @@ mod package_array_operand_in_method;
 
 #[path = "collections/unpacked_struct_concat_1035.rs"]
 mod unpacked_struct_concat_1035;
+
+#[path = "collections/dyn_array_of_dyn_array_rows.rs"]
+mod dyn_array_of_dyn_array_rows;

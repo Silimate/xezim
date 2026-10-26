@@ -3355,7 +3355,7 @@ impl Simulator {
         if !self.pending_nba_instance_triggers.is_empty() {
             let ievs = std::mem::take(&mut self.pending_nba_instance_triggers);
             for key in ievs {
-                self.fire_instance_event(key);
+                self.fire_instance_event_object(key);
             }
         }
     }

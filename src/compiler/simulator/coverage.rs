@@ -159,10 +159,12 @@ impl Simulator {
                                     o.properties.contains_key(&id.path[0].name.name)
                                 });
                         if is_prop {
-                            self.cg_instance_event_waiters
-                                .entry((h, id.path[0].name.name.clone()))
-                                .or_default()
-                                .push((handle, t.iff.clone()));
+                            // Keyed by the object the property names now.
+                            let key = (h, id.path[0].name.name.clone());
+                            if let Some(k) = self.canonical_instance_event(key) {
+                                let w = self.cg_instance_event_waiters.entry(k).or_default();
+                                w.push((handle, t.iff.clone()));
+                            }
                             return Value::from_u64((CG_HANDLE_TAG + handle) as u64, 32);
                         }
                     }

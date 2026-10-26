@@ -354,8 +354,8 @@ impl Simulator {
     }
 
     /// `(handle, field)` of a class property declared `event`, or None.
-    /// Select-free only: an index with a side effect must not be evaluated
-    /// twice when this probe misses and the value assign runs next.
+    /// Effect-free selects only: an index with a side effect must not be
+    /// evaluated twice when this probe misses and the value assign runs next.
     pub(super) fn class_event_assign_key(&mut self, e: &Expression) -> Option<(usize, String)> {
         if !Self::select_free_event_expr(e) {
             return None;
@@ -374,8 +374,12 @@ impl Simulator {
 
     fn select_free_event_expr(e: &Expression) -> bool {
         match &e.kind {
-            ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+            ExprKind::Ident(h) => (h.path.iter().flat_map(|s| &s.selects))
+                .all(|x| Self::cond_expr_is_effect_free(x, false)),
             ExprKind::MemberAccess { expr, .. } => Self::select_free_event_expr(expr),
+            ExprKind::Index { expr, index } => {
+                Self::cond_expr_is_effect_free(index, false) && Self::select_free_event_expr(expr)
+            }
             ExprKind::This => true,
             _ => false,
         }
@@ -1203,9 +1207,21 @@ impl Simulator {
     pub(super) fn fire_instance_event(&mut self, key: (usize, String)) {
         // §15.5.5: `-> seqr.tick` and `-> mon.tick` are one object after
         // `seqr.tick = mon.tick`. A null handle triggers nothing.
-        let Some(canon) = self.canonical_instance_event(key.clone()) else {
-            return;
-        };
+        if let Some(canon) = self.canonical_instance_event(key) {
+            self.fire_instance_event_object(canon);
+        }
+    }
+
+    /// §15.5.1: `->> h.ce` triggers the object `h.ce` names when it runs,
+    /// even if the handle is reassigned before the NBA region.
+    pub(super) fn defer_instance_trigger(&mut self, key: (usize, String)) {
+        if let Some(canon) = self.canonical_instance_event(key) {
+            self.pending_nba_instance_triggers.push(canon);
+        }
+    }
+
+    /// Trigger the already resolved synchronization object `canon`.
+    pub(super) fn fire_instance_event_object(&mut self, canon: (usize, String)) {
         let now = self.time;
         // §15.5.3: `<h>.<ev>.triggered` must read 1 for the rest of this slot.
         // Instance events have no backing signal, so stamp the same table the

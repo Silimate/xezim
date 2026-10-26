@@ -5896,16 +5896,16 @@ impl Simulator {
                     // Resolve a class-field instance key NOW (while `this` is
                     // live); the NBA drain cannot reconstruct it later.
                     if let Some(key) = self.resolve_this_event_field(&name.name) {
-                        self.pending_nba_instance_triggers.push(key);
+                        self.defer_instance_trigger(key);
                     } else if let Some(key) =
                         self.static_class_event_trigger_key(&name.name, target.as_deref())
                     {
-                        self.pending_nba_instance_triggers.push(key);
+                        self.defer_instance_trigger(key);
                     } else if let Some(key) = target
                         .as_ref()
                         .and_then(|t| self.expr_instance_event_field_general(t))
                     {
-                        self.pending_nba_instance_triggers.push(key);
+                        self.defer_instance_trigger(key);
                     } else {
                         let key = target
                             .as_ref()

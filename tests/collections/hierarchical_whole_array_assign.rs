@@ -1,7 +1,6 @@
 //! IEEE 1800-2017 §7.6, §10.3, §23.6: a continuous assign of one whole
 //! unpacked array to another drives every element when either side is a
 //! hierarchical name (an interface instance's array, a child module's array).
-//! The assign had no target and the array stayed x.
 
 use xezim::simulate;
 

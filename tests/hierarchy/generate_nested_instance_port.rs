@@ -23,10 +23,10 @@ module top;
   if (1) begin : gen_rams
     for (genvar way = 0; way < 2; way++) begin : gen_rams_inner
       if (1) begin : gen_scramble_rams
-        prim_like tag_bank (.key_i(key_q));
+        prim_like tag_bank (.key_i(key_q + way));
         initial begin
           #1;
-          if (tag_bank.key_i !== 32'h00001111)
+          if (tag_bank.key_i !== 32'h00001111 + way)
             $display("FAIL rel %0d %h", way, tag_bank.key_i);
           else
             $display("PASS rel %0d", way);
@@ -92,7 +92,7 @@ module top;
         prim_like tag_bank (
           .clk_i(clk),
           .key_valid_i(vq),
-          .key_i(kq)
+          .key_i(kq + way)
         );
         logic [31:0] sampled;
         always_ff @(posedge clk or negedge rst_ni) begin
@@ -100,7 +100,7 @@ module top;
           else if (vi) sampled <= ki;
         end
         assert property (@(posedge clk) disable iff (!rst_ni)
-          vi |-> ##[0:10] tag_bank.key_valid_i && (tag_bank.key_i == sampled))
+          vi |-> ##[0:10] tag_bank.key_valid_i && (tag_bank.key_i == sampled + way))
         else $display("FAIL hier %0d", way);
       end
     end

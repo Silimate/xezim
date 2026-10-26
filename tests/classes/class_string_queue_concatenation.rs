@@ -25,6 +25,7 @@ class d extends b;
   function void clear(); q = {}; own = {}; endfunction
   function void set2(); q = {"x", "y"}; own = {"p", "q", "r"}; endfunction
   function void app(); q = {q, "z"}; own = {own, "s"}; endfunction
+  function void loc(); string q; q = {"a", "b"}; $display("loc %s", q); endfunction
 endclass
 module t;
   string mq[$] = {"m"};
@@ -35,6 +36,7 @@ module t;
     $display("clear q=%0d own=%0d mq=%0d", o.q.size(), o.own.size(), mq.size());
     o.set2();
     $display("set2 q=%0d own=%0d %s %s", o.q.size(), o.own.size(), o.q[0], o.own[2]);
+    o.loc();
     o.app();
     $display("app q=%0d own=%0d %s %s", o.q.size(), o.own.size(), o.q[2], o.own[3]);
   end
@@ -45,6 +47,7 @@ endmodule
         "clear q=0 own=0 mq=0",
         "set2 q=2 own=3 x r",
         "app q=3 own=4 z s",
+        "loc ab",
     ] {
         assert!(out.iter().any(|m| m == want), "missing {want:?}: {out:?}");
     }

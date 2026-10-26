@@ -386,8 +386,8 @@ struct Dist {
     items: Vec<(i128, i128, f64)>,
     guards: Vec<Node>,
     /// One arm of a weight that reads rand variables
-    /// (`csp_dist_rand_weights`): the arms' guards cover every case, so the
-    /// variable is always drawn by one of them.
+    /// (`csp_dist_rand_weights`) with no enclosing condition: the arms'
+    /// guards cover every case, so the variable is always drawn by one of them.
     arm: bool,
 }
 
@@ -2203,7 +2203,8 @@ impl Simulator {
         // A variable drawn by a dist in force counts no values; one whose
         // dist still waits on its guard does (`if (!cfg) total dist {…}`:
         // `cfg == 0` leaves `total` five values, `cfg == 1` all of them).
-        // The arms of a rand-variable weight leave no case without a dist.
+        // The arms of a rand-variable weight outside any `if` or `->` leave
+        // no case without a dist.
         let mut drawn = vec![false; csp.vars.len()];
         for (u, ds) in aux.dists.iter().enumerate() {
             if !ds.is_empty() {
@@ -4564,19 +4565,21 @@ impl Simulator {
                 dist_weights: Vec::new(),
                 span,
             };
-            let mut inside = None;
+            // `x` narrows to the item even while the arms' conditions are open.
+            let mut live = Vec::new();
             for (conds, w) in arms {
                 if *w == 0 {
                     continue;
                 }
-                if inside.is_none() {
-                    inside = Some(self.csp_item_inner(csp, &member, env)?);
-                }
-                let mut parts = vec![inside.clone()?];
+                let mut parts = Vec::new();
                 for (c, neg) in conds {
                     parts.push(self.csp_bool(csp, c, env, *neg)?);
                 }
-                alts.push(Node::And(parts));
+                live.push(Node::And(parts));
+            }
+            if !live.is_empty() {
+                let inside = self.csp_item_inner(csp, &member, env)?;
+                alts.push(Node::And(vec![inside, Node::Or(live)]));
             }
         }
         // Each item contributes one arm to a combination.
@@ -4604,7 +4607,7 @@ impl Simulator {
                 let g = self.csp_bool(csp, c, env, *neg)?;
                 genv = genv.guarded(&g);
             }
-            self.csp_dist_weighted(csp, expr, ranges, &wts, &genv, true);
+            self.csp_dist_weighted(csp, expr, ranges, &wts, &genv, env.guards.is_empty());
         }
         Some(match alts.len() {
             0 => Node::False,

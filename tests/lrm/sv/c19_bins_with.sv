@@ -41,6 +41,14 @@ module c19_bins_with;
       bins big = {[8:15]};
     }
   endgroup
+  covergroup ign_cg;
+    coverpoint v { bins b[] = {[0:3]}; ignore_bins odd = {[0:3]} with (item % 2 == 1); }
+  endgroup
+  covergroup red_cg;
+    coverpoint v { bins r[] = {[0:3]} with (|item); }
+  endgroup
+  ign_cg ic;
+  red_cg rc;
   enc4_cov e4;
   enc32_cov e32;
   even_cg ec;
@@ -62,5 +70,9 @@ module c19_bins_with;
     $display("T|odd_2|%0.2f", oc.get_inst_coverage());
     v = 3; oc.sample();
     $display("T|odd_3|%0.2f", oc.get_inst_coverage());
+    ic = new; rc = new;
+    v = 0; ic.sample(); v = 1; rc.sample();
+    $display("T|ign|%0.2f", ic.get_inst_coverage());
+    $display("T|red|%0.2f", rc.get_inst_coverage());
   end
 endmodule

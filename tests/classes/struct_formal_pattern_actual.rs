@@ -37,7 +37,7 @@ module t;\n\
     r = id('{{b: 1, a: 3}});      $display(\"T reordered %0d %0d\", r.a, r.b);\n\
     r = id('{{default: 0, a: 4}}); $display(\"T default %0d %0d\", r.a, r.b);\n\
     r = id(flat_t'{{a: 5, b: 1}}); $display(\"T typed %0d %0d\", r.a, r.b);\n\
-    $display(\"T method %0d\", p.f('{{a: 6, b: 1}}));\n\
+    $display(\"T method %0d\", p.f('{{a: 6.4, b: 1}}));\n\
   end\n\
 endmodule"
     );

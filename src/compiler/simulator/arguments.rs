@@ -1296,8 +1296,7 @@ impl Simulator {
             })
             .count();
         let pattern_vals = self.eval_flat_struct_pattern(arg, leaf_count).or_else(|| {
-            let keys: Vec<(String, u32)> =
-                leaves.iter().map(|(k, _, w, _)| (k.clone(), *w)).collect();
+            let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
             self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
         });
         let call_vals = if copies_in && pattern_vals.is_none() {
@@ -1526,7 +1525,7 @@ impl Simulator {
         port_name: &str,
         su: &crate::ast::types::StructUnionType,
         arg: &Expression,
-        keys: &[(String, u32)],
+        keys: &[(String, u32, bool)],
     ) -> Option<Vec<Value>> {
         let ExprKind::AssignmentPattern(items) = &arg.kind else {
             return None;
@@ -1545,10 +1544,13 @@ impl Simulator {
         self.assign_pattern_into_struct(&scratch, su, items);
         let vals = keys
             .iter()
-            .map(|(key, w)| {
+            .map(|(key, w, real)| {
                 let leaf = format!("{}{}", scratch, &key[port_name.len()..]);
-                self.get_signal_value_by_name(&leaf)
-                    .unwrap_or_else(|| Value::new(*w))
+                let v = self.get_signal_value_by_name(&leaf);
+                match v.unwrap_or_else(|| Value::new(*w)) {
+                    v if v.is_real && !real => Self::real_to_int(v.to_f64(), *w),
+                    v => v,
+                }
             })
             .collect();
         self.pattern_scratch_free.push(id);
@@ -1645,8 +1647,7 @@ impl Simulator {
             let pattern_vals = self
                 .eval_flat_struct_pattern(arg, leaves.len())
                 .or_else(|| {
-                    let keys: Vec<(String, u32)> =
-                        leaves.iter().map(|(k, _, w, _)| (k.clone(), *w)).collect();
+                    let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                     self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
                 });
             let call_vals = if pattern_vals.is_none() {
@@ -1685,8 +1686,9 @@ impl Simulator {
                         Some(&self.module.parameters),
                         Some(&self.module.typedefs),
                     );
+                    let r = super::elaborate::is_type_real(&m.data_type);
                     for md in &m.declarators {
-                        keys.push((format!("{}.{}", port_name, md.name.name), w));
+                        keys.push((format!("{}.{}", port_name, md.name.name), w, r));
                     }
                 }
                 self.struct_pattern_leaf_values(port_name, &su, arg, &keys)

@@ -866,3 +866,6 @@ mod randomize_fill_literal;
 mod randomize_nested_dyn_scope;
 #[path = "classes/shadowed_member_same_named_formal.rs"]
 mod shadowed_member_same_named_formal;
+
+#[path = "classes/dollar_index_handle_member_write.rs"]
+mod dollar_index_handle_member_write;

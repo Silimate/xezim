@@ -1,6 +1,6 @@
-//! A package with no `timescale directive takes the CLI `-timescale`, the
-//! same default a directive-less module uses. Falling back to the global
-//! tick counted `#limit` in picoseconds under `-timescale 1ns/1ps`, so a
+//! IEEE 1800-2017 §3.14.2.3: a package with no `timescale directive takes the
+//! default time unit, as a module does; xezim's is the CLI `-timescale`.
+//! Counted in global ticks, `#limit` was picoseconds under `-timescale 1ns/1ps`, so a
 //! 200 us timeout expired at 200 ns. The module-level delay of the same
 //! value stayed 200 us.
 

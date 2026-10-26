@@ -859,7 +859,7 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let is_real = super::elaborate::is_type_real(&m.data_type);
+            let is_real = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
@@ -1686,7 +1686,7 @@ impl Simulator {
                         Some(&self.module.parameters),
                         Some(&self.module.typedefs),
                     );
-                    let r = super::elaborate::is_type_real(&m.data_type);
+                    let r = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
                     for md in &m.declarators {
                         keys.push((format!("{}.{}", port_name, md.name.name), w, r));
                     }

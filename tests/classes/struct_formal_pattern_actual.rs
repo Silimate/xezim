@@ -21,6 +21,7 @@ fn lines(src: &str) -> Vec<String> {
 const S: &str = "\
 typedef struct { int x; bit [3:0] y; } in_t;\n\
 typedef struct { int a; bit b; } flat_t;\n\
+typedef real r_t; typedef struct { r_t a; } real_t;\n\
 typedef struct { int a; bit b; in_t n; } nest_t;\n";
 
 #[test]
@@ -30,6 +31,7 @@ fn named_and_default_patterns_bind_a_flat_struct_formal() {
 class plain; function int f(flat_t s); return s.a * 10 + s.b; endfunction endclass\n\
 module t;\n\
   function automatic flat_t id(flat_t s); return s; endfunction\n\
+  function automatic real rf(real_t s); return s.a; endfunction\n\
   initial begin\n\
     plain p = new();\n\
     flat_t r;\n\
@@ -38,6 +40,7 @@ module t;\n\
     r = id('{{default: 0, a: 4}}); $display(\"T default %0d %0d\", r.a, r.b);\n\
     r = id(flat_t'{{a: 5, b: 1}}); $display(\"T typed %0d %0d\", r.a, r.b);\n\
     $display(\"T method %0d\", p.f('{{a: 6.4, b: 1}}));\n\
+    $display(\"T real %0.1f\", rf('{{a: 1.6}}));\n\
   end\n\
 endmodule"
     );
@@ -48,7 +51,8 @@ endmodule"
             "T reordered 3 1",
             "T default 4 0",
             "T typed 5 1",
-            "T method 61"
+            "T method 61",
+            "T real 1.6"
         ]
     );
 }

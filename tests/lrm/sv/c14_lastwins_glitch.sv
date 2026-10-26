@@ -7,9 +7,11 @@
 // Each output below is driven 1 and then 0, and both drives mature on one
 // negedge, so the output never changes and nothing waiting on it wakes.
 // a: 1 at 5.001 (between events), 0 at the event at 15; both mature at 20.
-// b: 1 at 5.001, 0 at 7.001; both mature at 20.
+//    With --clocking-drive=next-edge, the first lands at 10 instead, so a is
+//    1 from 10 to 20.
+// b: 1 at 5.001, 0 at 7.001; both mature at 20, or at 10 with next-edge.
 // c: `##1` 1 at the event at 5, 0 at the event at 15; both mature at 20.
-// d: as a, through `output #0`; both mature at 15.
+// d: as a, through `output #0`; both mature at 15 in both modes.
 `timescale 1ns/1ps
 module c14lg;
   logic clk = 0;

@@ -265,3 +265,18 @@ fn lastwins_no_glitch(mode: ClockingDrive, expected: &[&str]) {
 fn c14_16_2_clocking_last_wins_no_glitch() {
     lastwins_no_glitch(Lrm, &["T|end a=0 b=0 c=0 d=0"]);
 }
+
+// `next-edge`: a's two drives land on different negedges (10 and 20), so a
+// pulses; b's both land at 10, c's and d's as with `lrm`.
+#[test]
+fn c14_16_2_clocking_last_wins_no_glitch_next_edge() {
+    lastwins_no_glitch(
+        NextEdge,
+        &[
+            "T|wake|t=10000 a=1",
+            "T|rise|t=10000 a",
+            "T|wake|t=20000 a=0",
+            "T|end a=0 b=0 c=0 d=0",
+        ],
+    );
+}

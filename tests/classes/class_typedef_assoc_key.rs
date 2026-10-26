@@ -15,6 +15,7 @@ fn t_lines(src: &str) -> Vec<String> {
 fn class_typedef_key_takes_the_specialization_width() {
     let expected = [
         "T|num|4 2 4",
+        "T|copy|2 3",
         "T|kd_key|80000000",
         "T|kd_key|80000001",
         "T|kd_key|80000002",

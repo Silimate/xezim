@@ -7,7 +7,7 @@ endclass
 
 module top;
   keyed kd;
-  keyed #(8) k8;
+  keyed #(8) k8, c8;
   keyed #(40) k40;
   initial begin
     kd = new;
@@ -20,6 +20,7 @@ module top;
     k8.m[8'hff] = 1;
     k8.m[9'h100] = 2;
     $display("T|num|%0d %0d %0d", kd.m.num(), k8.m.num(), k40.m.num());
+    c8 = new k8; c8.m[9'h100] = 3; $display("T|copy|%0d %0d", c8.m.num(), c8.m[0]);
     foreach (kd.m[k]) $display("T|kd_key|%0h", k);
     foreach (k8.m[k]) $display("T|k8_key|%0h", k);
     foreach (k40.m[k]) $display("T|k40_key|%0h", k);

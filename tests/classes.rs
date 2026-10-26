@@ -866,3 +866,6 @@ mod randomize_fill_literal;
 mod randomize_nested_dyn_scope;
 #[path = "classes/shadowed_member_same_named_formal.rs"]
 mod shadowed_member_same_named_formal;
+
+#[path = "classes/foreach_indexed_element_member_array.rs"]
+mod foreach_indexed_element_member_array;

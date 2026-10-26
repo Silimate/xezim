@@ -763,11 +763,7 @@ impl Simulator {
                 ) && !b.is_wildcard
                     && b.transitions.is_empty()
             })
-            .flat_map(|b| {
-                b.values
-                    .iter()
-                    .filter_map(|r| self.cg_range_bounds(r, ctor))
-            })
+            .flat_map(|b| self.cg_bin_segs(b, ctor))
             .collect();
         Self::cg_merge_ranges(v)
     }
@@ -1540,7 +1536,7 @@ impl Simulator {
                 .collect();
         };
         let key = (
-            bin as *const crate::ast::decl::CoverBin as usize,
+            format!("{:?}{:?}", bin.values, f),
             ctor.iter().map(|(_, v)| v.to_i64().unwrap_or(i64::MIN)).collect(),
         );
         if let Some(hit) = self.cg_with_segs_cache.borrow().get(&key) {
@@ -1551,6 +1547,13 @@ impl Simulator {
             .iter()
             .filter_map(|r| self.cg_range_bounds(r, ctor))
             .collect();
+        if segs
+            .first()
+            .is_some_and(|&(l, _)| self.cg_item_eval(f, l, ctor).is_none())
+        {
+            let name = &bin.name.name;
+            eprintln!("[xezim][warning] bins '{name}': unsupported with filter, every value kept");
+        }
         let mut out: Vec<(i64, i64)> = Vec::new();
         let mut keep = |a: i64, b: i64| match out.last_mut() {
             Some(last) if last.1.checked_add(1) == Some(a) => last.1 = b,
@@ -1582,12 +1585,14 @@ impl Simulator {
                     n += 1;
                     if n > MAX_VALUES {
                         eprintln!(
-                            "[xezim][warning] bins '{}': the with filter is applied to the \
-                             first {} values only",
+                            "[xezim][warning] bins '{}': a with filter over more than {} \
+                             values is not supported, so the bin is left empty",
                             bin.name.name, MAX_VALUES
                         );
-                        keep(v, h);
-                        break;
+                        self.cg_with_segs_cache
+                            .borrow_mut()
+                            .insert(key, Vec::new().into());
+                        return Vec::new();
                     }
                     if self.cg_with_accepts(f, v, ctor) {
                         keep(v, v);
@@ -1736,7 +1741,8 @@ impl Simulator {
             ExprKind::Unary { op, operand } => {
                 let x = self.cg_item_eval(operand, v, ctor)?;
                 match op {
-                    U::LogNot => b(x == 0),
+                    U::LogNot | U::BitNor => b(x == 0),
+                    U::BitOr => b(x != 0),
                     U::Minus => x.checked_neg(),
                     U::Plus => Some(x),
                     _ => None,

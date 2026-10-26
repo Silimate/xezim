@@ -47,22 +47,29 @@ interface mon_if #(parameter DATA_WIDTH = 32);
 endinterface
 
 module top;
-  int str_ok, plain_ok, mon_ok;
-  res_base cq[$], pq[$], mq[$];
+  int str_ok, plain_ok, mon_ok, wide_ok;
+  res_base cq[$], pq[$], mq[$], wq[$];
   initial begin
     cq.push_back(res#(virtual str_if)::make());
     pq.push_back(res#(virtual plain_if)::make());
     mq.push_back(res#(virtual mon_if)::make());
+    wq.push_back(res#(virtual mon_if#(64))::make());
     str_ok = res#(virtual str_if)::from_q(cq);
     plain_ok = res#(virtual plain_if)::from_q(pq);
     mon_ok = res#(virtual mon_if)::from_q(mq);
+    wide_ok = res#(virtual mon_if)::from_q(wq);
   end
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(
-        (u(&sim, "str_ok"), u(&sim, "plain_ok"), u(&sim, "mon_ok")),
-        (1, 1, 1),
-        "string-param, plain, and integer-param virtual interfaces"
+        (
+            u(&sim, "str_ok"),
+            u(&sim, "plain_ok"),
+            u(&sim, "mon_ok"),
+            u(&sim, "wide_ok")
+        ),
+        (1, 1, 1, 0),
+        "string-param, plain, integer-param, and a different integer parameter"
     );
 }

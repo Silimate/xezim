@@ -1879,8 +1879,9 @@ impl Simulator {
         let mut map: HashMap<String, Value> = HashMap::default();
         let mut cn: Option<&str> = Some(inst.class_name.as_str());
         for _ in 0..64 {
-            let c = cn?;
-            let cd = self.module.classes.get(c)?;
+            let Some(cd) = cn.and_then(|c| self.module.classes.get(c)) else {
+                break;
+            };
             for (n, _) in &cd.param_defaults {
                 if cd.type_param_names.iter().any(|t| t == n) {
                     continue;

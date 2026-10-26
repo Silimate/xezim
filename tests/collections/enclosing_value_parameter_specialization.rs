@@ -171,3 +171,26 @@ endmodule
         "item width, put_response cast, and an omitted width stays the default"
     );
 }
+
+/// `child #(N)` built inside `outer #(194)` passes N on to its parent.
+#[test]
+fn new_passes_an_enclosing_value_parameter_to_an_ancestor() {
+    let src = r#"
+class parent #(int P = 8);
+  int pw;
+  function new(); pw = P; endfunction
+endclass
+class child #(int W = 32) extends parent #(W);
+endclass
+class outer #(int N = 32);
+  function int go(); child #(N) c; c = new; return c.pw; endfunction
+endclass
+module top;
+  outer #(194) o;
+  int got;
+  initial begin o = new; got = o.go(); end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "got"), 194);
+}

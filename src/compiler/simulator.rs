@@ -1582,6 +1582,17 @@ struct CombEntry {
     defer_at_time0: bool,
 }
 
+impl CombEntry {
+    /// A procedural block that reads a signal it also writes, whose own writes
+    /// must not re-queue it. A continuous assignment re-runs until it settles.
+    fn reads_own_writes(&self) -> bool {
+        matches!(
+            self.item,
+            CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+        ) && (self.cold.read_signal_ids.iter()).any(|r| self.cold.write_signal_ids.contains(r))
+    }
+}
+
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntryCold {

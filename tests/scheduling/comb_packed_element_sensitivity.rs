@@ -40,16 +40,17 @@ module top;
   logic [1:0][7:0] tw;
   assign tw[0] = di;
   always_comb begin tw[1] = '0; tw[1] = tw[0]; end
+  wire [3:0] sa; assign sa = {sa[2:0], 1'b1};
   always_comb begin lo[0] = di ^ 8'h0f; lo[0] ^= 8'h01; end
   always_comb begin r1 = ~lo[0]; end
   assign lo[1] = r1 ^ 8'h3c;
   assign lo[2] = ~lo[1];
   initial begin
-    di = 8'h10; #1 $display("lo2=%h tw1=%h", lo[2], tw[1]);
+    di = 8'h10; #1 $display("lo2=%h tw1=%h sa=%b", lo[2], tw[1], sa);
     di = 8'h33; #1 $display("lo2=%h tw1=%h", lo[2], tw[1]);
   end
 endmodule
 "#);
-    assert_eq!(msgs, ["lo2=22 tw1=10", "lo2=01 tw1=33"]);
+    assert_eq!(msgs, ["lo2=22 tw1=10 sa=1111", "lo2=01 tw1=33"]);
     assert_eq!(hits, 0);
 }

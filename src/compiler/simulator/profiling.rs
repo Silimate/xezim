@@ -886,12 +886,7 @@ impl Simulator {
         self.comb_self_exempt = self
             .comb_entries
             .iter()
-            .map(|e| {
-                let c = &e.cold;
-                c.read_signal_ids
-                    .iter()
-                    .any(|r| c.write_signal_ids.contains(r))
-            })
+            .map(CombEntry::reads_own_writes)
             .collect();
         self.comb_par_safe = vec![false; n];
         // Writer-count pre-pass: a signal written by >1 comb entry is

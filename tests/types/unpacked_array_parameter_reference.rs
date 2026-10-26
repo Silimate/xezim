@@ -1,7 +1,7 @@
 //! IEEE 1800-2017 §6.20.2, §23.10: an unpacked-array parameter whose value is
 //! the name of another unpacked-array parameter takes that array's elements.
 //! A default `= pk::A` and an override `.R(R)` or `.R(L)` that forwards the
-//! parent's header parameter or body localparam each read 0 in every element.
+//! parent's header parameter or body localparam used to read 0 in every element.
 
 use xezim::simulate;
 

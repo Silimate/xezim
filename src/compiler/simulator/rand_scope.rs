@@ -2007,3 +2007,114 @@ impl Simulator {
         }
     }
 }
+
+impl Simulator {
+    /// §18.5.8.1: `foreach (h.q[j])` in a class constraint, where `h` is a
+    /// non-rand handle member and `q` a non-rand queue or dynamic array of
+    /// that object, iterates state: unroll it to one copy of the body per
+    /// index before the solve. Neither the trials nor the joint solver
+    /// follow a loop through another object, so the body constrained nothing.
+    pub(super) fn unroll_handle_state_foreach(
+        &mut self,
+        handle: usize,
+        constraints: &mut [ClassConstraint],
+    ) {
+        for con in constraints.iter_mut() {
+            for it in con.items.iter_mut() {
+                self.unroll_handle_state_foreach_item(handle, it);
+            }
+        }
+    }
+
+    fn unroll_handle_state_foreach_item(&mut self, handle: usize, it: &mut ConstraintItem) {
+        match it {
+            ConstraintItem::Foreach {
+                array, vars, item, ..
+            } => {
+                if let [Some(v)] = vars.as_slice()
+                    && let Some(n) = self.handle_state_coll_size(handle, array)
+                {
+                    let mut out = Vec::with_capacity(n);
+                    for i in 0..n as i64 {
+                        let mut body = (**item).clone();
+                        let lit = Self::literal_of(&Self::signed_loop_val(i), v.span);
+                        Self::subst_ident_item(&mut body, &v.name, &lit);
+                        self.unroll_handle_state_foreach_item(handle, &mut body);
+                        out.push(body);
+                    }
+                    *it = ConstraintItem::Block(out);
+                } else {
+                    self.unroll_handle_state_foreach_item(handle, item);
+                }
+            }
+            ConstraintItem::Implication { constraint, .. } => {
+                self.unroll_handle_state_foreach_item(handle, constraint);
+            }
+            ConstraintItem::IfElse {
+                then_item,
+                else_item,
+                ..
+            } => {
+                self.unroll_handle_state_foreach_item(handle, then_item);
+                if let Some(e) = else_item {
+                    self.unroll_handle_state_foreach_item(handle, e);
+                }
+            }
+            ConstraintItem::Soft(x) => self.unroll_handle_state_foreach_item(handle, x),
+            ConstraintItem::Block(xs) => {
+                for x in xs.iter_mut() {
+                    self.unroll_handle_state_foreach_item(handle, x);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Size of `h.q` when `h` is a non-rand class-handle member of `handle`
+    /// and `q` a non-rand queue or dynamic array of the object it holds.
+    fn handle_state_coll_size(&self, handle: usize, array: &Expression) -> Option<usize> {
+        let (obj, name) = match &array.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (h.path[0].name.name.as_str(), h.path[1].name.name.as_str())
+            }
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    (h.path[0].name.name.as_str(), member.name.as_str())
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if obj == "this" || self.prop_is_rand(handle, obj) {
+            return None;
+        }
+        let mut cur = Some(self.prop_class_type(handle, obj)?);
+        let sub = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(obj))
+            .and_then(|v| v.to_u64())? as usize;
+        if sub == 0 || self.heap.get(sub).and_then(|o| o.as_ref()).is_none() {
+            return None;
+        }
+        if self.prop_is_rand(sub, name) {
+            return None;
+        }
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.queue_properties.contains_key(name) {
+                let n = self.get_queue_size(&format!("{}#{}", sub, name)) as usize;
+                return (n <= 4096).then_some(n);
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+}

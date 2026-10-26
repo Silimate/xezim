@@ -270,6 +270,8 @@ mod constraint_arrays_ordering;
 mod constraint_dyn_size_pinned_scalar;
 #[path = "classes/constraint_foreach_and_casts.rs"]
 mod constraint_foreach_and_casts;
+#[path = "classes/constraint_foreach_handle_member_queue.rs"]
+mod constraint_foreach_handle_member_queue;
 #[path = "classes/constraint_foreach_conditional.rs"]
 mod constraint_foreach_conditional;
 #[path = "classes/constraint_funcs_aggregates.rs"]

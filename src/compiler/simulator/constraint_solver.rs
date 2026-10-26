@@ -798,6 +798,7 @@ impl Simulator {
         // §18.5.5: expand the array SLICE of a `unique {…}` list into the
         // element-wise inequalities it denotes.
         Self::expand_unique_slices(&mut constraints, &self.module.parameters);
+        self.unroll_handle_state_foreach(handle, &mut constraints);
 
         // §18.3: a constraint may read a state variable of the module the
         // class is declared in. Statements get instance-qualified when the

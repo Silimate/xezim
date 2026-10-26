@@ -289,3 +289,6 @@ mod reduction_with_struct_field;
 mod compiled_queue_last_index;
 #[path = "collections/unpacked_2d_element_width.rs"]
 mod unpacked_2d_element_width;
+
+#[path = "collections/package_array_operand_in_method.rs"]
+mod package_array_operand_in_method;

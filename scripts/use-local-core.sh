@@ -46,7 +46,7 @@ cat > "$CFG" <<CFGEOF
 # Makes plain \`cargo build\` use the local xezim-core checkout below
 # instead of the Cargo.lock-pinned git dependency. Remove with
 # \`./scripts/use-local-core.sh --remove\`.
-[patch."https://github.com/aionhw/xezim-core.git"]
+[patch."https://github.com/Silimate/xezim-core.git"]
 xezim-core = { path = "$CORE" }
 sv-parser = { path = "$CORE/xezim-parser" }
 CFGEOF

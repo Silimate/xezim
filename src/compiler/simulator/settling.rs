@@ -1701,6 +1701,13 @@ impl Simulator {
                         if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
                             continue;
                         }
+                        if __dep == $eidx && {
+                            let __c = &entries[__dep].cold;
+                            let (__r, __w) = (&__c.read_signal_ids, &__c.write_signal_ids);
+                            __r.iter().any(|s| __w.contains(s))
+                        } {
+                            continue;
+                        }
                         if lane_on {
                             let __g = unsafe { *gate_lane.get_unchecked(__dep) };
                             if __g != u32::MAX {

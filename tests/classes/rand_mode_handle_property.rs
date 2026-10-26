@@ -3,9 +3,10 @@
 //! `sub`): inside a class, `sub.rand_mode(0)` on a `rand` class-handle
 //! property names that variable. "If the random variable is an object
 //! handle, only the mode of the variable is changed, not the mode of random
-//! variables within that object." With the handle
-//! inactive the object it holds is not randomized and its constraints are
-//! not solved (§18.5.9 covers only active rand handles). Every random
+//! variables within that object." With the handle inactive the object it
+//! holds is not randomized and its constraints are not solved: an inactive
+//! variable "is treated the same as if it had not been declared rand"
+//! (§18.8), and §18.5.9 solves the objects of rand members. Every random
 //! variable inside the object used to be switched off instead, so its
 //! constraints were still checked against the current values and the
 //! enclosing randomize() failed.

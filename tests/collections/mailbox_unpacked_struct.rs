@@ -335,6 +335,8 @@ module t;\n\
     mailbox #(pair_t) mb = new();\n\
     mailbox #(nest_t) mn = new();\n\
     mailbox #(ppair_t) mp = new();\n\
+    mailbox #(longint) ml = new();\n\
+    longint lv;\n\
     pair_t q;\n\
     nest_t r;\n\
     ppair_t pp;\n\
@@ -342,6 +344,8 @@ module t;\n\
     mb.put('{{a: v, b: v + 1}});\n\
     mb.put('{{7, 8}});\n\
     mb.put(pair_t'{{b: 10, a: 9}});\n\
+    ml.put(64'h5a50_0000_0000_0001); ml.get(lv);\n\
+    $display(\"T longint %h\", lv);\n\
     v = 100;\n\
     for (int i = 0; i < 3; i++) begin\n\
       q = '{{99, 99}}; mb.peek(q);\n\
@@ -349,7 +353,7 @@ module t;\n\
       q = '{{99, 99}}; mb.get(q);\n\
       $display(\"T get %0d %0d\", q.a, q.b);\n\
     end\n\
-    void'(mn.try_put('{{n: '{{x: 3, y: 4'h4}}, default: 1}}));\n\
+    void'(mn.try_put('{{n: '{{x: 3, y: 4'h4}}, default: '1}}));\n\
     r = '{{default: 0}}; void'(mn.try_get(r));\n\
     $display(\"T nested %0d %0d %0d %h\", r.a, r.b, r.n.x, r.n.y);\n\
     mp.put('{{a: 8'h12, b: 8'h34}});\n\
@@ -362,13 +366,14 @@ endmodule"
     assert_eq!(
         lines(&src),
         vec![
+            "T longint 5a50000000000001",
             "T peek 5 6",
             "T get 5 6",
             "T peek 7 8",
             "T get 7 8",
             "T peek 9 10",
             "T get 9 10",
-            "T nested 1 1 3 4",
+            "T nested -1 1 3 4",
             "T packed 12 34",
             "T num 0 0 0"
         ]

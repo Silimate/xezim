@@ -5,7 +5,9 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 /// Marks a queued `mbx_patterns` token so it is not taken for a struct
-/// shadow id or for a small scalar message.
+/// shadow id or for a small scalar message. The token also carries
+/// `is_fill`, which no 64-bit message has, so a `longint` message whose
+/// value matches a token is still delivered as a number.
 const MBX_PATTERN_TAG: u64 = 0x5a50_0000_0000_0000;
 
 impl Simulator {
@@ -235,7 +237,9 @@ impl Simulator {
                 self.mbx_msg_seq += 1;
                 let tok = MBX_PATTERN_TAG | self.mbx_msg_seq;
                 self.mbx_patterns.insert(tok, items);
-                return Value::from_u64(tok, 64);
+                let mut v = Value::from_u64(tok, 64);
+                v.is_fill = true;
+                return v;
             }
         }
         match self.mbx_struct_arg(arg) {
@@ -284,6 +288,9 @@ impl Simulator {
                 span,
             );
         }
+        if matches!(e.kind, ExprKind::Number(_)) {
+            return e.clone();
+        }
         let v = self.eval_expr(e);
         let lit = if v.is_real {
             NumberLiteral::Real(v.to_f64())
@@ -303,7 +310,7 @@ impl Simulator {
     /// the destination's type gives the pattern its context. `false` when `v`
     /// is not a pattern token.
     fn mbx_deliver_pattern(&mut self, lvalue: &Expression, v: &Value, consume: bool) -> bool {
-        if v.width != 64 {
+        if v.width != 64 || !v.is_fill {
             return false;
         }
         let Some(tok) = v.to_u64() else {

@@ -1608,11 +1608,12 @@ impl Simulator {
                     }
                     let mut keys = Vec::new();
                     for k in self.assoc_key_strs(&c.scoped) {
-                        let i = k.parse::<i64>().ok()?;
+                        // A `foreach` key is bound as a signed 32-bit value.
+                        let i = k.parse::<i32>().ok()?;
                         if i.to_string() != k {
                             return None;
                         }
-                        keys.push(i);
+                        keys.push(i.into());
                     }
                     keys
                 }

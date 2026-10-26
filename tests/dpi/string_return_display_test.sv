@@ -6,6 +6,7 @@ module top;
   string a, b, c;
   logic clk = 1'b0;
   int fails = 0;
+  bit seen = 0;
   initial begin
     $display(srd_msg(0));
     a = $sformatf(srd_msg(0));
@@ -15,11 +16,12 @@ module top;
     if (b != "xsecond message") begin fails++; $display("FAIL sformatf arg: %s", b); end
     if (c != "hello from C|second message") begin fails++; $display("FAIL swrite: %s", c); end
     #1 clk = 1'b1;
-    #1 if (fails == 0) $display("TEST_PASS");
+    #1 if (fails == 0 && seen) $display("TEST_PASS");
   end
   always @(posedge clk) begin
     string d;
     d = $sformatf(srd_msg(1));
     if (d != "second message") begin fails++; $display("FAIL always: %s", d); end
+    seen = 1;
   end
 endmodule

@@ -204,3 +204,6 @@ mod review_package_collection_aliases;
 
 #[path = "collections/foreach_omitted_var_before_collection.rs"]
 mod foreach_omitted_var_before_collection;
+
+#[path = "collections/dyn_array_of_dyn_array_rows.rs"]
+mod dyn_array_of_dyn_array_rows;

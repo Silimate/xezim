@@ -136,6 +136,13 @@ impl Simulator {
                 self.module
                     .associative_arrays
                     .insert(n_name.clone(), is_str);
+                if let Some(&kw) = self
+                    .module
+                    .assoc_index_widths
+                    .get(&s_pre[..s_pre.len() - 1])
+                {
+                    self.module.assoc_index_widths.insert(n_name.clone(), kw);
+                }
                 let entries: Vec<(String, Value)> = self
                     .signals
                     .keys_with_elem_prefix(&s_pre)

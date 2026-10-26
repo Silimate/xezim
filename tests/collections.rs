@@ -204,3 +204,6 @@ mod review_package_collection_aliases;
 
 #[path = "collections/foreach_omitted_var_before_collection.rs"]
 mod foreach_omitted_var_before_collection;
+
+#[path = "collections/concat_actual_fixed_array_formal.rs"]
+mod concat_actual_fixed_array_formal;

@@ -1547,8 +1547,9 @@ impl Simulator {
         Self::carried_type_binding_rec(bindings, chain, k, name, 0)
     }
 
-    /// `carried_type_binding`, with a hop limit so a default that names
-    /// another parameter of the same class (`type RSP = REQ`) cannot cycle.
+    /// `carried_type_binding`. `depth` counts only defaults that name another
+    /// parameter of the same class (`type RSP = REQ`), so those cannot cycle.
+    /// Each step up the `extends` chain lowers `k`, which bounds the rest.
     fn carried_type_binding_rec(
         bindings: &HashMap<String, String>,
         chain: &[&super::elaborate::ElaboratedClass],
@@ -1583,15 +1584,16 @@ impl Simulator {
                 if parent.type_param_names.iter().any(|p| p == &def) {
                     return Self::carried_type_binding_rec(bindings, chain, k, &def, depth + 1);
                 }
-                def
+                // A default is written in the parent's scope, not the child's.
+                return Some(def);
             }
         };
         if Self::spec_projection(&a).is_some() {
             return Self::carry_extends_arg(&a, &|p| {
-                Self::carried_type_binding_rec(bindings, chain, k - 1, p, depth + 1)
+                Self::carried_type_binding_rec(bindings, chain, k - 1, p, depth)
             });
         }
-        Some(Self::carried_type_binding_rec(bindings, chain, k - 1, &a, depth + 1).unwrap_or(a))
+        Some(Self::carried_type_binding_rec(bindings, chain, k - 1, &a, depth).unwrap_or(a))
     }
 
     /// The per-instance part of `is_string_keyed_array` for `member` of an

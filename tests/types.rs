@@ -41,6 +41,8 @@ mod bits_package_scoped_type_width;
 mod block_local_unpacked_struct;
 #[path = "types/block_local_width_in_index_shift.rs"]
 mod block_local_width_in_index_shift;
+#[path = "types/block_local_size_query_scope.rs"]
+mod block_local_size_query_scope;
 #[path = "types/byte_local_narrow.rs"]
 mod byte_local_narrow;
 #[path = "types/callback_typedef_static.rs"]
@@ -93,6 +95,8 @@ mod division_operand_width;
 mod dollar_lvalue_and_assoc_width;
 #[path = "types/enum_base_and_packed_members.rs"]
 mod enum_base_and_packed_members;
+#[path = "types/enum_cross_cast_assignment.rs"]
+mod enum_cross_cast_assignment;
 #[path = "types/enum_member_per_instance.rs"]
 mod enum_member_per_instance;
 #[path = "types/enum_name_cross_method_local.rs"]
@@ -523,3 +527,24 @@ mod procedural_bitwise_sign_500;
 
 #[path = "types/arithmetic_shift_xz.rs"]
 mod arithmetic_shift_xz;
+
+#[path = "types/child_param_packed_elem_width.rs"]
+mod child_param_packed_elem_width;
+
+#[path = "types/unsigned_context_501.rs"]
+mod unsigned_context_501;
+
+#[path = "types/review_qualified_enum_casts.rs"]
+mod review_qualified_enum_casts;
+
+#[path = "types/review_exponent_width.rs"]
+mod review_exponent_width;
+
+#[path = "types/review_local_query_widths.rs"]
+mod review_local_query_widths;
+
+#[path = "types/review_nested_struct_params.rs"]
+mod review_nested_struct_params;
+
+#[path = "types/struct_param_override.rs"]
+mod struct_param_override;

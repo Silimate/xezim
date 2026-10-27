@@ -1286,6 +1286,66 @@ impl Simulator {
         ))
     }
 
+    /// §7.6 / §8.3.2: copy a class/package array constant in declared order.
+    fn try_class_const_array_copy(&mut self, lhs: &Expression, rhs: &Expression) -> bool {
+        if !matches!(lhs.kind, ExprKind::Ident(_)) {
+            return false;
+        }
+        let Some(leaf) = Self::receiver_prop_name(rhs) else {
+            return false;
+        };
+        if !self.class_member_names().constant_arrays.contains(leaf)
+            && !matches!(rhs.kind, ExprKind::MemberAccess { .. })
+        {
+            return false;
+        }
+        let Some(name) = self.array_operand_name(lhs) else {
+            return false;
+        };
+        if self.module.dynamic_arrays.contains(&name) {
+            return false;
+        }
+        let Some(&(lo, hi, _)) = self.module.arrays.get(&name) else {
+            return false;
+        };
+        let Some(c) = self.resolve_class_scope_array_const(rhs) else {
+            return false;
+        };
+        let count = (hi - lo + 1).min(c.hi - c.lo + 1).max(0) as usize;
+        let (left, right) = self
+            .module
+            .unpacked_decl_dims
+            .get(&name)
+            .and_then(|d| d.first())
+            .copied()
+            .unwrap_or_else(|| {
+                if self.module.descending_arrays.contains(&name) {
+                    (hi, lo)
+                } else {
+                    (lo, hi)
+                }
+            });
+        for i in 0..count {
+            let src = if c.left > c.right {
+                c.left - i as i64
+            } else {
+                c.left + i as i64
+            };
+            let dst = if left > right {
+                left - i as i64
+            } else {
+                left + i as i64
+            };
+            let value = self
+                .class_scope_array_const_elem(&c, src)
+                .unwrap_or(Value::zero(32));
+            let key = format!("{name}[{dst}]");
+            let value = self.fit_block_local_array_elem(&name, &key, value);
+            self.set_signal_value_by_name(&key, value);
+        }
+        true
+    }
+
     pub(super) fn exec_stmt_blocking_assign_body(
         &mut self,
         stmt: &Statement,
@@ -3433,6 +3493,12 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // Resolve a whole constant array before scalar evaluation or the
+        // generic collection resolver can treat a class constant as a property.
+        if self.try_class_const_array_copy(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
         }
         let val = if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {

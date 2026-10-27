@@ -382,7 +382,7 @@ impl Simulator {
             eprintln!(
                 "               Raise XEZIM_CASCADE_LIMIT=<n> if the design legitimately needs deeper same-time NBA cascades."
             );
-            self.finished = true;
+            self.abort_run();
         }
         // Final propagation pass: level-sensitive always blocks fired by the
         // last check_edges may have done blocking-writes to regs that feed
@@ -2456,7 +2456,7 @@ impl Simulator {
                     // livelock with NOTHING ahead is fatal.
                     if !self.try_break_zero_delay_livelock() {
                         self.report_zero_delay_stall(None);
-                        self.finished = true;
+                        self.abort_run();
                         break;
                     }
                 }
@@ -2469,7 +2469,7 @@ impl Simulator {
                 self.zero_delay_defer_pending = false;
                 if !self.try_break_zero_delay_livelock() {
                     self.report_zero_delay_stall(None);
-                    self.finished = true;
+                    self.abort_run();
                     break;
                 }
             }
@@ -2500,7 +2500,7 @@ impl Simulator {
                         "[INLINE_BITS] ABORTING at iter={} due to {} mismatches",
                         iters, mismatches
                     );
-                    self.finished = true;
+                    self.abort_run();
                     break;
                 }
             }

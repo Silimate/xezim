@@ -1880,6 +1880,9 @@ impl Simulator {
     /// name) guards the one ambiguous case: a real struct member literally
     /// called `triggered`, which resolves as a signal in its own right.
     pub(super) fn hier_event_key(&self, head: &str, leaf: &str, full: &str) -> Option<String> {
+        if let Some(key) = self.package_event_key(head) {
+            return Some(key);
+        }
         if self.module.events.contains(head) {
             return Some(head.to_string());
         }
@@ -2539,7 +2542,14 @@ impl Simulator {
                     }]
                 } else {
                     vec![Sensitivity {
-                        signal_name: id.name.clone(),
+                        signal_name: {
+                            let key = self.lexical_event_name(&id.name);
+                            if self.module.events.contains(&key) {
+                                key
+                            } else {
+                                id.name.clone()
+                            }
+                        },
                         edge: EdgeKind::AnyEdge,
                         iff: None,
                         value_of: None,

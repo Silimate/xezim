@@ -1,0 +1,47 @@
+# cargo-deny's gates for a release build (docs/release.md): what the shipped
+# binary links must carry an allowed license, come from crates.io or the
+# pinned xezim-core repository, and have no open RustSec advisory.
+# release/build.sh runs `cargo deny --config release/deny.toml check` on
+# release/Cargo.lock.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+# Test-only crates don't ship.
+exclude-dev = true
+
+[advisories]
+# Every advisory fails the gate: a vulnerability, an unsound or unmaintained
+# crate, a yanked version. An exception goes in `ignore`, with the reason and
+# what would let it be dropped, and the same id in release/osv-scanner.toml.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is unmaintained, not vulnerable: its authors consider it complete. xezim and xezim-core use it for the design cache and compiled artifacts they write themselves. Drop this when xezim-core moves off it." },
+]
+
+[licenses]
+# Permissive licenses only: no GPL, LGPL, AGPL or other copyleft. A crate
+# offered under alternatives (`MIT OR Apache-2.0`) passes when one of them is
+# here; licenses that apply together (`AND`) must all be.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+# The list is the policy, so a license no crate uses yet stays on it.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/aionhw/xezim-core.git"]

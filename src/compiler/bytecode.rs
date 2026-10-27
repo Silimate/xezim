@@ -15575,10 +15575,13 @@ impl<'a> BytecodeCompiler<'a> {
                     };
                     // §13.5.1: the actual is context-determined by the
                     // parent's declared formal, as for the bare call below.
-                    // `method_formal_widths` walks the defining class's
-                    // chain, which includes the parent's prototypes.
-                    let callee_widths: Option<Vec<u32>> =
-                        self.method_formal_widths.get(member.name.as_str()).cloned();
+                    // `super.<m>` holds the parent chain's widths, which a
+                    // `m` the defining class hides does not shadow (fork
+                    // patch, see `class_method_formal_widths`).
+                    let callee_widths: Option<Vec<u32>> = self
+                        .method_formal_widths
+                        .get(format!("super.{}", member.name).as_str())
+                        .cloned();
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;

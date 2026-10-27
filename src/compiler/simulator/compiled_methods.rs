@@ -755,6 +755,21 @@ impl Simulator {
     /// bare call to the first defining class, and a virtual override may only
     /// redeclare the same prototype.
     pub(super) fn class_method_formal_widths(&self, cname: &str) -> HashMap<String, Vec<u32>> {
+        let mut out = self.chain_method_formal_widths(cname);
+        // Fork patch (drop when upstream resolves `super.m` widths along the
+        // parent chain): `super.m` calls the PARENT's `m`, so its widths come
+        // from the parent's chain, under `super.<m>`, apart from a `m` that
+        // this class hides (§13.5.1).
+        if let Some(parent) = self.module.classes.get(cname).and_then(|cd| cd.extends.as_deref()) {
+            for (m, w) in self.chain_method_formal_widths(parent) {
+                out.insert(format!("super.{m}"), w);
+            }
+        }
+        out
+    }
+
+    /// `class_method_formal_widths` of the class chain from `cname` up.
+    fn chain_method_formal_widths(&self, cname: &str) -> HashMap<String, Vec<u32>> {
         use crate::ast::decl::ClassMethodKind as Kind;
         use crate::ast::types::PortDirection;
         let mut out: HashMap<String, Vec<u32>> = HashMap::default();

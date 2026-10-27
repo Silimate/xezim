@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A compiled `super.m(...)` sizes each actual by the formal of the parent's
+  `m`, the method it calls, also when the class hides `m` with a different
+  formal width (§13.5.1, §11.6.1). Fork patch over upstream 1c50e25d; drop it
+  when upstream takes the widths from the parent chain.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

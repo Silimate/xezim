@@ -49,6 +49,8 @@ mod compiled_method_static_locals;
 mod class_param_default_scope;
 #[path = "classes/class_property_x_default.rs"]
 mod class_property_x_default;
+#[path = "classes/compiled_super_hidden_method_width.rs"]
+mod compiled_super_hidden_method_width;
 #[path = "classes/issue320_harness_mwe.rs"]
 mod issue320_harness_mwe;
 #[path = "classes/vif_specialization_keys.rs"]

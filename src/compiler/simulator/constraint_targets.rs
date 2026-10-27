@@ -2118,20 +2118,26 @@ impl Simulator {
     }
 
     /// §18.5.5: the parser spells `unique {a, b}` as pairwise `a != b`. A
-    /// `!=` between two whole rand dynamic arrays or queues can only come
-    /// from there (§18.3 admits only integral operands), so turn it back
-    /// into a `unique` group over both collections' elements.
+    /// `!=` with a whole rand fixed, dynamic or queue array on either side
+    /// can only come from there (§18.3 admits only integral operands), so
+    /// turn it back into a `unique` group over both operands: the
+    /// collections' elements and a plain scalar member.
     pub(super) fn regroup_unique_colls(constraints: &mut [ClassConstraint], colls: &[RandColl]) {
-        fn coll_name<'a>(e: &'a Expression, colls: &[RandColl]) -> Option<&'a str> {
+        fn plain_name(e: &Expression) -> Option<&str> {
             let ExprKind::Ident(h) = &e.kind else {
                 return None;
             };
             let [seg] = h.path.as_slice() else {
                 return None;
             };
-            let n = seg.name.name.as_str();
-            (seg.selects.is_empty() && colls.iter().any(|c| c.prop == n && c.kind == CollKind::Dyn))
-                .then_some(n)
+            seg.selects.is_empty().then_some(seg.name.name.as_str())
+        }
+        fn is_coll(e: &Expression, colls: &[RandColl]) -> bool {
+            plain_name(e).is_some_and(|n| {
+                colls
+                    .iter()
+                    .any(|c| c.prop == n && matches!(c.kind, CollKind::Dyn | CollKind::Fixed))
+            })
         }
         fn walk(item: &mut ConstraintItem, colls: &[RandColl]) {
             match item {
@@ -2145,7 +2151,10 @@ impl Simulator {
                     else {
                         return;
                     };
-                    if coll_name(left, colls).is_some() && coll_name(right, colls).is_some() {
+                    if (is_coll(left, colls) || is_coll(right, colls))
+                        && plain_name(left).is_some()
+                        && plain_name(right).is_some()
+                    {
                         *item = ConstraintItem::Unique {
                             exprs: vec![(**left).clone(), (**right).clone()],
                             span: e.span,
@@ -2178,14 +2187,24 @@ impl Simulator {
         match item {
             ConstraintItem::Unique { exprs, .. } => {
                 let mut cs = Vec::with_capacity(exprs.len());
+                let mut scalars = Vec::new();
                 for e in exprs {
                     let ExprKind::Ident(h) = &e.kind else {
                         return None;
                     };
                     let name = &h.path.last()?.name.name;
-                    cs.push(colls.iter().find(|c| &c.prop == name)?.clone());
+                    match colls.iter().find(|c| &c.prop == name) {
+                        Some(c) => cs.push(c.clone()),
+                        None if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                            scalars.push(self.unique_scalar_value(handle, name)?)
+                        }
+                        None => return None,
+                    }
                 }
-                Some(self.coll_is_unique(&cs))
+                if cs.is_empty() {
+                    return None;
+                }
+                Some(self.coll_is_unique(&cs, &scalars))
             }
             ConstraintItem::Foreach {
                 array,
@@ -2725,10 +2744,21 @@ impl Simulator {
         has_cond
     }
 
-    /// True when every element of the collection holds a distinct value.
-    pub(super) fn coll_is_unique(&mut self, cs: &[RandColl]) -> bool {
+    /// The current value of a scalar member of a `unique` group.
+    pub(super) fn unique_scalar_value(&self, handle: usize, name: &str) -> Option<u64> {
+        self.heap.get(handle)?.as_ref()?.properties.get(name)?.to_u64()
+    }
+
+    /// True when every element of the collections, and every value in
+    /// `scalars`, is distinct.
+    pub(super) fn coll_is_unique(&mut self, cs: &[RandColl], scalars: &[u64]) -> bool {
         let keys: Vec<String> = cs.iter().flat_map(|c| self.coll_elem_keys(c)).collect();
         let mut seen: HashSet<u64> = HashSet::default();
+        for &v in scalars {
+            if !seen.insert(v) {
+                return false;
+            }
+        }
         for k in keys {
             let v = self
                 .read_coll_elem(&k)

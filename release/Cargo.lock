@@ -48,11 +48,12 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bincode"
-version = "1.3.3"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
 dependencies = [
  "serde",
+ "unty",
 ]
 
 [[package]]
@@ -754,7 +755,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "sv-parser"
 version = "0.11.3"
-source = "git+https://github.com/aionhw/xezim-core.git?rev=48820a89e113df68687a10831e7051fbeb97340e#48820a89e113df68687a10831e7051fbeb97340e"
+source = "git+https://github.com/aionhw/xezim-core.git?rev=1947ac68859f823610c63833f61d52d6d7695342#1947ac68859f823610c63833f61d52d6d7695342"
 dependencies = [
  "serde",
  "serde_json",
@@ -849,6 +850,12 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "version_check"
@@ -1025,7 +1032,7 @@ dependencies = [
 [[package]]
 name = "xezim-core"
 version = "0.11.3"
-source = "git+https://github.com/aionhw/xezim-core.git?rev=48820a89e113df68687a10831e7051fbeb97340e#48820a89e113df68687a10831e7051fbeb97340e"
+source = "git+https://github.com/aionhw/xezim-core.git?rev=1947ac68859f823610c63833f61d52d6d7695342#1947ac68859f823610c63833f61d52d6d7695342"
 dependencies = [
  "ahash",
  "bincode",

@@ -84,8 +84,8 @@ impl Simulator {
             // whose countdown hits zero (honoring output skew), keep the rest.
             if let Some(mut pend) = self.clocking_cycle_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
-                let mut keep: Vec<(u64, String, Value)> = Vec::new();
-                for (n, net, val) in pend.drain(..) {
+                let mut keep: Vec<(u64, String, Value, Option<(u32, u32)>)> = Vec::new();
+                for (n, net, val, select) in pend.drain(..) {
                     if n <= 1 {
                         let skew = self
                             .clocking_sig_out_skew
@@ -93,12 +93,9 @@ impl Simulator {
                             .and_then(|m| m.get(&net))
                             .copied()
                             .unwrap_or(dskew);
-                        if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
-                            let w = self.signal_widths[id];
-                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
-                        }
+                        self.commit_clocking_drive(&net, &val, select, skew);
                     } else {
-                        keep.push((n - 1, net, val));
+                        keep.push((n - 1, net, val, select));
                     }
                 }
                 if !keep.is_empty() {
@@ -114,7 +111,7 @@ impl Simulator {
             // see the new output values when they run in the Reactive region.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
-                for (sig, val) in pending {
+                for (sig, val, select) in pending {
                     // §14.4 output skew for drives maturing at THIS edge.
                     let skew = self
                         .clocking_sig_out_skew
@@ -122,13 +119,21 @@ impl Simulator {
                         .and_then(|m| m.get(&sig))
                         .copied()
                         .unwrap_or(dskew);
-                    if skew > 0 {
-                        if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
-                            let w = self.signal_widths[id];
-                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
-                            continue;
-                        }
+                    if skew > 0 && self.signal_name_to_id.contains_key(sig.as_str()) {
+                        self.commit_clocking_drive(&sig, &val, select, skew);
+                        continue;
                     }
+                    let val = match (select, self.signal_name_to_id.get(sig.as_str())) {
+                        (Some((lo, w)), Some(&id)) => {
+                            let mut merged = self.signal_table[id].clone();
+                            let bits = val.resize(w);
+                            for i in 0..w as usize {
+                                merged.set_bit_code(lo as usize + i, bits.get_bit_code(i));
+                            }
+                            merged
+                        }
+                        _ => val,
+                    };
                     let lval = Expression::new(
                         ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                             root: None,
@@ -898,6 +903,69 @@ impl Simulator {
             &self.m_block_scope
         } else {
             &self.current_scope
+        }
+    }
+
+    /// §14.16: the physical (lsb, width) a drive of `sel`, a bit-select or
+    /// slice of the clockvar whose signal is `net`, writes. The indices are
+    /// read when the drive executes. None when `sel` is not a select of a
+    /// plain vector.
+    pub(super) fn clocking_select_bits(
+        &mut self,
+        net: &str,
+        sel: &Expression,
+    ) -> Option<(u32, u32)> {
+        let id = *self.signal_name_to_id.get(net)?;
+        let width = self.signal_widths[id];
+        let dim = event_bits::vector_decl_dim(&self.module, net, width)?;
+        let (lo, hi) = match &sel.kind {
+            ExprKind::Index { index, .. } => {
+                let v = self.eval_expr(index);
+                let k = if v.has_xz() { None } else { v.to_i64() }?;
+                (k, k)
+            }
+            ExprKind::RangeSelect {
+                left, right, kind, ..
+            } => {
+                let l = self.eval_expr(left);
+                let r = self.eval_expr(right);
+                if l.has_xz() || r.has_xz() {
+                    return None;
+                }
+                event_bits::select_label_span(dim, *kind, l.to_i64()?, r.to_i64()?)?
+            }
+            _ => return None,
+        };
+        let (a, b) = (
+            event_bits::label_to_phys(dim, lo),
+            event_bits::label_to_phys(dim, hi),
+        );
+        let (plo, phi) = (a.min(b), a.max(b));
+        if plo < 0 || phi >= width as i64 {
+            return None;
+        }
+        Some((plo as u32, (phi - plo + 1) as u32))
+    }
+
+    /// Commit a matured clocking drive of `val` to `net` after `skew`: the
+    /// whole signal, or with `select` only those bits, composed with any
+    /// drive already scheduled on it (§14.16.2: the last value wins).
+    pub(super) fn commit_clocking_drive(
+        &mut self,
+        net: &str,
+        val: &Value,
+        select: Option<(u32, u32)>,
+        skew: u64,
+    ) {
+        let Some(&id) = self.signal_name_to_id.get(net) else {
+            return;
+        };
+        match select {
+            Some((lo, w)) => self.schedule_delayed_slice(id, lo, w, &val.resize(w), skew),
+            None => {
+                let w = self.signal_widths[id];
+                self.schedule_delayed_with_delay(id, val.resize(w), skew);
+            }
         }
     }
 

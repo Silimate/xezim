@@ -107,6 +107,27 @@ fn c14_4_clocking_input_sampling() {
     );
 }
 
+// §14.16, §14.16.2: a bit-select or slice of a clockvar is driven after the output skew,
+// and a later drive in the same cycle overrides only the bits it selects
+#[test]
+fn c14_16_clocking_select_drive() {
+    check(
+        "14.16_clocking_select_drive",
+        include_str!("sv/14.16_clocking_select_drive.sv"),
+        "csel",
+        Order::Exact,
+        &[
+            "T|a|t=16000 nib=0000 asc=0000 o1=0000 o2=0000",
+            "T|b|t=18000 nib=0111 asc=1100 o1=1011 o2=1010",
+            "T|c|t=26000 nib=0111",
+            "T|d|t=28000 nib=1111",
+            "T|e|t=36000 o1=1011",
+            "T|f|t=38000 o1=1111",
+        ],
+        &[],
+    );
+}
+
 // §14.3, §14.4, §14.11, §14.12, §14.16: clocking blocks: skews, cycle delays, default clocking, ## drives
 #[test]
 fn c14_clocking_blocks() {

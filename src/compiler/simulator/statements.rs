@@ -3919,7 +3919,18 @@ impl Simulator {
                 // segment but the last, and the queued signal is the RESOLVED
                 // output net (matched from the block's signal list by exact
                 // name or `.sig` suffix) so `tick_clocking_blocks` drives it.
-                if let ExprKind::Ident(hier) = &lvalue.kind {
+                // §14.16: a bit-select or slice of a clockvar (`cb.sig[2]`,
+                // `cb.sig[8:2]`) is driven through the same skew and writes
+                // only those bits when it matures.
+                let (clockvar, clockvar_select) = match &lvalue.kind {
+                    ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }
+                        if matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() >= 2) =>
+                    {
+                        (&**expr, Some(lvalue))
+                    }
+                    _ => (lvalue, None),
+                };
+                if let ExprKind::Ident(hier) = &clockvar.kind {
                     if hier.path.len() >= 2 {
                         let cb_segs: Vec<&str> = hier
                             .path
@@ -3945,15 +3956,20 @@ impl Simulator {
                                 (!*is_in || inouts.is_some_and(|s| s.contains(n)))
                                     && (n == sig || n.rsplit('.').next() == Some(sig))
                             });
-                            if let Some((net, _)) = out_net {
-                                let net = net.clone();
+                            let out_net = out_net.map(|(n, _)| n.clone());
+                            let select = match (&out_net, clockvar_select) {
+                                (Some(net), Some(sel)) => Some(self.clocking_select_bits(net, sel)),
+                                _ => None,
+                            };
+                            if let Some(net) = out_net.filter(|_| !matches!(select, Some(None))) {
+                                let select = select.flatten();
                                 // §14.16 `##N`: wait N further clocking events.
                                 if let Some(n) = intra_cycles {
                                     if n > 0 {
                                         self.clocking_cycle_pending
                                             .entry(cb)
                                             .or_default()
-                                            .push((n, net, val));
+                                            .push((n, net, val, select));
                                         return;
                                     }
                                 }
@@ -3969,17 +3985,16 @@ impl Simulator {
                                     .copied()
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
-                                if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
-                                    if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
-                                        let w = self.signal_widths[id];
-                                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
-                                        return;
-                                    }
+                                if self.clocking_last_edge.get(&cb).copied() == Some(self.time)
+                                    && self.signal_name_to_id.contains_key(net.as_str())
+                                {
+                                    self.commit_clocking_drive(&net, &val, select, skew);
+                                    return;
                                 }
                                 self.clocking_output_pending
                                     .entry(cb)
                                     .or_default()
-                                    .push((net, val));
+                                    .push((net, val, select));
                                 return;
                             }
                         }

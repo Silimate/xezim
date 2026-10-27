@@ -1355,6 +1355,38 @@ impl Simulator {
         // §25.9: a static virtual-interface property binds by name before
         // any value path below stores (and returns).
         self.bind_static_vif(lvalue, rvalue);
+        // §11.9: a whole-union write that is NOT a `tagged` expression moves
+        // the active tag along with the value — `b = a` makes `b.Valid` a read
+        // of the member `a` holds — and any other such write (a function
+        // result, a pattern) drops the tag a previous `tagged` assignment
+        // left, or the inactive-member check refused `b.Valid` against a
+        // stale `Invalid` and raised a spurious run-time error. Ahead of the
+        // simple-assign fast path, which is where `b = a` stores and returns;
+        // a design without tagged unions pays the one `is_empty` test.
+        if !self.active_union_tag.is_empty() && !matches!(rvalue.kind, ExprKind::Tagged { .. }) {
+            if let ExprKind::Ident(lh) = &lvalue.kind {
+                if lh.path.len() == 1 && lh.path[0].selects.is_empty() {
+                    let lname = self.resolve_hier_name(lh);
+                    let src_tag = match &rvalue.kind {
+                        ExprKind::Ident(rh)
+                            if rh.path.len() == 1 && rh.path[0].selects.is_empty() =>
+                        {
+                            let rname = self.resolve_hier_name(rh);
+                            self.active_union_tag.get(&*rname).cloned()
+                        }
+                        _ => None,
+                    };
+                    match src_tag {
+                        Some(tag) => {
+                            self.active_union_tag.insert(lname.to_string(), tag);
+                        }
+                        None => {
+                            self.active_union_tag.remove(&*lname);
+                        }
+                    }
+                }
+            }
+        }
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
         {
             return;

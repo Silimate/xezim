@@ -33,6 +33,8 @@ mod adaptive_edge_skip;
 mod always_comb_sensitivity_audit;
 #[path = "scheduling/always_iff_guard.rs"]
 mod always_iff_guard;
+#[path = "scheduling/t0_comb_defer_start_batch_550.rs"]
+mod t0_comb_defer_start_batch;
 #[path = "scheduling/always_level_delay.rs"]
 mod always_level_delay;
 #[path = "scheduling/armed_array_element_inputs.rs"]
@@ -73,6 +75,8 @@ mod clocking_iff_samples_this_edge;
 mod clocking_task_context;
 #[path = "scheduling/comb_collection_element_sensitivity.rs"]
 mod comb_collection_element_sensitivity;
+#[path = "scheduling/comb_member_write_sensitivity.rs"]
+mod comb_member_write_sensitivity;
 #[path = "scheduling/comb_result_clobbered_by_process.rs"]
 mod comb_result_clobbered_by_process;
 #[path = "scheduling/computed_edge_expressions.rs"]
@@ -384,6 +388,9 @@ mod sva_until_properties;
 #[path = "scheduling/or_vacuity_508.rs"]
 mod or_vacuity_508;
 
+#[path = "scheduling/or_settles_early_533.rs"]
+mod or_settles_early_533;
+
 #[path = "scheduling/until_folding_510.rs"]
 mod until_folding_510;
 
@@ -395,3 +402,10 @@ mod review_action_sampling;
 
 #[path = "scheduling/review_package_event_scopes.rs"]
 mod review_package_event_scopes;
+#[path = "scheduling/function_formal_not_in_sensitivity.rs"]
+mod function_formal_not_in_sensitivity;
+
+#[path = "scheduling/port_handshake_t0_550.rs"]
+mod port_handshake_t0_550;
+#[path = "scheduling/armed_edge_dynamic_offset_read.rs"]
+mod armed_edge_dynamic_offset_read;

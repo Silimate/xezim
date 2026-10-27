@@ -1043,6 +1043,15 @@ pub enum CompiledMethodOutcome {
     Nil,
 }
 
+/// Decodes one on-disk method-cache entry (`m<key>.bin`). The cache's wire
+/// format is the artifact format; readers outside the simulator (tests)
+/// go through here so a format change touches one place.
+pub fn decode_persisted_method_outcome(bytes: &[u8]) -> Option<PersistedMethodOutcome> {
+    bincode::serde::decode_from_slice(bytes, xezim_core::xez_bincode_config())
+        .ok()
+        .map(|(outcome, _)| outcome)
+}
+
 /// class-perf persistent cache (XEZIM_METHOD_CACHE): the disk form of one
 /// compiled class-method outcome — the Rc-free mirror of
 /// `CompiledMethodOutcome`, bincode-serialized under a content key in the
@@ -1641,6 +1650,12 @@ pub struct BytecodeCompiler<'a> {
     /// with a bare local name (`mem_valid`) is first tried verbatim, then
     /// with this prefix applied (`testbench.mem_valid`).
     pub scope_hint: Option<String>,
+    /// §26.3: `pkg::member` -> (value, width) of every package enum member,
+    /// shared by the module-code compilers (`pkg_enum_consts` is the
+    /// method-mode snapshot). A member two packages both declare reaches
+    /// the compiler as the two-segment `pkg.member` the inliner spells it
+    /// with; resolving that by name landed on the bare signal twin.
+    pkg_enum_consts_ref: Option<&'a HashMap<String, (u64, u32)>>,
     /// Process-FSM mode (roadmap 11-12): statement-level `#delay` and
     /// `@(event)` compile to WaitDelayReg / WaitEdge instead of bailing.
     /// Never set for edge or comb blocks.
@@ -1746,6 +1761,16 @@ pub struct BytecodeCompiler<'a> {
     /// Step 9f: BARE-call static targets — non-virtual method name -> the
     /// first defining class from the lexical chain (§8.20).
     static_bare_targets: HashMap<String, String>,
+    /// LRM 11.6/11.8.2: declared width of every input port of every method
+    /// visible in the enclosing class chain, keyed by method name.  A call
+    /// ACTUAL is context-determined by the callee's declared formal — with
+    /// `function bit wide9(logic [8:0] v)`, the call site `wide9(a + b)`
+    /// must evaluate `a + b` at 9 bits (300), not at its 8-bit self width
+    /// (44).  The inline path already gets this from `port_effective_width`;
+    /// the CallMethod/CallScopedMethod lowerings compile their actuals
+    /// against `ctx_width = 0` and so silently truncated.  Missing entry or
+    /// width 0 = keep the old self-determined behavior.
+    method_formal_widths: HashMap<String, Vec<u32>>,
     /// Step 9g: WRITABLE static-property names (bare) of the enclosing
     /// class chain — reads AND stores lower to Load/StoreClassStatic.
     static_member_names: HashSet<String>,
@@ -2126,6 +2151,7 @@ impl<'a> BytecodeCompiler<'a> {
             allow_ast_fallback: false,
             m_labels: Vec::new(),
             scope_hint: None,
+            pkg_enum_consts_ref: None,
             allow_waits: false,
             wait_specs: Vec::new(),
             for_loop_var_ids: std::collections::HashMap::default(),
@@ -2146,6 +2172,7 @@ impl<'a> BytecodeCompiler<'a> {
             super_method_names: HashSet::default(),
             method_class_parent: None,
             static_bare_targets: HashMap::default(),
+            method_formal_widths: HashMap::default(),
             static_member_names: HashSet::default(),
             class_const_names: HashSet::default(),
             new_type_map: HashMap::default(),
@@ -2798,6 +2825,26 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
         self.scope_hint = scope;
+    }
+
+    pub fn set_pkg_enum_consts(&mut self, m: &'a HashMap<String, (u64, u32)>) {
+        self.pkg_enum_consts_ref = Some(m);
+    }
+
+    /// `pkg::member` of a two-segment identifier naming a package enum
+    /// member, from either enum table.
+    fn pkg_enum_const_of(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
+        if hier.root.is_some()
+            || hier.path.len() != 2
+            || hier.path.iter().any(|seg| !seg.selects.is_empty())
+        {
+            return None;
+        }
+        let key = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
+        self.pkg_enum_consts
+            .get(&key)
+            .or_else(|| self.pkg_enum_consts_ref.and_then(|m| m.get(&key)))
+            .map(|&(val, width)| Value::from_u64(val, width.max(1)))
     }
 
     pub fn set_cast_widths(&mut self, m: &'a HashMap<String, (u32, bool)>) {
@@ -6472,6 +6519,13 @@ impl<'a> BytecodeCompiler<'a> {
             match &e.kind {
                 ExprKind::Ident(h) => {
                     if h.path.len() != 1 {
+                        // `Cfg.VLEN`: a member of a packed-struct parameter
+                        // is a constant (§6.20.2), not module state.
+                        if h.path.iter().all(|seg| seg.selects.is_empty())
+                            && me.lookup_param_value(h).is_some()
+                        {
+                            return true;
+                        }
                         // `fname.member` may arrive as TWO segments; it is
                         // function-local when the head is bound (the return
                         // variable or a formal).
@@ -8711,7 +8765,8 @@ impl<'a> BytecodeCompiler<'a> {
                         self.lookup_param_value(h)?
                     }
                 } else {
-                    self.lookup_param_value(h)?
+                    self.lookup_param_value(h)
+                        .or_else(|| self.const_param_member_path(h))?
                 }
             }
             ExprKind::Unary { op, operand } => {
@@ -8754,9 +8809,58 @@ impl<'a> BytecodeCompiler<'a> {
                     _ => return None,
                 }
             }
+            ExprKind::MemberAccess { expr, member } => self.const_param_member(expr, &member.name)?,
             _ => return None,
         };
         (!v.has_xz() && !v.is_real).then_some(v)
+    }
+
+    /// §6.20.2, §7.2.1: a member of a struct-typed parameter (`Cfg.LW`) is a
+    /// constant — the parameter's value sliced by its registered layout. None
+    /// of the constant folders had a MemberAccess arm, so a part-select bound
+    /// written through one (`q[Cfg.LW/Cfg.AW-1:1]` on a `[1:0][63:0]` array)
+    /// counted as dynamic and took the flat BIT-range path: CVA6's AXI adapter
+    /// returned its cache line shifted by 63 bits and the core never fetched a
+    /// second instruction.
+    fn const_param_member(&self, base: &Expression, member: &str) -> Option<Value> {
+        let mut base = base;
+        while let ExprKind::Paren(inner) = &base.kind {
+            base = inner;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        self.const_param_member_hier(h, member)
+    }
+
+    /// The inliner spells an instance's `Cfg.LW` as ONE hierarchical
+    /// identifier whose last segment is the member (`u1.Cfg` . `LW`).
+    fn const_param_member_path(&self, h: &HierarchicalIdentifier) -> Option<Value> {
+        if h.path.len() < 2 {
+            return None;
+        }
+        let member = h.path.last()?.name.name.as_str();
+        let base = HierarchicalIdentifier {
+            root: h.root.clone(),
+            path: h.path[..h.path.len() - 1].to_vec(),
+            span: h.span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        self.const_param_member_hier(&base, member)
+    }
+
+    fn const_param_member_hier(&self, h: &HierarchicalIdentifier, member: &str) -> Option<Value> {
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let pv = self.lookup_param_value(h)?;
+        let (_, fields) = self.packed_struct_layout_for_hier(h)?;
+        let &(_, off, w) = fields.iter().find(|(n, _, _)| n == member)?;
+        if w == 0 || off.checked_add(w)? > pv.width {
+            return None;
+        }
+        Some(pv.range_select((off + w - 1) as usize, off as usize))
     }
 
     /// Detect the ROM `case` shape: every arm `L = <const>` with constant
@@ -9767,6 +9871,12 @@ impl<'a> BytecodeCompiler<'a> {
             let q = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
             if let Some(v) = params.get(q.as_str()) {
                 return Some(v.clone());
+            }
+            // §26.3: a package ENUM member has no parameter entry under its
+            // qualified spelling; take it from the enum table before any
+            // bare fallback can pick another package's member.
+            if let Some(v) = self.pkg_enum_const_of(hier) {
+                return Some(v);
             }
         }
         if let Some(scope) = &self.scope_hint {
@@ -13213,6 +13323,19 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                 }
+                // §26.3: a package constant two packages both declare has a
+                // shared bare signal twin (last package registered wins);
+                // the compiled unit's import decides which one it names.
+                // §26.3: `pkg.member` — the inliner's spelling of an enum
+                // member two packages both declare — is a constant of THAT
+                // package; resolved by name it landed on the bare signal twin.
+                if hier.path.len() == 2
+                    && let Some(v) = self.pkg_enum_const_of(hier)
+                {
+                    let r = self.alloc_reg();
+                    self.emit(Insn::LoadConst(r, Box::new(v)));
+                    return Some(r);
+                }
                 // A register-backed block local (a for-loop variable) shadows
                 // any same-named signal for the duration of its loop.
                 if let Some((src, _)) = self.local_var_reg_of(hier) {
@@ -14204,12 +14327,21 @@ impl<'a> BytecodeCompiler<'a> {
                         // index came out X.)
                         if let Some(idx) = self.eval_const_expr(index) {
                             let base = self.compile_expr(expr, 0)?;
-                            let lo = Self::packed_elem_lsb(
-                                self.packed_outer_dim(hier),
-                                idx as i64,
-                                elem_w,
-                            )
-                            .max(0) as u32;
+                            // §11.5.1: a constant index outside the declared
+                            // range reads x. `eval_const_expr` folds in u32, so
+                            // a `-1` (`conf_addr_i[i-1]` at genvar 0) arrived as
+                            // 4294967295 and `lo + elem_w` overflowed.
+                            let dim = self.packed_outer_dim(hier);
+                            let in_range = match dim {
+                                Some((l, r)) => (idx as i64) >= l.min(r) && (idx as i64) <= l.max(r),
+                                None => (idx as u64).saturating_mul(elem_w as u64) < u32::MAX as u64,
+                            };
+                            if !in_range {
+                                let dest = self.alloc_reg();
+                                self.emit(Insn::LoadConst(dest, Box::new(Value::new(elem_w))));
+                                return Some(dest);
+                            }
+                            let lo = Self::packed_elem_lsb(dim, idx as i64, elem_w).max(0) as u32;
                             let hi = lo + elem_w - 1;
                             let dest = self.alloc_reg();
                             self.emit(Insn::RangeSelectConst(dest, base, hi, lo));
@@ -15441,12 +15573,22 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("super_no_parent");
                         return None;
                     };
+                    // §13.5.1: the actual is context-determined by the
+                    // parent's declared formal, as for the bare call below.
+                    // `method_formal_widths` walks the defining class's
+                    // chain, which includes the parent's prototypes.
+                    let callee_widths: Option<Vec<u32>> =
+                        self.method_formal_widths.get(member.name.as_str()).cloned();
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;
                     let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                    for a in args {
-                        match self.compile_expr(a, 0) {
+                    for (ai, a) in args.iter().enumerate() {
+                        let ctx = callee_widths
+                            .as_ref()
+                            .and_then(|w| w.get(ai).copied())
+                            .unwrap_or(0);
+                        match self.compile_expr(a, ctx) {
                             Some(r) => arg_values.push(r),
                             None => {
                                 ok = false;
@@ -15636,12 +15778,29 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("bare_call_no_this");
                         return None;
                     };
+                    // LRM 11.6/11.8.2: a call ACTUAL is context-determined
+                    // by the callee's DECLARED formal, exactly like the
+                    // operand of a comparison.  `wide9(a + b)` against
+                    // `function bit wide9(logic [8:0] v)` must evaluate
+                    // `a + b` at 9 bits (300); compiling it self-determined
+                    // yields 8-bit 44 and the callee compares 44 !== 300.
+                    // Mirrors the inline path, which binds with
+                    // `port_effective_width`.  Unknown callee / non-scalar
+                    // port = width 0 = the previous self-determined behavior.
+                    let callee_widths: Option<Vec<u32>> = self
+                        .method_formal_widths
+                        .get(h.path[0].name.name.as_str())
+                        .cloned();
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;
                     let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                    for a in args {
-                        match self.compile_expr(a, 0) {
+                    for (ai, a) in args.iter().enumerate() {
+                        let ctx = callee_widths
+                            .as_ref()
+                            .and_then(|w| w.get(ai).copied())
+                            .unwrap_or(0);
+                        match self.compile_expr(a, ctx) {
                             Some(r) => arg_values.push(r),
                             None => {
                                 ok = false;
@@ -15741,8 +15900,17 @@ impl<'a> BytecodeCompiler<'a> {
                     let call_next = self.next_reg;
                     let mut ok = true;
                     let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                    for a in args {
-                        match self.compile_expr(a, 0) {
+                    // §13.5.1: a scalar input formal is the actual's context
+                    // width (the inline path binds the same way); unpacked
+                    // formals keep the self-determined compile.
+                    let fn_scope = name.rsplit_once('.').map(|(s, _)| s.to_string());
+                    for (ai, a) in args.iter().enumerate() {
+                        let ctx = if fd.ports[ai].dimensions.is_empty() {
+                            self.port_effective_width(&fd.ports, ai, fn_scope.as_deref())
+                        } else {
+                            0
+                        };
+                        match self.compile_expr(a, ctx) {
                             Some(r) => arg_values.push(r),
                             None => {
                                 ok = false;
@@ -18296,8 +18464,15 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(v as u32);
                     }
                 }
-                self.lookup_param_value(hier)?.to_u64().map(|u| u as u32)
+                self.lookup_param_value(hier)
+                    .or_else(|| self.const_param_member_path(hier))?
+                    .to_u64()
+                    .map(|u| u as u32)
             }
+            ExprKind::MemberAccess { expr, member } => self
+                .const_param_member(expr, &member.name)?
+                .to_u64()
+                .map(|u| u as u32),
             // Fold simple parameter arithmetic so slice bounds like
             // `[ENTRY_NUM-1:0]` resolve. Without this, expr_max_width on a
             // sliced range returned 1 (unwrap_or(0)), which then clobbered
@@ -19198,6 +19373,7 @@ impl<'a> BytecodeCompiler<'a> {
         super_method_names: &HashSet<String>,
         method_class_parent: &Option<String>,
         static_bare_targets: &HashMap<String, String>,
+        method_formal_widths: &HashMap<String, Vec<u32>>,
         static_member_names: &HashSet<String>,
         class_const_names: &HashSet<String>,
         new_type_map: &HashMap<String, String>,
@@ -19344,6 +19520,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.super_method_names = super_method_names.clone();
         self.method_class_parent = method_class_parent.clone();
         self.static_bare_targets = static_bare_targets.clone();
+        self.method_formal_widths = method_formal_widths.clone();
         // class-perf P2 (typed handle roots): declared class per handle
         // formal / class-typed local, consulted by
         // `method_handle_chain_class` so `sched.m_parent.get_pt()` admits.
@@ -19479,6 +19656,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_class = None;
             self.handle_member_types = None;
             self.class_method_names.clear();
+            self.method_formal_widths.clear();
             self.method_result_reg = None;
             self.method_return_val_reg = None;
             self.method_result_width = None;
@@ -23188,6 +23366,7 @@ mod tests {
             &HashSet::default(),
             &None,
             &HashMap::default(),
+            &HashMap::default(),
             &HashSet::default(),
             &HashSet::default(),
             &HashMap::default(),
@@ -23285,6 +23464,7 @@ mod tests {
             &HashSet::default(),
             &None,
             &HashMap::default(),
+            &HashMap::default(),
             &HashSet::default(),
             &HashSet::default(),
             &HashMap::default(),
@@ -23360,6 +23540,7 @@ mod tests {
                     &HashSet::default(),
                     &HashSet::default(),
                     &None,
+                    &HashMap::default(),
                     &HashMap::default(),
                     &HashSet::default(),
                     &HashSet::default(),

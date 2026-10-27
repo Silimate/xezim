@@ -1850,14 +1850,57 @@ impl Simulator {
             // methods are stored separately from instance methods, so the
             // instance dispatch path would miss them and return null.
             // (e.g. `uvm_create`'s `req.get_type()`.)
-            if let Some(base_cls) = self
-                .receiver_static_class(expr, handle)
-                .map(|c| c.split('#').next().unwrap_or(&c).to_string())
-            {
+            if let Some(decl_full) = self.receiver_static_class(expr, handle) {
+                let base_cls = decl_full.split('#').next().unwrap_or(&decl_full).to_string();
                 if self.is_static_method(&base_cls, &member.name) {
-                    if let Some(res) =
-                        self.exec_static_method_via_object(&base_cls, &member.name, args, handle)
-                    {
+                    // §8.25: same as the flattened `req::get_type()` arm — a
+                    // static method through a null receiver declared with a
+                    // SPECIALIZATION runs in that specialization's context
+                    // (the body's bare self-references denote the current
+                    // specialization). Seed `current_spec` from the declared
+                    // type; the live-object recovery inside
+                    // `exec_static_method_via_object` cannot see a null handle.
+                    let saved_spec = if handle == 0 {
+                        // A variable receiver's declaration names its
+                        // specialization through `var_type_args` (the flat
+                        // `var_class_types` text is the bare class name), so
+                        // resolve the receiver VARIABLE, not just the type
+                        // text; `this.member` receivers resolve through the
+                        // property table the same way.
+                        let recv_var: Option<&str> = match &expr.kind {
+                            ExprKind::Ident(h)
+                                if h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                            {
+                                Some(&h.path[0].name.name)
+                            }
+                            ExprKind::MemberAccess { expr: base, member } => {
+                                match &base.kind {
+                                    ExprKind::Ident(b)
+                                        if b.path.len() == 1
+                                            && b.path[0].selects.is_empty()
+                                            && (b.path[0].name.name == "this"
+                                                || b.path[0].name.name == "super") =>
+                                    {
+                                        Some(&member.name)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        let s = self.spec_for_null_receiver(recv_var, &decl_full);
+                        s
+                    } else {
+                        None
+                    };
+                    let saved =
+                        saved_spec.map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+                    let res =
+                        self.exec_static_method_via_object(&base_cls, &member.name, args, handle);
+                    if let Some(prev) = saved {
+                        self.current_spec = prev;
+                    }
+                    if let Some(res) = res {
                         return res;
                     }
                 }
@@ -3053,14 +3096,37 @@ impl Simulator {
                     } else {
                         decl_cls_opt
                     };
-                    if let Some(base_cls) =
-                        base_cls.map(|c| c.split('#').next().unwrap_or(&c).to_string())
-                    {
+                    if let Some(decl_full) = base_cls {
+                        let base_cls =
+                            decl_full.split('#').next().unwrap_or(&decl_full).to_string();
                         let m = method_name.clone();
                         if self.is_static_method(&base_cls, &m) {
-                            if let Some(res) =
-                                self.exec_static_method_via_object(&base_cls, &m, args, handle)
-                            {
+                            // §8.25: a static method called through a NULL
+                            // receiver whose declared type is a SPECIALIZATION
+                            // (`req::get_type()` where req is declared
+                            // `C#(T)` — `uvm_create_on`'s shape) runs in that
+                            // specialization's context: the body's bare
+                            // self-references (the `C` type argument of a
+                            // member typedef like
+                            // `uvm_object_registry#(C,"C") type_id`, written by
+                            // `uvm_object_utils(C)`) denote the CURRENT
+                            // specialization, not the default. The live-object
+                            // spec recovery in `exec_static_method_via_object`
+                            // cannot see a null handle, so seed `current_spec`
+                            // from the DECLARED type here.
+                            let saved_spec = if handle == 0 {
+                                self.spec_for_null_receiver(Some(obj_name.as_str()), &decl_full)
+                            } else {
+                                None
+                            };
+                            let saved = saved_spec
+                                .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+                            let res =
+                                self.exec_static_method_via_object(&base_cls, &m, args, handle);
+                            if let Some(prev) = saved {
+                                self.current_spec = prev;
+                            }
+                            if let Some(res) = res {
                                 return res;
                             }
                         }
@@ -3234,6 +3300,24 @@ impl Simulator {
                     {
                         let mname = hier.path.last().unwrap().name.name.clone();
                         return self.exec_method_call(h, &mname, args);
+                    }
+                    // §8.4: `c.m()` on a class variable that holds null. The
+                    // remaining fallbacks (static call, constructor, DPI,
+                    // builtin) cannot take it, so it returned a silent 0 and
+                    // ran nothing; the reference simulator reports the null
+                    // dereference. A static method never needs the object.
+                    if h == 0
+                        && hier.path.len() == 2
+                        && let Some(decl) = self.class_of_var(&hier.path[0].name.name)
+                    {
+                        let base = decl.split('#').next().unwrap_or(&decl).to_string();
+                        let mname = hier.path[1].name.name.clone();
+                        if self.class_has_method(&base, &mname)
+                            && !self.is_static_method(&base, &mname)
+                        {
+                            self.report_null_handle_call(&mname);
+                            return Value::zero(32);
+                        }
                     }
                     // A covergroup of another instance (`u0.cg.sample()`).
                     if let Some(idx) = self.cg_index(h) {

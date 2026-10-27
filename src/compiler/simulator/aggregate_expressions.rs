@@ -1758,6 +1758,7 @@ impl Simulator {
             hi: 0,
             nested: false,
             is_object_elem: false,
+            nd_base: None,
         };
         Self::csp_size_solved(&c, &wrapper)
     }
@@ -1779,12 +1780,74 @@ impl Simulator {
     > {
         let mut scalars = Vec::new();
         let mut arrays = Vec::new();
+        self.rand_scope_nd.clear();
         for (name, lv) in targets {
             let enum_vals = |me: &Self, n: &str| {
                 me.declared_enum_members(n)
                     .filter(|m| !m.is_empty())
                     .map(|m| m.iter().map(|x| x.1).collect::<Vec<u64>>())
             };
+            // §18.12 / §18.4 (#519): a multi-dimensional unpacked array
+            // joins as one solver array per row (all but the last dimension
+            // indexed), its bounds kept for the `foreach` levels above.
+            if let ExprKind::Ident(h) = &lv.kind
+                && h.root.is_none()
+                && h.path.iter().all(|s| s.selects.is_empty())
+            {
+                let nm = self.resolve_hier_name(h).into_owned();
+                let nm = self.instance_assoc_member(&nm).unwrap_or(nm);
+                let shape: Option<(Vec<(i64, i64)>, u32)> =
+                    if let Some(&(d0, d1, w)) = self.module.arrays_2d.get(&nm) {
+                        Some((vec![d0, d1], w))
+                    } else {
+                        self.module.arrays_nd.get(&nm).map(|(sh, w)| (sh.clone(), *w))
+                    };
+                if let Some((dims, w)) = shape
+                    && dims.len() >= 2
+                {
+                    let w = w.max(1);
+                    if w > 64 {
+                        return Err(rand_csp::CspOutcome::NotApplicable);
+                    }
+                    let written = if h.path.len() == 1 && h.path[0].name.name != nm {
+                        h.path[0].name.name.clone()
+                    } else {
+                        nm.clone()
+                    };
+                    let signed = match self.module.var_decl_types.get(&nm) {
+                        Some(dt) => super::elaborate::is_type_signed_resolved(
+                            dt,
+                            &self.module.typedef_types,
+                        ),
+                        None => self.signed_signals.contains(&nm),
+                    };
+                    let ev = enum_vals(self, &nm);
+                    let (ll, lr) = dims[dims.len() - 1];
+                    let idx: Vec<i64> = (ll.min(lr)..=ll.max(lr)).collect();
+                    let mut prefixes: Vec<String> = vec![String::new()];
+                    for &(l, r) in &dims[..dims.len() - 1] {
+                        let mut next = Vec::new();
+                        for p in &prefixes {
+                            for i in l.min(r)..=l.max(r) {
+                                next.push(format!("{p}[{i}]"));
+                            }
+                        }
+                        prefixes = next;
+                    }
+                    self.rand_scope_nd.insert(written.clone(), dims.clone());
+                    for p in prefixes {
+                        arrays.push((
+                            format!("{written}{p}"),
+                            format!("{nm}{p}"),
+                            idx.clone(),
+                            w,
+                            signed,
+                            ev.clone(),
+                        ));
+                    }
+                    continue;
+                }
+            }
             if let Some(nm) = self.array_operand_name(lv) {
                 if self.module.arrays_nd.contains_key(&nm)
                     || self.module.arrays_2d.contains_key(&nm)

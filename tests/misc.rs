@@ -535,3 +535,14 @@ mod undefined_macro_recovery;
 
 #[path = "misc/constant_scopes_488.rs"]
 mod constant_scopes_488;
+#[path = "misc/imported_enum_name_collision.rs"]
+mod imported_enum_name_collision;
+
+#[path = "misc/named_block_struct_member.rs"]
+mod named_block_struct_member;
+
+#[path = "misc/include_intra_delay_567.rs"]
+mod include_intra_delay_567;
+
+#[path = "misc/override_timescale_package_delay_571.rs"]
+mod override_timescale_package_delay_571;

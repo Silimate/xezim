@@ -2474,6 +2474,19 @@ impl Simulator {
             }
         }
 
+        // §26.3: package enum members under their qualified spelling, for
+        // the bytecode compiler (see `Simulator::pkg_enum_consts`).
+        let pkg_enum_consts: HashMap<String, (u64, u32)> = module
+            .package_enum_members
+            .iter()
+            .flat_map(|(pkg, members)| {
+                members
+                    .iter()
+                    .filter(|(_, (_, w))| *w > 0 && *w <= 64)
+                    .map(move |(m, (v, w))| (format!("{}::{}", pkg, m), (*v, *w)))
+            })
+            .collect();
+
         let n = names.len();
         let mut signal_name_to_id = NameMap::with_capacity(n);
         signal_name_to_id
@@ -3844,6 +3857,10 @@ impl Simulator {
             settle_limit_last_time: 0,
             proc_settle_defer: false,
             deferred_proc_entries: Vec::new(),
+            t0_starts_remaining: 0,
+            rand_scope_nd: HashMap::default(),
+            p_top_level: false,
+            null_call_reported: Default::default(),
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -3989,6 +4006,8 @@ impl Simulator {
             assert_inst_ix: HashMap::default(),
             assert_imm_ix: HashMap::default(),
             assert_scope_ids: HashMap::default(),
+            assertion_labels: HashMap::default(),
+            assert_wrap_label: None,
             code_cov: None,
             code_cov_hits: Vec::new(),
             code_cov_toggle_names,
@@ -4042,6 +4061,7 @@ impl Simulator {
             pkg_scope_stack: Vec::new(),
             pending_pkg_scope: None,
             pkg_ambiguous_names,
+            pkg_enum_consts,
             contested_pkg_vars,
             m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),

@@ -3993,6 +3993,15 @@ impl Simulator {
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
     /// form. `None` if neither the variable nor its base has a declared type.
     pub(super) fn render_p_var(&mut self, name: &str) -> Option<String> {
+        // Elements of a collection are nested leaves (`p_top_level`).
+        if self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.module.arrays.contains_key(name)
+            || self.module.arrays_2d.contains_key(name)
+            || self.module.arrays_nd.contains_key(name)
+        {
+            self.p_top_level = false;
+        }
         // A queue / dynamic array prints exactly its `size()` elements — not the
         // fixed 64-slot buffer it is backed by. Its ELEMENTS (`q[i]` of an
         // array of queues) have no declared type of their own. A static
@@ -4126,7 +4135,7 @@ impl Simulator {
                     }
                 })
                 .collect();
-            return Some(format!("'{{{} }}", parts.join(", ")));
+            return Some(format!("'{{{}}}", parts.join(", ")));
         }
         let decl = self.module.var_decl_types.get(name).cloned().or_else(|| {
             // §8.9: a static fixed-array member's store (`Cls::S`).
@@ -4176,7 +4185,7 @@ impl Simulator {
                     }
                 })
                 .collect();
-            return Some(format!("'{{{} }}", parts.join(", ")));
+            return Some(format!("'{{{}}}", parts.join(", ")));
         }
         // Fixed unpacked array -> element list. An element may itself be a
         // collection (`int q[3][$]`), so it goes back through `render_p_var`.

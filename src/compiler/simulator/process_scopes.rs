@@ -2652,6 +2652,42 @@ impl Simulator {
         }
     }
 
+    /// §10.4.2 (#569): the root name of a member/element NBA target when it
+    /// is a frame local or formal holding a live object handle, with the
+    /// handle value, so the apply site writes THAT object.
+    pub(super) fn nba_root_frame(&self, lvalue: &Expression) -> Option<(String, Value)> {
+        if !matches!(
+            lvalue.kind,
+            ExprKind::MemberAccess { .. } | ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && !matches!(&lvalue.kind, ExprKind::Ident(h) if h.path.len() > 1)
+        {
+            return None;
+        }
+        let mut e = lvalue;
+        loop {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => e = expr,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let root = &h.path[0].name.name;
+        // `this` is carried by `this_handle`.
+        if root == "this" {
+            return None;
+        }
+        let v = self.local_stack.last()?.get(root)?;
+        let handle = v.to_u64()? as usize;
+        if handle == 0 || !self.heap.get(handle).is_some_and(|o| o.is_some()) {
+            return None;
+        }
+        Some((root.clone(), v.clone()))
+    }
+
     pub(super) fn freeze_lvalue_indices(&mut self, e: &Expression) -> Expression {
         let lit = |v: i64, span| {
             Expression::new(
@@ -3072,6 +3108,7 @@ impl Simulator {
         }
         self.enqueue_context_nba(
             NbaEntry {
+                root_frame: None,
                 lhs: key.is_none().then(|| root.into_owned()),
                 value,
                 resolved_id: None,
@@ -3278,10 +3315,20 @@ impl Simulator {
             }
             if let Some(lhs) = entry.lhs {
                 // Re-establish the scheduling context so a class-property
-                // target resolves (see NbaEntry::this_handle).
+                // target resolves (see NbaEntry::this_handle), and the
+                // object the target's root NAMED when it was scheduled
+                // (see NbaEntry::root_frame).
                 if let Some(h) = entry.this_handle {
                     self.this_stack.push(Some(h));
                 }
+                let pushed_root = if let Some((name, val)) = entry.root_frame {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    frame.insert(name, val);
+                    self.local_stack.push(frame);
+                    true
+                } else {
+                    false
+                };
                 let value = if let Some((dst, src, len)) = entry.static_slice {
                     let mut stored = self.eval_expr(&lhs);
                     stored.copy_bits_from(dst as usize, &entry.value, src as usize, len as usize);
@@ -3290,6 +3337,9 @@ impl Simulator {
                     entry.value
                 };
                 self.assign_value(&lhs, &value);
+                if pushed_root {
+                    self.local_stack.pop();
+                }
                 if entry.this_handle.is_some() {
                     self.this_stack.pop();
                 }

@@ -725,6 +725,29 @@ impl Simulator {
         // that end in a collection (`int a[3][3][$]`, `int a[2][2][int]`,
         // a class property too): the last variable walks each element's
         // own size or keys, not the element's packed bits.
+        // §12.7.3: an omitted variable skips that dimension. Before a
+        // collection dimension that leaves the element's size undefined
+        // (every row has its own), so the loop is rejected rather than
+        // walking the element's packed bits (it iterated 32 times over an
+        // `int` row).
+        if vars.len() >= 2
+            && self.indexed_colls_live()
+            && let Some((an, dims)) = self.fixed_dims_of_colls(array)
+            && vars.len() == dims.len() + 1
+            && vars[..dims.len()].iter().any(|v| v.is_none())
+            && vars.last().is_some_and(Option::is_some)
+        {
+            let m = format!(
+                "[xezim][error] foreach ({}[...]): a loop variable before a queue, dynamic or \
+                 associative dimension cannot be omitted (§12.7.3: the collection's size \
+                 depends on that index)",
+                an
+            );
+            self.record_output(m.clone());
+            self.stdout_writeln(&m);
+            self.abort_run();
+            return;
+        }
         if vars.len() >= 2
             && self.indexed_colls_live()
             && let Some((an, dims)) = self.fixed_dims_of_colls(array)
@@ -2870,7 +2893,41 @@ impl Simulator {
                 {
                     frame.push((bare.clone(), name.clone()));
                 }
+                // §7.4.4 (#519): a fixed MULTI-dimensional local keeps its
+                // full shape — it was registered from its first dimension
+                // as a 1-D array, and the elaborated shape of a same-named
+                // local of another subroutine stayed in the other table, so
+                // a later `std::randomize` read whichever shape it met first.
+                // Each declaration now owns the name in exactly one table.
+                let nd_shape: Option<Vec<(i64, i64)>> = if dims.len() >= 2 {
+                    dims.iter()
+                        .map(|dm| {
+                            super::elaborate::extract_array_range(
+                                std::slice::from_ref(dm),
+                                &self.module.parameters,
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .filter(|sh| sh.iter().all(|&(l, h)| h >= l && h - l < 4096))
+                } else {
+                    None
+                };
+                if let Some(shape) = nd_shape {
+                    self.module.arrays.remove(&name);
+                    if shape.len() == 2 {
+                        self.module
+                            .arrays_2d
+                            .insert(name.clone(), (shape[0], shape[1], w));
+                        self.module.arrays_nd.remove(&name);
+                    } else {
+                        self.module.arrays_nd.insert(name.clone(), (shape, w));
+                        self.module.arrays_2d.remove(&name);
+                    }
+                    continue;
+                }
                 self.module.arrays.insert(name.clone(), (lo, hi, w));
+                self.module.arrays_2d.remove(&name);
+                self.module.arrays_nd.remove(&name);
                 if descending {
                     self.module.descending_arrays.insert(name.clone());
                 }
@@ -4031,6 +4088,7 @@ impl Simulator {
                             static_key: Some(key),
                             static_slice: None,
                             this_handle: None,
+                            root_frame: self.nba_root_frame(lvalue),
                         },
                         d,
                     );
@@ -4080,6 +4138,7 @@ impl Simulator {
                             static_key,
                             static_slice: None,
                             this_handle,
+                            root_frame: self.nba_root_frame(lvalue),
                         });
                     }
                 } else if let Some(id) = self.resolve_nba_target(lvalue) {
@@ -4123,6 +4182,7 @@ impl Simulator {
                             static_key,
                             static_slice: None,
                             this_handle,
+                            root_frame: self.nba_root_frame(lvalue),
                         },
                         d,
                     );
@@ -4610,6 +4670,13 @@ impl Simulator {
                 self.record_ast_loop_heat(i);
             }
             StatementKind::SeqBlock { stmts, name } => {
+                // §9.3.1: a labelled procedural assertion is this block.
+                if let Some(n) = name
+                    && stmts.len() == 1
+                    && matches!(stmts[0].kind, StatementKind::Assertion(_))
+                {
+                    self.assert_wrap_label = Some(n.name.clone());
+                }
                 // §6.21: a block-local declaration SHADOWS a same-named module
                 // signal — without a frame the frameless VarDecl exec lands on
                 // the signal itself and the block's writes clobber the module
@@ -5413,6 +5480,12 @@ impl Simulator {
             }
             StatementKind::Assertion(a) => {
                 use crate::ast::stmt::AssertionKind;
+                // The site's label: a module item's own (§16.5), or the name
+                // of the block the parser wrapped a labelled procedural
+                // statement in (§9.3.1).
+                let wrap_label = self.assert_wrap_label.take();
+                let site_label: Option<String> =
+                    a.label.as_ref().map(|l| l.name.clone()).or(wrap_label);
                 // LRM §16.5 — concurrent (`assert property (…)`) defers
                 // evaluation to the observed region. We queue an
                 // `ObservedProbe`; the drain in `drain_observed_region`
@@ -5556,7 +5629,7 @@ impl Simulator {
                         let idx = match existing {
                             Some(i) => i,
                             None => {
-                                self.register_sva_site(a, events, body);
+                                self.register_sva_site(a, events, body, site_label.as_deref());
                                 self.sva_sites.len() - 1
                             }
                         };
@@ -5581,16 +5654,23 @@ impl Simulator {
                         }
                         return;
                     }
-                    let probe_name = format!("prop@{}", a.span.start);
-                    let this_handle = self.this_stack.last().and_then(|t| *t);
-                    let kind = match a.kind {
+                    // The unclocked property's outcomes land on the site's
+                    // own entry (file, line, kind and label), not on a
+                    // locationless one keyed by a synthetic name: the entry
+                    // its instance's tally keys, as for an immediate one.
+                    let kind: u8 = match a.kind {
                         AssertionKind::Assert => 0,
                         AssertionKind::Assume => 1,
                         AssertionKind::Cover => 2,
                     };
+                    let this_handle = self.this_stack.last().and_then(|t| *t);
                     let inst = self.imm_assert_inst(a, kind);
+                    let (stat_key, loc) = (self.assert_insts[inst].key, self.assert_insts[inst].loc);
+                    self.note_assert_label(stat_key, site_label.as_deref());
                     self.pending_observed.push(ObservedProbe {
-                        name: probe_name,
+                        stat_key,
+                        loc,
+                        kind,
                         predicate: resolved_expr,
                         this_handle,
                         inst,
@@ -5609,7 +5689,7 @@ impl Simulator {
                 };
                 let true_branch = self.eval_expr(&a.expr).is_true();
                 if let Some(kind) = a.deferred {
-                    self.queue_deferred_assert(a, kind, true_branch);
+                    self.queue_deferred_assert(a, kind, true_branch, site_label.as_deref());
                     return;
                 }
                 // Track per-site tallies for end-of-sim summary + JSON DB.
@@ -5618,7 +5698,7 @@ impl Simulator {
                     AssertionKind::Assume => 1,
                     AssertionKind::Cover => 2,
                 };
-                self.imm_assert_tally(a, kind_tag, true_branch);
+                self.imm_assert_tally(a, kind_tag, true_branch, site_label.as_deref());
                 if !true_branch {
                     if !ctl.fail_action() {
                     } else if let Some(ea) = &a.else_action {

@@ -377,7 +377,16 @@ impl Simulator {
                 }
             }
             let mut val = if arg_supplied(i) {
-                let value = self.eval_expr(&args[i]);
+                // §11.6.1/§11.8.2: the ACTUAL is context-determined by this
+                // formal's declared width (see `actual_ctx_shape`), so
+                // `fwide9(x + y)` over 8-bit x, y adds at 9 bits. `fit_scalar_-
+                // formal_seed` below only resizes the value that is handed it,
+                // which cannot restore a carry the self-determined width
+                // already dropped.
+                let value = match self.actual_context_width(port) {
+                    Some(w) => self.eval_expr_ctx(&args[i], w),
+                    None => self.eval_expr(&args[i]),
+                };
                 self.vif_argument_value(port, &args[i], value)
             } else if let Some(def) = &port.default {
                 // §13.5.3: a default may reference EARLIER formals (`int b =

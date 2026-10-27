@@ -81,7 +81,8 @@ impl Simulator {
             if &magic != PREPARED_COMB_MAGIC {
                 return Err("bad format marker".to_string());
             }
-            bincode::deserialize_from(reader).map_err(|e| e.to_string())
+            bincode::serde::decode_from_std_read(&mut reader, xezim_core::xez_bincode_config())
+                .map_err(|e| e.to_string())
         })();
         let cache = match result {
             Ok(cache) if self.prepared_comb_cache_is_valid(&cache) => cache,
@@ -174,7 +175,12 @@ impl Simulator {
                 time0_deferred: &self.comb_time0_deferred,
                 cont_driven: &self.cont_driven,
             };
-            bincode::serialize_into(&mut writer, &payload).map_err(|e| e.to_string())?;
+            bincode::serde::encode_into_std_write(
+                &payload,
+                &mut writer,
+                xezim_core::xez_bincode_config(),
+            )
+            .map_err(|e| e.to_string())?;
             writer.flush().map_err(|e| e.to_string())?;
             drop(writer);
             std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
@@ -668,6 +674,7 @@ impl Simulator {
                     &self.widths,
                 );
                 compiler.set_scope_hint(scope_hint.clone());
+                compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
@@ -752,6 +759,7 @@ impl Simulator {
                     &self.widths,
                 );
                 compiler.set_scope_hint(scope_hint.clone());
+                compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
@@ -1338,22 +1346,11 @@ impl Simulator {
                 // block re-queue itself every settle pass (the pass-through write
                 // then the field write commit two different values per eval), which
                 // churns to the settle limit. Strip a read whose '.'-base prefix is
-                // in the write set.
+                // in the write set — and a bare base that is read only through
+                // members this block writes (`self_written_read`).
                 let sens_reads: HashSet<String> = reads
                     .iter()
-                    .filter(|r| {
-                        if writes.contains(*r) {
-                            return false;
-                        }
-                        let mut base: &str = r.as_str();
-                        while let Some(pos) = base.rfind('.') {
-                            base = &base[..pos];
-                            if writes.contains(base) {
-                                return false;
-                            }
-                        }
-                        true
-                    })
+                    .filter(|r| !Self::self_written_read(r, &reads, &writes))
                     .cloned()
                     .collect();
                 // A bare read may resolve BOTH to a top-level signal and to
@@ -1509,6 +1506,7 @@ impl Simulator {
                         &self.widths,
                     );
                     compiler.set_scope_hint(scope_hint.clone());
+                    compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);

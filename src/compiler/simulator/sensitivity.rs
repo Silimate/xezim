@@ -304,6 +304,27 @@ impl Simulator {
         for item in &fdecl.items {
             Self::collect_stmt_reads(item, module, &mut body_reads, &mut scratch_writes);
         }
+        // §13.4: the formals, the return variable and the block locals are
+        // frame state, not module signals the caller can be sensitive to. A
+        // formal named like a design net (`uj_imm(logic [31:0] instruction_i)`
+        // beside a decoder port `instruction_i`) made the calling assign
+        // depend on that unrelated net — and trip the elided-port report.
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let mut frame: HashSet<&str> = fdecl.ports.iter().map(|p| p.name.name.as_str()).collect();
+        frame.insert(leaf);
+        fn local_names<'a>(items: &'a [Statement], out: &mut HashSet<&'a str>) {
+            for st in items {
+                match &st.kind {
+                    StatementKind::VarDecl { declarators, .. } => {
+                        out.extend(declarators.iter().map(|d| d.name.name.as_str()));
+                    }
+                    StatementKind::SeqBlock { stmts, .. } => local_names(stmts, out),
+                    _ => {}
+                }
+            }
+        }
+        local_names(&fdecl.items, &mut frame);
+        body_reads.retain(|r| !frame.contains(r.as_str()));
         // A bare read in the body of an INSTANCE's function names that
         // instance's variable (`internal_func_dep` inside
         // `dut.eval_with_hidden_dep` is `dut.internal_func_dep`) — the bare
@@ -1747,6 +1768,48 @@ impl Simulator {
         }
     }
 
+    /// §9.2.2.2.1(b): is read `r` excluded from a block's implicit sensitivity
+    /// because the block writes it? Exact; a written '.'-prefix (`out` written,
+    /// `out.vld` read); or a bare base that is in `reads` only as the prefix of
+    /// member reads the block itself writes — `collect_expr_reads` records
+    /// `decoded.op` AND `decoded`, and with `decoded.op` written the surviving
+    /// `decoded` re-armed the block on its own two-step member write
+    /// (`decoded.op = 0; decoded.op = x;`) every settle pass, to the limit
+    /// (CVA6's decoder, which reads back the `op` it just wrote). A base with
+    /// any member read the block does NOT write stays: `s.a` written, `s.b`
+    /// read — `s` is the only signal that carries `s.b`.
+    pub(super) fn self_written_read(
+        r: &str,
+        reads: &HashSet<String>,
+        writes: &HashSet<String>,
+    ) -> bool {
+        fn direct(r: &str, writes: &HashSet<String>) -> bool {
+            if writes.contains(r) {
+                return true;
+            }
+            let mut base: &str = r;
+            while let Some(pos) = base.rfind('.') {
+                base = &base[..pos];
+                if writes.contains(base) {
+                    return true;
+                }
+            }
+            false
+        }
+        if direct(r, writes) {
+            return true;
+        }
+        let prefix = format!("{r}.");
+        if !writes.iter().any(|w| w.starts_with(&prefix)) {
+            return false;
+        }
+        let mut member_reads = reads.iter().filter(|x| x.starts_with(&prefix));
+        let Some(first) = member_reads.next() else {
+            return false;
+        };
+        direct(first, writes) && member_reads.all(|m| direct(m, writes))
+    }
+
     /// §9.4.2.2 — the inferred sensitivity of `@*` / `@(*)`: every signal READ
     /// by the statement it guards, minus the ones that statement writes (a
     /// variable assigned by the block is not part of its own sensitivity).
@@ -1777,22 +1840,8 @@ impl Simulator {
             // §9.2.2.2.1: exclude reads of variables this block writes —
             // at MEMBER granularity too (same rule as the comb-entry path),
             // or the base fallback below would re-introduce the self-dep.
-            if writes.contains(r) {
+            if Self::self_written_read(r, &reads, &writes) {
                 continue;
-            }
-            {
-                let mut wbase: &str = r.as_str();
-                let mut self_written = false;
-                while let Some(pos) = wbase.rfind('.') {
-                    wbase = &wbase[..pos];
-                    if writes.contains(wbase) {
-                        self_written = true;
-                        break;
-                    }
-                }
-                if self_written {
-                    continue;
-                }
             }
             // Prefer the instance-scoped name when one exists, mirroring the
             // scope-first resolution the rest of the runtime performs. A

@@ -724,6 +724,56 @@ impl Simulator {
             )
     }
 
+    /// The SHAPE a call actual may be context-sized for: a plain scalar
+    /// integral-or-not INPUT port with no unpacked dimensions. An lvalue
+    /// actual (`ref`/`output`/`inout`) is the caller's own variable rather
+    /// than an expression, and a port with unpacked dimensions, a class
+    /// handle, a struct, a collection or a `string` is not something
+    /// `resize_for_assign`'s path understands. `actual_context_width` adds the
+    /// second half — that the width is statically known; the AST class-method
+    /// binder answers the same question from its cached `PortPlan` instead of
+    /// recomputing the width on every call.
+    pub(super) fn actual_ctx_shape(port: &crate::ast::decl::FunctionPort) -> bool {
+        port.dimensions.is_empty()
+            && Self::port_is_plain_scalar(port)
+            && !matches!(
+                port.direction,
+                PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+            )
+    }
+
+    /// §11.6.1/§11.8.2: the width at which a call ACTUAL must be EVALUATED —
+    /// the declared width of the FORMAL it binds. A subroutine call is one of
+    /// the contexts that determine an expression's width, so `wide9(a + b)`
+    /// over 8-bit `a`/`b` and a 9-bit `v` adds at 9 bits (300); evaluated
+    /// self-determined the sum keeps the operands' own 8 bits and wraps (44),
+    /// and resizing afterwards only zero-extends the value that already lost
+    /// its carry.
+    ///
+    /// `None` — keep the self-determined path — whenever the rule does not
+    /// cover the port or the width tables cannot answer it statically: bounds
+    /// that are not literals (`[W-1:0]`, whose width needs the specialization
+    /// to be known) or a type whose width is not a plain integral one.
+    pub(super) fn actual_context_width(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+    ) -> Option<u32> {
+        if !Self::actual_ctx_shape(port) {
+            return None;
+        }
+        let dt = &port.data_type;
+        let fixed = matches!(dt, DataType::IntegerAtom { .. }) || Self::packed_dims_are_literal(dt);
+        fixed
+            .then(|| {
+                super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+            })
+            .filter(|w| *w > 0)
+    }
+
     /// A declared type with no packed-array, struct, enum or typedef layout
     /// to register: an integral atom, a vector with at most one packed
     /// dimension, `real`/`shortreal`/`realtime` or `string`.

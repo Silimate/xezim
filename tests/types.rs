@@ -69,6 +69,8 @@ mod class_module_same_name;
 mod conditional_real_x_select;
 #[path = "types/const_function_params.rs"]
 mod const_function_params;
+#[path = "types/const_fn_struct_config.rs"]
+mod const_fn_struct_config;
 #[path = "types/constructor_new_not_static.rs"]
 mod constructor_new_not_static;
 #[path = "types/constructor_new_property_type.rs"]
@@ -548,3 +550,28 @@ mod review_nested_struct_params;
 
 #[path = "types/struct_param_override.rs"]
 mod struct_param_override;
+
+#[path = "types/const_fn_type_cast_localparam.rs"]
+mod const_fn_type_cast_localparam;
+#[path = "types/param_array_pattern_forms.rs"]
+mod param_array_pattern_forms;
+#[path = "types/tagged_union_whole_copy_keeps_tag.rs"]
+mod tagged_union_whole_copy_keeps_tag;
+#[path = "types/inlined_typedef_packed_array_dims.rs"]
+mod inlined_typedef_packed_array_dims;
+#[path = "types/struct_param_member_select_bounds.rs"]
+mod struct_param_member_select_bounds;
+#[path = "types/instance_local_typedef_struct_array.rs"]
+mod instance_local_typedef_struct_array;
+
+#[path = "types/scoped_typed_assignment_pattern.rs"]
+mod scoped_typed_assignment_pattern;
+
+#[path = "types/param_array_struct_default.rs"]
+mod param_array_struct_default;
+#[path = "types/wide_array_elem_x_index.rs"]
+mod wide_array_elem_x_index;
+#[path = "types/packed_elem_const_index_out_of_range.rs"]
+mod packed_elem_const_index_out_of_range;
+#[path = "types/fn_return_width_struct_param_member.rs"]
+mod fn_return_width_struct_param_member;

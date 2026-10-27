@@ -303,7 +303,7 @@ fn method_boost_enabled() -> bool {
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
 // §6.16 / §6.24.3: string casts emit conversion rather than width resizing.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3046;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3047;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1585,7 +1585,7 @@ struct CombEntryCold {
     cov: Option<u32>,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB020";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB021";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -1656,6 +1656,12 @@ struct NbaEntry {
     /// and re-pushed for the apply, exactly as `static_key` pins the declaring
     /// frame.
     this_handle: Option<usize>,
+    /// §10.4.2 / §4.9.4 (#569): the ROOT of a member or element target that
+    /// is a subroutine formal or local holding an object handle (`tr.data[3]
+    /// <= v` inside a task), captured when the NBA was SCHEDULED. Resolving
+    /// the name in the NBA region would consult whichever frame the event
+    /// loop still holds, which with two concurrent tasks is the wrong one.
+    root_frame: Option<(String, Value)>,
 }
 
 #[derive(Debug, Clone)]
@@ -3084,6 +3090,13 @@ impl TimingWheel {
         event
     }
 
+    /// Events currently queued at `time` (wheel slot + overflow). Captured
+    /// once, before the first pop, to size the time-0 start batch for
+    /// `t0_starts_remaining`.
+    fn slot_len(&self, time: u64) -> usize {
+        self.wheel[Self::slot(time)].len() + self.overflow.get(&time).map_or(0, |v| v.len())
+    }
+
     /// Remove and return all events at the given time.
     fn remove(&mut self, time: u64) -> EventList {
         self.current_time = time;
@@ -3522,7 +3535,11 @@ struct DeferredReport {
 /// consumer-side follow-up.
 #[derive(Debug, Clone)]
 struct ObservedProbe {
-    name: String,
+    /// The site's `assertion_stats` key, location and kind tag, so its
+    /// outcome lands on the same entry the other assertion paths use.
+    stat_key: usize,
+    loc: (Option<u32>, usize),
+    kind: u8,
     predicate: Expression,
     /// Optional `this` handle so a property declared in a class context can
     /// resolve member references at evaluation time.
@@ -5182,7 +5199,7 @@ mod erased_size {
     }
     impl<T: serde::Serialize> Ser for T {
         fn size(&self) -> usize {
-            bincode::serialized_size(self).unwrap_or(0) as usize
+            crate::serialized_len(self)
         }
     }
 }
@@ -6833,6 +6850,27 @@ pub struct Simulator {
     /// normal dependency machinery — entry INDICES would go stale across the
     /// topo reorder / lazy materialization of `comb_entries`.
     deferred_proc_entries: Vec<u32>,
+    /// (#t0-comb-defer) Compile-time process starts still unrun in the
+    /// time-0 slot. A commercial simulator queues the cont-assign /
+    /// port-connect update events that a time-0 process write schedules
+    /// BEHIND every start activation of the slot (active-region FIFO), so a
+    /// source-later blocking-body `always` parked on the propagated signal
+    /// is armed before the propagation fires. While positive, the #35
+    /// deferred-entry drain is held; it releases once, when the last start
+    /// of the batch has run.
+    t0_starts_remaining: usize,
+    /// §18.12 (#519): the multi-dimensional arrays of the `std::randomize`
+    /// call being set up — name as the constraints write it, bounds
+    /// outermost first — handed to the scope solve as `Csp::nd_dims`.
+    rand_scope_nd: HashMap<String, Vec<(i64, i64)>>,
+    /// §21.2.1.7: set while the `%p` operand itself is being rendered; a
+    /// standalone scalar prints plain decimal, a leaf INSIDE an aggregate
+    /// prints by its declared type (`'h` hex for vectors). Cleared by the
+    /// aggregate renderers before they descend into members or elements.
+    p_top_level: bool,
+    /// §8.4: method names already reported as called through a null handle
+    /// from inside class code (one report per method, not per call).
+    null_call_reported: HashSet<String>,
     /// Maximum snapshot→apply_nba→settle→check_edges rounds per event-loop
     /// iter (see drain_edge_cascade). Cached at sim init; override via
     /// XEZIM_CASCADE_LIMIT env var.
@@ -7227,6 +7265,17 @@ pub struct Simulator {
     /// entry without building the `%m` path.
     assert_imm_ix: HashMap<(usize, usize, u8, u32, u32), usize>,
     assert_scope_ids: HashMap<String, u32>,
+    /// Statement label of a labelled assertion site (`ap: assert property`,
+    /// §16.5, §16.14), keyed like `assertion_stats`. Filled once when the
+    /// site registers; read only by the coverage DB writer.
+    assertion_labels: HashMap<usize, String>,
+    /// §9.3.1: the name of a named block whose only statement is the
+    /// assertion about to execute. The parser hosts a procedural statement
+    /// label (`a_imm: assert (x);`) in such a block, and the bytecode
+    /// compiler's statement fallback re-wraps an assertion in its enclosing
+    /// named blocks the same way, so the block executor sets this and the
+    /// assertion takes it as its label.
+    assert_wrap_label: Option<String>,
     /// Code coverage sites and toggle state (`--code-coverage`); `None` when
     /// the run collects none. See `code_cov`.
     code_cov: Option<Box<code_cov::CodeCov>>,
@@ -7485,6 +7534,13 @@ pub struct Simulator {
     /// only ones whose bare hoisted entry is ambiguous. Empty for a design
     /// without such a collision, which short-circuits the qualified lookup.
     pkg_ambiguous_names: HashSet<String>,
+    /// §26.3: every package enum member as `pkg::member` -> (value, width),
+    /// for the bytecode compiler. The inliner spells a member two packages
+    /// both declare as `pkg.member`; compiled blocks used to resolve that to
+    /// the bare signal twin (last package registered wins), so CVA6's `alu`
+    /// compared against `fpnew_pkg::ADD` (2) instead of `ariane_pkg::ADD` (0)
+    /// and never took the ADD arm.
+    pkg_enum_consts: HashMap<String, (u64, u32)>,
     /// §26.3: the package VARIABLE names among `pkg_ambiguous_names` (see
     /// `split_contested_package_vars`): only these resolve through a design
     /// unit's imports or a package class's package.
@@ -12685,6 +12741,11 @@ struct RandColl {
     /// a fresh random draw would overwrite the handle with junk, destroying
     /// the object reference and any aliasing (`arr[1]==arr[2]`).
     is_object_elem: bool,
+    /// §18.4 (#519): a ROW of a multi-dimensional unpacked array (`m[0]`
+    /// of `rand int m[2][2]`): the base member and its declared bounds,
+    /// outermost first. The solver keys a row like a 1-D array and walks
+    /// the leading dimensions through the bounds (`Csp::nd_dims`).
+    nd_base: Option<(String, Vec<(i64, i64)>)>,
 }
 
 /// A `.size()` constraint on a rand dynamic array (§18.4): the array must be
@@ -12748,6 +12809,26 @@ fn vm_hdr(v: &Value) -> Option<(u64, u64, u32, bool)> {
 /// old construct/move/drop, and that path also frees the heap buffer.
 #[inline(always)]
 fn vm_store(dst: &mut Value, val: u64, xz: u64, width: u32, signed: bool) {
+    if width > 64 {
+        // Inline storage holds 64 bits by invariant. An element wider than
+        // that reached here through the x/z-index arm of LoadArrayElem (the
+        // 140-bit store-buffer entry read through an x pointer at time 0):
+        // the inline form then read past its planes, and in release the
+        // shift wrapped and returned bit-pattern garbage instead of x.
+        let mut v = Value::new(width);
+        for i in 0..64usize {
+            let b = match ((val >> i) & 1, (xz >> i) & 1) {
+                (0, 0) => LogicBit::Zero,
+                (1, 0) => LogicBit::One,
+                (0, 1) => LogicBit::X,
+                _ => LogicBit::Z,
+            };
+            v.set_bit(i, b);
+        }
+        v.is_signed = signed;
+        *dst = v;
+        return;
+    }
     if dst.set_inline_bits(val, xz) {
         dst.width = width;
         dst.is_signed = signed;

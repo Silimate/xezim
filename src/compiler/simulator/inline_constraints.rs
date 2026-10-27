@@ -2454,7 +2454,12 @@ impl Simulator {
                         }
                     }
                     let saved = self.bind_loop_vars(binds);
-                    let ok = self.check_constraint_item_impl(body);
+                    // The body may itself be a `foreach` over the next
+                    // dimension (`foreach (a[i]) foreach (a[i][j]) …`, #519)
+                    // or a block of them: check it through this function so
+                    // its loop variables are bound too; the member-foreach
+                    // check has no object here and passed it vacuously.
+                    let ok = self.inline_constraint_item_ok(body);
                     self.unbind_loop_vars(saved);
                     if !ok {
                         return false;

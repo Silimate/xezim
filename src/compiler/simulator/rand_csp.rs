@@ -466,6 +466,10 @@ struct Csp {
     dom0: Vec<Dom>,
     scalars: HashMap<String, usize>,
     arrays: HashMap<String, CspArr>,
+    /// §18.4 (#519): the multi-dimensional arrays of the solve, by the name
+    /// the constraints write, with their bounds outermost first. Their rows
+    /// (all but the last dimension indexed) are `arrays` entries.
+    nd_dims: HashMap<String, Vec<(i64, i64)>>,
     srcs: Vec<Src>,
     nodes: Vec<Node>,
     /// None enables all preferences; otherwise only the selected instances.
@@ -1327,6 +1331,7 @@ impl Simulator {
             dom0: Vec::new(),
             scalars: HashMap::default(),
             arrays: HashMap::default(),
+            nd_dims: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
             soft_enabled: None,
@@ -1417,6 +1422,7 @@ impl Simulator {
                 },
             );
         }
+        csp.nd_dims = self.rand_scope_nd.clone();
         for (name, lv, w, s, members) in scalars {
             if *w == 0 || csp.arrays.contains_key(name) {
                 return Err(CspOutcome::NotApplicable);
@@ -1452,11 +1458,13 @@ impl Simulator {
         csp.size_phase = !sized.is_empty();
         if std::env::var_os("XEZIM_RAND_DBG").is_some() {
             eprintln!(
-                "[rand-dbg] scope solve: arrays {:?}",
+                "[rand-dbg] scope solve: arrays {:?} vars {:?} nd {:?}",
                 csp.arrays
                     .iter()
                     .map(|(n, a)| (n.clone(), a.elems.len(), a.width, a.signed))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                csp.vars.iter().map(|v| format!("{:?}", v.key)).collect::<Vec<_>>(),
+                csp.nd_dims
             );
         }
         let constraints = vec![ClassConstraint {
@@ -1527,6 +1535,7 @@ impl Simulator {
             dom0: Vec::new(),
             scalars: HashMap::default(),
             arrays: HashMap::default(),
+            nd_dims: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
             soft_enabled: None,
@@ -1569,6 +1578,9 @@ impl Simulator {
             ))
         };
         for c in colls {
+            if let Some((base, dims)) = &c.nd_base {
+                csp.nd_dims.insert(base.clone(), dims.clone());
+            }
             // §18.5.9: the objects of an array of rand handles are no
             // values; they join as sub-objects (`csp_add_sub`).
             if c.is_object_elem && !c.nested && c.kind != CollKind::Assoc {
@@ -1648,7 +1660,7 @@ impl Simulator {
             );
         }
         for (name, w) in rand_props {
-            if csp.arrays.contains_key(name) {
+            if csp.arrays.contains_key(name) || csp.nd_dims.contains_key(name) {
                 continue;
             }
             if *w == 0 {
@@ -4138,6 +4150,63 @@ impl Simulator {
                     }
                     return Some(Self::csp_and(out));
                 }
+                // §18.4 / §12.7.3 (#519): a loop over a multi-dimensional
+                // solver array (`foreach (a[i])`, `foreach (a[i][j])`) or over
+                // one of its rows (`foreach (a[i][j])` with `i` bound): each
+                // loop variable walks the declared bounds of its dimension.
+                if !csp.nd_dims.is_empty() {
+                    let mut konst = |me: &mut Self, x: &Expression| -> Option<i64> {
+                        if !me.csp_free(csp, x, env) {
+                            return None;
+                        }
+                        me.csp_const(x, env)?.to_i64()
+                    };
+                    if let Some((base, consts)) = self.csp_nd_prefix_k(csp, array, &mut konst)
+                        && let Some(dims) = csp.nd_dims.get(&base).cloned()
+                        && consts.len() + vars.len() <= dims.len()
+                    {
+                        let loops: Vec<(Option<String>, i64, i64)> = vars
+                            .iter()
+                            .enumerate()
+                            .map(|(j, v)| {
+                                let (l, r) = dims[consts.len() + j];
+                                (v.as_ref().map(|v| v.name.clone()), l.min(r), l.max(r))
+                            })
+                            .collect();
+                        let count = loops
+                            .iter()
+                            .try_fold(1u64, |n, l| n.checked_mul((l.2 - l.1 + 1) as u64))?;
+                        if count > 4096 {
+                            return None;
+                        }
+                        let mut idx: Vec<i64> = loops.iter().map(|l| l.1).collect();
+                        let mut out = Vec::new();
+                        loop {
+                            let mut e2 = env.clone();
+                            for (l, &i) in loops.iter().zip(&idx) {
+                                if let Some(n) = &l.0 {
+                                    e2.binds.push((n.clone(), Self::signed_loop_val(i)));
+                                }
+                            }
+                            match self.csp_item(csp, body, &e2)? {
+                                Node::True => {}
+                                n => out.push(n),
+                            }
+                            let mut k = loops.len();
+                            loop {
+                                if k == 0 {
+                                    return Some(Self::csp_and(out));
+                                }
+                                k -= 1;
+                                idx[k] += 1;
+                                if idx[k] <= loops[k].2 {
+                                    break;
+                                }
+                                idx[k] = loops[k].1;
+                            }
+                        }
+                    }
+                }
                 let name = Self::foreach_base_name(array);
                 let arr = name.as_ref().and_then(|n| csp.arrays.get(n)).cloned();
                 let idx_var = match vars.as_slice() {
@@ -5514,7 +5583,9 @@ impl Simulator {
     /// The object's own member named by `e` (`x`, `this.x`, `obj.x` for the
     /// inline-constraint receiver), if it is a solver scalar or array.
     fn csp_member(&self, csp: &Csp, e: &Expression) -> Option<String> {
-        let known = |n: &str| csp.scalars.contains_key(n) || csp.arrays.contains_key(n);
+        let known = |n: &str| {
+            csp.scalars.contains_key(n) || csp.arrays.contains_key(n) || csp.nd_dims.contains_key(n)
+        };
         let recv_ok = |me: &Self, r: &str| r == "this" || me.rand_receiver.as_deref() == Some(r);
         // A rand sub-object's member (`a.x`, `this.a.x`, `t.a.x`): a
         // `prop.name` variable when the sub-object joined the solve.
@@ -5625,6 +5696,16 @@ impl Simulator {
                 for x in &a.elems {
                     push_var(x.1, out);
                 }
+            } else if csp.nd_dims.contains_key(n) {
+                // Every element of a multi-dimensional array (#519).
+                let prefix = format!("{n}[");
+                for (rn, a) in &csp.arrays {
+                    if rn.starts_with(&prefix) {
+                        for x in &a.elems {
+                            push_var(x.1, out);
+                        }
+                    }
+                }
             }
         };
         match &e.kind {
@@ -5639,6 +5720,48 @@ impl Simulator {
                             out.push(*v);
                             return true;
                         }
+                    }
+                }
+                // §18.4 (#519): `a[i][j]` of a multi-dimensional solver
+                // array reads that element of its row — every element of
+                // the array when an index is not yet known.
+                if !csp.nd_dims.is_empty()
+                    && h.root.is_none()
+                    && h.path.last().is_some_and(|s| !s.selects.is_empty())
+                    && h.path[..h.path.len() - 1].iter().all(|s| s.selects.is_empty())
+                {
+                    let mut bh = h.clone();
+                    let sels = std::mem::take(&mut bh.path.last_mut().unwrap().selects);
+                    let base = Expression::new(ExprKind::Ident(bh), e.span);
+                    if let Some(bn) = self.csp_member(csp, &base)
+                        && csp.nd_dims.contains_key(&bn)
+                    {
+                        let consts: Option<Vec<i64>> =
+                            sels.iter().map(|s| Self::nd_const_index(s, env)).collect();
+                        match consts {
+                            Some(cs) if !cs.is_empty() => {
+                                let mut row = bn.clone();
+                                for c in &cs[..cs.len() - 1] {
+                                    row.push_str(&format!("[{c}]"));
+                                }
+                                if let Some(a) = csp.arrays.get(&row)
+                                    && let Some(x) = a.elems.iter().find(|x| x.0 == cs[cs.len() - 1])
+                                {
+                                    push_var(x.1, out);
+                                    return true;
+                                }
+                            }
+                            _ => {}
+                        }
+                        let prefix = format!("{bn}[");
+                        for (n, a) in &csp.arrays {
+                            if n.starts_with(&prefix) {
+                                for x in &a.elems {
+                                    push_var(x.1, out);
+                                }
+                            }
+                        }
+                        return true;
                     }
                 }
                 if let Some(n) = self.csp_member(csp, e) {
@@ -5757,6 +5880,15 @@ impl Simulator {
                 self.csp_refs(csp, b, env, out) && x
             }
             ExprKind::Index { expr, index } => {
+                // §18.4 (#519): `a[i][j]` as nested indexes of a
+                // multi-dimensional solver array reads one element when the
+                // indices are known.
+                if !csp.nd_dims.is_empty()
+                    && let Some(v) = self.nd_chain_elem(csp, e, env)
+                {
+                    push_var(v, out);
+                    return true;
+                }
                 let x = self.csp_refs(csp, expr, env, out);
                 self.csp_refs(csp, index, env, out) && x
             }
@@ -5877,6 +6009,15 @@ impl Simulator {
 
     fn csp_ae_raw(&mut self, csp: &Csp, e: &Expression, env: &Env) -> Option<Ae> {
         let e = Self::unparen(e);
+        // §18.4 (#519): an element of a multi-dimensional solver array
+        // (`a[i][j]`, as nested indexes or as selects on the identifier)
+        // is the row's element variable.
+        if !csp.nd_dims.is_empty()
+            && matches!(e.kind, ExprKind::Index { .. } | ExprKind::Ident(_))
+            && let Some(v) = self.nd_chain_elem(csp, e, env)
+        {
+            return Some(Self::csp_var_ae(csp, v));
+        }
         // the `with` iterator and its index
         if let Some((it, v, i)) = &env.it {
             match &e.kind {
@@ -7541,7 +7682,10 @@ impl Simulator {
             return None;
         }
         let mut elem = |me: &mut Self, base: &Expression, idx: &Expression| -> Option<usize> {
-            let n = me.csp_member(csp, base)?;
+            let n = me
+                .csp_member(csp, base)
+                .filter(|n| csp.arrays.contains_key(n))
+                .or_else(|| me.csp_nd_row(csp, base, konst))?;
             let a = csp.arrays.get(&n)?;
             let v = match konst(me, idx) {
                 Some(i) => a.elems.iter().find(|x| x.0 == i)?.1,
@@ -7552,9 +7696,11 @@ impl Simulator {
         };
         match &e.kind {
             ExprKind::Index { expr, index } => elem(self, expr, index),
+            // One select names an element of a 1-D array; several name an
+            // element of a multi-dimensional one through its row (#519).
             ExprKind::Ident(h)
                 if h.root.is_none()
-                    && h.path.last().is_some_and(|s| s.selects.len() == 1)
+                    && h.path.last().is_some_and(|s| !s.selects.is_empty())
                     && h.path[..h.path.len() - 1]
                         .iter()
                         .all(|s| s.selects.is_empty()) =>
@@ -7564,6 +7710,138 @@ impl Simulator {
                 let base = Expression::new(ExprKind::Ident(bh), e.span);
                 elem(self, &base, &idx)
             }
+            _ => None,
+        }
+    }
+
+    /// §18.4 (#519): the row of a multi-dimensional solver array that `e`
+    /// names with constant indices (`a[i]` under a bound `i`, `a[i][j]`
+    /// for a 3-D array): the base name followed by the indices, when a
+    /// solver array of that name exists.
+    fn csp_nd_row(
+        &mut self,
+        csp: &Csp,
+        e: &Expression,
+        konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
+    ) -> Option<String> {
+        if csp.nd_dims.is_empty() {
+            return None;
+        }
+        let (base, consts) = self.csp_nd_prefix_k(csp, e, konst)?;
+        if consts.is_empty() {
+            return None;
+        }
+        let mut row = base;
+        for c in consts {
+            row.push_str(&format!("[{c}]"));
+        }
+        csp.arrays.contains_key(&row).then_some(row)
+    }
+
+    /// The multi-dimensional base `e` indexes and the constant indices
+    /// applied to it, outermost first (`a[1][0]` → (`a`, [1, 0])).
+    fn csp_nd_prefix_k(
+        &mut self,
+        csp: &Csp,
+        e: &Expression,
+        konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
+    ) -> Option<(String, Vec<i64>)> {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let (b, mut cs) = self.csp_nd_prefix_k(csp, expr, konst)?;
+                cs.push(konst(self, index)?);
+                Some((b, cs))
+            }
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.last().is_some_and(|s| !s.selects.is_empty())
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .all(|s| s.selects.is_empty()) =>
+            {
+                let mut bh = h.clone();
+                let sels = std::mem::take(&mut bh.path.last_mut().unwrap().selects);
+                let base = Expression::new(ExprKind::Ident(bh), e.span);
+                let (b, mut cs) = self.csp_nd_prefix_k(csp, &base, konst)?;
+                for s in &sels {
+                    cs.push(konst(self, s)?);
+                }
+                Some((b, cs))
+            }
+            _ => {
+                let n = self.csp_member(csp, e)?;
+                csp.nd_dims.contains_key(&n).then_some((n, Vec::new()))
+            }
+        }
+    }
+
+    /// The element variable a chain of constant indexes on a
+    /// multi-dimensional solver array names (`a[1][0]`, `a[i][j]` under
+    /// bound loop variables), without evaluating anything.
+    fn nd_chain_elem(&self, csp: &Csp, e: &Expression, env: &Env) -> Option<usize> {
+        let mut consts: Vec<i64> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    consts.push(Self::nd_const_index(index, env)?);
+                    cur = expr;
+                }
+                ExprKind::Paren(i) => cur = i,
+                _ => break,
+            }
+        }
+        consts.reverse();
+        let base = match &cur.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.last().is_some_and(|s| !s.selects.is_empty())
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .all(|s| s.selects.is_empty()) =>
+            {
+                let mut bh = h.clone();
+                let sels = std::mem::take(&mut bh.path.last_mut().unwrap().selects);
+                let mut lead: Vec<i64> = Vec::new();
+                for s in &sels {
+                    lead.push(Self::nd_const_index(s, env)?);
+                }
+                lead.extend(consts);
+                consts = lead;
+                self.csp_member(csp, &Expression::new(ExprKind::Ident(bh), cur.span))?
+            }
+            _ => self.csp_member(csp, cur)?,
+        };
+        if !csp.nd_dims.contains_key(&base) || consts.is_empty() {
+            return None;
+        }
+        let mut row = base;
+        for c in &consts[..consts.len() - 1] {
+            row.push_str(&format!("[{c}]"));
+        }
+        csp.arrays
+            .get(&row)?
+            .elems
+            .iter()
+            .find(|x| x.0 == consts[consts.len() - 1])
+            .map(|x| x.1)
+    }
+
+    /// A constant index of a multi-dimensional element reference: a
+    /// literal, or a loop variable the environment binds.
+    fn nd_const_index(x: &Expression, env: &Env) -> Option<i64> {
+        match &x.kind {
+            ExprKind::Paren(i) => Self::nd_const_index(i, env),
+            ExprKind::Number(NumberLiteral::Integer { .. }) => {
+                let v = crate::compiler::elaborate::const_eval_i64_with_params(x, None)?;
+                Some(v)
+            }
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => env
+                .binds
+                .iter()
+                .rev()
+                .find(|b| b.0 == h.path[0].name.name)
+                .and_then(|b| b.1.to_i64()),
             _ => None,
         }
     }

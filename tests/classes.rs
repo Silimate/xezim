@@ -109,6 +109,8 @@ mod pure_constraint_nonvirtual;
 mod rand_array_elem_signedness;
 #[path = "classes/rand_obj_array_elem_constraints.rs"]
 mod rand_obj_array_elem_constraints;
+#[path = "classes/rand_sub_object_back_handle.rs"]
+mod rand_sub_object_back_handle;
 #[path = "classes/randomize_args_name_object_members.rs"]
 mod randomize_args_name_object_members;
 #[path = "classes/randomize_failure_diag.rs"]

@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An `always_comb` that reads a whole struct and also writes one of its
+  members (`out = s; s.a = s.a;`) is sensitive to the struct again, so a
+  change to another member updates `out` (§9.2.2.2.1). Fork patch over
+  upstream 1c913764; drop it when upstream keeps whole-value reads.
 * An `always_comb` or continuous assignment that calls a function whose
   callee reads a module variable is sensitive to that variable again when
   the outer function has a formal or local of the same name (§9.2.2.2.1,

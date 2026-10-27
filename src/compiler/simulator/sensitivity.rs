@@ -8,6 +8,18 @@ thread_local! {
     /// While a function body's reads are collected: the reads of the
     /// functions it calls, kept apart from its own (`collect_callee_reads`).
     static CALLEE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+    /// While set (`collect_stmt_reads_whole`): the names read as a whole value,
+    /// not only as the base of a member read.
+    static WHOLE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+}
+
+/// Record `name` as read whole, when `collect_stmt_reads_whole` is collecting.
+fn note_whole_read(name: &str) {
+    WHOLE_READS.with(|c| {
+        if let Some(set) = c.borrow_mut().as_mut() {
+            set.insert(name.to_string());
+        }
+    });
 }
 
 impl Simulator {
@@ -742,6 +754,7 @@ impl Simulator {
                         reads.insert(parent.to_string());
                     }
                 }
+                note_whole_read(&name);
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -794,6 +807,7 @@ impl Simulator {
                             }
                         }
                     } else {
+                        note_whole_read(&name);
                         reads.insert(name);
                     }
                 } else if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
@@ -970,7 +984,9 @@ impl Simulator {
                                 parts.push(seg.name.name.clone());
                             }
                             parts.reverse();
-                            reads.insert(parts.join("."));
+                            let name = parts.join(".");
+                            note_whole_read(&name);
+                            reads.insert(name);
                             // A member of a PACKED struct/union has no separate
                             // leaf signal — the value lives in the parent's bit
                             // slice. Register the parent when it is an actual
@@ -1798,6 +1814,19 @@ impl Simulator {
         }
     }
 
+    /// `collect_stmt_reads`, also returning the names `stmt` reads as a whole
+    /// value (for `self_written_read`).
+    pub(super) fn collect_stmt_reads_whole(
+        stmt: &Statement,
+        module: &ElaboratedModule,
+        reads: &mut HashSet<String>,
+        writes: &mut HashSet<String>,
+    ) -> HashSet<String> {
+        let outer = WHOLE_READS.with(|c| c.replace(Some(HashSet::default())));
+        Self::collect_stmt_reads(stmt, module, reads, writes);
+        WHOLE_READS.with(|c| c.replace(outer)).unwrap_or_default()
+    }
+
     /// §9.2.2.2.1(b): is read `r` excluded from a block's implicit sensitivity
     /// because the block writes it? Exact; a written '.'-prefix (`out` written,
     /// `out.vld` read); or a bare base that is in `reads` only as the prefix of
@@ -1812,6 +1841,7 @@ impl Simulator {
         r: &str,
         reads: &HashSet<String>,
         writes: &HashSet<String>,
+        whole: &HashSet<String>,
     ) -> bool {
         fn direct(r: &str, writes: &HashSet<String>) -> bool {
             if writes.contains(r) {
@@ -1828,6 +1858,12 @@ impl Simulator {
         }
         if direct(r, writes) {
             return true;
+        }
+        // Fork patch (drop when upstream keeps whole-value reads): a base the
+        // block also reads as a whole (`out = s` beside `s.a = …`) stays, as
+        // every member it does not write reaches `out` through it.
+        if whole.contains(r) {
+            return false;
         }
         let prefix = format!("{r}.");
         if !writes.iter().any(|w| w.starts_with(&prefix)) {
@@ -1855,7 +1891,7 @@ impl Simulator {
         let mut writes: HashSet<String> = HashSet::default();
         // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
         SKIP_FN_BODY_READS.with(|c| c.set(true));
-        Self::collect_stmt_reads(body, &self.module, &mut reads, &mut writes);
+        let whole = Self::collect_stmt_reads_whole(body, &self.module, &mut reads, &mut writes);
         SKIP_FN_BODY_READS.with(|c| c.set(false));
         // Registration usually runs with the hint unset (the process body
         // just executed); the executing instance's own scope is the correct
@@ -1870,7 +1906,7 @@ impl Simulator {
             // §9.2.2.2.1: exclude reads of variables this block writes —
             // at MEMBER granularity too (same rule as the comb-entry path),
             // or the base fallback below would re-introduce the self-dep.
-            if Self::self_written_read(r, &reads, &writes) {
+            if Self::self_written_read(r, &reads, &writes, &whole) {
                 continue;
             }
             // Prefer the instance-scoped name when one exists, mirroring the

@@ -1283,7 +1283,8 @@ impl Simulator {
                 if !is_always_comb {
                     SKIP_FN_BODY_READS.with(|c| c.set(true));
                 }
-                Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
+                let whole =
+                    Self::collect_stmt_reads_whole(&ab.stmt, &self.module, &mut reads, &mut writes);
                 SKIP_FN_BODY_READS.with(|c| c.set(false));
                 // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
                 // to resolve hierarchical refs whose path includes the
@@ -1350,7 +1351,7 @@ impl Simulator {
                 // members this block writes (`self_written_read`).
                 let sens_reads: HashSet<String> = reads
                     .iter()
-                    .filter(|r| !Self::self_written_read(r, &reads, &writes))
+                    .filter(|r| !Self::self_written_read(r, &reads, &writes, &whole))
                     .cloned()
                     .collect();
                 // A bare read may resolve BOTH to a top-level signal and to

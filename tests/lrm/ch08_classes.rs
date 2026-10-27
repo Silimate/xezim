@@ -67,6 +67,26 @@ fn c8_25_parameterized_classes() {
     );
 }
 
+// §8.25/§6.20.2 (issue #423): class-scope array constants — header value
+// parameter with unpacked dims, class localparam array, static array
+// property initializer — read per specialization.
+#[test]
+fn c8_25_class_param_array_reads() {
+    check(
+        "8.25_class_param_array_reads",
+        include_str!("sv/8.25_class_param_array_reads.sv"),
+        "t8_25pa",
+        Order::Exact,
+        &[
+            "T|8.25|spec LP 4 7",
+            "T|8.25|spec fn 5 6",
+            "T|8.25|default 7 4",
+            "T|8.25|static arr 20 30 3",
+        ],
+        &[],
+    );
+}
+
 // §8.25: Parameterized classes: static method called through a handle
 #[test]
 fn c8_25_static_via_handle() {

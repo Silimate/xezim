@@ -2538,6 +2538,8 @@ mod class_access;
 mod class_members;
 mod class_methods;
 mod class_specialization;
+mod class_array_constants;
+mod property_initialization;
 mod clocking;
 mod collection_methods;
 mod collections;
@@ -3318,6 +3320,43 @@ impl StaticMap {
     }
 }
 
+/// §8.25/§6.20.2 (issue #423): the materialized elements of one class-scope
+/// ARRAY constant of one specialization — a header VALUE parameter declared
+/// with unpacked dimensions (`class C #(int unsigned TBL [4] = '{...})`,
+/// read `C#(..)::TBL[i]`) or a class-body `localparam` array (`LP[i]`).
+/// Lazily built on first element read by
+/// `Simulator::materialize_class_param_array`; `lo`/`hi` preserve bounds;
+/// `default` carries the declared element type for invalid/unknown indices.
+#[derive(Debug, Clone)]
+struct ClassParamArray {
+    lo: i64,
+    hi: i64,
+    descending: bool,
+    default: Value,
+    elems: Vec<Value>,
+}
+
+/// §8.3.2/§6.20.2 (issue #388): a class-scope ARRAY constant resolved for a
+/// WHOLE-COLLECTION context — `$size`, `inside`, `foreach`, whole-array copy —
+/// spelled `pkg::Cls::T`, `Cls::T` from a foreign class, or bare `T` inside a
+/// method of the declaring class. Holds the bounds plus the element source:
+/// `param_cell` constants (class-body `localparam` arrays, header value
+/// parameters with unpacked dims) read the materialized `class_param_arrays`
+/// cell named by `key`; a static fixed-array property reads its per-element
+/// signals `Cls::name[i]` (also named by `key`).
+struct ClassScopeArrayConst {
+    key: String,
+    /// Normalized bounds (min, max) — the indexing domain.
+    lo: i64,
+    hi: i64,
+    /// Declared bounds in source order (`[5:4]` gives (5, 4)) — drives
+    /// `$left`/`$right`/`$increment` and the `foreach` visit order. Falls
+    /// back to the normalized pair when no declared-dimension row exists.
+    left: i64,
+    right: i64,
+    param_cell: bool,
+}
+
 impl std::ops::Deref for StaticMap {
     type Target = HashMap<String, Value>;
     fn deref(&self) -> &Self::Target {
@@ -3387,6 +3426,8 @@ struct ClassMemberNames {
     /// Every static property and class `localparam` name: the only names
     /// `static_prop_key` can resolve.
     static_or_param: HashSet<String>,
+    /// Names of class constant arrays and fixed static arrays.
+    constant_arrays: HashSet<String>,
     /// Names `plain_ident_read` leaves to the full path: static, vif and
     /// struct-capable properties, and the UVM activity constants.
     ident_slow: HashSet<String>,
@@ -3814,6 +3855,7 @@ enum SvaState {
     Followed {
         ante: SvaRun,
         ante_alive: bool,
+        nonvacuous: bool,
         cons: Vec<(u32, SvaState)>,
     },
     And {
@@ -3830,7 +3872,15 @@ enum SvaState {
     },
     Until {
         env: SvaEnv,
-        ticks: Vec<SvaUntilTick>,
+        /// Only ticks with an evaluation still pending, or whose failure
+        /// (*left* failed) settled the attempt, are retained. Ticks whose
+        /// left held and right has failed are folded into `nonvacuous` and
+        /// dropped, so the list stays bounded by the pending evaluations
+        /// (issue #510); the folded ticks keep the prefix-holds invariant.
+        ticks: VecDeque<SvaUntilTick>,
+        /// Nonvacuity contributed by folded ticks (and live ones, see
+        /// `sva_advance_until`): §16.14.8, either operand can be nonvacuous.
+        nonvacuous: bool,
         closed: bool,
     },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
@@ -6508,7 +6558,8 @@ pub struct Simulator {
     pub output: Vec<SimOutput>,
     capture_output: bool,
     pub finished: bool,
-    /// §20.10: a `$fatal` executed — the run must not exit 0.
+    /// §20.10: a `$fatal` executed, or the run ended on a run-time error
+    /// (`abort_run`) — the run must not exit 0.
     pub saw_fatal: bool,
     /// `$fatal`'s finish_number (0/1/2), for the exit status.
     pub fatal_finish_number: Option<i32>,
@@ -6950,6 +7001,13 @@ pub struct Simulator {
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
     class_statics: StaticMap,
+    /// §8.25/§6.20.2 (issue #423): lazily materialized per-specialization
+    /// elements of class-scope ARRAY constants (header value parameters
+    /// with unpacked dims, class localparam arrays), keyed
+    /// `DeclClass#canon_sig::name` — or `DeclClass::name`-shaped default
+    /// bindings when no specialization is active. See
+    /// `materialize_class_param_array`.
+    class_param_arrays: HashMap<String, ClassParamArray>,
     /// Per-frame overlay for class/typedef types of frame-locals. The
     /// global var_class_types/var_typedef_types are keyed by BARE name and
     /// shared across every process, so a class-typed local declared in one
@@ -7033,6 +7091,9 @@ pub struct Simulator {
     /// Recursion guard for evaluating call-bearing instance-property
     /// initializers at construction (see `evaluate_call_init_at_construct`).
     construct_init_depth: u32,
+    /// Classes awaiting their §8.7 initialization for each constructing object.
+    pending_class_initializers:
+        HashMap<usize, Vec<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>>>,
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,

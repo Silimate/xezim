@@ -33,11 +33,10 @@ fn nested_vacuity_truth_table_and_action_controls() {
             ),
             (c && d && a && b, c && d && a && !b),
             (!pair_fail && ((a && b) || (c && d)), pair_fail),
-            // `p or q` is nonvacuous iff either operand's evaluation is
-            // (§16.14.8), and an implication whose antecedent matched is
-            // nonvacuous even when it fails: `a |-> b` failing beside a
-            // vacuous `c |-> d` is a nonvacuous success, as on the
-            // reference simulator.
+            // §16.14.8: `(a |-> b) or (c |-> d)` is nonvacuous whenever either
+            // operand's attempt is nonvacuous and the `or` holds. The left
+            // implication is nonvacuous iff `a`, the right iff `c`; the `or`
+            // fails only when both operands do.
             (
                 (a || c) && !((a && !b) && (c && !d)),
                 (a && !b) && (c && !d),

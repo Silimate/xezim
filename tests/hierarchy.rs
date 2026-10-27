@@ -17,6 +17,8 @@ mod absolute_path_writes_in_subroutines;
 mod array_of_module_instances;
 #[path = "hierarchy/bind_directive_basic.rs"]
 mod bind_directive_basic;
+#[path = "hierarchy/bind_static_init_syscall_scope.rs"]
+mod bind_static_init_syscall_scope;
 #[path = "hierarchy/bind_in_module.rs"]
 mod bind_in_module;
 #[path = "hierarchy/bind_into_interface.rs"]
@@ -320,3 +322,8 @@ mod package_array_params;
 
 #[path = "hierarchy/vif_defaults_469.rs"]
 mod vif_defaults_469;
+
+#[path = "hierarchy/static_init_dependency_order.rs"]
+mod static_init_dependency_order;
+#[path = "hierarchy/review_static_init_dependencies.rs"]
+mod review_static_init_dependencies;

@@ -1,8 +1,23 @@
 name: CI
 
+# Fork-only CI policy, kept at upstream syncs: push runs only on main (a pull
+# request runs once, not again for its branch push), docs-only changes skip CI,
+# the macOS job skips pull requests and runs weekly, and a newer push to a pull
+# request cancels its superseded run.
 on:
   push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
   pull_request:
+    paths-ignore: ["docs/**", "**/*.md"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+# Runs on main, on the schedule or by hand get a group each, so none is cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Surface a panic location instead of just "exit code 101" in the job log.
@@ -77,6 +92,7 @@ jobs:
   # The DPI groups on macOS arm64: the fibers there are aarch64 and the
   # trampoline links for Mach-O (#290). Only the DPI tests, not the suite.
   dpi-macos:
+    if: github.event_name != 'pull_request'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7

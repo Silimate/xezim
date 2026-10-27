@@ -375,5 +375,23 @@ mod nested_vacuity_445;
 #[path = "scheduling/sampled_action_468.rs"]
 mod sampled_action_468;
 
+#[path = "scheduling/sampled_action_array_509.rs"]
+mod sampled_action_array_509;
+
 #[path = "scheduling/sva_until_properties.rs"]
 mod sva_until_properties;
+
+#[path = "scheduling/or_vacuity_508.rs"]
+mod or_vacuity_508;
+
+#[path = "scheduling/until_folding_510.rs"]
+mod until_folding_510;
+
+#[path = "scheduling/review_assertion_vacuity.rs"]
+mod review_assertion_vacuity;
+
+#[path = "scheduling/review_action_sampling.rs"]
+mod review_action_sampling;
+
+#[path = "scheduling/review_package_event_scopes.rs"]
+mod review_package_event_scopes;

@@ -10,34 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* An unsigned operand makes every context-determined operator beside it
-  unsigned before it runs (§11.8.1, §11.8.2), not only a shift: in
-  `z ? '0 : (a / b)` with signed `a` and `b`, the unsigned `'0` (§5.7.1)
-  makes the division unsigned, and so does an unsigned variable or sized
-  literal in the other arm, an unsigned side of a comparison (`(a / b) > u`)
-  or of a sum (`u + a / b`). A signed operand that such an operator extends
-  is zero-extended. The division ran signed and only its result was made
-  unsigned, so `a = -10, b = 3` gave -3 instead of 82 at 8 bits. Compiled
-  code now types `'0`, `'1`, `'x` and `'z` as unsigned; the interpreter
-  passes the type into any nested operator, as it already did for shifts.
-  Concatenation members, casts, call arguments and exponents stay
-  self-determined.
-* A hierarchical name that does not resolve is an elaboration error (§23.8),
-  wherever it is written: a read or a write, a continuous assignment, an
-  event control, an assertion, a system task argument, or a task or function
-  that is never called. The message gives the file and line, the name, the
-  scope that does not declare it and the scope the search started from. Such
-  a name was accepted silently: a testbench that wrote to a guessed internal
-  name (`dut.mem_data[3] = ...`) ran as if the write had happened, and a read
-  returned x. A name inside a generate block a constant rules out is not
-  elaborated, so it is not checked. `--no-strict` turns the check off, for
-  designs that relied on the old behaviour.
-* An assertion attempt at time 0 reads default sampled values (§16.5.1): a
-  variable's declaration initializer, else its type's default. It read the
-  values the time-0 continuous assignments and `always_comb` blocks had
-  already driven, so under a clock that rises at time 0 (an HDL clock, or
-  cocotb's Python `Clock`) such an attempt passed. `$past` at the next tick
-  reads the same samples (§16.9.3).
+* A run that ends on a run-time error exits 1, as one that ends on `$fatal`
+  does (§20.10): a read or a task call through a null handle in a process
+  body, or a wait on a mailbox that was never constructed (§8.4); a `forever`
+  with no timing control, or a zero-delay loop, that can never let time
+  advance; a nonblocking-assignment cascade that does not converge; a
+  `foreach` that makes no progress; an SDF file `$sdf_annotate` cannot read or
+  parse; and a failed internal consistency check. Each printed its error and
+  stopped the run, but the exit status was 0, so a script or harness that
+  checks it took the run for a pass.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick
@@ -55,6 +36,146 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
+* `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
+  adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
+  `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so
+  a cocotb test run with `-sv_seed random` starts instead of failing to parse
+  `+seed=random` as its seed. If both are given, `-sv_seed` wins over
+  `+seed=`. A `+seed=` you write is still a plusarg, and still seeds the RNG
+  (§21.6, §38.17). (Silimate/xezim#2)
+* Code coverage leaves out what a constant condition rules out in an
+  instance, as the reference simulator does: a `case` whose selector and
+  items are constants, an `if` chain or `?:` on parameters, genvars or ports
+  tied to literals is no branch, and the arms that cannot run and their
+  statements are not counted. `xezim_cov.json` marks those rows
+  `"excluded": "constant"` and counts them in an `excluded` member of the
+  totals; a design unit counts an item that any of its instances counts.
+  `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`)
+  counts them as before (§11.2.1, §12.4, §12.5). (Silimate/xezim#25)
+* Toggle coverage counts each instance's input and inout ports in that
+  instance, as commercial simulators do, with the value the connection gives
+  the port: a port connected to a whole net shows that net's counts, one
+  connected to an expression or select toggles as its value, and a constant
+  or unconnected port never toggles (§23.3.3). The ports of a module that is
+  the top of the design, driven through VPI, are now covered too. Instance
+  toggle scores and design totals change accordingly;
+  `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
+  previous counting, where only the driving signal counts.
+* Toggle coverage leaves out a variable whose value is fixed before the run
+  starts, as the reference simulator does: one only its declaration
+  initializer sets (`reg [4:0] poly = 5'b10011;`), and one only a single
+  constant assignment sets in an `initial` block without timing controls.
+  Such a variable never changes, so its bins could never be covered and
+  held instance scores down (§6.8). Any other write keeps a variable, even
+  one that never runs; writes through VPI don't count. (Silimate/xezim#46)
+* Code coverage collects condition and expression coverage, as focused
+  expression coverage: each logic condition (`if`, `while`, `?:`) and 1-bit
+  logic value (procedural and continuous assignments, input ports connected
+  to expressions) is split into input terms, and each term's rows at 0 and
+  at 1 count when the term alone decides the result, short-circuit aware
+  (§11.3.5). `--code-coverage=cond,expr`, `+cover=ce` and `-coverage E`
+  select them; bare `--code-coverage`, `+cover` and `-coverage` (or
+  `-coverage all`) now collect them too. Each
+  scope in `xezim_cov.json` gains `condition` and `expression` totals
+  (covered terms) and `conditions[]`/`expressions[]`, every item with its
+  terms and their row counts. An item of a continuous assignment, or at the
+  top level of a combinational `always` block, also counts the transient
+  states its inputs pass through in a time slot, replayed in the reference
+  simulator's delta-cycle order (#75). Items with `^`, `~^` or `?:` count rows
+  by the item's value (bimodal), and a negated `&&`/`||` decides as
+  `~&`/`~|`, as in the reference simulator. On the design instances of 23 CVDP
+  designs, the items and terms match the reference simulator's report on 22
+  and the covered terms on 18. The items in code that a constant condition
+  rules out are left out, like its statements and arms. Off by default; a run
+  without it compiles and runs as before. (#48)
+
+**Usability**
+
+* FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
+  `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
+  machines (one- and two-process, enum, parameter and `` `define `` encodings,
+  `case` or `if` next-state logic, a continuous-assignment next state) and
+  count each state's visits and each transition, reset and `default`
+  transitions included. `xezim_cov.json` gets `fsm` totals (states and
+  transitions, together and apart) and the details of each FSM per scope.
+  Recognition, state sets, transitions, lines and counts follow the reference
+  simulator; on the CVDP agentic designs both find the same 16 FSMs with the
+  same bins. It costs nothing when off. See docs/coverage-guide.md, "FSMs".
+* `--compat` (or `XEZIM_COMPAT=1`) runs a flow written for commercial
+  simulators with one flag: no time cap, `--relax-implicit-static`,
+  `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
+  or `-do` run time still sets the run length.
+* `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
+  `$finish` or no events remain, as with `-do "run -all"`. The default is
+  unchanged: a design that never finishes still stops.
+* `--version` and `-version` print the version and git revision, as `-V`
+  does, and exit 0.
+* More of other simulators' options run as-is: `-define`, `-incdir` and
+  `-top` (same as `-D`, `-I`, `-s`), `-coverage <types>` (`all`, or `B`,
+  `T`, `U`, `E`, `F` joined by `:`), `-covworkdir`/`-covscope`/`-covtest`
+  (the results file goes in `<dir>/<scope>/<test>/`), and, with no effect,
+  `-covoverwrite`, `-licqueue`, `-R`, `-access`, `+access+`, `-nowarn`,
+  `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
+  to be read as source files or top names, and `-licqueue` as `-l icqueue`,
+  which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
+  (same as `+seed=`) now work on the command line too, where they were read
+  as `-s vseed` and `-s eed`.
+* Code coverage counting rules, each its own option and off by default.
+  Five follow the code coverage defaults the reference simulator documents:
+  `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
+  signals declared in generate blocks out of toggle coverage;
+  `--code-coverage-expressions=logical` scores only the conditions with a
+  `&&` or `||`, a term covered once it has been 0 and 1;
+  `--code-coverage-granularity=block` counts straight-line blocks, implicit
+  `else` and `default` arms included and continuous assignments not; and
+  `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
+  makes, an asynchronous reset's included. FSM coverage skips the code a
+  constant condition rules out, as statement and branch coverage do, also
+  where the rest of the condition can't change it (`if (EN && go)` with `EN`
+  0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of bits whose
+  only drivers are constants (`{4'b0, x}`, a port tied to `1'b0` and the
+  ports wired to it). Each has an `XEZIM_*` variable. See
+  docs/coverage-guide.md, "Counting rules".
+* `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
+  an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
+  toggle coverage, as some simulators do by default, so a module-level loop
+  counter no longer adds 64 bins that rarely toggle. By default they are
+  still tracked, as in the reference simulator. Each toggle entry in
+  `xezim_cov.json` gains a `type`, the data type the signal was declared with
+  (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
+  See docs/coverage-guide.md.
+
+**Maintenance**
+
+* Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned
+  AlmaLinux 8 container against glibc 2.28, with every other dependency linked
+  in, and publishes it with a CycloneDX SBOM, the third-party notices, a
+  provenance record and signed checksums. The build fails on a dependency
+  license outside a permissive allowlist (no GPL or LGPL), a RustSec advisory,
+  a known vulnerability (OSV), a secret in the history (gitleaks), a failing
+  test or a smoke test on bare EL8, and the same tag rebuilds to the same bytes.
+  See [docs/release.md](docs/release.md).
+
+### 0.11.3 — hierarchy, interfaces, assertions and collection correctness (October 2026)
+
+**Correctness**
+
+* A hierarchical name that does not resolve is an elaboration error (§23.8),
+  wherever it is written: a read or a write, a continuous assignment, an
+  event control, an assertion, a system task argument, or a task or function
+  that is never called. The message gives the file and line, the name, the
+  scope that does not declare it and the scope the search started from. Such
+  a name was accepted silently: a testbench that wrote to a guessed internal
+  name (`dut.mem_data[3] = ...`) ran as if the write had happened, and a read
+  returned x. A name inside a generate block a constant rules out is not
+  elaborated, so it is not checked. `--no-strict` turns the check off, for
+  designs that relied on the old behaviour.
+* An assertion attempt at time 0 reads default sampled values (§16.5.1): a
+  variable's declaration initializer, else its type's default. It read the
+  values the time-0 continuous assignments and `always_comb` blocks had
+  already driven, so under a clock that rises at time 0 (an HDL clock, or
+  cocotb's Python `Clock`) such an attempt passed. `$past` at the next tick
+  reads the same samples (§16.9.3).
 * The optional SoA signal store preserves X/Z when a four-state signal starts
   with a known value, and converts both X and Z to zero for explicitly declared
   two-state signals, including vectors wider than 64 bits (§6.11.2).
@@ -86,23 +207,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   different width. Unsupported variable-length strings are omitted with a
   warning naming them, preserving the rest of the waveform (§6.16, §10.8).
   (#339, reported by Lramseyer)
-* `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
-  adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
-  `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so
-  a cocotb test run with `-sv_seed random` starts instead of failing to parse
-  `+seed=random` as its seed. If both are given, `-sv_seed` wins over
-  `+seed=`. A `+seed=` you write is still a plusarg, and still seeds the RNG
-  (§21.6, §38.17). (Silimate/xezim#2)
-
-* Code coverage leaves out what a constant condition rules out in an
-  instance, as the reference simulator does: a `case` whose selector and
-  items are constants, an `if` chain or `?:` on parameters, genvars or ports
-  tied to literals is no branch, and the arms that cannot run and their
-  statements are not counted. `xezim_cov.json` marks those rows
-  `"excluded": "constant"` and counts them in an `excluded` member of the
-  totals; a design unit counts an item that any of its instances counts.
-  `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`)
-  counts them as before (§11.2.1, §12.4, §12.5). (Silimate/xezim#25)
 
 * Integer `inside` constraints evaluate size-cast bounds in the joint
   comparison context and sample uniformly over distinct legal values,
@@ -114,22 +218,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§7.5, §7.8). Recompile saved designs to refresh their class metadata.
   (#337, reported by Dragon-Git)
 
-* Toggle coverage counts each instance's input and inout ports in that
-  instance, as commercial simulators do, with the value the connection gives
-  the port: a port connected to a whole net shows that net's counts, one
-  connected to an expression or select toggles as its value, and a constant
-  or unconnected port never toggles (§23.3.3). The ports of a module that is
-  the top of the design, driven through VPI, are now covered too. Instance
-  toggle scores and design totals change accordingly;
-  `--no-toggle-input-ports` or `XEZIM_TOGGLE_INPUT_PORTS=0` restores the
-  previous counting, where only the driving signal counts.
-* Toggle coverage leaves out a variable whose value is fixed before the run
-  starts, as the reference simulator does: one only its declaration
-  initializer sets (`reg [4:0] poly = 5'b10011;`), and one only a single
-  constant assignment sets in an `initial` block without timing controls.
-  Such a variable never changes, so its bins could never be covered and
-  held instance scores down (§6.8). Any other write keeps a variable, even
-  one that never runs; writes through VPI don't count. (Silimate/xezim#46)
 * Named blocking `case` branches retain their `%m` scope and `disable`
   targets across suspension (§9.3, §9.6.2).
 
@@ -276,26 +364,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§6.16, §6.18, §6.24.3, §11.4.12).
   (#391, reported by urbanij; #396, contributed by Ganesh-TNL)
 
-* Code coverage collects condition and expression coverage, as focused
-  expression coverage: each logic condition (`if`, `while`, `?:`) and 1-bit
-  logic value (procedural and continuous assignments, input ports connected
-  to expressions) is split into input terms, and each term's rows at 0 and
-  at 1 count when the term alone decides the result, short-circuit aware
-  (§11.3.5). `--code-coverage=cond,expr`, `+cover=ce` and `-coverage E`
-  select them; bare `--code-coverage`, `+cover` and `-coverage` (or
-  `-coverage all`) now collect them too. Each
-  scope in `xezim_cov.json` gains `condition` and `expression` totals
-  (covered terms) and `conditions[]`/`expressions[]`, every item with its
-  terms and their row counts. An item of a continuous assignment, or at the
-  top level of a combinational `always` block, also counts the transient
-  states its inputs pass through in a time slot, replayed in the reference
-  simulator's delta-cycle order (#75). Items with `^`, `~^` or `?:` count rows
-  by the item's value (bimodal), and a negated `&&`/`||` decides as
-  `~&`/`~|`, as in the reference simulator. On the design instances of 23 CVDP
-  designs, the items and terms match the reference simulator's report on 22
-  and the covered terms on 18. The items in code that a constant condition
-  rules out are left out, like its statements and arms. Off by default; a run
-  without it compiles and runs as before. (#48)
 * Interpreted nonblocking and event-controlled assignments evaluate their
   right-hand sides at the target width, preserving carries and unary results
   (§11.6.1). (#399, reported by akashlevy; #407, contributed by akashlevy)
@@ -478,6 +546,81 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   retain the left operand's signing for unknown amounts and overshifts
   (§11.4.10).
 
+* Class parameter and localparam arrays preserve specialization bindings,
+  element types, declared index order and assignment-pattern keys across
+  class, object and method access. Recompile saved designs to refresh their
+  array declaration metadata
+  (§6.20.2, §8.25, §10.9.1).
+  (#423, #503 and xezim-core#82, reported and contributed by Ganesh-TNL)
+* Deferred static initializers run once in each elaborated instance,
+  including bound instances, generated scopes and instance arrays (§6.21).
+  (#494 and #504, reported and contributed by Ganesh-TNL)
+* Class fields initialize once in declaration order after the base constructor,
+  using their declared assignment types and lexical scope. Dynamic-array and
+  class-typed field constructors retain their sizes and type bindings (§8.7).
+  (#496 and #505, reported and contributed by Ganesh-TNL)
+* Hierarchical class-member access follows nested object handles and updates
+  selected bits in instance or shared static storage. Same-named observer
+  variables cannot redirect hierarchical struct accesses (§8.4, §11.5.1, §23.7).
+  (#497 and #506, reported and contributed by Ganesh-TNL)
+
+* Unsigned expression types reach context-determined operands before nested
+  division, modulus and widening are evaluated (§11.8.1/§11.8.2). Compiled
+  expressions also recognize unbased fill literals as unsigned. Signed array
+  elements and increment/decrement results retain their declared types
+  (#501, reported by akashlevy).
+
+* Packed selects in parameterized child instances use each instance's
+  elaborated dimensions, including typedef element widths and hierarchical
+  reads (§7.4.1/§23.10; #507, contributed by chenbhil).
+
+* An exponent keeps its own signedness and width when a surrounding
+  expression is unsigned (§11.6.1). Continuous and procedural results agree
+  (#502, contributed by akashlevy).
+* Enum casts retain their declaring type through package and class names,
+  including same-named classes in different packages (§6.19.3). Assigning a
+  cast of a different enum is diagnosed (#511, contributed by Thomasb81).
+* Assertion `or`, `and`, `iff` and `until` preserve recursive nonvacuity
+  (§16.14.8). Completed `until` ticks are folded so long attempts retain only
+  pending evaluations (#512, contributed by Thomasb81).
+* `$sampled` in assertion actions reads unpacked-array cells and variable
+  indices from the same sampled edge (§16.5.1), including indices changed by
+  an NBA (#514, contributed by Thomasb81).
+* Whole references to class and package array constants retain specialized
+  bounds, query direction and declared element order when copied (§7.6,
+  §20.7), including automatic destinations (#516, contributed by Ganesh-TNL).
+* Static initializers that depend on deferred values run in declaration
+  order, with function calls executed once (§6.21). Package ownership and
+  dependencies in casts, slices and replications are preserved (#517,
+  contributed by Ganesh-TNL).
+* Failed `std::randomize` calls restore scalar values, array elements and
+  dynamic collection sizes, including early unsatisfiable size constraints
+  (§18.12). Static subroutine locals participate in joint constraints
+  (#518 and #520, contributed by Ganesh-TNL).
+* Array queries in procedural packed ranges use the current instance or
+  shadowing local array (§20.7), including generated scopes and static tasks.
+  Width lookup visits only queried arrays (#524, contributed by davekeeshan).
+* Forwarded packed-struct parameters retain their field layout before later
+  header localparams are evaluated (§6.20, §23.10), including type bindings
+  and `defparam` overrides (#525 and xezim-core #85, contributed by davekeeshan).
+* Constant nested member selects of packed structs in unpacked parameter
+  arrays retain their values and `$bits` widths (§7.2.2), including qualified
+  package arrays and compilation-unit typedefs (xezim-core #83, contributed
+  by davekeeshan). Saved compiled designs affected by this constant-folding
+  bug, the struct-parameter override bug or the static-initializer bug above
+  require recompilation.
+* Class methods declared inside modules call tasks in the object's declaring
+  instance (§23.8), including blocking calls through sibling and descendant
+  instances. Package events keep their own identity through scoped and imported
+  names, aliases and same-named declarations (§15.5, §26.3), including triggers
+  from package tasks (#526, contributed by aionhw). Saved compiled designs
+  affected by package event name collisions require recompilation.
+* Package typedef aliases and imports retain collection dimensions and
+  packed element widths (§6.18, §26.3), including queues inside associative
+  arrays of structs and same-named scalar aliases. This completes the
+  xezim-core #83 namespace follow-up and preserves the #323 case reported
+  by Ganesh-TNL.
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and
@@ -502,67 +645,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   after enough interpreted loop iterations, including `foreach`; default
   admission continues to use call counts. (#326, contributed by Thomasb81)
 
+* The integrated correctness fixes use 1.18% more host instructions on AXI4
+  and 0.004% more on C906 CoreMark than the previous main revision
+  (`5cd31ee5`). Outputs match, and C906 guest cycles are unchanged. These
+  measurements cover two interleaved AXI4 pairs and one C906 pair with one
+  CoreMark iteration; they do not establish a general performance trend.
+
 **Command line**
 
 * `--tee <file>` copies stdout/stderr and DPI/VPI output to a transcript while
   retaining console output. `-vcd` and `-vcd dumpon` enable source-driven VCD
   dumping like `--wave`. (#347, reported by akashlevy)
-
-**Usability**
-
-* FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
-  `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
-  machines (one- and two-process, enum, parameter and `` `define `` encodings,
-  `case` or `if` next-state logic, a continuous-assignment next state) and
-  count each state's visits and each transition, reset and `default`
-  transitions included. `xezim_cov.json` gets `fsm` totals (states and
-  transitions, together and apart) and the details of each FSM per scope.
-  Recognition, state sets, transitions, lines and counts follow the reference
-  simulator; on the CVDP agentic designs both find the same 16 FSMs with the
-  same bins. It costs nothing when off. See docs/coverage-guide.md, "FSMs".
-* `--compat` (or `XEZIM_COMPAT=1`) runs a flow written for commercial
-  simulators with one flag: no time cap, `--relax-implicit-static`,
-  `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
-  or `-do` run time still sets the run length.
-* `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
-  `$finish` or no events remain, as with `-do "run -all"`. The default is
-  unchanged: a design that never finishes still stops.
-* `--version` and `-version` print the version and git revision, as `-V`
-  does, and exit 0.
-* More of other simulators' options run as-is: `-define`, `-incdir` and
-  `-top` (same as `-D`, `-I`, `-s`), `-coverage <types>` (`all`, or `B`,
-  `T`, `U`, `E`, `F` joined by `:`), `-covworkdir`/`-covscope`/`-covtest`
-  (the results file goes in `<dir>/<scope>/<test>/`), and, with no effect,
-  `-covoverwrite`, `-licqueue`, `-R`, `-access`, `+access+`, `-nowarn`,
-  `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
-  to be read as source files or top names, and `-licqueue` as `-l icqueue`,
-  which sent the transcript to a file named `icqueue`. `-svseed` and `-seed`
-  (same as `+seed=`) now work on the command line too, where they were read
-  as `-s vseed` and `-s eed`.
-* Code coverage counting rules, each its own option and off by default.
-  Five follow the code coverage defaults the reference simulator documents:
-  `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
-  signals declared in generate blocks out of toggle coverage;
-  `--code-coverage-expressions=logical` scores only the conditions with a
-  `&&` or `||`, a term covered once it has been 0 and 1;
-  `--code-coverage-granularity=block` counts straight-line blocks, implicit
-  `else` and `default` arms included and continuous assignments not; and
-  `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
-  makes, an asynchronous reset's included. FSM coverage skips the code a
-  constant condition rules out, as statement and branch coverage do, also
-  where the rest of the condition can't change it (`if (EN && go)` with `EN`
-  0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of bits whose
-  only drivers are constants (`{4'b0, x}`, a port tied to `1'b0` and the
-  ports wired to it). Each has an `XEZIM_*` variable. See
-  docs/coverage-guide.md, "Counting rules".
-* `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
-  an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
-  toggle coverage, as some simulators do by default, so a module-level loop
-  counter no longer adds 64 bins that rarely toggle. By default they are
-  still tracked, as in the reference simulator. Each toggle entry in
-  `xezim_cov.json` gains a `type`, the data type the signal was declared with
-  (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
-  See docs/coverage-guide.md.
 
 **Maintenance**
 
@@ -579,6 +672,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Shortened simulation windows and optimized dependency test builds reduce
   regression runtime. Coverage analysis stops on failed or unprofiled tests.
   (#458, contributed by Thomasb81)
+
+**Validation**
+
+* The release passes 5,412 default debug tests in CI, with one existing
+  ignored test, plus two JIT smoke tests. Core and parser CI pass 98 and
+  142 tests respectively.
+  The 32 DPI tests pass on Linux's nested-scheduler fallback and on macOS
+  with both fibers and the fallback. Both repositories pass their minimum
+  supported Rust version checks.
+* Local release checks pass 4,830 related simulator tests, 98 core tests and
+  142 parser tests. Production-build checks pass 211 saved-design and cache
+  checks across 24 fixtures, six AVIP workloads, and C906 hello with output
+  identical to the saved reference. The C906 CoreMark comparison also
+  preserves the full program output and 295,294 guest cycles.
+* Fresh 0.11.3 measurements cover C906 CoreMark, C910 memcpy with 200
+  iterations and five AXI4 runs. C910 completes the 1,024-byte copy in 216
+  guest CPU cycles. The README reports the measured elapsed times and
+  distinguishes the historical reference timings from the new xezim runs.
 
 ### 0.11.2 — class, collection and DPI parity fixes, `-uvm`, crash-safe FST dumps (October 2026)
 

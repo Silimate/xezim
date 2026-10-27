@@ -83,6 +83,12 @@ impl Simulator {
     }
 
     pub(super) fn class_prop_receiver(&mut self, base: &Expression) -> Option<(usize, String)> {
+        if let ExprKind::Ident(hier) = &base.kind
+            && hier.path.len() > 2
+            && let Some(h) = self.hier_parent_handle(hier)
+        {
+            return Some((h, hier.path.last()?.name.name.clone()));
+        }
         if let Some((obj, prop)) = Self::split_trailing_member(base) {
             // §8.9: `Cls::prop` of a static struct names its shared store.
             if !self.static_struct_names.is_empty()

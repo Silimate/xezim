@@ -729,17 +729,31 @@ impl Simulator {
     /// implication is nonvacuous iff some consequent started by a match was
     /// nonvacuous; each compound operator keeps a recursive rule. For a
     /// pending operand the value is how far the attempt has established
-    /// nonvacuity, which is enough because a compound body only resolves an
-    /// operand once it has resolved.
+    /// nonvacuity; an `or` that already holds settles on it without waiting
+    /// for the operand to resolve.
     fn sva_attempt_nonvacuous(node: &SvaNode, st: &SvaState) -> bool {
         match (node, st) {
             // §16.14.8: an evaluation attempt of a sequence expression is
             // always nonvacuous, whether the sequence matched or failed.
             (SvaNode::Seq(..), SvaState::Seq(_)) => true,
+            // A match that started a consequent whose attempt is nonvacuous
+            // (a sequence always is) makes the implication nonvacuous before
+            // that consequent resolves. A nonoverlapped consequent still
+            // waiting for its first clock tick has not started yet.
             (
-                SvaNode::Impl { .. } | SvaNode::Followed { .. },
-                SvaState::Impl { nonvacuous, .. } | SvaState::Followed { nonvacuous, .. },
-            ) => *nonvacuous,
+                SvaNode::Impl { cons: cn, .. } | SvaNode::Followed { cons: cn, .. },
+                SvaState::Impl {
+                    nonvacuous, cons, ..
+                }
+                | SvaState::Followed {
+                    nonvacuous, cons, ..
+                },
+            ) => {
+                *nonvacuous
+                    || cons
+                        .iter()
+                        .any(|(delay, cs)| *delay == 0 && Self::sva_attempt_nonvacuous(cn, cs))
+            }
             (SvaNode::Not(inner), SvaState::Not(ist)) => Self::sva_attempt_nonvacuous(inner, ist),
             (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
                 Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
@@ -1504,22 +1518,49 @@ impl Simulator {
                 if rb.is_none() {
                     *rb = self.sva_advance(nb, b);
                 }
-                // Settled when an operand holds, as on the reference
-                // simulator: nonvacuous if that operand's success is, or if
-                // the other operand's evaluation is already known to be.
+                // §16.12.6: `p or q` holds as soon as either operand holds,
+                // whatever the other still owes. §16.14.8: it is nonvacuous if
+                // either operand's attempt is, so once an operand holds and
+                // either attempt has established nonvacuity, the `or` is a
+                // nonvacuous success even while the other operand is pending
+                // (say a strong obligation that may never resolve).
+                let holds = |r: &Option<SvaOutcome>| {
+                    matches!(r, Some(SvaOutcome::Pass | SvaOutcome::Vacuous))
+                };
+                if (holds(ra) || holds(rb))
+                    && (Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b))
+                {
+                    return Some(SvaOutcome::Pass);
+                }
+                // Otherwise the `or` succeeds unless both operands fail, and
+                // it is nonvacuous if either operand's attempt is nonvacuous
+                // (a failing but nonvacuous operand still makes the `or`
+                // nonvacuous when it succeeds).
                 match (*ra, *rb) {
-                    (Some(x), Some(y)) => Some(SvaOutcome::of(
-                        x.holds() || y.holds(),
-                        x.nonvacuous() || y.nonvacuous(),
-                    )),
-                    (Some(x), None) if x.holds() => Some(SvaOutcome::of(
-                        true,
-                        x.nonvacuous() || Self::sva_known_nonvacuous(nb, b),
-                    )),
-                    (None, Some(y)) if y.holds() => Some(SvaOutcome::of(
-                        true,
-                        y.nonvacuous() || Self::sva_known_nonvacuous(na, a),
-                    )),
+                    (Some(_), Some(_)) => {
+                        let fails = *ra == Some(SvaOutcome::Fail) && *rb == Some(SvaOutcome::Fail);
+                        let nonvacuous = Self::sva_op_nonvacuous(ra, na, a)
+                            || Self::sva_op_nonvacuous(rb, nb, b);
+                        Some(if fails {
+                            SvaOutcome::Fail
+                        } else if nonvacuous {
+                            SvaOutcome::Pass
+                        } else {
+                            SvaOutcome::Vacuous
+                        })
+                    }
+                    // Fork only: an operand that held vacuously settles the
+                    // `or` at once beside one still pending, nonvacuous only if
+                    // the pending operand's evaluation is already known to be.
+                    // §16.14.8 would wait for the pending operand, whose later
+                    // nonvacuous result could change the vacuity; the fork
+                    // keeps the early settle on purpose.
+                    (Some(SvaOutcome::Vacuous), None) => {
+                        Some(SvaOutcome::of(true, Self::sva_known_nonvacuous(nb, b)))
+                    }
+                    (None, Some(SvaOutcome::Vacuous)) => {
+                        Some(SvaOutcome::of(true, Self::sva_known_nonvacuous(na, a)))
+                    }
                     _ => None,
                 }
             }
@@ -1625,6 +1666,7 @@ impl Simulator {
         a: &crate::ast::stmt::AssertionStatement,
         events: Vec<EventExpr>,
         body: Expression,
+        label: Option<&str>,
     ) {
         use crate::ast::stmt::AssertionKind;
         let span_key = a.span.start;
@@ -1807,9 +1849,11 @@ impl Simulator {
             a.label.as_ref().map(|l| l.name.as_str()),
             true,
         );
+        let stat_key = self.assert_insts[inst].key;
+        self.note_assert_label(stat_key, label);
         self.sva_sites.push(SvaClockedSite {
             span_key,
-            stat_key: self.assert_insts[inst].key,
+            stat_key,
             stat_loc: self.assert_insts[inst].loc,
             inst,
             dedup_scope: self.running_instance_scope().to_string(),

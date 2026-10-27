@@ -2312,12 +2312,25 @@ impl Simulator {
                     })
                 })
             };
+            // §8.3 / §23.9: inside a method, a BARE array name that the
+            // object (or its class's static store) declares is the
+            // member — a same-named module-level array's elements, found
+            // in the signal table first, took `a[i] = v` from a method's
+            // `foreach (a[i])` and the object's `a` stayed 0 (sibling of
+            // #519 / #534: the name-keyed store must not outrank the
+            // member lift that the read side and `expr_assoc_name` use).
+            let member_shadows = |sim: &Self, b: &str| -> bool {
+                !b.contains('.')
+                    && matches!(sim.this_stack.last(), Some(Some(_)))
+                    && sim.instance_assoc_member(b).is_some()
+            };
             if let Some(base) = base.filter(|b| !base_is_packed_member(self, b)) {
                 // An ASSOCIATIVE member (`s.aa["k"] = v`) is keyed, not
                 // indexed: the keyed write below formats its key (§7.8).
                 if !self.signal_name_to_id.contains_key(base.as_ref())
                     && !self.signals.contains_key(&*base)
                     && !self.module.associative_arrays.contains_key(base.as_ref())
+                    && !member_shadows(self, &base)
                 {
                     let i = self.eval_expr(index).to_i64().unwrap_or(0);
                     // §7.4.1: a bit-select into a FRAME-local unpacked-struct
@@ -4595,7 +4608,14 @@ impl Simulator {
                         .map(|s| s.name.name.as_str())
                         .collect::<Vec<_>>()
                         .join(".");
-                    if let Some(existing_val) = self.signals.get(&dotted_name).cloned() {
+                    // Only a name WITHOUT a table slot lives in the name-keyed
+                    // copy alone. After `sync_table_to_hashmap` (a `$monitor`,
+                    // a dump, a `$readmemh`) every table signal has a copy
+                    // there too; writing that copy loses the write at the next
+                    // sync while every read uses the table (#568, §10.4.1).
+                    if !self.signal_name_to_id.contains_key(dotted_name.as_str())
+                        && let Some(existing_val) = self.signals.get(&dotted_name).cloned()
+                    {
                         let w = existing_val.width;
                         let is_real =
                             self.real_signals.contains(&dotted_name) || existing_val.is_real;

@@ -13,7 +13,8 @@
 
 use xezim_core::SourceDefinition;
 use xezim_core::ast::decl::{
-    ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, TypedefDeclaration,
+    ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, ParameterDeclaration,
+    ParameterKind, TypedefDeclaration,
 };
 use xezim_core::ast::expr::{
     AssignmentPatternItem, ExprKind, Expression, NumberBase, NumberLiteral, RangeKind,
@@ -1778,6 +1779,32 @@ fn check_wildcard_cmp(items: &[ModuleItem], _elab: &ElaboratedModule, errs: &mut
 fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     let mut blocks: HashMap<String, HashSet<String>> = HashMap::new();
     let mut other: HashSet<String> = HashSet::new();
+    // Data objects (variables, nets, ports, parameters, subroutines,
+    // formals and block locals): a dotted name is a MEMBER select from such
+    // a segment on (`resp.exception.valid` reads a struct field, §7.2), so
+    // the walk below stops there instead of matching the next segment
+    // against a same-named block label. Instance and generate names are
+    // scopes and keep the walk going (`U[0].V.a`).
+    let mut data: HashSet<String> = HashSet::new();
+    fn param_names(params: &[ParameterDeclaration], out: &mut HashSet<String>) {
+        for p in params {
+            match &p.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()));
+                }
+                ParameterKind::Type { assignments } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()));
+                }
+            }
+        }
+    }
+    fn ansi_port_names(ports: &PortList, out: &mut HashSet<String>) {
+        match ports {
+            PortList::Ansi(ps) => out.extend(ps.iter().map(|p| p.name.name.clone())),
+            PortList::NonAnsi(ids) => out.extend(ids.iter().map(|i| i.name.clone())),
+            PortList::Empty => {}
+        }
+    }
 
     fn block_members(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
@@ -1814,6 +1841,7 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
         stmts: &mut Vec<&'a Statement>,
         exprs: &mut Vec<&'a Expression>,
         other: &mut HashSet<String>,
+        data: &mut HashSet<String>,
     ) {
         for it in items {
             match it {
@@ -1822,11 +1850,18 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
                 ModuleItem::FinalConstruct(f) => stmts.push(&f.stmt),
                 ModuleItem::TaskDeclaration(t) => {
                     other.insert(t.name.name.name.clone());
+                    data.insert(t.name.name.name.clone());
+                    data.extend(t.ports.iter().map(|p| p.name.name.clone()));
                     stmts.extend(t.items.iter());
                 }
                 ModuleItem::FunctionDeclaration(f) => {
                     other.insert(f.name.name.name.clone());
+                    data.insert(f.name.name.name.clone());
+                    data.extend(f.ports.iter().map(|p| p.name.name.clone()));
                     stmts.extend(f.items.iter());
+                }
+                ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                    param_names(std::slice::from_ref(p), data)
                 }
                 ModuleItem::ContinuousAssign(ca) => {
                     for (l, r) in &ca.assignments {
@@ -1839,25 +1874,27 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
                 }
                 ModuleItem::DataDeclaration(d) => {
                     other.extend(d.declarators.iter().map(|x| x.name.name.clone()));
+                    data.extend(d.declarators.iter().map(|x| x.name.name.clone()));
                 }
                 ModuleItem::NetDeclaration(d) => {
                     other.extend(d.declarators.iter().map(|x| x.name.name.clone()));
+                    data.extend(d.declarators.iter().map(|x| x.name.name.clone()));
                 }
-                ModuleItem::GenerateRegion(g) => walk_items(&g.items, stmts, exprs, other),
+                ModuleItem::GenerateRegion(g) => walk_items(&g.items, stmts, exprs, other, data),
                 ModuleItem::GenerateIf(g) => {
                     other.extend(g.branch_labels.iter().flatten().cloned());
                     for (_, b) in &g.branches {
-                        walk_items(b, stmts, exprs, other);
+                        walk_items(b, stmts, exprs, other, data);
                     }
                 }
                 ModuleItem::GenerateFor(g) => {
                     other.extend(g.name.iter().cloned());
-                    walk_items(&g.items, stmts, exprs, other);
+                    walk_items(&g.items, stmts, exprs, other, data);
                 }
                 ModuleItem::GenerateCase(g) => {
                     for arm in &g.arms {
                         other.extend(arm.label.iter().cloned());
-                        walk_items(&arm.items, stmts, exprs, other);
+                        walk_items(&arm.items, stmts, exprs, other, data);
                     }
                 }
                 _ => {}
@@ -1868,15 +1905,32 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     let mut exprs: Vec<&Expression> = Vec::new();
     for def in defs {
         let items = match def {
-            SourceDefinition::Module(m) => &m.items,
-            SourceDefinition::Interface(m) => &m.items,
-            SourceDefinition::Program(m) => &m.items,
+            SourceDefinition::Module(m) => {
+                param_names(&m.params, &mut data);
+                ansi_port_names(&m.ports, &mut data);
+                &m.items
+            }
+            SourceDefinition::Interface(m) => {
+                param_names(&m.params, &mut data);
+                ansi_port_names(&m.ports, &mut data);
+                &m.items
+            }
+            SourceDefinition::Program(m) => {
+                param_names(&m.params, &mut data);
+                ansi_port_names(&m.ports, &mut data);
+                &m.items
+            }
             _ => continue,
         };
-        walk_items(items, &mut stmts, &mut exprs, &mut other);
+        walk_items(items, &mut stmts, &mut exprs, &mut other, &mut data);
     }
     for st in &stmts {
         note_stmt(st, &mut blocks);
+        for_each_stmt(st, &mut |s| {
+            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                data.extend(declarators.iter().map(|d| d.name.name.clone()));
+            }
+        });
     }
     blocks.retain(|label, _| !other.contains(label));
     if blocks.is_empty() {
@@ -1909,6 +1963,9 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
             return;
         }
         for w in segs.windows(2) {
+            if data.contains(&w[0]) {
+                break;
+            }
             let Some(members) = blocks.get(&w[0]) else {
                 continue;
             };

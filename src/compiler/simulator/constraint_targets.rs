@@ -373,6 +373,56 @@ impl Simulator {
                     .get(prop)
                     .and_then(|s| s.type_name.clone())
                     .is_some_and(|tn| self.module.classes.contains_key(&tn));
+                // §18.4 (#519): a multi-dimensional member joins as one row
+                // per prefix of its leading dimensions, each keyed like a
+                // 1-D array (`m[0]`, elements `m[0][j]`), with the base's
+                // bounds carried for the `foreach` levels above the row.
+                if cd.array_nd_properties.contains_key(prop) {
+                    let dims: Option<Vec<(i64, i64)>> =
+                        if let Some(&(d0, d1, _)) = self.module.arrays_2d.get(&scoped) {
+                            Some(vec![d0, d1])
+                        } else {
+                            self.module.arrays_nd.get(&scoped).map(|(sh, _)| sh.clone())
+                        };
+                    let w = self
+                        .module
+                        .arrays_2d
+                        .get(&scoped)
+                        .map(|t| t.2)
+                        .or_else(|| self.module.arrays_nd.get(&scoped).map(|t| t.1))
+                        .unwrap_or(32)
+                        .max(1);
+                    if let Some(dims) = dims
+                        && dims.len() >= 2
+                    {
+                        let (lo, hi) = dims[dims.len() - 1];
+                        let (lo, hi) = (lo.min(hi), lo.max(hi));
+                        let mut prefixes: Vec<String> = vec![String::new()];
+                        for &(l, r) in &dims[..dims.len() - 1] {
+                            let mut next = Vec::new();
+                            for p in &prefixes {
+                                for i in l.min(r)..=l.max(r) {
+                                    next.push(format!("{p}[{i}]"));
+                                }
+                            }
+                            prefixes = next;
+                        }
+                        for p in prefixes {
+                            out.push(RandColl {
+                                prop: format!("{prop}{p}"),
+                                scoped: format!("{scoped}{p}"),
+                                kind: CollKind::Fixed,
+                                width: w,
+                                lo,
+                                hi,
+                                nested: false,
+                                is_object_elem,
+                                nd_base: Some((prop.clone(), dims.clone())),
+                            });
+                        }
+                    }
+                    continue;
+                }
                 if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
                     let (lo, hi) = self.inst_fixed_bounds(cd, handle, prop, (lo, hi));
                     out.push(RandColl {
@@ -384,6 +434,7 @@ impl Simulator {
                         hi,
                         nested: false,
                         is_object_elem,
+                        nd_base: None,
                     });
                 } else if cd.assoc_properties.contains_key(prop) {
                     let w = cd.properties.get(prop).map_or(32, |s| s.width).max(1);
@@ -396,6 +447,7 @@ impl Simulator {
                         hi: 0,
                         nested: false,
                         is_object_elem,
+                        nd_base: None,
                     });
                 } else if let Some(&(w, _cap)) = cd.queue_properties.get(prop) {
                     let nested = Self::coll_is_nested(prop, constraints);
@@ -408,6 +460,7 @@ impl Simulator {
                         hi: 0,
                         nested,
                         is_object_elem,
+                        nd_base: None,
                     });
                 }
             }

@@ -3904,17 +3904,27 @@ suppressed but the explicit SDF annotation still applies."
         }
 
         // §9.4.5 intra-assignment delay canonicalization — keep the compiled
-        // artifact consistent with the simulate path (see xezim::intra_delay).
+        // artifact consistent with the simulate path (see xezim::intra_delay):
+        // rewrite the PREPROCESSED texts too, so a delay spliced in by
+        // `include or a macro is a timing control here as well (#567).
         let sources: Vec<String> = sources
             .iter()
             .map(|s| xezim::intra_delay::rewrite_intra_assignment_delays(s))
             .collect();
-        match xezim::parse_and_elaborate_multi(
+        let mut pre = xezim_core::preprocess_design(&sources, &source_files, &include_dirs, &defines);
+        for t in pre.texts.iter_mut() {
+            let rewritten = xezim::intra_delay::rewrite_intra_assignment_delays(t);
+            if rewritten != *t {
+                *t = rewritten;
+            }
+        }
+        match xezim_core::parse_and_elaborate_multi_preprocessed(
             &sources,
             top_module.as_deref(),
             &include_dirs,
             &source_files,
             &defines,
+            Some(pre),
         ) {
             Ok((_defs, mut elab)) => {
                 // Second-pass `should_fail` lint (additive — does not alter the

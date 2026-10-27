@@ -1567,6 +1567,14 @@ impl Simulator {
                 // Without this, `rv = rb.driver;` bound nothing and every
                 // write through `rv` landed on a phantom copy.
                 let head = &h.path[0].name.name;
+                // §23.6 / §25.9 (#570): `outer.leaf` names the interface
+                // instance `leaf` nested in `outer`; an interface cannot
+                // declare a modport and an instance of one name, so the
+                // instance list decides before the modport-view reading.
+                let nested = format!("{}.{}", head, h.path[1].name.name);
+                if self.is_interface_instance(&nested) {
+                    return Some(nested);
+                }
                 if self.is_interface_instance(head) {
                     return Some(head.clone());
                 }
@@ -1595,7 +1603,12 @@ impl Simulator {
                 if let ExprKind::Ident(h) = &expr.kind {
                     if h.path.len() == 1 {
                         let head = &h.path[0].name.name;
-                        // Same §25.9 modport-view case in MemberAccess shape.
+                        // A nested interface instance first (#570), then the
+                        // same §25.9 modport-view case in MemberAccess shape.
+                        let nested = format!("{}.{}", head, member.name);
+                        if self.is_interface_instance(&nested) {
+                            return Some(nested);
+                        }
                         if self.is_interface_instance(head) {
                             return Some(head.clone());
                         }

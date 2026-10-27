@@ -121,6 +121,8 @@ mod nonansi_port_expressions;
 mod nonansi_port_redeclaration;
 #[path = "hierarchy/nonansi_ports_and_vif_accessors.rs"]
 mod nonansi_ports_and_vif_accessors;
+#[path = "hierarchy/nonzero_lsb_port_select.rs"]
+mod nonzero_lsb_port_select;
 #[path = "hierarchy/null_ports_lib_defines_nowarn.rs"]
 mod null_ports_lib_defines_nowarn;
 #[path = "hierarchy/package_scoped_vars_and_methods.rs"]
@@ -327,3 +329,20 @@ mod vif_defaults_469;
 mod static_init_dependency_order;
 #[path = "hierarchy/review_static_init_dependencies.rs"]
 mod review_static_init_dependencies;
+#[path = "hierarchy/descending_array_port_inside_instance_keeps_index.rs"]
+mod descending_array_port_inside_instance_keeps_index;
+
+#[path = "hierarchy/port_fill_literal_width.rs"]
+mod port_fill_literal_width;
+
+#[path = "hierarchy/upward_module_name_actual_561.rs"]
+mod upward_module_name_actual_561;
+
+#[path = "hierarchy/nested_iface_write_after_sync_568.rs"]
+mod nested_iface_write_after_sync_568;
+
+#[path = "hierarchy/vif_nested_instance_570.rs"]
+mod vif_nested_instance_570;
+
+#[path = "hierarchy/nonansi_child_port_width_572.rs"]
+mod nonansi_child_port_width_572;

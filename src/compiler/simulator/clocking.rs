@@ -374,14 +374,18 @@ impl Simulator {
     /// Count one evaluation of an immediate or deferred assertion in its
     /// statement's `assertion_stats` entry and its instance's `assert_insts`
     /// entry. A cover's false evaluation is no failure in the latter
-    /// (§16.14.3: a cover counts its matches).
+    /// (§16.14.3: a cover counts its matches). `label` is the site's label
+    /// for the former (§16.5, §9.3.1).
     pub(super) fn imm_assert_tally(
         &mut self,
         a: &crate::ast::stmt::AssertionStatement,
         kind: u8,
         passed: bool,
+        label: Option<&str>,
     ) {
         let i = self.imm_assert_inst(a, kind);
+        let key = self.assert_insts[i].key;
+        self.note_assert_label(key, label);
         let ai = &mut self.assert_insts[i];
         let entry = self.assertion_stats.entry(ai.key).or_insert(AssertionStat {
             kind,
@@ -410,13 +414,14 @@ impl Simulator {
         a: &crate::ast::stmt::AssertionStatement,
         kind: crate::ast::stmt::DeferredAssertion,
         passed: bool,
+        label: Option<&str>,
     ) {
         let kind_tag: u8 = match a.kind {
             crate::ast::stmt::AssertionKind::Assert => 0,
             crate::ast::stmt::AssertionKind::Assume => 1,
             crate::ast::stmt::AssertionKind::Cover => 2,
         };
-        self.imm_assert_tally(a, kind_tag, passed);
+        self.imm_assert_tally(a, kind_tag, passed, label);
         // An `always_comb` / `always @*` the settle runs as a comb entry is
         // not the process that happens to be current (whose resumption, a
         // §16.4.2 flush point, would drop the report): its reports belong to
@@ -560,27 +565,17 @@ impl Simulator {
             let outcome = self.eval_expr(&probe.predicate).is_true();
             self.this_stack.pop();
             // Fold into assertion_stats so the coverage DB reflects
-            // concurrent-property hits without a separate channel.
-            // Synthesize a "span_key" by hashing the probe name so it
-            // doesn't collide with file-position-keyed immediate stats.
-            let span_key = probe
-                .name
-                .as_bytes()
-                .iter()
-                .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
-                .wrapping_add(1); // never 0
-            // AssertionStat.kind is a u8 tag — reuse the immediate-cover
-            // tag for concurrent-cover probes (no dedicated tag yet).
+            // concurrent-property hits without a separate channel, on the
+            // site's own entry: it was keyed by a hash of a synthetic name,
+            // tagged `cover` whatever its kind, and had no location.
             let stat = self
                 .assertion_stats
-                .entry(span_key as usize)
-                .or_insert_with(|| {
-                    AssertionStat {
-                        kind: 2,
-                        /* cover */ loc: None,
-                        pass_count: 0,
-                        fail_count: 0,
-                    }
+                .entry(probe.stat_key)
+                .or_insert_with(|| AssertionStat {
+                    kind: probe.kind,
+                    loc: Some(probe.loc),
+                    pass_count: 0,
+                    fail_count: 0,
                 });
             if outcome {
                 stat.pass_count += 1;

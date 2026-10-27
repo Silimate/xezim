@@ -20,13 +20,13 @@ rand = "0.8"
 # `./scripts/use-local-core.sh` once (or use scripts/cargo-local.sh per
 # invocation) and plain `cargo build` uses it — no network, no git dep.
 # See "Modifying xezim-core" in README.md.
-xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "48820a89e113df68687a10831e7051fbeb97340e" }
-sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "48820a89e113df68687a10831e7051fbeb97340e" }
+xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "1947ac68859f823610c63833f61d52d6d7695342" }
+sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "1947ac68859f823610c63833f61d52d6d7695342" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
-bincode = "1.3"
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
 once_cell = "1.18"
 # JIT: enabled with `--features jit`. Kept optional to avoid adding the
 # cranelift build dependency to users who only want the interpreter.

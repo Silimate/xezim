@@ -2726,7 +2726,14 @@ impl Simulator {
                             };
                             cand.is_signed = signed;
                             self.signals.insert(scoped_key.clone(), cand.clone());
-                            self.set_signal_value_by_name(&elem_name, cand);
+                            // The unscoped form only for a module-level array
+                            // of that name (#519 B3: a bare copy minted for a
+                            // class property took a later object's write).
+                            if self.module.arrays.contains_key(&arr_name)
+                                || self.signal_name_to_id.contains_key(elem_name.as_str())
+                            {
+                                self.set_signal_value_by_name(&elem_name, cand);
+                            }
                             if self.item_holds(handle, body) {
                                 ok = true;
                                 changed = true;
@@ -2736,7 +2743,11 @@ impl Simulator {
                         if !ok {
                             if let Some(sv) = saved {
                                 self.signals.insert(scoped_key.clone(), sv.clone());
-                                self.set_signal_value_by_name(&elem_name, sv);
+                                if self.module.arrays.contains_key(&arr_name)
+                                    || self.signal_name_to_id.contains_key(elem_name.as_str())
+                                {
+                                    self.set_signal_value_by_name(&elem_name, sv);
+                                }
                             }
                         }
                     }
@@ -2960,8 +2971,16 @@ impl Simulator {
                         // Write to the scoped per-element key (`<handle>#arr[i]`)
                         // — the place exec_randomize wrote the random baseline.
                         self.class_elem_store(handle, arr_name, idx, picked.clone());
-                        // Also try the unscoped form for module-level arrays.
-                        self.set_signal_value_by_name(&elem_name, picked);
+                        // The unscoped form only for a MODULE-level array of
+                        // that name: for a class property it minted a phantom
+                        // bare `a[i]` that a later method's `a[i] = v` of
+                        // another object then wrote instead of its own
+                        // element (#519 B3).
+                        if self.module.arrays.contains_key(arr_name)
+                            || self.signal_name_to_id.contains_key(elem_name.as_str())
+                        {
+                            self.set_signal_value_by_name(&elem_name, picked);
+                        }
                         return true;
                     }
                     false
@@ -3018,7 +3037,11 @@ impl Simulator {
                     let w = cur.as_ref().map(|v| v.width).unwrap_or(32).max(1);
                     let write_elem = |s: &mut Self, v: Value| {
                         s.class_elem_store(handle, arr_name, idx, v.clone());
-                        s.set_signal_value_by_name(&elem_name, v);
+                        if s.module.arrays.contains_key(arr_name)
+                            || s.signal_name_to_id.contains_key(elem_name.as_str())
+                        {
+                            s.set_signal_value_by_name(&elem_name, v);
+                        }
                     };
                     match eff {
                         BinaryOp::Eq => {

@@ -1108,8 +1108,9 @@ impl Simulator {
             && (rand_obj_props.is_empty() || sub_objs.is_some())
             && unpacked_agg_props
                 .iter()
-                .all(|(_, ms)| ms.iter().all(|m| !m.2))
-            && rand_nd_arrays.is_empty();
+                .all(|(_, ms)| ms.iter().all(|m| !m.2));
+        // §18.4 (#519): multi-dimensional rand arrays join the joint solve
+        // as rows (`RandColl::nd_base`), so they no longer bar it.
         // §18.4: the rand members of an unpacked struct member are solver
         // scalars of their own, stored (and named) `<prop>.<member>`.
         let (csp_rand_props, csp_signed, csp_enums) = if unpacked_agg_props.is_empty() {
@@ -1161,7 +1162,7 @@ impl Simulator {
                 .get(handle)
                 .and_then(|o| o.as_ref())
                 .map(|i| i.properties.clone());
-            match self.rand_csp_solve(
+            let csp_outcome = self.rand_csp_solve(
                 handle,
                 &constraints,
                 &constraint_depth,
@@ -1172,7 +1173,15 @@ impl Simulator {
                 &array_enums,
                 true,
                 &[],
-            ) {
+            );
+            if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+                eprintln!(
+                    "[rand-dbg] class joint solve: {:?} (collections {:?})",
+                    csp_outcome,
+                    rand_colls.iter().map(|c| c.prop.clone()).collect::<Vec<_>>()
+                );
+            }
+            match csp_outcome {
                 rand_csp::CspOutcome::Sat if !self.randomize_budget_exhausted => {
                     if has_post {
                         self.exec_method_call(handle, "post_randomize", &[]);

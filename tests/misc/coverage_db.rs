@@ -141,7 +141,10 @@ fn labelled_assertion_entries_carry_name() {
     assert!(has("\"name\": \"c_miss\", ", 6, "cover", 0), "{json}");
     assert!(has("\"name\": \"a_lbl\", ", 7, "assert", 6), "{json}");
     assert!(has("", 8, "cover", 2), "{json}");
-    assert_eq!(json.matches("\"name\": ").count(), 3, "{json}");
+    // Count in `assertions` only: every `assertion_instances` entry has a
+    // name too.
+    let sites = json.split("\"assertion_instances\"").next().unwrap();
+    assert_eq!(sites.matches("\"name\": ").count(), 3, "{json}");
     assert!(json.contains("\"assertion_sites\": 4"), "{json}");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -210,7 +213,10 @@ fn every_labelled_assertion_form_carries_name() {
     assert!(has("a_imm", 10, "assert", 6, 0), "{json}");
     assert!(has("c_imm", 11, "cover", 2, 4), "{json}");
     assert!(has("p_lbl", 12, "assert", 6, 0), "{json}");
-    assert_eq!(json.matches("\"name\": ").count(), 7, "{json}");
+    // Count in `assertions` only: every `assertion_instances` entry has a
+    // name too.
+    let sites = json.split("\"assertion_instances\"").next().unwrap();
+    assert_eq!(sites.matches("\"name\": ").count(), 7, "{json}");
     assert!(json.contains("\"assertion_sites\": 7"), "{json}");
     let _ = std::fs::remove_dir_all(&d);
 }

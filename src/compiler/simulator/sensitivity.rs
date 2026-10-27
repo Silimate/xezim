@@ -4,6 +4,12 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+thread_local! {
+    /// While a function body's reads are collected: the reads of the
+    /// functions it calls, kept apart from its own (`collect_callee_reads`).
+    static CALLEE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+}
+
 impl Simulator {
     pub(super) fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
         match &expr.kind {
@@ -258,6 +264,27 @@ impl Simulator {
         v
     }
 
+    /// The reads of the function `name` a call reaches (`collect_function_reads`).
+    /// Inside another function's body they go to that function's
+    /// `CALLEE_READS` sink, apart from its own reads, so its frame names
+    /// (formals, locals) do not filter them (§13.4: the callee's `x` is not
+    /// the caller's formal `x`). Fork patch over upstream's frame filter;
+    /// drop it when upstream filters before merging callee reads.
+    fn collect_callee_reads(name: &str, module: &ElaboratedModule, reads: &mut HashSet<String>) {
+        let mut got: HashSet<String> = HashSet::default();
+        Self::collect_function_reads(name, module, &mut got);
+        let rest = CALLEE_READS.with(|c| match c.borrow_mut().as_mut() {
+            Some(sink) => {
+                sink.extend(got);
+                None
+            }
+            None => Some(got),
+        });
+        if let Some(got) = rest {
+            reads.extend(got);
+        }
+    }
+
     pub(super) fn collect_function_reads(
         name: &str,
         module: &ElaboratedModule,
@@ -294,6 +321,7 @@ impl Simulator {
         }
         let mut scratch_writes: HashSet<String> = HashSet::default();
         let mut body_reads: HashSet<String> = HashSet::default();
+        let outer = CALLEE_READS.with(|c| c.replace(Some(HashSet::default())));
         // §13.4.3: a default-argument expression is evaluated at call time, so
         // its reads are part of the caller's sensitivity too.
         for port in &fdecl.ports {
@@ -304,6 +332,7 @@ impl Simulator {
         for item in &fdecl.items {
             Self::collect_stmt_reads(item, module, &mut body_reads, &mut scratch_writes);
         }
+        let callee_reads = CALLEE_READS.with(|c| c.replace(outer)).unwrap_or_default();
         // §13.4: the formals, the return variable and the block locals are
         // frame state, not module signals the caller can be sensitive to. A
         // formal named like a design net (`uj_imm(logic [31:0] instruction_i)`
@@ -325,6 +354,7 @@ impl Simulator {
         }
         local_names(&fdecl.items, &mut frame);
         body_reads.retain(|r| !frame.contains(r.as_str()));
+        body_reads.extend(callee_reads);
         // A bare read in the body of an INSTANCE's function names that
         // instance's variable (`internal_func_dep` inside
         // `dut.eval_with_hidden_dep` is `dut.internal_func_dep`) — the bare
@@ -875,9 +905,9 @@ impl Simulator {
                             // and would collect unprefixed, unresolvable reads.
                             let full = Self::resolve_hier_name_static(hier, module);
                             if full != seg.name.name && module.functions.contains_key(&full) {
-                                Self::collect_function_reads(&full, module, reads);
+                                Self::collect_callee_reads(&full, module, reads);
                             } else {
-                                Self::collect_function_reads(&seg.name.name, module, reads);
+                                Self::collect_callee_reads(&seg.name.name, module, reads);
                             }
                         }
                     }

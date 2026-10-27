@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An `always_comb` or continuous assignment that calls a function whose
+  callee reads a module variable is sensitive to that variable again when
+  the outer function has a formal or local of the same name (§9.2.2.2.1,
+  §13.4). Fork patch over upstream 9b1301eb; drop it when upstream leaves
+  callee reads out of the frame-name filter.
 * A compiled `super.m(...)` sizes each actual by the formal of the parent's
   `m`, the method it calls, also when the class hides `m` with a different
   formal width (§13.5.1, §11.6.1). Fork patch over upstream 1c50e25d; drop it

@@ -1491,6 +1491,14 @@ impl Simulator {
         None
     }
 
+    /// §18.3/§18.4: the values an element of the collection property `prop`
+    /// may take when its element type is an enum (its named constants).
+    pub(super) fn coll_enum_values(&self, handle: usize, prop: &str) -> Option<Vec<u64>> {
+        let et = self.prop_enum_type(handle, prop)?;
+        let members = self.module.enum_members.get(&et)?;
+        (!members.is_empty()).then(|| members.iter().map(|m| m.1).collect())
+    }
+
     /// The rand SCALAR properties that appear in `e`, in source order of first
     /// appearance — the candidate targets of an algebraic solve. Only bare
     /// single-segment identifiers qualify (a `sub.field` is not a scalar
@@ -2277,6 +2285,22 @@ impl Simulator {
                             .next()
                             .unwrap_or("");
                         let domain = self.rand_elem_ranges.get(prop).cloned().unwrap_or_default();
+                        let owner = key
+                            .split_once('#')
+                            .and_then(|(h, _)| h.parse::<usize>().ok())
+                            .unwrap_or(handle);
+                        if domain.is_empty()
+                            && let Some(members) = self.coll_enum_values(owner, prop)
+                        {
+                            let others: Vec<u64> =
+                                members.into_iter().filter(|v| *v != avoid & mask).collect();
+                            if others.is_empty() {
+                                continue;
+                            }
+                            let pick = others[self.cur_rng().gen_range(0..others.len())];
+                            self.write_coll_elem(&key, Value::from_u64(pick, w));
+                            return true;
+                        }
                         if !domain.is_empty() {
                             for _try in 0..32 {
                                 let (lo, hi) = domain[self.cur_rng().gen_range(0..domain.len())];

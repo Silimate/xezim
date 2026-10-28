@@ -222,3 +222,5 @@ mod concat_actual_queue_formal;
 mod concat_actual_fixed_array_formal;
 #[path = "collections/assoc_queue_element_copy.rs"]
 mod assoc_queue_element_copy;
+#[path = "collections/dyn_array_of_dyn_array_rows.rs"]
+mod dyn_array_of_dyn_array_rows;

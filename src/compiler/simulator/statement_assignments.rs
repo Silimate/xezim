@@ -1564,6 +1564,16 @@ impl Simulator {
                     .or_else(|| self.flat_member_name(lvalue))
                     .map(std::borrow::Cow::Owned),
             };
+            // `d[i] = new[n]` on a class-property or local dynamic array of
+            // dynamic arrays: its rows are registered only when sized. Left
+            // unresolved, the constructor path below took the element type
+            // for the enclosing class and ran that class's `new`.
+            if let Some(row) = self.dyn_row_of_new_target(lvalue) {
+                self.module.dynamic_arrays.insert(row.clone());
+                self.fill_sized_new(&row, n_expr, src_expr);
+                self.settle_after_proc_write();
+                return;
+            }
             // A class-property dynamic array (`c.p = new[n]`)
             // lives under the instance-scoped `<handle>#p`, which
             // is never in the module-scope `dynamic_arrays` set —

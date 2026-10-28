@@ -866,3 +866,6 @@ mod randomize_fill_literal;
 mod randomize_nested_dyn_scope;
 #[path = "classes/shadowed_member_same_named_formal.rs"]
 mod shadowed_member_same_named_formal;
+
+#[path = "classes/struct_prop_nested_member_copy.rs"]
+mod struct_prop_nested_member_copy;

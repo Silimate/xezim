@@ -198,6 +198,9 @@ impl Simulator {
         {
             return v;
         }
+        if let Some(v) = self.pkg_struct_param_member_access(expr, &member.name) {
+            return v;
+        }
         if let ExprKind::Ident(h) = &expr.kind {
             // §26.3: the same shape with a PACKAGE base — `pkg::MEMBER`.
             // The elaborator only collapses `MemberAccess` into a
@@ -1251,6 +1254,45 @@ impl Simulator {
             }
             Value::zero(32)
         }
+    }
+
+    /// §26.3: `pkg::P.member` written as a member access on `pkg::P` (the
+    /// shape a subroutine body keeps), with `pkg::P` a two-segment identifier
+    /// or itself a member access.
+    fn pkg_struct_param_member_access(&self, base: &Expression, member: &str) -> Option<Value> {
+        let plain = |h: &HierarchicalIdentifier, n: usize| {
+            h.root.is_none() && h.path.len() == n && h.path.iter().all(|s| s.selects.is_empty())
+        };
+        let (pkg, name) = match &base.kind {
+            ExprKind::Ident(h) if plain(h, 2) => (&h.path[0].name.name, &h.path[1].name.name),
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if plain(h, 1) => (&h.path[0].name.name, &member.name),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !self.module.packages.contains(pkg)
+            || self.signal_name_to_id.contains_key(pkg.as_str())
+            || self.signals.contains_key(pkg)
+        {
+            return None;
+        }
+        self.pkg_struct_param_member(pkg, name, member)
+    }
+
+    /// §26.3: `pkg::P.member` on a struct package parameter selects from the
+    /// package's own `P`, keyed `pkg::P` in the parameter and layout tables,
+    /// not from a `P` visible by its bare name.
+    fn pkg_struct_param_member(&self, pkg: &str, name: &str, member: &str) -> Option<Value> {
+        let key = format!("{}::{}", pkg, name);
+        let &(_, off, w) = self
+            .module
+            .packed_struct_fields
+            .get(&key)?
+            .iter()
+            .find(|(m, _, _)| m == member)?;
+        let v = self.module.parameters.get(&key)?;
+        (w > 0).then(|| v.range_select((off + w - 1) as usize, off as usize))
     }
 
     /// Read fast path for a select-free single-segment identifier: the frame
@@ -2512,6 +2554,16 @@ impl Simulator {
                     // Keep `P::x` (len 2) on the existing paths — those work
                     // via the bare-name fallbacks; only deeper paths need the
                     // reshape.
+                    if hier.path.len() == 3
+                        && hier.path.iter().all(|s| s.selects.is_empty())
+                        && let Some(v) = self.pkg_struct_param_member(
+                            &hier.path[0].name.name,
+                            &hier.path[1].name.name,
+                            &hier.path[2].name.name,
+                        )
+                    {
+                        return v;
+                    }
                     if hier.path.len() >= 3 {
                         let mut stripped = hier.clone();
                         stripped.path.remove(0);

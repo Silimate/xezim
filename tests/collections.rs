@@ -220,3 +220,5 @@ mod parameterized_vif_specialization_cast;
 mod concat_actual_queue_formal;
 #[path = "collections/concat_actual_fixed_array_formal.rs"]
 mod concat_actual_fixed_array_formal;
+#[path = "collections/assoc_queue_element_copy.rs"]
+mod assoc_queue_element_copy;

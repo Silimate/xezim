@@ -596,3 +596,5 @@ mod packed_package_parameter_element;
 mod module_struct_localparam_first_instance;
 #[path = "types/package_struct_parameter_in_submodule.rs"]
 mod package_struct_parameter_in_submodule;
+#[path = "types/package_scoped_struct_parameter_member.rs"]
+mod package_scoped_struct_parameter_member;

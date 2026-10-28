@@ -7889,6 +7889,9 @@ impl<'a> BytecodeCompiler<'a> {
                 resolved = Some((id, base.to_string()));
             }
         }
+        if resolved.is_none() {
+            return self.compile_pkg_struct_param_member_read(base, member);
+        }
         let (base_id, key) = resolved?;
         let layout = fields_tbl.get(&key).or_else(|| fields_tbl.get(base))?;
         let &(_, off, w) = layout.iter().find(|(m, _, _)| m == member)?;
@@ -7897,6 +7900,27 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let root = self.alloc_reg();
         self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
+        Some(dest)
+    }
+
+    /// §26.3: `pkg::P.member`, joined as `pkg.P` / `member`, selects from the
+    /// package's own struct parameter, keyed `pkg::P` in both tables.
+    fn compile_pkg_struct_param_member_read(&mut self, base: &str, member: &str) -> Option<RegId> {
+        let (pkg, name) = base.split_once('.')?;
+        if name.contains('.') {
+            return None;
+        }
+        let key = format!("{}::{}", pkg, name);
+        let layout = self.packed_struct_fields?.get(&key)?;
+        let &(_, off, w) = layout.iter().find(|(m, _, _)| m == member)?;
+        let v = self.params?.get(&key)?;
+        if w == 0 {
+            return None;
+        }
+        let root = self.alloc_reg();
+        self.emit(Insn::LoadConst(root, Box::new(v.clone())));
         let dest = self.alloc_reg();
         self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
         Some(dest)

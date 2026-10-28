@@ -136,6 +136,10 @@ impl Simulator {
                 self.module
                     .associative_arrays
                     .insert(n_name.clone(), is_str);
+                let widths = &mut self.module.assoc_index_widths;
+                if let Some(&kw) = widths.get(&s_pre[..s_pre.len() - 1]) {
+                    widths.insert(n_name.clone(), kw);
+                }
                 let entries: Vec<(String, Value)> = self
                     .signals
                     .keys_with_elem_prefix(&s_pre)
@@ -2617,6 +2621,16 @@ impl Simulator {
                 self.module
                     .associative_arrays
                     .insert(format!("{}#{}", handle, prop), is_str);
+            }
+            // §8.25: a key sized by a class parameter takes this object's
+            // specialization, not the default `assoc_index_props` holds.
+            for (prop, kdt) in &cdef.assoc_key_decl_types {
+                if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
+                    let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
+                    self.module
+                        .assoc_index_widths
+                        .insert(format!("{}#{}", handle, prop), (kw, signed));
+                }
             }
             // Per-instance queue / dynamic-array members. Register the instance-
             // scoped name `<handle>#<member>` in the array tables (mirroring the

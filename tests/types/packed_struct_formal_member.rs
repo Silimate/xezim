@@ -153,9 +153,7 @@ endmodule
 /// continuous assigns read direct and nested members of a module typedef, a
 /// package typedef and an instance's own typedef, and every assign follows its
 /// actual, x bits included.
-#[test]
-fn continuous_assigns_read_packed_struct_formal_members() {
-    let src = r#"
+const MEMBER_READS: &str = r#"
 package pk;
   typedef struct packed { logic [1:0] hi; logic [1:0] lo; } p_t;
   typedef struct packed { logic a; p_t p; logic [2:0] b; } s_t;
@@ -196,8 +194,11 @@ module top;
   end
 endmodule
 "#;
+
+#[test]
+fn continuous_assigns_read_packed_struct_formal_members() {
     assert_eq!(
-        notes(src),
+        notes(MEMBER_READS),
         vec![
             "NOTE: 01 0111 10 01 1111 11",
             "NOTE: 10 1000 01 10 0001 11",
@@ -210,9 +211,7 @@ endmodule
 /// §11.8.1, §7.4.1): `c.a >> 4` shifts all 8 bits of `a` before the 2-bit return
 /// truncates, a signed member sign-extends and compares as signed, in the root
 /// module and in an instance, and selects use the member's declared labels.
-#[test]
-fn packed_struct_formal_members_keep_width_sign_and_range() {
-    let src = r#"
+const WIDTH_SIGN_RANGE: &str = r#"
 module sub (input logic [7:0] i, output int o, output logic l);
   typedef struct packed { logic signed [3:0] a; logic [3:0] b; } t_t;
   function automatic int g(t_t c); return c.a; endfunction
@@ -247,8 +246,36 @@ module top;
   end
 endmodule
 "#;
+
+#[test]
+fn packed_struct_formal_members_keep_width_sign_and_range() {
     assert_eq!(
-        notes(src),
+        notes(WIDTH_SIGN_RANGE),
         vec!["NOTE: 3 -2 -1 1 0110", "NOTE: 1 1 5 0 1001"]
     );
+}
+
+/// The member reads above compile into their continuous assigns: a fallback to
+/// the interpreter keeps the output and loses the speed (`pk::lo_of`, a package
+/// function, is not inlined either way).
+#[test]
+fn packed_struct_formal_member_reads_compile() {
+    for (i, src) in [MEMBER_READS, WIDTH_SIGN_RANGE].into_iter().enumerate() {
+        let sv =
+            std::env::temp_dir().join(format!("xezim_formal_member_{}_{i}.sv", std::process::id()));
+        std::fs::write(&sv, src).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .env("XEZIM_COMPILE_FAIL_STATS", "1")
+            .args(["--no-cache", "-s", "top"])
+            .arg(&sv)
+            .output()
+            .expect("run xezim");
+        let _ = std::fs::remove_file(&sv);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(
+            !stderr.contains("Expr_MemberAccess") && !stderr.contains("_impure"),
+            "{stderr}"
+        );
+    }
 }

@@ -218,3 +218,5 @@ mod enclosing_value_parameter_specialization;
 mod parameterized_vif_specialization_cast;
 #[path = "collections/concat_actual_queue_formal.rs"]
 mod concat_actual_queue_formal;
+#[path = "collections/concat_actual_fixed_array_formal.rs"]
+mod concat_actual_fixed_array_formal;

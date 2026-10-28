@@ -343,11 +343,8 @@ impl Simulator {
             Some(target) if target == linst => {
                 self.instance_event_aliases.remove(&linst);
             }
-            Some(target) => {
-                self.instance_event_aliases.insert(linst, Some(target));
-            }
-            None => {
-                self.instance_event_aliases.insert(linst, None);
+            target => {
+                self.instance_event_aliases.insert(linst, target);
             }
         }
         true
@@ -357,28 +354,35 @@ impl Simulator {
     /// Effect-free selects only: an index with a side effect must not be
     /// evaluated twice when this probe misses and the value assign runs next.
     pub(super) fn class_event_assign_key(&mut self, e: &Expression) -> Option<(usize, String)> {
-        if !Self::select_free_event_expr(e) {
+        if !self.select_free_event_expr(e) {
             return None;
         }
-        let key = if let ExprKind::Ident(h) = &e.kind {
-            if h.path.len() == 1 {
+        let key = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
                 self.resolve_this_event_field(&h.path[0].name.name)?
-            } else {
-                self.expr_instance_prop_field_general(e)?
             }
-        } else {
-            self.expr_instance_prop_field_general(e)?
+            _ => self.expr_instance_prop_field_general(e)?,
         };
         self.class_prop_declared_event(key.0, &key.1).then_some(key)
     }
 
-    fn select_free_event_expr(e: &Expression) -> bool {
+    fn select_free_event_expr(&self, e: &Expression) -> bool {
+        let methods = &self.class_member_names().methods;
         match &e.kind {
-            ExprKind::Ident(h) => (h.path.iter().flat_map(|s| &s.selects))
-                .all(|x| Self::cond_expr_is_effect_free(x, false)),
-            ExprKind::MemberAccess { expr, .. } => Self::select_free_event_expr(expr),
+            ExprKind::Ident(h) => {
+                h.path[..h.path.len().saturating_sub(1)]
+                    .iter()
+                    .all(|s| !methods.contains(&s.name.name))
+                    && (h.path.iter().flat_map(|s| &s.selects))
+                        .all(|x| Self::cond_expr_is_effect_free(x, false))
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                !self.chain_names_method(expr) && self.select_free_event_expr(expr)
+            }
             ExprKind::Index { expr, index } => {
-                Self::cond_expr_is_effect_free(index, false) && Self::select_free_event_expr(expr)
+                !self.chain_names_method(expr)
+                    && Self::cond_expr_is_effect_free(index, false)
+                    && self.select_free_event_expr(expr)
             }
             ExprKind::This => true,
             _ => false,
@@ -670,15 +674,13 @@ impl Simulator {
     /// must not: an untyped or integral property is a value, and consuming
     /// the statement would drop the copy. True only for an explicit `event`.
     pub(super) fn class_prop_declared_event(&self, handle: usize, field: &str) -> bool {
-        let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
-            return false;
-        };
-        let mut cur = Some(inst.class_name.clone());
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
         let mut seen: HashSet<String> = HashSet::default();
-        while let Some(cn) = cur {
-            if !seen.insert(cn.clone()) {
-                break;
-            }
+        while let Some(cn) = cur.filter(|c| seen.insert(c.clone())) {
             let Some(cd) = self.module.classes.get(&cn) else {
                 break;
             };

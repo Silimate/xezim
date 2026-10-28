@@ -393,15 +393,11 @@ module top;
     event tick;
     task pulse(); -> tick; endtask
   endclass
-  class seqr;
-    event tick;
-  endclass
+  class seqr; event tick; endclass
   class agent;
     mon m;
     seqr s;
-    function void connect();
-      s.tick = m.tick;
-    endfunction
+    function void connect(); s.tick = m.tick; endfunction
   endclass
   class seq;
     seqr p_sequencer;
@@ -442,19 +438,20 @@ fn class_int_member_assign_is_not_an_event_alias() {
     let src = r#"
 module top;
   class c;
-    int x;
+    int x, calls;
+    function c next_item; calls++; return this; endfunction
   endclass
   c obj;
-  int got;
+  int got, calls;
   initial begin
-    obj = new();
-    obj.x = 7;
-    got = obj.x;
+    obj = new(); obj.next_item.x = 7;
+    got = obj.x; calls = obj.calls;
   end
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "got"), 7, "int member assignment still copies");
+    assert_eq!(u(&sim, "calls"), 1, "receiver function runs once");
 }
 
 /// `h.ce = null` drops the alias. Triggering the old target must not wake a
@@ -464,15 +461,12 @@ fn class_event_null_assignment_breaks_the_alias() {
     let src = r#"
 `timescale 1ns/1ns
 module top;
-  class holder;
-    event ce;
-  endclass
+  class holder; event ce; endclass
   holder h1, h2;
   int is_null, w1_woke, w2;
   initial begin
     h1 = new(); h2 = new();
-    h1.ce = h2.ce;
-    h1.ce = null;
+    h1.ce = h2.ce; h1.ce = null;
     is_null = (h1.ce == null);
     fork
       begin @(h1.ce); w1_woke = 1; end
@@ -491,22 +485,25 @@ endmodule
 
 /// §15.5.5: an event handle names the object it was assigned, not the other
 /// property. Reassigning the right-hand property afterwards (here to null)
-/// does not move the left-hand one.
+/// does not move the left-hand one, and a shallow copy (`new src`) copies
+/// each event property's resolved handle (including null).
 #[test]
 fn class_event_alias_keeps_its_object_after_the_source_is_reassigned() {
     let src = r#"
 `timescale 1ns/1ns
 module top;
-  class holder;
-    event ce;
-  endclass
-  holder h1, h3;
-  int w3, trig3;
+  class holder; event ce; endclass
+  holder h1, h3, hc, hn;
+  int w3, wc, trig3, c_null;
   initial begin
     h1 = new(); h3 = new();
-    h3.ce = h1.ce;
-    h1.ce = null;
-    fork begin @(h3.ce); w3 = $time; end join_none
+    h3.ce = h1.ce; hc = new h3;
+    h1.ce = null; hn = new h1;
+    c_null = (hn.ce == null);
+    fork
+      begin @(h3.ce); w3 = $time; end
+      begin @(hc.ce); wc = $time; end
+    join_none
     #10 -> h3.ce;
     trig3 = h3.ce.triggered;
     #5 $finish;
@@ -515,5 +512,7 @@ endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
     assert_eq!(u(&sim, "w3"), 10, "h3.ce still names h1's original event");
+    assert_eq!(u(&sim, "wc"), 10, "shallow copy shares the event handle");
+    assert_eq!(u(&sim, "c_null"), 1, "shallow copy preserves a null event");
     assert_eq!(u(&sim, "trig3"), 1, "and its .triggered state");
 }

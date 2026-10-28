@@ -207,3 +207,5 @@ mod foreach_omitted_var_before_collection;
 
 #[path = "collections/dyn_array_of_dyn_array_rows.rs"]
 mod dyn_array_of_dyn_array_rows;
+#[path = "collections/dyn_array_of_dyn_array_row_copy.rs"]
+mod dyn_array_of_dyn_array_row_copy;

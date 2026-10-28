@@ -895,3 +895,5 @@ mod class_queue_empty_pattern_through_handle;
 mod rand_typedef_handle;
 #[path = "classes/randomize_countones_wide.rs"]
 mod randomize_countones_wide;
+#[path = "classes/ref_formal_array_of_collections_row.rs"]
+mod ref_formal_array_of_collections_row;

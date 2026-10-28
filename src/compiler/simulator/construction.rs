@@ -95,6 +95,15 @@ impl Simulator {
                     self.signals.insert(nk, v);
                 }
             }
+            for prop in cd.property_types.keys() {
+                if !cd.static_properties.contains(prop)
+                    && self.class_prop_declared_event(src_handle, prop)
+                {
+                    let t = self.canonical_instance_event((src_handle, prop.clone()));
+                    self.instance_event_aliases
+                        .insert((new_handle, prop.clone()), t);
+                }
+            }
         }
         Value::from_u64(new_handle as u64, 32)
     }

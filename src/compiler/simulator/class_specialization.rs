@@ -2122,7 +2122,6 @@ impl Simulator {
         Some(v.to_string())
     }
 
-<<<<<<< HEAD
     /// The decimal value of a constant expression whose only names are
     /// package parameters (`pkg::N + pkg::K`); None when it reads anything
     /// else.
@@ -2176,7 +2175,8 @@ impl Simulator {
             }
         }
         false
-=======
+    }
+
     /// `T[#(...)]` of a type argument spelled `pkg::T[#(...)]`, when the bare
     /// name `T` is tabled as that same package class or typedef (package
     /// members also live in the flat design namespace under their bare
@@ -2206,7 +2206,6 @@ impl Simulator {
                 _ => false,
             };
         (same_class || same_typedef).then_some(rest)
->>>>>>> origin/fix/package-scoped-type-arg-key
     }
 
     /// IEEE 1800-2017 §6.20.2: the DECLARED DEFAULT of parameter

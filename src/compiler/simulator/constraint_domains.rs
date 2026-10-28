@@ -1562,7 +1562,6 @@ impl Simulator {
         None
     }
 
-<<<<<<< HEAD
     /// §18.3: the `enum_members` key of an unpacked struct member's enum
     /// type. A member of a package struct names its type `pkg::name`, while
     /// `enum_members` holds that enum under its bare name; the bare entry is
@@ -1582,14 +1581,14 @@ impl Simulator {
         );
         (same_decl && self.module.packages.contains(pkg) && self.module.enum_members.contains_key(leaf))
             .then(|| leaf.to_string())
-=======
+    }
+
     /// §18.3/§18.4: the values an element of the collection property `prop`
     /// may take when its element type is an enum (its named constants).
     pub(super) fn coll_enum_values(&self, handle: usize, prop: &str) -> Option<Vec<u64>> {
         let et = self.prop_enum_type(handle, prop)?;
         let members = self.module.enum_members.get(&et)?;
         (!members.is_empty()).then(|| members.iter().map(|m| m.1).collect())
->>>>>>> origin/fix/rand-enum-collection-elements
     }
 
     /// The rand SCALAR properties that appear in `e`, in source order of first

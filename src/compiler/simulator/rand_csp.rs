@@ -1802,11 +1802,7 @@ impl Simulator {
             if c.is_object_elem && !c.nested && c.kind != CollKind::Assoc {
                 continue;
             }
-<<<<<<< HEAD
-            if c.is_object_elem || (c.nested && c.row_tail.is_none()) || c.kind == CollKind::Assoc {
-=======
             if c.is_object_elem || c.nested {
->>>>>>> origin/fix/randomize-assoc-joint-solve
                 return None;
             }
             if sized.contains(&c.prop) {
@@ -7449,16 +7445,6 @@ impl Simulator {
         if let ExprKind::SystemCall { name, args } = &Self::unparen(e).kind
             && name == "$countones"
             && let [x] = args.as_slice()
-<<<<<<< HEAD
-            && let Some((v, lo, w, whole)) = self.csp_slice_base_k(csp, x, &mut konst)
-            && w > 0
-        {
-            if whole && lo == 0 && w == csp.vars[v].width && w <= 64 && !csp.wide.contains(&v) {
-                CSP_SCAN_POPS.with(|p| p.borrow_mut().push(v));
-            } else if csp.vars.len() + w as usize <= MAX_VARS {
-                let u = uses.entry(v).or_default();
-                u.0.extend((lo..lo + w).map(|b| (b, 1)));
-=======
         {
             // §20.9: the ones of a concatenation are those of its parts.
             let parts: &[Expression] = match &Self::unparen(x).kind {
@@ -7474,11 +7460,10 @@ impl Simulator {
                 }
                 if whole && lo == 0 && w == csp.vars[v].width && !csp.wide.contains(&v) {
                     CSP_SCAN_POPS.with(|p| p.borrow_mut().push(v));
-                } else {
+                } else if csp.vars.len() + w as usize <= MAX_VARS {
                     let u = uses.entry(v).or_default();
                     u.0.extend((lo..lo + w).map(|b| (b, 1)));
                 }
->>>>>>> origin/fix/randomize-countones-concat
             }
         }
         // `x & MASK`: the runs of ones in the mask are selects of x.

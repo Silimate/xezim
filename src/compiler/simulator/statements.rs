@@ -4193,7 +4193,6 @@ impl Simulator {
                                     .copied()
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
-<<<<<<< HEAD
                                 if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
                                     // §14.3: an edge skew drives on the next
                                     // such edge of the clock after the event.
@@ -4206,18 +4205,10 @@ impl Simulator {
                                             .push((net, val, edge, d));
                                         return;
                                     }
-                                    if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
-                                        let w = self.signal_widths[id];
-                                        self.schedule_delayed_with_delay(id, val.resize(w), skew);
+                                    if self.signal_name_to_id.contains_key(net.as_str()) {
+                                        self.commit_clocking_drive(&net, &val, select, skew);
                                         return;
                                     }
-=======
-                                if self.clocking_last_edge.get(&cb).copied() == Some(self.time)
-                                    && self.signal_name_to_id.contains_key(net.as_str())
-                                {
-                                    self.commit_clocking_drive(&net, &val, select, skew);
-                                    return;
->>>>>>> origin/fix/clocking-select-drive-skew
                                 }
                                 self.clocking_output_pending
                                     .entry(cb)

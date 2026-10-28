@@ -5,15 +5,10 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
-<<<<<<< HEAD
     /// `(lo, hi)` of a fixed unpacked array named `name`, or None.
-    /// The span is capped so a clocking sample cannot walk a huge array.
     pub(super) fn unpacked_array_bounds(&self, name: &str) -> Option<(i64, i64)> {
         let &(lo, hi, _) = self.module.arrays.get(name)?;
-        if hi < lo || hi - lo > 4096 {
-            return None;
-        }
-        Some((lo, hi))
+        (hi >= lo).then_some((lo, hi))
     }
 
     /// The value a clocking input named `sig` contributes to this edge's
@@ -29,7 +24,9 @@ impl Simulator {
         } else {
             self.clocking_hist_value(sig, self.time.saturating_sub(skew))
                 .or_else(|| self.get_signal_value_by_name(sig))
-=======
+        }
+    }
+
     /// The edge and post-edge delay of a §14.3 edge output skew
     /// (`output negedge`, `output negedge #d`) for `net` of block `cb`, or
     /// None when its skew is a plain delay. `raw` is the clocking-visible name.
@@ -125,7 +122,6 @@ impl Simulator {
         }
         if !keep.is_empty() {
             self.clocking_edge_out_pending.insert(cb.to_string(), keep);
->>>>>>> origin/fix/clocking-edge-output-skew
         }
     }
 
@@ -246,8 +242,7 @@ impl Simulator {
             // see the new output values when they run in the Reactive region.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
-<<<<<<< HEAD
-                for (sig, val) in pending {
+                for (sig, val, select) in pending {
                     let raw = sig.rsplit('.').next().unwrap_or(&sig).to_string();
                     if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &sig) {
                         self.clocking_edge_out_pending
@@ -260,24 +255,12 @@ impl Simulator {
                     // `#0` drive is scheduled like one made at this event,
                     // so a later drive in this time step replaces it
                     // (§14.16.2) instead of following it onto the net.
-=======
-                for (sig, val, select) in pending {
-                    // §14.4 output skew for drives maturing at THIS edge.
->>>>>>> origin/fix/clocking-select-drive-skew
                     let skew = self
                         .clocking_sig_out_skew
                         .get(&cb)
                         .and_then(|m| m.get(&sig))
                         .copied()
                         .unwrap_or(dskew);
-<<<<<<< HEAD
-                    if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
-                        let v = self.fit_clocking_value(id, &val);
-                        self.schedule_delayed_with_delay(id, v, skew);
-                        continue;
-                    }
-                    self.drive_clocking_net(&sig, &val);
-=======
                     if skew > 0 && self.signal_name_to_id.contains_key(sig.as_str()) {
                         self.commit_clocking_drive(&sig, &val, select, skew);
                         continue;
@@ -310,7 +293,6 @@ impl Simulator {
                         crate::ast::Span::dummy(),
                     );
                     self.assign_value(&lval, &val);
->>>>>>> origin/fix/clocking-select-drive-skew
                 }
             }
             // Refresh the input samples. IEEE 1800-2023 §14.4 input skew:

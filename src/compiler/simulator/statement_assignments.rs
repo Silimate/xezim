@@ -3892,66 +3892,8 @@ impl Simulator {
                 }
             }
         }
-<<<<<<< HEAD
-        let resolve_coll = |sim: &mut Self, e: &Expression| -> Option<(String, bool)> {
-            if let ExprKind::Ident(h) = &e.kind {
-                // A method-local queue / dynamic array lives under its
-                // per-call storage key (`declare_local_dyn`), which shadows
-                // any same-named property.
-                if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                    let bare = h.path[0].name.name.as_str();
-                    if let Some(uq) = sim.dyn_name_lookup(bare).filter(|uq| *uq != bare) {
-                        if sim.module.dynamic_arrays.contains(uq) {
-                            return Some((uq.to_string(), false));
-                        }
-                    }
-                }
-                if !sim.ident_shadowed_by_non_collection(h) {
-                    let n = Self::resolve_hier_name_static(h, &sim.module);
-                    // A bare identifier naming a COLLECTION MEMBER of
-                    // `this` must resolve to its `<handle>#member` storage
-                    // even when a same-named value-param / dyn-array is
-                    // registered from an enclosing frame. Prefer the
-                    // `this`-scoped member; a true local (instance_assoc_member
-                    // returns None) falls through to the bare name below.
-                    // Without this, a deep `Store::do_write` whose `val = t`
-                    // ran while an outer `make(T val)` value-param `val` was
-                    // still live in `module.dynamic_arrays` resolved the LHS
-                    // to bare `"val"` and the queue copy was dropped (§13.5.2).
-                    // §13.5.2/§8.24 name resolution: the CURRENT call's own
-                    // queue/dyn-array formal (bound in the top `local_dyn`
-                    // frame by `bind_queue_param`) shadows a same-named
-                    // property — only an ENCLOSING frame's registration
-                    // loses to the property. Without this, a whole-array
-                    // copy whose LHS formal shadows the property
-                    // (`uvm_reg_item::get_value_array(ref u64_t value[])`
-                    // — body `value = this.value`) resolved the LHS to the
-                    // property store: the property was clobbered and the
-                    // ref writeback shipped an empty array.
-                    let formal_in_current_frame = sim
-                        .local_dyn
-                        .last()
-                        .is_some_and(|f| f.iter().any(|(k, _)| k == &n));
-                    if sim.module.dynamic_arrays.contains(&n) {
-                        if !formal_in_current_frame {
-                            if let Some(m) = sim.instance_assoc_member(&n) {
-                                return Some((m, true));
-                            }
-                        }
-                        return Some((n, false));
-                    }
-                }
-            }
-            // An object's collection PROPERTY (`d.data`, `this.data`)
-            // lives under "<handle>#member" — resolve it like element
-            // accesses already do, else a whole-array copy involving
-            // a property is silently dropped.
-            sim.expr_assoc_name(e)
-                .filter(|an| !sim.is_associative_array(an))
-                .map(|an| (an, true))
-        };
-        let l_res = resolve_coll(self, lvalue);
-        let mut r_res = resolve_coll(self, rvalue);
+        let l_res = self.resolve_coll_operand(lvalue);
+        let mut r_res = self.resolve_coll_operand(rvalue);
         // `q = aq[k]`: a queue element of an associative array (§7.8, §7.6).
         if r_res.is_none() && l_res.is_some() && matches!(rvalue.kind, ExprKind::Index { .. }) {
             r_res = self
@@ -3959,10 +3901,6 @@ impl Simulator {
                 .filter(|n| self.module.dynamic_arrays.contains(n))
                 .map(|n| (n, false));
         }
-=======
-        let l_res = self.resolve_coll_operand(lvalue);
-        let r_res = self.resolve_coll_operand(rvalue);
->>>>>>> origin/fix/dyn-array-of-dyn-array-row-copy
         // Extract the resolved names now — the both-collection `if let`
         // below consumes `l_res`/`r_res`. Used by the mixed
         // dynamic↔fixed path after it.

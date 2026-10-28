@@ -1591,7 +1591,6 @@ impl Simulator {
         // Effective result width: instance-resolved for param-bounded packed
         // returns, else the static width from the plan.
         let result_width = if pre.param_able_result {
-<<<<<<< HEAD
             if let Some(w) = (handle != 0)
                 .then(|| self.class_formal_width(handle, cname, &pre.return_type))
                 .flatten()
@@ -1599,27 +1598,21 @@ impl Simulator {
                 // §8.25: a class typedef or range over the receiver's class
                 // parameters, sized as the interpreter sizes the return.
                 w
+            } else if handle == 0 {
+                // The null handle (a free function) binds no class parameters,
+                // so the parameter table needs no per-call copy.
+                let w = resolve_type_width(
+                    &pre.return_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                if w > 0 { w } else { pre.static_result_width }
             } else {
                 let scope = self.instance_param_scope(handle);
                 let w =
                     resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs));
                 if w > 0 { w } else { pre.static_result_width }
             }
-=======
-            // The null handle (a free function) binds no class parameters,
-            // so the parameter table needs no per-call copy.
-            let w = if handle == 0 {
-                resolve_type_width(
-                    &pre.return_type,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                )
-            } else {
-                let scope = self.instance_param_scope(handle);
-                resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs))
-            };
-            if w > 0 { w } else { pre.static_result_width }
->>>>>>> origin/perf/package-call-parameter-table
         } else {
             pre.static_result_width
         };

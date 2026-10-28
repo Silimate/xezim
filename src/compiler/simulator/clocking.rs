@@ -5,6 +5,7 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+<<<<<<< HEAD
     /// `(lo, hi)` of a fixed unpacked array named `name`, or None.
     /// The span is capped so a clocking sample cannot walk a huge array.
     pub(super) fn unpacked_array_bounds(&self, name: &str) -> Option<(i64, i64)> {
@@ -28,6 +29,103 @@ impl Simulator {
         } else {
             self.clocking_hist_value(sig, self.time.saturating_sub(skew))
                 .or_else(|| self.get_signal_value_by_name(sig))
+=======
+    /// The edge and post-edge delay of a §14.3 edge output skew
+    /// (`output negedge`, `output negedge #d`) for `net` of block `cb`, or
+    /// None when its skew is a plain delay. `raw` is the clocking-visible name.
+    pub(super) fn clocking_drive_edge(
+        &self,
+        cb: &str,
+        raw: &str,
+        net: &str,
+    ) -> Option<(EdgeKind, u64)> {
+        let raw = self
+            .clocking_sig_alias
+            .get(cb)
+            .and_then(|m| m.iter().find(|(_, n)| n.as_str() == net))
+            .map_or(raw, |(v, _)| v.as_str());
+        let per_sig = |m: &HashMap<String, u64>| m.get(raw).or_else(|| m.get(net)).copied();
+        if let Some(e) = self
+            .clocking_sig_out_edge
+            .get(cb)
+            .and_then(|m| m.get(raw).or_else(|| m.get(net)))
+        {
+            let d = self.clocking_sig_out_skew.get(cb).and_then(per_sig);
+            return e.map(|e| (e, d.unwrap_or(0)));
+        }
+        let e = self.clocking_out_edge.get(cb).copied()?;
+        Some((e, self.clocking_out_skew.get(cb).copied().unwrap_or(0)))
+    }
+
+    /// Assign a clocking output's net now, with the width and signedness
+    /// handling of a procedural assignment.
+    fn drive_clocking_net(&mut self, net: &str, val: &Value) {
+        let lval = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: net.to_string(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    selects: Vec::new(),
+                }],
+                span: crate::ast::Span::dummy(),
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            crate::ast::Span::dummy(),
+        );
+        self.assign_value(&lval, val);
+    }
+
+    /// `val` at the width of signal `id`, with X/Z bits zeroed when the
+    /// signal is two-state, as an assignment stores it.
+    fn fit_clocking_value(&self, id: usize, val: &Value) -> Value {
+        let v = val.resize(self.signal_widths[id]);
+        if v.has_xz() && self.signal_two_state.get(id).copied().unwrap_or(false) {
+            return v.to_two_state();
+        }
+        v
+    }
+
+    /// §14.3: an output with an edge skew is driven on that edge of the
+    /// block's clock. Of the drives of `cb` waiting for this transition, only
+    /// the last one issued on each output is applied (§14.16.2), so an earlier
+    /// value never reaches the net.
+    fn mature_edge_skew_drives(&mut self, cb: &str, rising: bool) {
+        let Some(pend) = self.clocking_edge_out_pending.remove(cb) else {
+            return;
+        };
+        let mut keep = Vec::new();
+        let mut due: Vec<(String, Value, u64)> = Vec::new();
+        for (net, val, edge, delay) in pend {
+            let hit = match edge {
+                EdgeKind::Posedge => rising,
+                EdgeKind::Negedge => !rising,
+                _ => true,
+            };
+            if !hit {
+                keep.push((net, val, edge, delay));
+                continue;
+            }
+            due.retain(|(n, _, _)| *n != net);
+            due.push((net, val, delay));
+        }
+        for (net, val, delay) in due {
+            if delay > 0
+                && let Some(&id) = self.signal_name_to_id.get(net.as_str())
+            {
+                let v = self.fit_clocking_value(id, &val);
+                self.schedule_delayed_with_delay(id, v, delay);
+            } else {
+                self.drive_clocking_net(&net, &val);
+                self.clocking_edge_drive_dirty = true;
+            }
+        }
+        if !keep.is_empty() {
+            self.clocking_edge_out_pending.insert(cb.to_string(), keep);
+>>>>>>> origin/fix/clocking-edge-output-skew
         }
     }
 
@@ -86,6 +184,9 @@ impl Simulator {
             };
             let prev = ent.prev;
             ent.prev = cur;
+            if !self.clocking_edge_out_pending.is_empty() && prev != cur && prev != 2 && cur != 2 {
+                self.mature_edge_skew_drives(&ent.cb, cur == 1);
+            }
             // §14.3: advance on the block's declared clock edge (posedge by
             // default; negedge / any-edge when so declared).
             let fired = match ent.edge {
@@ -113,6 +214,14 @@ impl Simulator {
                 let mut keep: Vec<(u64, String, Value)> = Vec::new();
                 for (n, net, val) in pend.drain(..) {
                     if n <= 1 {
+                        let raw = net.rsplit('.').next().unwrap_or(&net).to_string();
+                        if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &net) {
+                            self.clocking_edge_out_pending
+                                .entry(cb.clone())
+                                .or_default()
+                                .push((net, val, edge, d));
+                            continue;
+                        }
                         let skew = self
                             .clocking_sig_out_skew
                             .get(&cb)
@@ -141,37 +250,30 @@ impl Simulator {
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
                 for (sig, val) in pending {
-                    // §14.4 output skew for drives maturing at THIS edge.
+                    let raw = sig.rsplit('.').next().unwrap_or(&sig).to_string();
+                    if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &sig) {
+                        self.clocking_edge_out_pending
+                            .entry(cb.clone())
+                            .or_default()
+                            .push((sig, val, edge, d));
+                        continue;
+                    }
+                    // §14.4 output skew for drives maturing at THIS edge. A
+                    // `#0` drive is scheduled like one made at this event,
+                    // so a later drive in this time step replaces it
+                    // (§14.16.2) instead of following it onto the net.
                     let skew = self
                         .clocking_sig_out_skew
                         .get(&cb)
                         .and_then(|m| m.get(&sig))
                         .copied()
                         .unwrap_or(dskew);
-                    if skew > 0 {
-                        if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
-                            let w = self.signal_widths[id];
-                            self.schedule_delayed_with_delay(id, val.resize(w), skew);
-                            continue;
-                        }
+                    if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
+                        let v = self.fit_clocking_value(id, &val);
+                        self.schedule_delayed_with_delay(id, v, skew);
+                        continue;
                     }
-                    let lval = Expression::new(
-                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                            root: None,
-                            path: vec![crate::ast::expr::HierPathSegment {
-                                name: crate::ast::Identifier {
-                                    name: sig.clone(),
-                                    span: crate::ast::Span::dummy(),
-                                },
-                                selects: Vec::new(),
-                            }],
-                            span: crate::ast::Span::dummy(),
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
-                        }),
-                        crate::ast::Span::dummy(),
-                    );
-                    self.assign_value(&lval, &val);
+                    self.drive_clocking_net(&sig, &val);
                 }
             }
             // Refresh the input samples. IEEE 1800-2023 §14.4 input skew:

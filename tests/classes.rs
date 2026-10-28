@@ -889,3 +889,5 @@ mod class_string_queue_concatenation;
 mod class_queue_empty_pattern_through_handle;
 #[path = "classes/rand_typedef_handle.rs"]
 mod rand_typedef_handle;
+#[path = "classes/randomize_countones_wide.rs"]
+mod randomize_countones_wide;

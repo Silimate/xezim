@@ -212,3 +212,5 @@ mod foreach_omitted_var_before_collection;
 mod hierarchical_whole_array_assign;
 #[path = "collections/row_of_2d_array_assign.rs"]
 mod row_of_2d_array_assign;
+#[path = "collections/enclosing_value_parameter_specialization.rs"]
+mod enclosing_value_parameter_specialization;

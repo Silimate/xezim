@@ -1850,7 +1850,11 @@ impl Simulator {
             Some(f) => f,
             None => return,
         };
-        self.sync_table_to_hashmap();
+        // Do not copy signal_table into `self.signals` here. FST enumeration
+        // and snapshots read the signal table (`dump_signal_names`,
+        // `dump_backing_ids`). Seeding that hashmap before time 0 made an
+        // Ibex UVM run with `--fst` fail `ReqIsKnown_A` at time 2047000.
+        // The same test without `--fst` reaches the cosim scoreboard mismatch.
 
         // Same enumeration + top-relative scope normalization as `$dumpvars`
         // (see `dump_signal_names`): the old copy read the empty `self.signals`

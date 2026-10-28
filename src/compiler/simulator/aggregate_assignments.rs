@@ -134,14 +134,20 @@ impl Simulator {
         else {
             return false;
         };
-        let Some(cd) = self.module.classes.get(&cn) else {
-            return false;
-        };
         let member = &member;
         let scoped = format!("{}#{}", handle, member);
         if items.is_empty() {
+            // `'{}` leaves the queue or dynamic array with no elements.
+            // `class_queue_prop` also finds one the class inherits.
+            if self.class_queue_prop(&scoped) {
+                self.set_queue_size(&scoped, 0);
+                return true;
+            }
             return false;
         }
+        let Some(cd) = self.module.classes.get(&cn) else {
+            return false;
+        };
         // Associative array: `'{k:v,...}` — keyed items.
         if cd.assoc_properties.contains_key(member) {
             let val_w = cd.properties.get(member).map(|s| s.width).unwrap_or(32);

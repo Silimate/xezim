@@ -883,3 +883,5 @@ mod shadowed_member_same_named_formal;
 mod class_queue_struct_pattern_init;
 #[path = "classes/class_string_queue_concatenation.rs"]
 mod class_string_queue_concatenation;
+#[path = "classes/class_queue_empty_pattern_through_handle.rs"]
+mod class_queue_empty_pattern_through_handle;

@@ -75,8 +75,9 @@ impl Simulator {
     /// call, a null or self-referencing plain handle, an associative or
     /// multi-dimensional array of handles, a dynamic array whose size a
     /// constraint draws, or one object reached through two array slots.
-    /// A member no constraint of the class reads shares no constraint with
-    /// it and is left out: each trial draws it with its own solve first
+    /// A member no constraint of the class reads, and whose object holds no
+    /// handle back to this one, shares no constraint with it and is left
+    /// out: each trial draws it with its own solve first
     /// (`randomize_nested_with`), which gives the same solutions.
     pub(crate) fn rand_csp_subs(
         &self,
@@ -90,7 +91,7 @@ impl Simulator {
         let mut seen: HashSet<usize> = HashSet::default();
         let mut elems_in = false;
         for p in rand_obj_props {
-            if !Self::csp_constraints_read(p, constraints) {
+            if !Self::csp_constraints_read(p, constraints) && !self.csp_sub_points_back(handle, p) {
                 continue;
             }
             let scoped = format!("{}#{}", handle, p);
@@ -150,6 +151,28 @@ impl Simulator {
             return None;
         }
         Some(out)
+    }
+
+    /// §18.5.9: whether an object in member `prop` of `handle` (the member
+    /// itself, or an element of an array of handles) holds a handle back to
+    /// `handle`. Its constraints may then read this object's variables
+    /// (`p.x`), so the two are solved together.
+    fn csp_sub_points_back(&self, handle: usize, prop: &str) -> bool {
+        let back = |sub: usize| {
+            sub != 0
+                && sub != handle
+                && self.heap.get(sub).and_then(|o| o.as_ref()).is_some_and(|i| {
+                    i.properties.iter().any(|(m, v)| {
+                        v.to_u64() == Some(handle as u64) && self.prop_class_type(sub, m).is_some()
+                    })
+                })
+        };
+        match self.rand_child_collection_keys(handle, prop) {
+            Some(keys) => keys.iter().any(|k| {
+                back(self.read_coll_elem(k).and_then(|v| v.to_u64()).unwrap_or(0) as usize)
+            }),
+            None => back(self.member_handle(handle, prop).unwrap_or(0)),
+        }
     }
 
     /// Whether some item of `constraints` may read member `prop`: a name or

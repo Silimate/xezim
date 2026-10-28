@@ -216,3 +216,5 @@ mod row_of_2d_array_assign;
 mod enclosing_value_parameter_specialization;
 #[path = "collections/parameterized_vif_specialization_cast.rs"]
 mod parameterized_vif_specialization_cast;
+#[path = "collections/concat_actual_queue_formal.rs"]
+mod concat_actual_queue_formal;

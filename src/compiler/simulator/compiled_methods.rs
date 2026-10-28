@@ -1591,6 +1591,7 @@ impl Simulator {
         // Effective result width: instance-resolved for param-bounded packed
         // returns, else the static width from the plan.
         let result_width = if pre.param_able_result {
+<<<<<<< HEAD
             if let Some(w) = (handle != 0)
                 .then(|| self.class_formal_width(handle, cname, &pre.return_type))
                 .flatten()
@@ -1604,6 +1605,21 @@ impl Simulator {
                     resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs));
                 if w > 0 { w } else { pre.static_result_width }
             }
+=======
+            // The null handle (a free function) binds no class parameters,
+            // so the parameter table needs no per-call copy.
+            let w = if handle == 0 {
+                resolve_type_width(
+                    &pre.return_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+            } else {
+                let scope = self.instance_param_scope(handle);
+                resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs))
+            };
+            if w > 0 { w } else { pre.static_result_width }
+>>>>>>> origin/perf/package-call-parameter-table
         } else {
             pre.static_result_width
         };

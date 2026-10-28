@@ -4279,6 +4279,7 @@ impl Simulator {
             meta_frames: Vec::new(),
             meta_pending: 0,
             type_tables_gen: 0,
+            formal_struct_layouts: HashMap::default(),
             local_type_pool: Vec::new(),
             sync_name_pool: Vec::new(),
             dyn_key_scratch: String::new(),

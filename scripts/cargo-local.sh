@@ -22,8 +22,8 @@ fi
 
 if [ -f ../xezim-core/Cargo.toml ]; then
   exec cargo \
-    --config 'patch."https://github.com/aionhw/xezim-core.git".xezim-core.path="../xezim-core"' \
-    --config 'patch."https://github.com/aionhw/xezim-core.git".sv-parser.path="../xezim-core/xezim-parser"' \
+    --config 'patch."https://github.com/Silimate/xezim-core.git".xezim-core.path="../xezim-core"' \
+    --config 'patch."https://github.com/Silimate/xezim-core.git".sv-parser.path="../xezim-core/xezim-parser"' \
     "${ARGS[@]}"
 else
   exec cargo "${ARGS[@]}"

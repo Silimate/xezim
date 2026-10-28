@@ -583,3 +583,6 @@ mod const_bits_of_cast;
 mod literal_whitespace_580;
 #[path = "types/const_bits_compound.rs"]
 mod const_bits_compound;
+
+#[path = "types/module_struct_localparam_first_instance.rs"]
+mod module_struct_localparam_first_instance;

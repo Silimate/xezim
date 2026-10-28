@@ -57,6 +57,8 @@ mod issue320_harness_mwe;
 mod randomize_empty_dyn_foreach;
 #[path = "classes/vif_specialization_keys.rs"]
 mod vif_specialization_keys;
+#[path = "classes/package_scoped_type_args.rs"]
+mod package_scoped_type_args;
 #[path = "classes/x_default_neighbours.rs"]
 mod x_default_neighbours;
 #[path = "classes/x_default_open.rs"]

@@ -905,3 +905,5 @@ mod concat_write_through_handle_member;
 mod dollar_index_handle_member_write;
 #[path = "classes/foreach_indexed_element_member_array.rs"]
 mod foreach_indexed_element_member_array;
+#[path = "classes/scalar_local_shadows_collection.rs"]
+mod scalar_local_shadows_collection;

@@ -899,3 +899,5 @@ mod randomize_countones_wide;
 mod ref_formal_array_of_collections_row;
 #[path = "classes/class_scoped_static_queue_copy.rs"]
 mod class_scoped_static_queue_copy;
+#[path = "classes/concat_write_through_handle_member.rs"]
+mod concat_write_through_handle_member;

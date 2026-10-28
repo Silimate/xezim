@@ -2214,9 +2214,15 @@ impl Simulator {
                     self.set_queue_size(&row, k as u64 + 1);
                 }
                 let elem = format!("{}[{}]", row, k);
+                // §10.6/§5.7.1: the element takes the row's element width
+                // (a `'1` fill fills every bit of a struct element).
+                let val = match self.module.arrays.get(&row) {
+                    Some(&(_, _, w)) if w != val.width || val.is_fill => val.resize_for_assign(w),
+                    _ => val.clone(),
+                };
                 let prev = self.get_signal_value_by_name(&elem);
-                let changed = prev.as_ref() != Some(val);
-                self.set_signal_value_by_name(&elem, val.clone());
+                let changed = prev.as_ref() != Some(&val);
+                self.set_signal_value_by_name(&elem, val);
                 return changed;
             }
             if self.is_associative_array(&row) {
@@ -2546,6 +2552,16 @@ impl Simulator {
                         base_name = std::borrow::Cow::Owned(s);
                     }
                 }
+                // `o.m[i][j][k]` on an object's member: its store is
+                // `<handle>#m` (§7.4.5).
+                if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2 {
+                    if let Some(s) = self
+                        .expr_assoc_name(cur)
+                        .filter(|s| self.module.arrays_nd.contains_key(s))
+                    {
+                        base_name = std::borrow::Cow::Owned(s);
+                    }
+                }
                 if let Some((shape, _w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                     if rev_idxs.len() == shape.len() {
                         let mut name = base_name.clone();
@@ -2711,6 +2727,16 @@ impl Simulator {
                 // resolve to its per-instance `<handle>#<member>`.
                 if !self.module.arrays_2d.contains_key(&*name) {
                     if let Some(s) = self.instance_assoc_member(&name) {
+                        name = std::borrow::Cow::Owned(s);
+                    }
+                }
+                // `o.m[i][j] = v` on an object's member: its store is
+                // `<handle>#m` (§7.4.5).
+                if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
+                    if let Some(s) = self
+                        .expr_assoc_name(inner_expr)
+                        .filter(|s| self.module.arrays_2d.contains_key(s))
+                    {
                         name = std::borrow::Cow::Owned(s);
                     }
                 }

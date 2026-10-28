@@ -651,11 +651,9 @@ impl Simulator {
                         .filter(|tn| self.module.enum_members.contains_key(tn));
                     // A member typed by a class (a handle, or a collection of
                     // handles) holds object references, not random values.
-                    let is_handle = class_def
-                        .properties
-                        .get(prop)
-                        .and_then(|s| s.type_name.clone())
-                        .is_some_and(|tn| self.module.classes.contains_key(&tn));
+                    // §8.25: so does one typed by a class type parameter
+                    // this object binds to a class (`rand T h;`, T = leaf).
+                    let is_handle = self.prop_class_type(handle, prop).is_some();
                     // §18.4: the elements of a fixed `rand obj arr[N]` are
                     // randomized recursively like any rand handle; drawing
                     // them as integers overwrote every handle with a random

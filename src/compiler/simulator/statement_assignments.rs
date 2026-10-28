@@ -2010,6 +2010,15 @@ impl Simulator {
                                 break;
                             }
                         }
+                        // §8.25: an element type that is a class type
+                        // parameter takes this object's binding (#576).
+                        if mtn
+                            .as_deref()
+                            .is_some_and(|t| !self.module.classes.contains_key(t))
+                            && let Some(b) = self.prop_class_type(handle, &member_name)
+                        {
+                            mtn = Some(b);
+                        }
                         if let Some(mcls) = mtn.as_deref().and_then(|t| {
                             self.resolve_typedef_spec(t)
                                 .map(|(b, s)| (b.clone(), Some((b, s))))
@@ -2065,8 +2074,16 @@ impl Simulator {
                     // and the current class context.
                     let recv_elem_cls: Option<String> =
                         if bh.path.len() == 2 && bh.path[0].selects.is_empty() {
-                            self.eval_ident_handle(&bh.path[0].name.name)
-                                .filter(|&h| h != 0)
+                            let recv = self
+                                .eval_ident_handle(&bh.path[0].name.name)
+                                .filter(|&h| h != 0);
+                            // §8.25: an element type that is a class type
+                            // parameter takes the receiver's binding (#576).
+                            let bound = recv.and_then(|h| {
+                                self.prop_class_type(h, &bname)
+                                    .filter(|_| !self.module.classes.contains_key(&bname))
+                            });
+                            bound.or_else(|| recv
                                 .and_then(|h| {
                                     self.heap
                                         .get(h)
@@ -2088,7 +2105,7 @@ impl Simulator {
                                             None => break None,
                                         }
                                     }
-                                })
+                                }))
                         } else {
                             None
                         };
@@ -3593,6 +3610,18 @@ impl Simulator {
                     // real `new` runs. Plain class names are unchanged.
                     let type_name =
                         type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
+                    // §8.25: `o.h = new()` from outside the class, `h`
+                    // declared by a type parameter: the active specialization
+                    // is not `o`'s, so the name stayed the parameter's and an
+                    // opaque object of class `T` was built. Bind it through
+                    // the object that owns the member (#576).
+                    let type_name = match type_name {
+                        Some(tn) if !self.module.classes.contains_key(&tn) => {
+                            Some(self.member_target_class(lvalue).unwrap_or(tn))
+                        }
+                        None => self.member_target_class(lvalue),
+                        other => other,
+                    };
                     if let Some(tname) = type_name {
                         if tname == "semaphore" {
                             let handle = self.heap.len();

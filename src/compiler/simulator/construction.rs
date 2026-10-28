@@ -5,6 +5,65 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Register the object-scoped dynamic or queue member `scoped` in the
+    /// array tables with the shape a module-scope declaration of the same
+    /// form gets: a fixed tail (`T a[][N]`, `T a[][N][M]`) makes it a 2-D or
+    /// N-D array whose outer dimension is the dynamic one, so `a[i][j]`
+    /// names an element instead of a bit of a scalar row (§7.4.5); any other
+    /// member is a 1-D collection, rows of a dynamic tail (`T a[][]`) being
+    /// collections of their own once `a[i] = new[n]` sizes them.
+    pub(super) fn register_dyn_member_shape(
+        &mut self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        params: &HashMap<String, Value>,
+        prop: &str,
+        scoped: &str,
+        width: u32,
+    ) {
+        let fixed_tail: Option<Vec<(i64, i64)>> =
+            cdef.dynamic_tail_properties.get(prop).and_then(|tail| {
+                tail.iter()
+                    .map(|d| match d {
+                        crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
+                            let l =
+                                super::elaborate::const_eval_i64_with_params(left, Some(params))?;
+                            let r =
+                                super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+                            Some((l.min(r), l.max(r)))
+                        }
+                        crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
+                            match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
+                                Some(n) if n > 0 => Some((0, n - 1)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+        match fixed_tail.as_deref() {
+            Some([d2]) => {
+                self.module.arrays.remove(scoped);
+                self.module
+                    .arrays_2d
+                    .insert(scoped.to_string(), ((0, 63), *d2, width));
+            }
+            Some(dims) if dims.len() >= 2 => {
+                self.module.arrays.remove(scoped);
+                let mut shape = vec![(0, 63)];
+                shape.extend_from_slice(dims);
+                self.module
+                    .arrays_nd
+                    .insert(scoped.to_string(), (shape, width));
+            }
+            _ => {
+                self.module
+                    .arrays
+                    .insert(scoped.to_string(), (0, 63, width));
+            }
+        }
+    }
+
     /// Shallow copy constructor: clone `src_handle`'s instance (scalar
     /// properties plus instance-scoped queue/assoc members) into a fresh heap
     /// object. Returns the new handle.
@@ -32,7 +91,13 @@ impl Simulator {
                 let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
                 self.module.dynamic_arrays.insert(n_name.clone());
-                self.module.arrays.insert(n_name.clone(), (0, 63, w));
+                if let Some(&t) = self.module.arrays_2d.get(&s_name) {
+                    self.module.arrays_2d.insert(n_name.clone(), t);
+                } else if let Some(t) = self.module.arrays_nd.get(&s_name).cloned() {
+                    self.module.arrays_nd.insert(n_name.clone(), t);
+                } else {
+                    self.module.arrays.insert(n_name.clone(), (0, 63, w));
+                }
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(n_name.clone(), m);
                 }
@@ -41,6 +106,27 @@ impl Simulator {
                 for i in 0..sz {
                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", s_name, i)) {
                         self.set_signal_value_by_name(&format!("{}[{}]", n_name, i), v);
+                    }
+                }
+                // §8.12/§7.4.5: rows of a dynamic outer dimension over unpacked
+                // arrays (`a[i][j]`, a dynamic row's own size) are copied too,
+                // each dynamic row registered under the copy.
+                if cd.dynamic_tail_properties.contains_key(prop) {
+                    for k in self.signals.keys_with_elem_prefix(&format!("{}[", s_name)) {
+                        let Some(v) = self.signals.get(&k).cloned() else {
+                            continue;
+                        };
+                        let nk = format!("{}{}", n_name, &k[s_name.len()..]);
+                        if let Some(row) = k.strip_suffix(".size") {
+                            let nrow = format!("{}{}", n_name, &row[s_name.len()..]);
+                            if self.module.dynamic_arrays.contains(row) {
+                                self.module.dynamic_arrays.insert(nrow.clone());
+                            }
+                            if let Some(&t) = self.module.arrays.get(row) {
+                                self.module.arrays.insert(nrow, t);
+                            }
+                        }
+                        self.signals.insert(nk, v);
                     }
                 }
             }
@@ -2547,7 +2633,15 @@ impl Simulator {
                     self.signed_class_colls.insert(scoped.clone());
                 }
                 self.module.dynamic_arrays.insert(scoped.clone());
-                self.module.arrays.insert(scoped.clone(), (0, 63, width));
+                // The object is not on the heap yet: its value parameters
+                // are read from the instance being built.
+                let mut params = self.module.parameters.clone();
+                for (pn, _) in &cdef.param_defaults {
+                    if let Some(v) = instance.properties.get(pn) {
+                        params.insert(pn.clone(), v.clone());
+                    }
+                }
+                self.register_dyn_member_shape(cdef, &params, prop, &scoped, width);
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(scoped.clone(), m);
                 }

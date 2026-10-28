@@ -209,6 +209,57 @@ impl Simulator {
         None
     }
 
+    /// The class a member assignment target (`o.h`, `this.h`, or an element
+    /// `o.arr[0]` of a collection of handles) holds, with a type parameter
+    /// bound by the object that owns the member (§8.25).
+    pub(super) fn member_target_class(&self, lvalue: &Expression) -> Option<String> {
+        let mut lvalue = lvalue;
+        let mut indexed = false;
+        while let ExprKind::Index { expr, .. } = &lvalue.kind {
+            lvalue = expr;
+            indexed = true;
+        }
+        let (owner, prop) = match &lvalue.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_handle_expr(expr)?, member.name.as_str())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    self.eval_ident_handle(&h.path[0].name.name)?,
+                    h.path[1].name.name.as_str(),
+                )
+            }
+            _ => return None,
+        };
+        if owner == 0 {
+            return None;
+        }
+        // A collection of handles names a class only through an element
+        // (`o.arr[0] = new()`); the member itself takes `new[n]`.
+        let mut cur = self
+            .heap
+            .get(owner)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(prop) {
+                let coll = cd.array_properties.contains_key(prop)
+                    || cd.array_nd_properties.contains_key(prop)
+                    || cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop);
+                if coll != indexed {
+                    return None;
+                }
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        self.prop_class_type(owner, prop)
+    }
+
     /// Class-chain member-type lookup without a live instance handle (used
     /// when the receiver's base object is null but its DECLARED class is
     /// known). Mirrors `prop_class_type`; type params resolve via current_spec
@@ -368,11 +419,15 @@ impl Simulator {
                 // is the class name `obj`, so the elements are object handles
                 // (randomized recursively, never as scalars). For scalar/
                 // packed element types `type_name` is None or a non-class.
-                let is_object_elem = cd
-                    .properties
-                    .get(prop)
-                    .and_then(|s| s.type_name.clone())
-                    .is_some_and(|tn| self.module.classes.contains_key(&tn));
+                // §8.25: an element type that is a class type parameter is a
+                // class when this object binds the parameter to one.
+                let is_object_elem = self.prop_class_type(handle, prop).is_some();
+                // §8.25/§6.20.2: the element width in this object's
+                // specialization. The class tables hold the default's, so a
+                // `rand T beats[]` bound wider than T's default solved its
+                // elements at the default width and a field select of the
+                // bound type fell outside them (#576).
+                let spec_w = self.spec_member_elem_width(cd, handle, prop);
                 // §18.4 (#519): a multi-dimensional member joins as one row
                 // per prefix of its leading dimensions, each keyed like a
                 // 1-D array (`m[0]`, elements `m[0][j]`), with the base's
@@ -390,6 +445,7 @@ impl Simulator {
                         .get(&scoped)
                         .map(|t| t.2)
                         .or_else(|| self.module.arrays_nd.get(&scoped).map(|t| t.1))
+                        .or(spec_w)
                         .unwrap_or(32)
                         .max(1);
                     if let Some(dims) = dims
@@ -418,6 +474,7 @@ impl Simulator {
                                 nested: false,
                                 is_object_elem,
                                 nd_base: Some((prop.clone(), dims.clone())),
+                                row_tail: None,
                             });
                         }
                     }
@@ -429,15 +486,19 @@ impl Simulator {
                         prop: prop.clone(),
                         scoped,
                         kind: CollKind::Fixed,
-                        width: w.max(1),
+                        width: spec_w.unwrap_or(w).max(1),
                         lo,
                         hi,
                         nested: false,
                         is_object_elem,
                         nd_base: None,
+                        row_tail: None,
                     });
                 } else if cd.assoc_properties.contains_key(prop) {
-                    let w = cd.properties.get(prop).map_or(32, |s| s.width).max(1);
+                    let w = spec_w
+                        .or_else(|| cd.properties.get(prop).map(|s| s.width))
+                        .unwrap_or(32)
+                        .max(1);
                     out.push(RandColl {
                         prop: prop.clone(),
                         scoped,
@@ -448,19 +509,24 @@ impl Simulator {
                         nested: false,
                         is_object_elem,
                         nd_base: None,
+                        row_tail: None,
                     });
                 } else if let Some(&(w, _cap)) = cd.queue_properties.get(prop) {
-                    let nested = Self::coll_is_nested(prop, constraints);
+                    // §7.4.5: dynamic rows are sized row by row (`nested`).
+                    let row_tail = self.dyn_row_tail(cd, handle, prop);
+                    let nested = matches!(row_tail, Some(RowTail::Dyn))
+                        || Self::coll_is_nested(prop, constraints);
                     out.push(RandColl {
                         prop: prop.clone(),
                         scoped,
                         kind: CollKind::Dyn,
-                        width: w.max(1),
+                        width: spec_w.unwrap_or(w).max(1),
                         lo: 0,
                         hi: 0,
                         nested,
                         is_object_elem,
                         nd_base: None,
+                        row_tail,
                     });
                 }
             }
@@ -574,6 +640,18 @@ impl Simulator {
                 .collect(),
             CollKind::Dyn => {
                 let n = self.get_queue_size(&c.scoped);
+                // §7.4.5: every element of every fixed row (`a[i][j]`).
+                if let Some(RowTail::Fixed(inner)) = &c.row_tail {
+                    let mut keys: Vec<String> =
+                        (0..n).map(|i| format!("{}[{}]", c.scoped, i)).collect();
+                    for &(lo, hi) in inner {
+                        keys = keys
+                            .iter()
+                            .flat_map(|k| (lo..=hi).map(move |j| format!("{}[{}]", k, j)))
+                            .collect();
+                    }
+                    return keys;
+                }
                 if !c.nested {
                     return (0..n).map(|i| format!("{}[{}]", c.scoped, i)).collect();
                 }
@@ -715,6 +793,21 @@ impl Simulator {
             {
                 return Some((handle, member, 1, None));
             }
+            // §7.4.5: a dynamic outer dimension over dynamic or queue rows
+            // (`int d[][]`): `d[i]` names one row collection.
+            if !fixed_only
+                && cd.dynamic_tail_properties.get(&member).is_some_and(|t| {
+                    matches!(
+                        t.first(),
+                        Some(
+                            crate::ast::types::UnpackedDimension::Unsized(_)
+                                | crate::ast::types::UnpackedDimension::Queue { .. }
+                        )
+                    )
+                })
+            {
+                return Some((handle, member, 1, None));
+            }
             cur_cls = cd.extends.clone();
         }
         None
@@ -825,7 +918,11 @@ impl Simulator {
                 Some(n) => n,
                 None => cur,
             };
-            self.resize_coll(&c.scoped, n);
+            if c.row_tail.is_some() {
+                self.resize_row_owner(c, n);
+            } else {
+                self.resize_coll(&c.scoped, n);
+            }
             self.module.dynamic_arrays.insert(c.scoped.clone());
             if c.nested {
                 for i in 0..n {
@@ -839,6 +936,63 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// The row shape of the dynamic member `prop` of `cd` declared over
+    /// unpacked rows (`T a[][N]`, `T a[][]`); `None` for any other member or
+    /// a deeper nesting the solver does not model.
+    pub(super) fn dyn_row_tail(
+        &self,
+        cd: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+    ) -> Option<RowTail> {
+        use crate::ast::types::UnpackedDimension as U;
+        let tail = cd.dynamic_tail_properties.get(prop)?;
+        if let [U::Unsized(_) | U::Queue { .. }] = tail.as_slice() {
+            return Some(RowTail::Dyn);
+        }
+        let params = self.instance_param_scope(handle);
+        let dims: Option<Vec<(i64, i64)>> = tail
+            .iter()
+            .map(|d| match d {
+                U::Range { left, right, .. } => {
+                    let l = super::elaborate::const_eval_i64_with_params(left, Some(&params))?;
+                    let r = super::elaborate::const_eval_i64_with_params(right, Some(&params))?;
+                    Some((l.min(r), l.max(r)))
+                }
+                U::Expression { expr, .. } => {
+                    match super::elaborate::const_eval_i64_with_params(expr, Some(&params)) {
+                        Some(n) if n > 0 => Some((0, n - 1)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        dims.map(RowTail::Fixed)
+    }
+
+    /// Resize the dynamic member `c` whose elements are rows: rows past the
+    /// new end lose their storage, and new dynamic rows are registered as
+    /// empty collections of their own.
+    pub(super) fn resize_row_owner(&mut self, c: &RandColl, n: u64) {
+        let old = self.get_queue_size(&c.scoped);
+        for i in n..old {
+            let row = format!("{}[{}]", c.scoped, i);
+            self.clear_dyn_row(&row);
+            self.signals.remove(&row);
+            self.signals.remove(&format!("{}.size", row));
+        }
+        if c.row_tail == Some(RowTail::Dyn) {
+            for i in old.min(n)..n {
+                let row = format!("{}[{}]", c.scoped, i);
+                self.module.dynamic_arrays.insert(row.clone());
+                self.module.arrays.insert(row.clone(), (0, 63, c.width));
+                self.set_queue_size(&row, 0);
+            }
+        }
+        self.set_queue_size(&c.scoped, n);
     }
 
     /// Set a dynamic array's length, dropping any element storage past the
@@ -2282,6 +2436,45 @@ impl Simulator {
                     if !good {
                         ok = false;
                         break;
+                    }
+                }
+            }
+            // §7.4.5: rows with fixed dimensions (`foreach (a[i, j, k])` on
+            // `T a[][2][3]`): every loop variable walks its dimension.
+            CollKind::Dyn if matches!(c.row_tail, Some(RowTail::Fixed(_))) => {
+                let mut dims = vec![(0, self.coll_outer_size(c) as i64 - 1)];
+                if let Some(RowTail::Fixed(inner)) = &c.row_tail {
+                    dims.extend_from_slice(inner);
+                }
+                dims.truncate(idx_names.len().max(1));
+                if dims.iter().any(|&(lo, hi)| hi < lo) {
+                    return true;
+                }
+                let mut at: Vec<i64> = dims.iter().map(|d| d.0).collect();
+                loop {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    for (d, n) in idx_names.iter().take(dims.len()).enumerate() {
+                        if let Some(n) = n {
+                            frame.insert(n.clone(), Self::signed_loop_val(at[d]));
+                        }
+                    }
+                    self.push_local_frame(frame);
+                    let good = self.item_holds(handle, body);
+                    self.pop_local_frame();
+                    if !good {
+                        return false;
+                    }
+                    let mut d = dims.len();
+                    loop {
+                        if d == 0 {
+                            return true;
+                        }
+                        d -= 1;
+                        if at[d] < dims[d].1 {
+                            at[d] += 1;
+                            break;
+                        }
+                        at[d] = dims[d].0;
                     }
                 }
             }

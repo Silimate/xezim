@@ -898,6 +898,23 @@ impl Simulator {
         left: &Expression,
         right: &Expression,
     ) -> Option<bool> {
+        // §5.7.1: an unsized `'0`/`'1` fills the width of its context, which
+        // the integer leaves below cannot express (`y == '1` compared with
+        // 1); the ordinary evaluation sizes it.
+        let mut fill = false;
+        for side in [left, right] {
+            Self::walk_operands(side, &mut |x| {
+                if matches!(
+                    x.kind,
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(_))
+                ) {
+                    fill = true;
+                }
+            });
+        }
+        if fill {
+            return None;
+        }
         let (mut ll, mut rl) = (Vec::new(), Vec::new());
         let (lw, ls) = self.exact_leaves(left, &mut ll)?;
         let (rw, rs) = self.exact_leaves(right, &mut rl)?;

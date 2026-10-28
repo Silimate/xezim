@@ -843,3 +843,54 @@ endmodule
     }
     assert_eq!(fst.end_time, 4);
 }
+
+/// `--fst-repack`: the finished dump is gzip-wrapped in an FST `ZWRAPPER`
+/// block (GTKWave's repack-on-close). The file starts with the wrapper's
+/// type byte, and a reader inflates it on open to the same hierarchy and
+/// value changes as the plain dump.
+#[test]
+fn fst_repack_wraps_the_dump_and_reads_back() {
+    let src = "module top;\n\
+               \x20 reg clk = 0; reg [7:0] cnt = 0;\n\
+               \x20 always #5 clk = ~clk;\n\
+               \x20 always @(posedge clk) cnt <= cnt + 3;\n\
+               \x20 initial #100 $finish;\n\
+               endmodule\n";
+    let dir = std::env::temp_dir().join(format!("xezim_fst_repack_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let design = dir.join("top.sv");
+    std::fs::write(&design, src).unwrap();
+    let run = |args: &[&str], out: &PathBuf| {
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .arg(&design)
+            .args(["--simulate", "-s", "top", "--no-cache", "--fst"])
+            .arg(out)
+            .args(args)
+            .output()
+            .expect("run xezim");
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    };
+    let plain = dir.join("plain.fst");
+    let packed = dir.join("packed.fst");
+    run(&[], &plain);
+    run(&["--fst-repack=4"], &packed);
+    let head = std::fs::read(&packed).unwrap();
+    assert_eq!(head[0], 254, "packed dump does not start with a ZWRAPPER block");
+    assert_ne!(std::fs::read(&plain).unwrap()[0], 254);
+    assert!(
+        head.len() < std::fs::metadata(&plain).unwrap().len() as usize + 64,
+        "the wrapper should not grow a tiny dump by more than its headers"
+    );
+    let a = decode(&plain);
+    let b = decode(&packed);
+    assert_eq!(a.paths(), b.paths());
+    assert_eq!(a.timeline("top.cnt"), b.timeline("top.cnt"));
+    // Ten rising edges before `$finish` at 100: 10 * 3 = 30.
+    assert_eq!(b.timeline("top.cnt").last().map(|(_, v)| v.as_str()), Some("00011110"));
+    assert_eq!((a.start_time, a.end_time), (b.start_time, b.end_time));
+    let _ = std::fs::remove_dir_all(&dir);
+}

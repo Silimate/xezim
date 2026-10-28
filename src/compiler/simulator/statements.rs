@@ -105,6 +105,38 @@ impl Simulator {
         }
     }
 
+    /// Leaf width of the class member `<h>#d` declared with dynamic or
+    /// queue rows (`T d[][]`, `T d[][$]`), when `name` is that member.
+    pub(super) fn class_dyn_row_width(&self, name: &str) -> Option<u32> {
+        let (h, prop) = name.split_once('#')?;
+        if prop.contains('[') || prop.contains('.') {
+            return None;
+        }
+        let handle = h.parse::<usize>().ok()?;
+        let cd = self.class_prop_declarer(handle, prop)?;
+        let tail = cd.dynamic_tail_properties.get(prop)?;
+        matches!(
+            tail.first(),
+            Some(
+                crate::ast::types::UnpackedDimension::Unsized(_)
+                    | crate::ast::types::UnpackedDimension::Queue { .. }
+            )
+        )
+        .then(|| {
+            self.spec_member_elem_width(&cd, handle, prop)
+                .or_else(|| cd.queue_properties.get(prop).map(|&(w, _)| w))
+                .unwrap_or(32)
+                .max(1)
+        })
+    }
+
+    /// Drop every element of the row collection `row` (`<h>#d[i]`).
+    pub(super) fn clear_dyn_row(&mut self, row: &str) {
+        for key in self.signals.keys_with_elem_prefix(&format!("{}[", row)) {
+            self.signals.remove(&key);
+        }
+    }
+
     /// The declared associative tail below a dynamic outer array, scoped to
     /// a local, object property, or unpacked-struct member (§7.4.5).
     #[cold]
@@ -294,6 +326,24 @@ impl Simulator {
                 if i < keep && src.as_deref() != Some(name) {
                     self.queue_copy_elem(src.as_deref().unwrap(), i, name, i);
                 }
+            }
+            self.set_queue_size(name, n);
+            return;
+        }
+        // §7.4.5: a class member `T d[][]` (dynamic rows): each element is
+        // a collection of its own, empty until `d[i] = new[m]` sizes it.
+        if let Some(w) = self.class_dyn_row_width(name) {
+            let keep = if src.as_deref() == Some(name) {
+                self.get_queue_size(name).min(n)
+            } else {
+                0
+            };
+            for i in keep..n {
+                let row = format!("{}[{}]", name, i);
+                self.clear_dyn_row(&row);
+                self.module.dynamic_arrays.insert(row.clone());
+                self.module.arrays.insert(row.clone(), (0, 63, w));
+                self.set_queue_size(&row, 0);
             }
             self.set_queue_size(name, n);
             return;
@@ -903,7 +953,12 @@ impl Simulator {
                 // single-var key-scan below would leave the inner
                 // index X and mis-parse `i][j` composite keys.
                 if vars.len() >= 2 {
-                    if let Some(dims) = self.foreach_dims(&an) {
+                    if let Some(mut dims) = self.foreach_dims(&an) {
+                        // A dynamic outer dimension (`T a[][N]`) iterates
+                        // its current size, not the 64-slot buffer.
+                        if self.module.dynamic_arrays.contains(&an) {
+                            dims[0] = (0, self.get_queue_size(&an) as i64 - 1);
+                        }
                         if dims.len() >= vars.len() {
                             self.exec_foreach_nested(
                                 &dims[..vars.len()],

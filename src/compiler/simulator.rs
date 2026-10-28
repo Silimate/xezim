@@ -308,7 +308,8 @@ const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3049;
 /// The fork's own part of that salt, hashed after it: a fork patch that
 /// changes compiled methods bumps this one, so upstream's salt line merges
 /// untouched. 1: a compiled `super.m(...)` takes the parent's formal widths.
-const METHOD_CACHE_FORK_SALT: u64 = 1;
+/// 2: `this` properties carry their declared widths into shifts and stores (§11.6.1).
+const METHOD_CACHE_FORK_SALT: u64 = 2;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

@@ -897,3 +897,5 @@ mod rand_typedef_handle;
 mod randomize_countones_wide;
 #[path = "classes/ref_formal_array_of_collections_row.rs"]
 mod ref_formal_array_of_collections_row;
+#[path = "classes/class_scoped_static_queue_copy.rs"]
+mod class_scoped_static_queue_copy;

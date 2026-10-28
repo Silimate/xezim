@@ -590,3 +590,5 @@ mod unpacked_array_parameter_reference;
 mod array_parameter_imported_dimension;
 #[path = "types/packed_package_parameter_element.rs"]
 mod packed_package_parameter_element;
+#[path = "types/module_struct_localparam_first_instance.rs"]
+mod module_struct_localparam_first_instance;

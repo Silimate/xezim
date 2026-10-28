@@ -319,6 +319,18 @@ impl Simulator {
             for cd in self.module.classes.values() {
                 scope_prefixes.extend(cd.typedef_targets.keys().cloned());
             }
+            let mut param_sized_typedefs: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                param_sized_typedefs.extend(
+                    cd.typedef_targets
+                        .iter()
+                        .filter(|(_, dt)| {
+                            matches!(dt, DataType::IntegerVector { dimensions, .. } if !dimensions.is_empty())
+                                && !Self::packed_dims_are_literal(dt)
+                        })
+                        .map(|(n, _)| n.clone()),
+                );
+            }
             let mut ident_slow: HashSet<String> = HashSet::default();
             ident_slow.extend(statics.iter().cloned());
             ident_slow.extend(vif_props.iter().cloned());
@@ -356,6 +368,7 @@ impl Simulator {
                 alias_typedefs,
                 scoped_typedefs,
                 scope_prefixes,
+                param_sized_typedefs,
                 param_first,
                 params,
                 assoc_props,
@@ -1014,6 +1027,42 @@ impl Simulator {
             meta_bloom,
             meta_bits,
             vif_absent: std::cell::Cell::new((usize::MAX, false)),
+        }
+    }
+
+    /// Width of formal type `dt` of method class `cname` called on `handle`,
+    /// when the type is sized by the class's parameters (see
+    /// `class_scoped_decl_width`). Formals bind before the callee's
+    /// specialization is installed, so it is seeded from the object here.
+    pub(super) fn class_formal_width(
+        &mut self,
+        handle: usize,
+        cname: &str,
+        dt: &DataType,
+    ) -> Option<u32> {
+        if !self.may_be_class_param_sized(dt) {
+            return None;
+        }
+        let saved = self.seed_callee_spec_from_instance(handle, cname);
+        self.class_context_stack.push(Some(cname.to_string()));
+        let w = self.class_scoped_decl_width(dt);
+        self.class_context_stack.pop();
+        self.restore_spec_pooled(saved);
+        w
+    }
+
+    /// A packed type whose width may come from class parameters: non-literal
+    /// packed dimensions, or a class typedef of such a range.
+    pub(super) fn may_be_class_param_sized(&mut self, dt: &DataType) -> bool {
+        match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                !dimensions.is_empty() && !Self::packed_dims_are_literal(dt)
+            }
+            DataType::TypeReference { name, .. } => self
+                .class_member_names()
+                .param_sized_typedefs
+                .contains(&name.name.name),
+            _ => false,
         }
     }
 
@@ -1719,7 +1768,32 @@ impl Simulator {
                     // derived from a CLASS type-param (not in module.parameters)
                     // isn't mis-resolved to `1` and truncates the caller's
                     // value.
-                    if matches!(&port.data_type, DataType::TypeReference { .. }) {
+                    let class_sized_w = if plain_class {
+                        None
+                    } else {
+                        self.class_formal_width(handle, &cname, &port.data_type)
+                    };
+                    if let Some(pw) = class_sized_w {
+                        // IEEE 1800-2017 §8.25: sized by this class's parameters
+                        // (`logic [W-1:0] a`, or a class typedef of that),
+                        // in the receiving object's specialization.
+                        val = if val.is_real {
+                            Self::real_to_int(val.to_f64(), pw)
+                        } else if pw != val.width {
+                            val.resize_for_assign(pw)
+                        } else {
+                            val
+                        };
+                        val.is_signed = plan.ports[i].signed;
+                        if val.has_xz()
+                            && super::elaborate::is_type_two_state_resolved(
+                                &port.data_type,
+                                &self.module.typedef_types,
+                            )
+                        {
+                            val = val.to_two_state();
+                        }
+                    } else if matches!(&port.data_type, DataType::TypeReference { .. }) {
                         if plain_class {
                             // A class handle is bound as passed.
                         } else if let Some((pw, signed)) =
@@ -1922,7 +1996,11 @@ impl Simulator {
                             // cell dropped the upper half. Register the width
                             // too so a later `retname = <narrow>` zero-extends
                             // back, mirroring a typed VarDecl.
-                            let rw = if plan.type_gen == self.type_tables_gen {
+                            let rw = if let Some(w) =
+                                self.class_formal_width(handle, &cname, &f.return_type)
+                            {
+                                w
+                            } else if plan.type_gen == self.type_tables_gen {
                                 rp.width
                             } else {
                                 super::elaborate::resolve_type_width(

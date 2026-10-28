@@ -1327,6 +1327,10 @@ impl Simulator {
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
                     }
+                    // §35.5.4: a DPI import declared in the package.
+                    if let Some(v) = self.exec_dpi_import_call_in(mname, args, None) {
+                        return v;
+                    }
                 }
                 // IEEE 1800-2023 §9.7: `process::self()` returns a handle to
                 // the CURRENT process — never null. xezim doesn't model the

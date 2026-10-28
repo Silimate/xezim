@@ -307,6 +307,17 @@ fn dpi_open_array_test() {
 }
 
 #[test]
+fn dpi_pkg_import_in_final_test() {
+    // §9.2.3 / §35.5.4: `pkg::f()` in a final procedure calls the package's
+    // DPI import.
+    assert_dpi_pass(
+        "tests/dpi/pkg_import_final.c",
+        "pkg_import_final",
+        "tests/dpi/pkg_import_final_test.sv",
+    );
+}
+
+#[test]
 fn dpi_vpi_backdoor_compliance_test() {
     let so = compile_dpi_lib(
         "tests/dpi/vpi_backdoor_compliance.c",

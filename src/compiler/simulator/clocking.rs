@@ -261,38 +261,16 @@ impl Simulator {
                         .and_then(|m| m.get(&sig))
                         .copied()
                         .unwrap_or(dskew);
-                    if skew > 0 && self.signal_name_to_id.contains_key(sig.as_str()) {
-                        self.commit_clocking_drive(&sig, &val, select, skew);
+                    if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
+                        if select.is_some() {
+                            self.commit_clocking_drive(&sig, &val, select, skew);
+                        } else {
+                            let v = self.fit_clocking_value(id, &val);
+                            self.schedule_delayed_with_delay(id, v, skew);
+                        }
                         continue;
                     }
-                    let val = match (select, self.signal_name_to_id.get(sig.as_str())) {
-                        (Some((lo, w)), Some(&id)) => {
-                            let mut merged = self.signal_table[id].clone();
-                            let bits = val.resize(w);
-                            for i in 0..w as usize {
-                                merged.set_bit_code(lo as usize + i, bits.get_bit_code(i));
-                            }
-                            merged
-                        }
-                        _ => val,
-                    };
-                    let lval = Expression::new(
-                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                            root: None,
-                            path: vec![crate::ast::expr::HierPathSegment {
-                                name: crate::ast::Identifier {
-                                    name: sig.clone(),
-                                    span: crate::ast::Span::dummy(),
-                                },
-                                selects: Vec::new(),
-                            }],
-                            span: crate::ast::Span::dummy(),
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
-                        }),
-                        crate::ast::Span::dummy(),
-                    );
-                    self.assign_value(&lval, &val);
+                    self.drive_clocking_net(&sig, &val);
                 }
             }
             // Refresh the input samples. IEEE 1800-2023 §14.4 input skew:

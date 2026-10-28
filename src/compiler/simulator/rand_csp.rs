@@ -1802,7 +1802,9 @@ impl Simulator {
             if c.is_object_elem && !c.nested && c.kind != CollKind::Assoc {
                 continue;
             }
-            if c.is_object_elem || c.nested {
+            if c.is_object_elem
+                || (c.nested && (c.row_tail.is_none() || c.kind == CollKind::Assoc))
+            {
                 return None;
             }
             if sized.contains(&c.prop) {
@@ -7455,10 +7457,11 @@ impl Simulator {
                 let Some((v, lo, w, whole)) = self.csp_slice_base_k(csp, x, &mut konst) else {
                     continue;
                 };
-                if w > 64 {
+                if w == 0 {
                     continue;
                 }
-                if whole && lo == 0 && w == csp.vars[v].width && !csp.wide.contains(&v) {
+                if whole && lo == 0 && w == csp.vars[v].width && w <= 64 && !csp.wide.contains(&v)
+                {
                     CSP_SCAN_POPS.with(|p| p.borrow_mut().push(v));
                 } else if csp.vars.len() + w as usize <= MAX_VARS {
                     let u = uses.entry(v).or_default();

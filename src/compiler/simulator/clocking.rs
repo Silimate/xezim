@@ -6,13 +6,9 @@ use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
     /// `(lo, hi)` of a fixed unpacked array named `name`, or None.
-    /// The span is capped so a clocking sample cannot walk a huge array.
     pub(super) fn unpacked_array_bounds(&self, name: &str) -> Option<(i64, i64)> {
         let &(lo, hi, _) = self.module.arrays.get(name)?;
-        if hi < lo || hi - lo > 4096 {
-            return None;
-        }
-        Some((lo, hi))
+        (hi >= lo).then_some((lo, hi))
     }
 
     /// The value a clocking input named `sig` contributes to this edge's

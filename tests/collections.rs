@@ -214,3 +214,5 @@ mod hierarchical_whole_array_assign;
 mod row_of_2d_array_assign;
 #[path = "collections/enclosing_value_parameter_specialization.rs"]
 mod enclosing_value_parameter_specialization;
+#[path = "collections/parameterized_vif_specialization_cast.rs"]
+mod parameterized_vif_specialization_cast;

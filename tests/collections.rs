@@ -204,3 +204,6 @@ mod review_package_collection_aliases;
 
 #[path = "collections/foreach_omitted_var_before_collection.rs"]
 mod foreach_omitted_var_before_collection;
+
+#[path = "collections/enclosing_value_parameter_specialization.rs"]
+mod enclosing_value_parameter_specialization;

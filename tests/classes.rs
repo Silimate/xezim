@@ -911,3 +911,5 @@ mod scalar_local_shadows_collection;
 mod forward_class_string_member_compare;
 #[path = "classes/struct_prop_nested_member_copy.rs"]
 mod struct_prop_nested_member_copy;
+#[path = "classes/output_formal_local_array_elem_member.rs"]
+mod output_formal_local_array_elem_member;

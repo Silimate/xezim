@@ -3992,6 +3992,82 @@ impl Simulator {
     /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
     /// form. `None` if neither the variable nor its base has a declared type.
+    /// The rows of the dynamic array `name` (`sz` of them) when each row is
+    /// itself an unpacked array: a fixed tail (`T a[][N]`, registered with a
+    /// 2-D or N-D shape) or dynamic rows (`T a[][]`, each row with its own
+    /// size). `None` for a dynamic array of scalars.
+    pub(super) fn render_p_dyn_rows(&mut self, name: &str, sz: u64) -> Option<Vec<String>> {
+        let inner: Option<Vec<(i64, i64)>> = self
+            .module
+            .arrays_2d
+            .get(name)
+            .map(|&(_, d2, _)| vec![d2])
+            .or_else(|| {
+                self.module
+                    .arrays_nd
+                    .get(name)
+                    .map(|(sh, _)| sh[1..].to_vec())
+            });
+        let dyn_rows = inner.is_none()
+            && (0..sz).any(|i| {
+                let row = format!("{}[{}]", name, i);
+                self.module.dynamic_arrays.contains(&row)
+                    || self
+                        .signals
+                        .contains_key(&Self::name_with_suffix(&row, ".size"))
+            });
+        if inner.is_none() && !dyn_rows {
+            return None;
+        }
+        let elem_dt = match self.class_member_coll_type(name) {
+            Some(dt) if !matches!(self.resolve_dt_ref(dt), DataType::TypeReference { .. }) => {
+                Some(dt.clone())
+            }
+            Some(_) => None,
+            None => self.p_elem_type(name),
+        };
+        let mut leaf = |me: &mut Self, key: &str| -> String {
+            match &elem_dt {
+                Some(dt) => me.render_p_typed(key, dt),
+                None => {
+                    let v = me
+                        .get_signal_value_by_name(key)
+                        .unwrap_or_else(|| Value::zero(32));
+                    Self::render_p_value(&v, false)
+                }
+            }
+        };
+        fn fixed(
+            me: &mut Simulator,
+            key: &str,
+            dims: &[(i64, i64)],
+            leaf: &mut dyn FnMut(&mut Simulator, &str) -> String,
+        ) -> String {
+            let Some((&(lo, hi), rest)) = dims.split_first() else {
+                return leaf(me, key);
+            };
+            let parts: Vec<String> = (lo..=hi)
+                .map(|i| fixed(me, &format!("{}[{}]", key, i), rest, leaf))
+                .collect();
+            format!("'{{{}}}", parts.join(", "))
+        }
+        let mut out = Vec::with_capacity(sz as usize);
+        for i in 0..sz {
+            let row = format!("{}[{}]", name, i);
+            out.push(match &inner {
+                Some(dims) => fixed(self, &row, dims, &mut leaf),
+                None => {
+                    let m = self.get_queue_size(&row);
+                    let parts: Vec<String> = (0..m)
+                        .map(|j| leaf(self, &format!("{}[{}]", row, j)))
+                        .collect();
+                    format!("'{{{}}}", parts.join(", "))
+                }
+            });
+        }
+        Some(out)
+    }
+
     pub(super) fn render_p_var(&mut self, name: &str) -> Option<String> {
         // Elements of a collection are nested leaves (`p_top_level`).
         if self.module.dynamic_arrays.contains(name)
@@ -4014,6 +4090,11 @@ impl Simulator {
                     .contains_key(&Self::name_with_suffix(name, ".size")))
         {
             let sz = self.get_queue_size(name);
+            // §7.4.5/§21.2.1.7: a dynamic outer dimension over unpacked rows
+            // (`T a[][N]`, `T a[][]`) lists each row as a nested list.
+            if let Some(rows) = self.render_p_dyn_rows(name, sz) {
+                return Some(format!("'{{{}}}", rows.join(", ")));
+            }
             // A LOCAL queue has no entry in `var_decl_types`, so `p_elem_type`
             // returns None; fall back to rendering each element from its stored
             // value (string elements quoted) instead of bailing to `x`.

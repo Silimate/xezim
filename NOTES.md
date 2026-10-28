@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A `foreach` constraint over an empty dynamic dimension (`std::randomize(b)
+  with { b.size() == 0; foreach (b[i, j]) ...; }` on `int b[][2]`) adds no
+  constraint again, so the call succeeds (§18.5.8.1, §12.7.3). Fork patch
+  over upstream 6539b4a4 and 270b39de; drop it when upstream skips empty
+  dynamic dimensions in the loop.
 * An `always_comb` that reads a whole struct and also writes one of its
   members (`out = s; s.a = s.a;`) is sensitive to the struct again, so a
   change to another member updates `out` (§9.2.2.2.1). Fork patch over
@@ -164,6 +169,73 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* White space, newlines included, may separate the size of a based literal
+  from its base and the base from its value (§5.7.1, §5.3). A space before
+  the apostrophe dropped the size with no message, so `2 'd1` was 32 bits
+  wide, `3 'd 9` read 9 and a concatenation holding one was 32 bits too
+  wide; a newline there was a parse error (#580, reported by git-hevangel).
+* A macro defined with arguments may have its actual-argument list on a
+  later line than its name, after blank lines or comments (§22.5.1). Each
+  such call was rejected as "requires parentheses" (#578, reported by
+  git-hevangel).
+* A UDP instance may omit its name after a bare delay (`my_mux #0 (z, a,
+  b, s);`, also from a macro), after a drive strength, and in a list
+  (§29.3, #579, reported by git-hevangel). Its delay may also be a
+  parameter (`#D`, which became an undelayed instance named `D`), a
+  `min:typ:max` value, or a `(rise, fall)` pair, whose fall value was
+  ignored (§28.16).
+* `$bits` in a constant expression has the width of a cast's target
+  (core #99, contributed by chenbhil), of a compound operand (an operator,
+  conditional, call, or a concatenation holding a cast or a signal) and of
+  an element or slice of a declared variable (`$bits(pk[2])` of
+  `logic [3:0][1:0] pk` is 2). Each was 0 or one bit, so a declaration
+  sized by it was one bit wide (§20.6.2).
+* `h.p`, with `p` redeclared in a derived class, resolves by the static
+  type of `h` while another process is suspended in a subroutine whose
+  formal of another class type is also named `h` (§8.14). A UVM driver's
+  `item.accept_time` landed in `uvm_transaction`'s private copy while the
+  sequence waited in `finish_item` (#577, contributed by chenbhil).
+* A class member typed by a class type parameter randomizes in the type
+  the object binds (§8.25, §18.4). A `rand T beats[]` (dynamic, fixed,
+  queue or associative) bound to a wider type than `T`'s default solved its
+  elements at the default width, so a constraint on a field of the element
+  (`beats[0].en == 1`, also under `foreach`, `dist`, `soft` or an
+  implication) failed randomize(); a `rand T h` bound to a class was drawn
+  as a number instead of randomizing the object, which left the handle
+  dangling; `o.h = new()` and `o.arr[0] = new()` from outside the class
+  built an object of class `T`; and a packed 2-D property through the
+  parameter dropped element writes (#576).
+* A class member with a dynamic or queue outer dimension over unpacked rows
+  (`bit [7:0] raw[][2]`, `int q3[][2][3]`, `T cells[$][2]`, `int d[][]`)
+  works (§7.4.5, §7.5, §18.4). It was a dynamic array of scalars:
+  `o.raw[0][1] = 9` wrote nothing, `d[1] = new[3]` left one scalar row, a
+  two-variable `foreach` saw no elements, the copy constructor dropped the
+  rows, and a constraint on a row element (`cells[0][0].en == 1`,
+  `d[i].size() == i + 1`, `foreach (q3[i, j, k])`) failed randomize(). Each
+  object now shapes the member like a module-scope declaration of the same
+  form, and the joint solver solves the outer size, then each row's size,
+  then the elements (#576). `%p` of such a member, and of a module-scope
+  variable of the same shapes, lists each row as a nested list; it printed
+  `'{0, 0}`.
+* `std::randomize` of a variable with a dynamic or queue outer dimension
+  over unpacked rows (`bit [7:0] raw[][2]`, `int d[][]`), at module scope
+  or as a task local, solves (§18.12, §7.4.5). The scope solve split
+  `raw[][2]` into rows over its 64-slot buffer, so `raw.size() == 2` read 64
+  and failed, and took `int d[][]` for a dynamic array of scalars. The
+  outer size, then each dynamic row's size (`d[i].size()`), are solved
+  before the elements.
+* An unsized `'1` or `'0` in a constraint fills the width of the other
+  operand (§5.7.1, §18.3). The joint solver and the constraint check took
+  `'1` as the 1-bit value 1, so `y == '1` on an 8-bit `y` gave `8'h01` and
+  `y != '1` admitted `8'hff`, in class constraints and `std::randomize`.
+* A cast to a typedef in a constant expression takes the typedef's width
+  and signing (§6.24.1): `localparam int A = q_t'(45)` with a 4-bit `q_t`
+  is 13, and the same holds for a declared width, a generate `if` or
+  `case`, a header parameter default and a parameter override. It works
+  for package and `$unit` typedefs, a child's own typedefs, and the type
+  parameters of a module, the root included. A `$unit` constant function
+  casts to the `$unit` typedef even when the calling instance declares one
+  of the same name (core #98 and #575, contributed by chenbhil).
 * The coverage results file (`XEZIM_COV_DB`) names a labelled `assert`,
   `assume` or `cover` site: `"name": "c_hit"` for `c_hit: cover property
   (...)` (§16.5, §16.14), so a tool matching cover points to a verification
@@ -355,11 +427,23 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Build**
 
+* xezim-core moves to zstd 0.14 (core #100): zstd 0.13 and zstd-safe 7
+  carry RustSec advisories (RUSTSEC-2026-0391, -0395 to -0406) that fail
+  `cargo deny` and OSV-Scanner on every build. None was reachable; the
+  compressed format is unchanged.
 * The compiled-artifact, prepared-comb and method-cache formats are encoded
   with bincode 2 (serde, standard configuration) instead of the unmaintained
   bincode 1.x (RUSTSEC-2025-0141). Artifacts written by earlier versions are
   refused with the usual "recompile with current xezim" message; the caches
   are rebuilt (#531, core #87).
+
+**Command line**
+
+* `--fst-repack[=N]` gzip-wraps the finished FST dump on a clean close, as
+  GTKWave's repack-on-close does (deflate level N, 1..9, default 6): about
+  1.5x smaller on top of the per-block LZ4, at the cost of one pass over
+  the file at close and an inflate on open. A run that dies earlier leaves
+  the unwrapped, crash-safe dump as before.
 
 ### 0.11.3 — hierarchy, interfaces, assertions and collection correctness (October 2026)
 

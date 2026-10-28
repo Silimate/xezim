@@ -53,6 +53,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--fst <file>` | Emit an FST (GTKWave binary) waveform dump |
 | `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable). `LEVEL:<hier>` limits the depth: `1:top.u1` dumps only `top.u1`'s own signals, `2:top.u1` one level of children too, and `0:` or no prefix every level (§21.7.1.4) |
 | `-fst_scope_file <file>` (also `--fst-scope-file`, `=` form) | FST scopes from a file, each optionally `LEVEL:SCOPE`: one or more per line, separated by spaces or commas, with `#` or `//` comments. Each adds a `--fst-scope`. Works in `-f`/`-F` files, where a relative path resolves as given, else next to the args file |
+| `--fst-repack[=N]` | gzip-wrap the finished FST dump on a clean close, as GTKWave's repack-on-close does (deflate level `N`, 1..9, default 6). About 1.5x smaller on top of the per-block LZ4; readers inflate it on open. A run that dies before the close leaves the unwrapped, crash-safe dump |
 | `-xezim_env <file>` (also `--xezim-env`, `=` form) | Set `XEZIM_*` variables from a file before xezim reads any of them: `NAME=value`, `export NAME=value`, `setenv NAME value`, `NAME value`, `unsetenv NAME`; `#`/`//` comments, quoted values. Values override the shell; several files apply in order. Command line only (an args file is read too late) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |

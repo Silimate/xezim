@@ -470,6 +470,11 @@ struct Csp {
     /// the constraints write, with their bounds outermost first. Their rows
     /// (all but the last dimension indexed) are `arrays` entries.
     nd_dims: HashMap<String, Vec<(i64, i64)>>,
+    /// Of `nd_dims`' arrays, the number of leading dimensions that are
+    /// dynamic, stored as `(0, size - 1)`: `(0, -1)` there is empty, not a
+    /// descending range. Fork patch; drop it when upstream skips empty
+    /// dynamic dimensions in a `foreach` constraint.
+    nd_dyn: HashMap<String, usize>,
     srcs: Vec<Src>,
     nodes: Vec<Node>,
     /// None enables all preferences; otherwise only the selected instances.
@@ -921,33 +926,44 @@ impl Simulator {
         // their own (`csp_size_phase`); the elements are then solved with
         // the arrays at those sizes. A size that leaves the elements without
         // a solution is drawn again a few times.
-        let sized: HashSet<String> = if subs.is_empty() {
-            colls
-                .iter()
-                .filter(|c| Self::csp_size_solved(c, constraints))
-                .map(|c| c.prop.clone())
-                .collect()
+        // §7.4.5: the rows of a dynamic member over unpacked rows exist only
+        // at its current size; they are expanded again whenever it changes,
+        // and their own sizes (`a[i].size()`) are solved once they exist.
+        let has_rows = colls.iter().any(|c| c.row_tail.is_some());
+        let mut cur: Vec<RandColl> = if has_rows {
+            self.csp_expand_rows(colls)
         } else {
-            HashSet::default()
+            colls.to_vec()
         };
-        let solve = |me: &mut Self| {
-            me.rand_csp_solve_sized(
+        let sized_of = |cs: &[RandColl]| -> HashSet<String> {
+            if subs.is_empty() {
+                cs.iter()
+                    .filter(|c| Self::csp_size_solved(c, constraints))
+                    .map(|c| c.prop.clone())
+                    .collect()
+            } else {
+                HashSet::default()
+            }
+        };
+        let mut sized = sized_of(&cur);
+        if sized.is_empty() {
+            return self.rand_csp_solve_sized(
                 handle,
                 constraints,
                 constraint_depth,
                 rand_props,
                 signed_props,
                 enum_props,
-                colls,
+                &cur,
                 array_enums,
                 strict,
                 subs,
-            )
-        };
-        if sized.is_empty() {
-            return solve(self);
+            );
         }
-        for _ in 0..4 {
+        let mut rounds = 0;
+        let mut solves = 0;
+        while rounds < 8 && solves < 4 {
+            rounds += 1;
             match self.csp_size_phase(
                 handle,
                 constraints,
@@ -955,12 +971,20 @@ impl Simulator {
                 rand_props,
                 signed_props,
                 enum_props,
-                colls,
+                &cur,
                 array_enums,
                 &sized,
             ) {
                 Ok(sizes) => {
+                    let sizes: Vec<(RandColl, u64)> =
+                        sizes.into_iter().map(|(c, n)| (c.clone(), n)).collect();
                     for (c, n) in sizes {
+                        if c.row_tail.is_some() {
+                            // Its elements are rows, not values.
+                            self.resize_row_owner(&c, n);
+                            self.module.dynamic_arrays.insert(c.scoped.clone());
+                            continue;
+                        }
                         self.resize_coll(&c.scoped, n);
                         self.module.dynamic_arrays.insert(c.scoped.clone());
                         let signed = self.class_prop_signed_of(handle, &c.prop);
@@ -984,13 +1008,52 @@ impl Simulator {
                 // Not modelled: the sizes the caller drew stay, and the
                 // outcome proves nothing about other sizes.
                 Err(_) => {
-                    return match solve(self) {
+                    if has_rows {
+                        cur = self.csp_expand_rows(colls);
+                    }
+                    return match self.rand_csp_solve_sized(
+                        handle,
+                        constraints,
+                        constraint_depth,
+                        rand_props,
+                        signed_props,
+                        enum_props,
+                        &cur,
+                        array_enums,
+                        strict,
+                        subs,
+                    ) {
                         CspOutcome::Unsat => CspOutcome::GaveUp,
                         o => o,
                     };
                 }
             }
-            match solve(self) {
+            if has_rows {
+                // New rows may have sizes of their own to solve first.
+                let next = self.csp_expand_rows(colls);
+                let next_sized = sized_of(&next);
+                let fresh = next_sized.iter().any(|n| {
+                    !sized.contains(n) && next.iter().any(|c| &c.prop == n && c.nd_base.is_some())
+                });
+                cur = next;
+                sized = next_sized;
+                if fresh {
+                    continue;
+                }
+            }
+            solves += 1;
+            match self.rand_csp_solve_sized(
+                handle,
+                constraints,
+                constraint_depth,
+                rand_props,
+                signed_props,
+                enum_props,
+                &cur,
+                array_enums,
+                strict,
+                subs,
+            ) {
                 CspOutcome::Unsat | CspOutcome::GaveUp => {}
                 o => return o,
             }
@@ -998,20 +1061,131 @@ impl Simulator {
         CspOutcome::GaveUp
     }
 
+    /// `colls` with the rows of every member over unpacked rows
+    /// (`RandColl::row_tail`) at its current size: a fixed row as a fixed
+    /// array, a dynamic row as a dynamic array, each keyed under the
+    /// member's multi-dimensional shape (`nd_base`).
+    pub(super) fn csp_expand_rows(&self, colls: &[RandColl]) -> Vec<RandColl> {
+        let mut out = Vec::with_capacity(colls.len());
+        for c in colls {
+            out.push(c.clone());
+            let Some(tail) = &c.row_tail else {
+                continue;
+            };
+            let shape = self.csp_row_owner_shape(c);
+            let n = self.get_queue_size(&c.scoped) as i64;
+            match tail {
+                RowTail::Fixed(inner) => {
+                    let Some(&(lo, hi)) = inner.last() else {
+                        continue;
+                    };
+                    let mut prefixes: Vec<String> = (0..n).map(|i| format!("[{}]", i)).collect();
+                    for &(l, r) in &inner[..inner.len() - 1] {
+                        prefixes = prefixes
+                            .iter()
+                            .flat_map(|p| (l..=r).map(move |j| format!("{}[{}]", p, j)))
+                            .collect();
+                    }
+                    for p in prefixes {
+                        out.push(RandColl {
+                            prop: format!("{}{}", c.prop, p),
+                            scoped: format!("{}{}", c.scoped, p),
+                            kind: CollKind::Fixed,
+                            width: c.width,
+                            lo,
+                            hi,
+                            nested: false,
+                            is_object_elem: c.is_object_elem,
+                            nd_base: Some((c.prop.clone(), shape.clone())),
+                            row_tail: None,
+                        });
+                    }
+                }
+                RowTail::Dyn => {
+                    for i in 0..n {
+                        out.push(RandColl {
+                            prop: format!("{}[{}]", c.prop, i),
+                            scoped: format!("{}[{}]", c.scoped, i),
+                            kind: CollKind::Dyn,
+                            width: c.width,
+                            lo: 0,
+                            hi: 0,
+                            nested: false,
+                            is_object_elem: c.is_object_elem,
+                            nd_base: Some((c.prop.clone(), shape.clone())),
+                            row_tail: None,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The multi-dimensional shape the joint solver walks for a member over
+    /// unpacked rows: its current size, then a fixed row's dimensions or
+    /// the longest dynamic row.
+    pub(super) fn csp_row_owner_shape(&self, c: &RandColl) -> Vec<(i64, i64)> {
+        let n = self.get_queue_size(&c.scoped) as i64;
+        let mut shape = vec![(0, n - 1)];
+        match &c.row_tail {
+            Some(RowTail::Fixed(inner)) => shape.extend_from_slice(inner),
+            Some(RowTail::Dyn) => {
+                let m = (0..n)
+                    .map(|i| self.get_queue_size(&format!("{}[{}]", c.scoped, i)) as i64)
+                    .max()
+                    .unwrap_or(0);
+                shape.push((0, m - 1));
+            }
+            None => {}
+        }
+        shape
+    }
+
     /// Whether the size phase decides the size of `c`: a dynamic array of
     /// values whose `size()` some constraint reads.
     pub(super) fn csp_size_solved(c: &RandColl, constraints: &[ClassConstraint]) -> bool {
-        if c.kind != CollKind::Dyn || c.nested || c.is_object_elem {
+        if c.kind != CollKind::Dyn || (c.nested && c.row_tail.is_none()) || c.is_object_elem {
             return false;
         }
+        // §7.4.5: a row (`a[1]` of `T a[][]`) is named by an index on its
+        // base: a literal one equal to the row's, or a loop variable.
+        let row_index: Option<(&str, i64)> = c.nd_base.as_ref().and_then(|(b, _)| {
+            let i = c
+                .prop
+                .strip_prefix(b.as_str())?
+                .strip_prefix('[')?
+                .strip_suffix(']')?;
+            Some((b.as_str(), i.parse().ok()?))
+        });
         let names = |e: &Expression| match &Self::unparen(e).kind {
-            ExprKind::Ident(h) => {
+            ExprKind::Ident(h) if row_index.is_none() => {
                 h.root.is_none()
                     && h.path.last().is_some_and(|s| s.name.name == c.prop)
                     && h.path.iter().all(|s| s.selects.is_empty())
                     && h.path.len() <= 2
             }
-            ExprKind::MemberAccess { member, .. } => member.name == c.prop,
+            ExprKind::MemberAccess { member, .. } if row_index.is_none() => member.name == c.prop,
+            ExprKind::Index { expr, index } => row_index.is_some_and(|(b, i)| {
+                let base_ok = match &Self::unparen(expr).kind {
+                    ExprKind::Ident(h) => {
+                        h.root.is_none()
+                            && h.path.last().is_some_and(|s| s.name.name == b)
+                            && h.path.iter().all(|s| s.selects.is_empty())
+                            && h.path.len() <= 2
+                    }
+                    ExprKind::MemberAccess { member, .. } => member.name == b,
+                    _ => false,
+                };
+                let idx_ok = match &Self::unparen(index).kind {
+                    ExprKind::Number(_) => {
+                        crate::compiler::elaborate::const_eval_i64_with_params(index, None)
+                            .is_some_and(|k| k == i)
+                    }
+                    _ => true,
+                };
+                base_ok && idx_ok
+            }),
             _ => false,
         };
         let mut hit = false;
@@ -1332,6 +1506,7 @@ impl Simulator {
             scalars: HashMap::default(),
             arrays: HashMap::default(),
             nd_dims: HashMap::default(),
+            nd_dyn: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
             soft_enabled: None,
@@ -1423,6 +1598,7 @@ impl Simulator {
             );
         }
         csp.nd_dims = self.rand_scope_nd.clone();
+        csp.nd_dyn = self.rand_scope_nd_dyn.clone();
         for (name, lv, w, s, members) in scalars {
             if *w == 0 || csp.arrays.contains_key(name) {
                 return Err(CspOutcome::NotApplicable);
@@ -1536,6 +1712,7 @@ impl Simulator {
             scalars: HashMap::default(),
             arrays: HashMap::default(),
             nd_dims: HashMap::default(),
+            nd_dyn: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
             soft_enabled: None,
@@ -1581,12 +1758,27 @@ impl Simulator {
             if let Some((base, dims)) = &c.nd_base {
                 csp.nd_dims.insert(base.clone(), dims.clone());
             }
+            // §7.4.5: a member whose elements are rows contributes its shape
+            // (and its size, while sizes are solved); the rows carry the
+            // values.
+            if c.row_tail.is_some() {
+                csp.nd_dims
+                    .entry(c.prop.clone())
+                    .or_insert_with(|| self.csp_row_owner_shape(c));
+                csp.nd_dyn.insert(
+                    c.prop.clone(),
+                    if matches!(c.row_tail, Some(RowTail::Dyn)) { 2 } else { 1 },
+                );
+                if !sized.contains(&c.prop) {
+                    continue;
+                }
+            }
             // §18.5.9: the objects of an array of rand handles are no
             // values; they join as sub-objects (`csp_add_sub`).
             if c.is_object_elem && !c.nested && c.kind != CollKind::Assoc {
                 continue;
             }
-            if c.is_object_elem || c.nested || c.kind == CollKind::Assoc {
+            if c.is_object_elem || (c.nested && c.row_tail.is_none()) || c.kind == CollKind::Assoc {
                 return None;
             }
             if sized.contains(&c.prop) {
@@ -3524,10 +3716,9 @@ impl Simulator {
                     continue;
                 }
                 let sig = cd.properties.get(&name)?;
-                let is_obj = sig
-                    .type_name
-                    .as_ref()
-                    .is_some_and(|tn| self.module.classes.contains_key(tn));
+                // §8.25: a member typed by a type parameter bound to a class
+                // is a handle too.
+                let is_obj = self.prop_class_type(sub, &name).is_some();
                 // §18.5.9: a rand object member joins the solve as a
                 // sub-object of its own (`rand_csp_nested_subs`).
                 if is_obj
@@ -3660,7 +3851,7 @@ impl Simulator {
     }
 
     /// Visit `it` and every item nested in it.
-    fn csp_item_walk(it: &ConstraintItem, f: &mut dyn FnMut(&ConstraintItem)) {
+    pub(super) fn csp_item_walk(it: &ConstraintItem, f: &mut dyn FnMut(&ConstraintItem)) {
         f(it);
         match it {
             ConstraintItem::Implication { constraint, .. } => Self::csp_item_walk(constraint, f),
@@ -4165,17 +4356,26 @@ impl Simulator {
                         && let Some(dims) = csp.nd_dims.get(&base).cloned()
                         && consts.len() + vars.len() <= dims.len()
                     {
+                        // A dynamic dimension is `(0, size - 1)`: one that is
+                        // empty gives the loop no iteration (§12.7.3), where
+                        // sorting its bounds walked -1 and 0.
+                        let ndyn = csp.nd_dyn.get(&base).copied().unwrap_or(0);
                         let loops: Vec<(Option<String>, i64, i64)> = vars
                             .iter()
                             .enumerate()
                             .map(|(j, v)| {
-                                let (l, r) = dims[consts.len() + j];
-                                (v.as_ref().map(|v| v.name.clone()), l.min(r), l.max(r))
+                                let d = consts.len() + j;
+                                let (l, r) = dims[d];
+                                let (lo, hi) = if d < ndyn { (0, r) } else { (l.min(r), l.max(r)) };
+                                (v.as_ref().map(|v| v.name.clone()), lo, hi)
                             })
                             .collect();
                         let count = loops
                             .iter()
-                            .try_fold(1u64, |n, l| n.checked_mul((l.2 - l.1 + 1) as u64))?;
+                            .try_fold(1u64, |n, l| n.checked_mul((l.2 - l.1 + 1).max(0) as u64))?;
+                        if count == 0 {
+                            return Some(Node::True);
+                        }
                         if count > 4096 {
                             return None;
                         }
@@ -5217,6 +5417,18 @@ impl Simulator {
         if w > 64 {
             return fallback(self, csp);
         }
+        // §5.7.1: an unsized `'0`/`'1` fills the width of its context; as a
+        // 1-bit constant, `y == '1` solved as `y == 1`.
+        let fill = |e: &Expression, ae: Ae| match &Self::unparen(e).kind {
+            ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('1')) => {
+                Ae::Const(Value::from_u64(u64::MAX >> (64 - w), w))
+            }
+            ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('0')) => {
+                Ae::Const(Value::zero(w))
+            }
+            _ => ae,
+        };
+        let (a, b) = (fill(left, a), fill(right, b));
         let s = sl && sr;
         let mut fits = Vec::new();
         let mut cx = LinCx::new(csp);
@@ -6192,7 +6404,10 @@ impl Simulator {
             && args.is_empty()
             && let ExprKind::MemberAccess { expr, member } = &func.kind
             && member.name == "size"
-            && let Some(&sv) = self.csp_member(csp, expr).and_then(|n| csp.sizes.get(&n))
+            && let Some(&sv) = self
+                .csp_member(csp, expr)
+                .or_else(|| self.csp_row_of(csp, expr, env))
+                .and_then(|n| csp.sizes.get(&n))
         {
             return Some(Self::csp_var_ae(csp, sv));
         }
@@ -6218,6 +6433,22 @@ impl Simulator {
                 if args.is_empty() && member.name == "size" {
                     if let Some(a) = self.csp_member(csp, expr).and_then(|n| csp.arrays.get(&n)) {
                         let mut v = Value::from_u64(a.elems.len() as u64, 32);
+                        v.is_signed = true;
+                        return Some(Ae::Const(v));
+                    }
+                    // §7.4.5: a row's size (`a[1].size()`), and the number
+                    // of rows of a member over rows (`a.size()`).
+                    let n = match self.csp_row_of(csp, expr, env) {
+                        Some(row) => csp.arrays.get(&row).map(|a| a.elems.len() as u64),
+                        None => self
+                            .csp_member(csp, expr)
+                            .filter(|n| !csp.arrays.contains_key(n))
+                            .and_then(|n| csp.nd_dims.get(&n))
+                            .and_then(|d| d.first())
+                            .map(|&(lo, hi)| (hi - lo + 1).max(0) as u64),
+                    };
+                    if let Some(n) = n {
+                        let mut v = Value::from_u64(n, 32);
                         v.is_signed = true;
                         return Some(Ae::Const(v));
                     }
@@ -6888,6 +7119,12 @@ impl Simulator {
         } else {
             // A sub-object's member is declared by the sub-object's class.
             let (owner, name) = Self::csp_owner(csp, name);
+            // A row of a multi-dimensional member (`a[1]`) has its
+            // element type (§7.4.5, #519).
+            let name = match name.split_once('[') {
+                Some((b, _)) if csp.nd_dims.contains_key(b) => b,
+                _ => name,
+            };
             if let Some(su) = self.class_prop_struct(owner, name) {
                 if !su.packed {
                     return None;
@@ -7718,6 +7955,21 @@ impl Simulator {
     /// names with constant indices (`a[i]` under a bound `i`, `a[i][j]`
     /// for a 3-D array): the base name followed by the indices, when a
     /// solver array of that name exists.
+    /// The row of a multi-dimensional solver array an index chain with
+    /// constant (or loop-bound) indices names (`a[1]`, `a[i]`).
+    fn csp_row_of(&mut self, csp: &Csp, e: &Expression, env: &Env) -> Option<String> {
+        if !matches!(e.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let mut konst = |me: &mut Self, x: &Expression| -> Option<i64> {
+            if !me.csp_free(csp, x, env) {
+                return None;
+            }
+            me.csp_const(x, env)?.to_i64()
+        };
+        self.csp_nd_row(csp, e, &mut konst)
+    }
+
     fn csp_nd_row(
         &mut self,
         csp: &Csp,

@@ -20,8 +20,8 @@ rand = "0.8"
 # `./scripts/use-local-core.sh` once (or use scripts/cargo-local.sh per
 # invocation) and plain `cargo build` uses it — no network, no git dep.
 # See "Modifying xezim-core" in README.md.
-xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "1947ac68859f823610c63833f61d52d6d7695342" }
-sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "1947ac68859f823610c63833f61d52d6d7695342" }
+xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "aad16e4d3bc37d96f78414268fd563ac6300dda7" }
+sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "aad16e4d3bc37d96f78414268fd563ac6300dda7" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"
@@ -67,7 +67,7 @@ fst-reader = "0.17"
 # `tests/xtrace_conformance.rs` reads a zstd-compressed XTrace dump back to
 # check that its header declares the compression (XTrace §6.8). Same version
 # xezim-core writes the stream with.
-zstd = "0.13"
+zstd = "0.14"
 
 [build-dependencies]
 cc = "1"

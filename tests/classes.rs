@@ -53,6 +53,8 @@ mod class_property_x_default;
 mod compiled_super_hidden_method_width;
 #[path = "classes/issue320_harness_mwe.rs"]
 mod issue320_harness_mwe;
+#[path = "classes/randomize_empty_dyn_foreach.rs"]
+mod randomize_empty_dyn_foreach;
 #[path = "classes/vif_specialization_keys.rs"]
 mod vif_specialization_keys;
 #[path = "classes/x_default_neighbours.rs"]
@@ -854,3 +856,13 @@ mod method_array_write_shadows_module_array;
 
 #[path = "classes/constructor_default_args_2023.rs"]
 mod constructor_default_args_2023;
+#[path = "classes/randomize_type_param_576.rs"]
+mod randomize_type_param_576;
+#[path = "classes/nested_dyn_members.rs"]
+mod nested_dyn_members;
+#[path = "classes/randomize_fill_literal.rs"]
+mod randomize_fill_literal;
+#[path = "classes/randomize_nested_dyn_scope.rs"]
+mod randomize_nested_dyn_scope;
+#[path = "classes/shadowed_member_same_named_formal.rs"]
+mod shadowed_member_same_named_formal;

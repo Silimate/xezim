@@ -42,8 +42,13 @@ impl Simulator {
                 return None;
             }
             if let Some(dt) = cd.property_types.get(prop) {
+                // §8.25: a property declared by a class type parameter
+                // (`rand T w;`, T = `logic [8:0][7:0]`) has the dimensions
+                // of the type this object binds to it; the declared `T`
+                // has none, so `o.w[1] = 7` wrote nothing (#576).
+                let bound = self.bind_type_params_in(dt, &|n| self.obj_type_param(handle, &c, n));
                 let dims = super::elaborate::packed_full_dims_chained(
-                    dt,
+                    bound.as_ref().unwrap_or(dt),
                     &self.module.parameters,
                     &self.module.typedef_types,
                 )?;
@@ -1673,7 +1678,7 @@ impl Simulator {
         items: &[crate::ast::decl::ConstraintItem],
         targets: &[(String, Expression)],
     ) -> rand_csp::CspOutcome {
-        let (scalars, arrays) = match self.std_randomize_vars(targets, false) {
+        let (scalars, arrays) = match self.std_randomize_vars(items, targets, false) {
             Ok(v) => v,
             Err(o) => return o,
         };
@@ -1698,8 +1703,8 @@ impl Simulator {
         items: &[crate::ast::decl::ConstraintItem],
         targets: &[(String, Expression)],
     ) -> Option<bool> {
-        let (scalars, arrays) = self.std_randomize_vars(targets, true).ok()?;
-        let sized: HashSet<String> = arrays
+        let (scalars, arrays) = self.std_randomize_vars(items, targets, true).ok()?;
+        let mut sized: HashSet<String> = arrays
             .iter()
             .filter(|a| {
                 (self.module.dynamic_arrays.contains(&a.1)
@@ -1713,7 +1718,27 @@ impl Simulator {
         if sized.is_empty() {
             return None;
         }
-        for _ in 0..4 {
+        let mut arrays = arrays;
+        let mut scalars = scalars;
+        for round in 0..6 {
+            if round > 0 && !self.rand_scope_row_owners.is_empty() {
+                // §7.4.5: rows created by the last round have sizes of
+                // their own to solve.
+                let (s2, a2) = self.std_randomize_vars(items, targets, true).ok()?;
+                sized = a2
+                    .iter()
+                    .filter(|a| {
+                        (self.module.dynamic_arrays.contains(&a.1)
+                            || self
+                                .signals
+                                .contains_key(&Self::name_with_suffix(&a.1, ".size")))
+                            && Self::items_read_size(items, &a.0)
+                    })
+                    .map(|a| a.0.clone())
+                    .collect();
+                scalars = s2;
+                arrays = a2;
+            }
             let sizes = match self.csp_scope_sizes(items, &scalars, &arrays, &sized) {
                 Ok(s) => s,
                 // A relaxation of the problem has no solution.
@@ -1723,7 +1748,27 @@ impl Simulator {
             for (name, n) in sizes {
                 if let Some(a) = arrays.iter().find(|a| a.0 == name) {
                     let key = a.1.clone();
-                    self.resize_random_dyn_target(&key, n);
+                    match self.rand_scope_row_owners.get(&key).copied() {
+                        // §7.4.5: its elements are rows; new dynamic rows
+                        // start empty, their sizes solved next round.
+                        Some(dyn_rows) => {
+                            let old = self.get_queue_size(&key);
+                            for i in n..old {
+                                let row = format!("{key}[{i}]");
+                                self.clear_dyn_row(&row);
+                                self.signals.remove(&format!("{row}.size"));
+                            }
+                            if dyn_rows {
+                                for i in old.min(n)..n {
+                                    let row = format!("{key}[{i}]");
+                                    self.module.dynamic_arrays.insert(row.clone());
+                                    self.set_queue_size(&row, 0);
+                                }
+                            }
+                            self.set_queue_size(&key, n);
+                        }
+                        None => self.resize_random_dyn_target(&key, n),
+                    }
                 }
             }
             if matches!(
@@ -1734,6 +1779,57 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Whether the dynamic `std::randomize` target stored at `key` (written
+    /// `written`) has dynamic rows (`T d[][]`): rows already sized, or a
+    /// constraint calling `size()` on a row, which only a dynamic array or
+    /// queue has (§7.5.2, §7.10.2).
+    pub(super) fn scope_dyn_rows(
+        &self,
+        key: &str,
+        written: &str,
+        items: &[crate::ast::decl::ConstraintItem],
+    ) -> bool {
+        let n = self.get_queue_size(key);
+        if (0..n).any(|i| {
+            let row = format!("{key}[{i}]");
+            self.module.dynamic_arrays.contains(&row)
+                || self
+                    .signals
+                    .contains_key(&Self::name_with_suffix(&row, ".size"))
+        }) {
+            return true;
+        }
+        let mut hit = false;
+        for it in items {
+            Self::csp_item_walk(it, &mut |i| {
+                let mut look = |e: &Expression| {
+                    Self::walk_operands(e, &mut |x| {
+                        if let ExprKind::Call { func, args } = &x.kind
+                            && args.is_empty()
+                            && let ExprKind::MemberAccess { expr, member } = &func.kind
+                            && member.name == "size"
+                            && let ExprKind::Index { expr: b, .. } = &expr.kind
+                            && let ExprKind::Ident(h) = &b.kind
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty()
+                            && h.path[0].name.name == written
+                        {
+                            hit = true;
+                        }
+                    })
+                };
+                match i {
+                    crate::ast::decl::ConstraintItem::Expr(e) => look(e),
+                    crate::ast::decl::ConstraintItem::Inside { expr, .. } => look(expr),
+                    crate::ast::decl::ConstraintItem::Implication { condition, .. }
+                    | crate::ast::decl::ConstraintItem::IfElse { condition, .. } => look(condition),
+                    _ => {}
+                }
+            });
+        }
+        hit
     }
 
     /// Whether some item reads `name.size()`.
@@ -1749,6 +1845,12 @@ impl Simulator {
             items: items.to_vec(),
             span: crate::ast::Span::dummy(),
         }];
+        // A row (`d[1]`) is named by an index on its base (§7.4.5).
+        let nd_base = name
+            .strip_suffix(']')
+            .and_then(|r| r.rsplit_once('['))
+            .filter(|(_, i)| i.parse::<i64>().is_ok())
+            .map(|(b, _)| (b.to_string(), Vec::new()));
         let c = RandColl {
             prop: name.to_string(),
             scoped: name.to_string(),
@@ -1758,7 +1860,8 @@ impl Simulator {
             hi: 0,
             nested: false,
             is_object_elem: false,
-            nd_base: None,
+            nd_base,
+            row_tail: None,
         };
         Self::csp_size_solved(&c, &wrapper)
     }
@@ -1769,6 +1872,7 @@ impl Simulator {
     #[allow(clippy::type_complexity)]
     pub(super) fn std_randomize_vars(
         &mut self,
+        items: &[crate::ast::decl::ConstraintItem],
         targets: &[(String, Expression)],
         empty: bool,
     ) -> Result<
@@ -1781,6 +1885,8 @@ impl Simulator {
         let mut scalars = Vec::new();
         let mut arrays = Vec::new();
         self.rand_scope_nd.clear();
+        self.rand_scope_row_owners.clear();
+        self.rand_scope_nd_dyn.clear();
         for (name, lv) in targets {
             let enum_vals = |me: &Self, n: &str| {
                 me.declared_enum_members(n)
@@ -1822,13 +1928,42 @@ impl Simulator {
                         None => self.signed_signals.contains(&nm),
                     };
                     let ev = enum_vals(self, &nm);
+                    // §7.4.5: a dynamic outer dimension (`T a[][N]`) has its
+                    // current size, not the 64-slot buffer; while sizes are
+                    // solved it is also a size-only array of its own.
+                    let mut dims = dims;
+                    let dyn_outer = self.module.dynamic_arrays.contains(&nm)
+                        || self
+                            .signals
+                            .contains_key(&Self::name_with_suffix(&nm, ".size"));
+                    if dyn_outer {
+                        let n = self.get_queue_size(&nm) as i64;
+                        dims[0] = (0, n - 1);
+                        self.rand_scope_row_owners.insert(nm.clone(), false);
+                        self.rand_scope_nd_dyn.insert(written.clone(), 1);
+                        if empty {
+                            arrays.push((
+                                written.clone(),
+                                nm.clone(),
+                                Vec::new(),
+                                w,
+                                signed,
+                                ev.clone(),
+                            ));
+                        }
+                    }
                     let (ll, lr) = dims[dims.len() - 1];
                     let idx: Vec<i64> = (ll.min(lr)..=ll.max(lr)).collect();
                     let mut prefixes: Vec<String> = vec![String::new()];
-                    for &(l, r) in &dims[..dims.len() - 1] {
+                    for (d, &(l, r)) in dims[..dims.len() - 1].iter().enumerate() {
+                        let span: Vec<i64> = if d == 0 && dyn_outer {
+                            (0..=r).collect()
+                        } else {
+                            (l.min(r)..=l.max(r)).collect()
+                        };
                         let mut next = Vec::new();
                         for p in &prefixes {
-                            for i in l.min(r)..=l.max(r) {
+                            for &i in &span {
                                 next.push(format!("{p}[{i}]"));
                             }
                         }
@@ -1858,6 +1993,73 @@ impl Simulator {
                     || self
                         .signals
                         .contains_key(&Self::name_with_suffix(&nm, ".size"));
+                // §7.4.5: dynamic rows (`T d[][]`), each with its own size.
+                if dynamic {
+                    let written = match &lv.kind {
+                        ExprKind::Ident(h)
+                            if h.root.is_none()
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty()
+                                && h.path[0].name.name != nm =>
+                        {
+                            h.path[0].name.name.clone()
+                        }
+                        _ => nm.clone(),
+                    };
+                    if self.scope_dyn_rows(&nm, &written, items) {
+                        let w = self
+                            .module
+                            .arrays
+                            .get(&nm)
+                            .map(|t| t.2)
+                            .unwrap_or(32)
+                            .max(1);
+                        if w > 64 {
+                            return Err(rand_csp::CspOutcome::NotApplicable);
+                        }
+                        let signed = self.signed_signals.contains(&nm)
+                            || self.module.var_decl_types.get(&nm).is_some_and(|dt| {
+                                super::elaborate::is_type_signed_resolved(
+                                    dt,
+                                    &self.module.typedef_types,
+                                )
+                            });
+                        let ev = enum_vals(self, &nm);
+                        let n = self.get_queue_size(&nm) as i64;
+                        let sizes: Vec<i64> = (0..n)
+                            .map(|i| self.get_queue_size(&format!("{nm}[{i}]")) as i64)
+                            .collect();
+                        let m = sizes.iter().copied().max().unwrap_or(0);
+                        self.rand_scope_nd
+                            .insert(written.clone(), vec![(0, n - 1), (0, m - 1)]);
+                        self.rand_scope_row_owners.insert(nm.clone(), true);
+                        self.rand_scope_nd_dyn.insert(written.clone(), 2);
+                        if empty {
+                            arrays.push((
+                                written.clone(),
+                                nm.clone(),
+                                Vec::new(),
+                                w,
+                                signed,
+                                ev.clone(),
+                            ));
+                        }
+                        for (i, &mi) in sizes.iter().enumerate() {
+                            if mi == 0 && !empty {
+                                continue;
+                            }
+                            arrays.push((
+                                format!("{written}[{i}]"),
+                                format!("{nm}[{i}]"),
+                                (0..mi).collect(),
+                                w,
+                                signed,
+                                ev.clone(),
+                            ));
+                        }
+                        continue;
+                    }
+                }
                 let idx: Vec<i64> = if dynamic {
                     (0..self.get_queue_size(&nm) as i64).collect()
                 } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&nm) {

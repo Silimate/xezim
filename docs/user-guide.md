@@ -74,7 +74,8 @@ per-signal trace table. Pass `--wave` to enable `$dumpfile`/`$dumpvars`
 * **VCD** — `$dumpfile`/`$dumpvars` (IEEE 1800-2017 §21.7); it shows the same
   in GTKWave as the output of other open-source simulators.
 * **FST** — `--fst <file>`, GTKWave's binary format, written on a dedicated
-  thread; `--fst-scope <hier>` limits it to a subtree. Fixed-width signals,
+  thread; `--fst-scope <hier>` limits it to a subtree, and `--fst-repack`
+  gzip-wraps the finished file (about 1.5x smaller). Fixed-width signals,
   reals, and events are supported. Variable-length string variables are
   omitted with a warning naming them; their values are never truncated.
 * **XTrace v1.0** — `--xtrace <file>`, optionally zstd-compressed

@@ -2201,6 +2201,35 @@ impl Simulator {
                 return changed;
             }
         }
+
+        // §7.4.2: `m[i][j] = v` on a class-property dynamic array of dynamic
+        // arrays writes element `j` of row `<h>#m[i]`, the key reads use. The
+        // arms below took `[j]` for a bit-select of the row's own cell.
+        if matches!(expr.kind, ExprKind::Index { .. })
+            && !self.no_class_objects()
+            && let Some(row) = self.coll_elem_expr_key(expr)
+            && row.contains('#')
+            && self.module.dynamic_arrays.contains(&row)
+        {
+            let Some(j) = self.eval_expr(index).to_i64() else {
+                return false;
+            };
+            if j < 0 || j as u64 >= self.get_queue_size(&row) {
+                return false;
+            }
+            let key = format!("{}[{}]", row, j);
+            let w = match self.signals.get(&key) {
+                Some(p) => p.width,
+                None => val.width,
+            };
+            let v = val.resize(w);
+            let changed = self.signals.get(&key) != Some(&v);
+            if changed {
+                self.write_coll_elem(&key, v);
+                self.touch_queue(&row);
+            }
+            return changed;
+        }
         // Element write into an ARRAY-OF-COLLECTIONS class property
         // (`expected[1][0][k] = v`, `dq[1][2] = v`, `aa[0][key] = v`):
         // the base names one element collection (see

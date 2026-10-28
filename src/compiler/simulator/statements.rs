@@ -137,6 +137,40 @@ impl Simulator {
         }
     }
 
+    /// The row key `<d>[i]` when `lvalue` is `d[i]` and `d` is a dynamic
+    /// array or queue whose declared element type is not a class or other
+    /// named handle type. `new[n]` and `new(n)` parse alike, and assigned to
+    /// such an element only the §7.5.1 dynamic-array constructor is legal.
+    pub(super) fn dyn_row_of_new_target(&mut self, lvalue: &Expression) -> Option<String> {
+        let ExprKind::Index { expr: base, index } = &lvalue.kind else {
+            return None;
+        };
+        let key = match &base.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let n = self.resolve_hier_name(h);
+                self.resolve_locator_storage(&n)
+            }
+            _ => self.expr_assoc_name(base)?,
+        };
+        if self.lvalue_container_kind(lvalue).is_some() {
+            return None;
+        }
+        if !self.module.dynamic_arrays.contains(&key) && self.class_dyn_row_width(&key).is_none() {
+            return None;
+        }
+        let dt = self
+            .class_member_coll_type(&key)
+            .or_else(|| self.module.var_decl_types.get(&key))?;
+        if matches!(
+            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+            DataType::TypeReference { .. }
+        ) {
+            return None;
+        }
+        let i = self.eval_expr(index).to_i64()?;
+        Some(format!("{}[{}]", key, i))
+    }
+
     /// The declared associative tail below a dynamic outer array, scoped to
     /// a local, object property, or unpacked-struct member (§7.4.5).
     #[cold]

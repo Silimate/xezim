@@ -164,6 +164,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   a known vulnerability (OSV), a secret in the history (gitleaks), a failing
   test or a smoke test on bare EL8, and the same tag rebuilds to the same bytes.
   See [docs/release.md](docs/release.md).
+* The two `simulation_version_banner` tests each simulate from their own
+  scratch directory. They shared one named after the process, so one test's
+  cleanup could delete the other's source and fail a test run, including a
+  release build's test gate. Fork test fix; drop it when upstream fixes the
+  test.
 
 ### Unreleased
 

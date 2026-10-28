@@ -6872,6 +6872,11 @@ pub struct Simulator {
     /// over unpacked rows, by storage key: true for dynamic rows (`T d[][]`),
     /// false for fixed ones (`T a[][N]`). Set by `std_randomize_vars`.
     rand_scope_row_owners: HashMap<String, bool>,
+    /// Of `rand_scope_nd`'s arrays, the number of leading dimensions that
+    /// are dynamic (a dynamic outer dimension, then dynamic rows), by the
+    /// name the constraints write: `Csp::nd_dyn`. Fork patch; drop it when
+    /// upstream skips empty dynamic dimensions in a `foreach` constraint.
+    rand_scope_nd_dyn: HashMap<String, usize>,
     /// §21.2.1.7: set while the `%p` operand itself is being rendered; a
     /// standalone scalar prints plain decimal, a leaf INSIDE an aggregate
     /// prints by its declared type (`'h` hex for vectors). Cleared by the

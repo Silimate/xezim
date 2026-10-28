@@ -3859,6 +3859,7 @@ impl Simulator {
             deferred_proc_entries: Vec::new(),
             t0_starts_remaining: 0,
             rand_scope_nd: HashMap::default(),
+            rand_scope_nd_dyn: HashMap::default(),
             rand_scope_row_owners: HashMap::default(),
             p_top_level: false,
             null_call_reported: Default::default(),

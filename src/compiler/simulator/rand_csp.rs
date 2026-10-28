@@ -470,6 +470,11 @@ struct Csp {
     /// the constraints write, with their bounds outermost first. Their rows
     /// (all but the last dimension indexed) are `arrays` entries.
     nd_dims: HashMap<String, Vec<(i64, i64)>>,
+    /// Of `nd_dims`' arrays, the number of leading dimensions that are
+    /// dynamic, stored as `(0, size - 1)`: `(0, -1)` there is empty, not a
+    /// descending range. Fork patch; drop it when upstream skips empty
+    /// dynamic dimensions in a `foreach` constraint.
+    nd_dyn: HashMap<String, usize>,
     srcs: Vec<Src>,
     nodes: Vec<Node>,
     /// None enables all preferences; otherwise only the selected instances.
@@ -1501,6 +1506,7 @@ impl Simulator {
             scalars: HashMap::default(),
             arrays: HashMap::default(),
             nd_dims: HashMap::default(),
+            nd_dyn: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
             soft_enabled: None,
@@ -1592,6 +1598,7 @@ impl Simulator {
             );
         }
         csp.nd_dims = self.rand_scope_nd.clone();
+        csp.nd_dyn = self.rand_scope_nd_dyn.clone();
         for (name, lv, w, s, members) in scalars {
             if *w == 0 || csp.arrays.contains_key(name) {
                 return Err(CspOutcome::NotApplicable);
@@ -1705,6 +1712,7 @@ impl Simulator {
             scalars: HashMap::default(),
             arrays: HashMap::default(),
             nd_dims: HashMap::default(),
+            nd_dyn: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
             soft_enabled: None,
@@ -1757,6 +1765,10 @@ impl Simulator {
                 csp.nd_dims
                     .entry(c.prop.clone())
                     .or_insert_with(|| self.csp_row_owner_shape(c));
+                csp.nd_dyn.insert(
+                    c.prop.clone(),
+                    if matches!(c.row_tail, Some(RowTail::Dyn)) { 2 } else { 1 },
+                );
                 if !sized.contains(&c.prop) {
                     continue;
                 }
@@ -4344,17 +4356,26 @@ impl Simulator {
                         && let Some(dims) = csp.nd_dims.get(&base).cloned()
                         && consts.len() + vars.len() <= dims.len()
                     {
+                        // A dynamic dimension is `(0, size - 1)`: one that is
+                        // empty gives the loop no iteration (§12.7.3), where
+                        // sorting its bounds walked -1 and 0.
+                        let ndyn = csp.nd_dyn.get(&base).copied().unwrap_or(0);
                         let loops: Vec<(Option<String>, i64, i64)> = vars
                             .iter()
                             .enumerate()
                             .map(|(j, v)| {
-                                let (l, r) = dims[consts.len() + j];
-                                (v.as_ref().map(|v| v.name.clone()), l.min(r), l.max(r))
+                                let d = consts.len() + j;
+                                let (l, r) = dims[d];
+                                let (lo, hi) = if d < ndyn { (0, r) } else { (l.min(r), l.max(r)) };
+                                (v.as_ref().map(|v| v.name.clone()), lo, hi)
                             })
                             .collect();
                         let count = loops
                             .iter()
-                            .try_fold(1u64, |n, l| n.checked_mul((l.2 - l.1 + 1) as u64))?;
+                            .try_fold(1u64, |n, l| n.checked_mul((l.2 - l.1 + 1).max(0) as u64))?;
+                        if count == 0 {
+                            return Some(Node::True);
+                        }
                         if count > 4096 {
                             return None;
                         }

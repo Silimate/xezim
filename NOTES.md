@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A `foreach` constraint over an empty dynamic dimension (`std::randomize(b)
+  with { b.size() == 0; foreach (b[i, j]) ...; }` on `int b[][2]`) adds no
+  constraint again, so the call succeeds (§18.5.8.1, §12.7.3). Fork patch
+  over upstream 6539b4a4 and 270b39de; drop it when upstream skips empty
+  dynamic dimensions in the loop.
 * An `always_comb` that reads a whole struct and also writes one of its
   members (`out = s; s.a = s.a;`) is sensitive to the struct again, so a
   change to another member updates `out` (§9.2.2.2.1). Fork patch over

@@ -53,6 +53,8 @@ mod class_property_x_default;
 mod compiled_super_hidden_method_width;
 #[path = "classes/issue320_harness_mwe.rs"]
 mod issue320_harness_mwe;
+#[path = "classes/randomize_empty_dyn_foreach.rs"]
+mod randomize_empty_dyn_foreach;
 #[path = "classes/vif_specialization_keys.rs"]
 mod vif_specialization_keys;
 #[path = "classes/x_default_neighbours.rs"]

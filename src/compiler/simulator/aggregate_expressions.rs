@@ -1886,6 +1886,7 @@ impl Simulator {
         let mut arrays = Vec::new();
         self.rand_scope_nd.clear();
         self.rand_scope_row_owners.clear();
+        self.rand_scope_nd_dyn.clear();
         for (name, lv) in targets {
             let enum_vals = |me: &Self, n: &str| {
                 me.declared_enum_members(n)
@@ -1939,6 +1940,7 @@ impl Simulator {
                         let n = self.get_queue_size(&nm) as i64;
                         dims[0] = (0, n - 1);
                         self.rand_scope_row_owners.insert(nm.clone(), false);
+                        self.rand_scope_nd_dyn.insert(written.clone(), 1);
                         if empty {
                             arrays.push((
                                 written.clone(),
@@ -2031,6 +2033,7 @@ impl Simulator {
                         self.rand_scope_nd
                             .insert(written.clone(), vec![(0, n - 1), (0, m - 1)]);
                         self.rand_scope_row_owners.insert(nm.clone(), true);
+                        self.rand_scope_nd_dyn.insert(written.clone(), 2);
                         if empty {
                             arrays.push((
                                 written.clone(),

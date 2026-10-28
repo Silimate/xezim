@@ -204,3 +204,6 @@ mod review_package_collection_aliases;
 
 #[path = "collections/foreach_omitted_var_before_collection.rs"]
 mod foreach_omitted_var_before_collection;
+
+#[path = "collections/package_array_operand_in_method.rs"]
+mod package_array_operand_in_method;

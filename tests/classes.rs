@@ -866,3 +866,5 @@ mod randomize_fill_literal;
 mod randomize_nested_dyn_scope;
 #[path = "classes/shadowed_member_same_named_formal.rs"]
 mod shadowed_member_same_named_formal;
+#[path = "classes/concat_write_through_handle_member.rs"]
+mod concat_write_through_handle_member;

@@ -546,3 +546,5 @@ mod include_intra_delay_567;
 
 #[path = "misc/override_timescale_package_delay_571.rs"]
 mod override_timescale_package_delay_571;
+#[path = "misc/macro_args_next_line_578.rs"]
+mod macro_args_next_line_578;

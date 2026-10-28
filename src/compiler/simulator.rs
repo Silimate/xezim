@@ -303,7 +303,7 @@ fn method_boost_enabled() -> bool {
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
 // §6.16 / §6.24.3: string casts emit conversion rather than width resizing.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3048;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3049;
 
 /// The fork's own part of that salt, hashed after it: a fork patch that
 /// changes compiled methods bumps this one, so upstream's salt line merges
@@ -1199,7 +1199,10 @@ struct UdpRuntime {
     out_ref: BitRef,
     in_refs: Vec<BitRef>,
     is_sequential: bool,
+    /// Rise delay, and every delay unless `delay_fall` differs (§29.3).
     delay: u64,
+    /// §28.16: the delay of a change to 0; equal to `delay` for one value.
+    delay_fall: u64,
     /// Shared by every instance of the same UDP definition. The elaborator
     /// attaches rows to each flattened instance, but retaining those clones
     /// wastes substantial memory on cell fabrics.
@@ -1590,7 +1593,7 @@ struct CombEntryCold {
     cov: Option<u32>,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB022";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB023";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

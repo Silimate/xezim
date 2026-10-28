@@ -169,6 +169,32 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* White space, newlines included, may separate the size of a based literal
+  from its base and the base from its value (§5.7.1, §5.3). A space before
+  the apostrophe dropped the size with no message, so `2 'd1` was 32 bits
+  wide, `3 'd 9` read 9 and a concatenation holding one was 32 bits too
+  wide; a newline there was a parse error (#580, reported by git-hevangel).
+* A macro defined with arguments may have its actual-argument list on a
+  later line than its name, after blank lines or comments (§22.5.1). Each
+  such call was rejected as "requires parentheses" (#578, reported by
+  git-hevangel).
+* A UDP instance may omit its name after a bare delay (`my_mux #0 (z, a,
+  b, s);`, also from a macro), after a drive strength, and in a list
+  (§29.3, #579, reported by git-hevangel). Its delay may also be a
+  parameter (`#D`, which became an undelayed instance named `D`), a
+  `min:typ:max` value, or a `(rise, fall)` pair, whose fall value was
+  ignored (§28.16).
+* `$bits` in a constant expression has the width of a cast's target
+  (core #99, contributed by chenbhil), of a compound operand (an operator,
+  conditional, call, or a concatenation holding a cast or a signal) and of
+  an element or slice of a declared variable (`$bits(pk[2])` of
+  `logic [3:0][1:0] pk` is 2). Each was 0 or one bit, so a declaration
+  sized by it was one bit wide (§20.6.2).
+* `h.p`, with `p` redeclared in a derived class, resolves by the static
+  type of `h` while another process is suspended in a subroutine whose
+  formal of another class type is also named `h` (§8.14). A UVM driver's
+  `item.accept_time` landed in `uvm_transaction`'s private copy while the
+  sequence waited in `finish_item` (#577, contributed by chenbhil).
 * A class member typed by a class type parameter randomizes in the type
   the object binds (§8.25, §18.4). A `rand T beats[]` (dynamic, fixed,
   queue or associative) bound to a wider type than `T`'s default solved its
@@ -401,6 +427,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Build**
 
+* xezim-core moves to zstd 0.14 (core #100): zstd 0.13 and zstd-safe 7
+  carry RustSec advisories (RUSTSEC-2026-0391, -0395 to -0406) that fail
+  `cargo deny` and OSV-Scanner on every build. None was reachable; the
+  compressed format is unchanged.
 * The compiled-artifact, prepared-comb and method-cache formats are encoded
   with bincode 2 (serde, standard configuration) instead of the unmaintained
   bincode 1.x (RUSTSEC-2025-0141). Artifacts written by earlier versions are

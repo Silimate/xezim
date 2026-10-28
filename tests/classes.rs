@@ -864,3 +864,5 @@ mod nested_dyn_members;
 mod randomize_fill_literal;
 #[path = "classes/randomize_nested_dyn_scope.rs"]
 mod randomize_nested_dyn_scope;
+#[path = "classes/shadowed_member_same_named_formal.rs"]
+mod shadowed_member_same_named_formal;

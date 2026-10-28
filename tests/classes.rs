@@ -901,3 +901,5 @@ mod ref_formal_array_of_collections_row;
 mod class_scoped_static_queue_copy;
 #[path = "classes/concat_write_through_handle_member.rs"]
 mod concat_write_through_handle_member;
+#[path = "classes/dollar_index_handle_member_write.rs"]
+mod dollar_index_handle_member_write;

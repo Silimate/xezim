@@ -583,3 +583,6 @@ mod const_bits_of_cast;
 mod literal_whitespace_580;
 #[path = "types/const_bits_compound.rs"]
 mod const_bits_compound;
+
+#[path = "types/packed_package_parameter_element.rs"]
+mod packed_package_parameter_element;

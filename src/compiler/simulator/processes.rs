@@ -4066,11 +4066,11 @@ impl Simulator {
                                 })
                                 .collect();
                             if let Some(keys) = keys {
-                                self.instance_event_waiters.push(InstanceEventWaiter {
-                                    key: InstanceEventKeys::Any(keys),
+                                self.park_instance_event_waiter(
+                                    InstanceEventKeys::Any(keys),
                                     pid,
-                                    continuation: pc.pushed_body(body, pc.start + i + 1),
-                                });
+                                    pc.pushed_body(body, pc.start + i + 1),
+                                );
                                 return;
                             }
                         }
@@ -4112,11 +4112,11 @@ impl Simulator {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
                                 // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
                                 let cont = pc.pushed_body(body, pc.start + i + 1);
-                                self.instance_event_waiters.push(InstanceEventWaiter {
-                                    key: InstanceEventKeys::One(key),
+                                self.park_instance_event_waiter(
+                                    InstanceEventKeys::One(key),
                                     pid,
-                                    continuation: cont,
-                                });
+                                    cont,
+                                );
                                 return;
                             }
                         }
@@ -4139,11 +4139,11 @@ impl Simulator {
                                 }
                                 // Chain the caller's tail rather than copying it.
                                 let cont = pc.pushed_body(body, pc.start + i + 1);
-                                self.instance_event_waiters.push(InstanceEventWaiter {
-                                    key: InstanceEventKeys::One(key),
+                                self.park_instance_event_waiter(
+                                    InstanceEventKeys::One(key),
                                     pid,
-                                    continuation: cont,
-                                });
+                                    cont,
+                                );
                                 return;
                             }
                         }
@@ -4195,11 +4195,7 @@ impl Simulator {
                         };
                         if let Some(key) = static_ev {
                             let cont = pc.pushed_body(body, pc.start + i + 1);
-                            self.instance_event_waiters.push(InstanceEventWaiter {
-                                key: InstanceEventKeys::One(key),
-                                pid,
-                                continuation: cont,
-                            });
+                            self.park_instance_event_waiter(InstanceEventKeys::One(key), pid, cont);
                             return;
                         }
                         // `@prop` / `@(h.prop)` on a NON-event class property:

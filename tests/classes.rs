@@ -909,3 +909,5 @@ mod foreach_indexed_element_member_array;
 mod scalar_local_shadows_collection;
 #[path = "classes/forward_class_string_member_compare.rs"]
 mod forward_class_string_member_compare;
+#[path = "classes/struct_prop_nested_member_copy.rs"]
+mod struct_prop_nested_member_copy;

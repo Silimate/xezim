@@ -458,6 +458,9 @@ mod null_receiver_static_spec;
 mod randomize_work_budget;
 #[path = "classes/enum_string_valued_scope_546.rs"]
 mod enum_string_valued_scope;
+
+#[path = "classes/rand_enum_collection_elements.rs"]
+mod rand_enum_collection_elements;
 #[path = "classes/scope_randomize_dist_and_foreach.rs"]
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/shadowed_property_storage.rs"]

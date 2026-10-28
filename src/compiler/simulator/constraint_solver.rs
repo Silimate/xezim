@@ -1164,6 +1164,11 @@ impl Simulator {
         let array_enums: HashMap<String, String> = rand_arrays
             .iter()
             .filter_map(|a| a.5.clone().map(|t| (a.0.clone(), t)))
+            .chain(rand_colls.iter().filter_map(|c| {
+                let t = (c.kind != CollKind::Fixed && !c.is_object_elem)
+                    .then(|| self.prop_enum_type(handle, &c.prop))??;
+                Some((c.prop.clone(), t))
+            }))
             .collect();
         // §18.5.4/§18.5.10: a set whose DISTRIBUTION the per-variable trials
         // below cannot honour (see `rand_order_sensitive`) goes to the joint
@@ -2385,9 +2390,15 @@ impl Simulator {
                     if c.kind == CollKind::Fixed || c.is_object_elem {
                         continue;
                     }
+                    let members = self.coll_enum_values(handle, &c.prop);
                     for key in self.coll_elem_keys(c) {
-                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
-                        let v = self.draw_elem(c.width, prev);
+                        let v = if let Some(m) = &members {
+                            let pick = m[self.rng.gen_range(0..m.len())];
+                            Value::from_u64(pick, c.width)
+                        } else {
+                            let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                            self.draw_elem(c.width, prev)
+                        };
                         self.write_coll_elem(&key, v);
                     }
                 }
@@ -2690,6 +2701,21 @@ impl Simulator {
         for con in constraints {
             for item in &con.items {
                 if !self.rand_item_accept(handle, item, rand_colls, fe_failed) {
+                    return false;
+                }
+            }
+        }
+        // §18.3: an element of enum type holds one of the enum's constants.
+        for c in rand_colls {
+            if c.kind == CollKind::Fixed || c.is_object_elem {
+                continue;
+            }
+            let Some(members) = self.coll_enum_values(handle, &c.prop) else {
+                continue;
+            };
+            for key in self.coll_elem_keys(c) {
+                let v = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                if v.is_some_and(|v| !members.contains(&v)) {
                     return false;
                 }
             }

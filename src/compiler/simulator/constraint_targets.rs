@@ -1688,9 +1688,13 @@ impl Simulator {
             return pinned;
         }
         let allowed = self.elem_allowed_ranges(prop, constraints);
+        let members = self.coll_enum_values(handle, prop);
         let saved = self.read_coll_elem(elem_key);
         for _ in 0..256 {
-            let cand = if allowed.is_empty() {
+            let cand = if let Some(m) = members.as_ref().filter(|_| allowed.is_empty()) {
+                use rand::Rng;
+                Value::from_u64(m[self.rng.gen_range(0..m.len())], width)
+            } else if allowed.is_empty() {
                 self.draw_elem(width, None)
             } else {
                 use rand::Rng;

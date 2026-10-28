@@ -903,3 +903,5 @@ mod class_scoped_static_queue_copy;
 mod concat_write_through_handle_member;
 #[path = "classes/dollar_index_handle_member_write.rs"]
 mod dollar_index_handle_member_write;
+#[path = "classes/foreach_indexed_element_member_array.rs"]
+mod foreach_indexed_element_member_array;

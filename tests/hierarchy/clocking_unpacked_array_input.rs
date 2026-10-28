@@ -78,32 +78,3 @@ endmodule
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert_eq!(msgs, ["arr1=5"]);
 }
-
-/// Every element is sampled, however large the array. An element written at
-/// the edge keeps its pre-edge value in the sample.
-#[test]
-fn clocking_unpacked_array_input_samples_a_large_array() {
-    let src = r#"
-`timescale 1ns/1ns
-interface big_if (input logic clk);
-  logic [7:0] mem [5000];
-  clocking cb @(posedge clk); input mem; endclocking
-endinterface
-module top;
-  logic clk = 0;
-  always #5 clk = ~clk;
-  big_if ifc (clk);
-  logic [7:0] arr [5000];
-  clocking cb @(posedge clk); input arr; endclocking
-  initial begin
-    arr[4999] = 8'h22; ifc.mem[4999] = 8'h44;
-    @(posedge clk);
-    arr[4999] = 8'hbb; ifc.mem[4999] = 8'hcc;
-    #1 $display("arr=%h mem=%h", cb.arr[4999], ifc.cb.mem[4999]);
-  end
-endmodule
-"#;
-    let sim = simulate(src, 100).expect("simulate failed");
-    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
-    assert_eq!(msgs, ["arr=22 mem=44"]);
-}

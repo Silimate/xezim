@@ -207,3 +207,5 @@ mod foreach_omitted_var_before_collection;
 
 #[path = "collections/hierarchical_whole_array_assign.rs"]
 mod hierarchical_whole_array_assign;
+#[path = "collections/row_of_2d_array_assign.rs"]
+mod row_of_2d_array_assign;

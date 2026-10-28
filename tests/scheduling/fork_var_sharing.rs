@@ -219,3 +219,117 @@ fn multiple_children_multiple_vars() {
     let sim = simulate(MULTIPLE_VARS, 200).expect("simulate failed");
     assert_pass(&sim, "ACC");
 }
+
+/// Two `join_none` siblings of a task that has returned share its locals:
+/// one sets `seen` at 5, 15, 25, the other reads and clears it at 10, 20,
+/// 30. A module `task automatic` and a class task (automatic lifetime).
+const SIBLINGS_AFTER_RETURN: &str = r#"
+class det;
+  task run();
+    bit seen = 0;
+    int got = 0;
+    fork
+      begin
+        repeat (3) begin
+          #10;
+          if (seen) got++;
+          seen = 0;
+        end
+        if (got == 3) $display("CSIB_PASS got=%0d", got);
+        else          $display("CSIB_FAIL got=%0d", got);
+      end
+      begin
+        repeat (3) begin
+          #5 seen = 1;
+          #5;
+        end
+      end
+    join_none
+  endtask
+endclass
+module top;
+  task automatic mrun();
+    bit seen = 0;
+    int got = 0;
+    fork
+      begin
+        repeat (3) begin
+          #10;
+          if (seen) got++;
+          seen = 0;
+        end
+        if (got == 3) $display("MSIB_PASS got=%0d", got);
+        else          $display("MSIB_FAIL got=%0d", got);
+      end
+      begin
+        repeat (3) begin
+          #5 seen = 1;
+          #5;
+        end
+      end
+    join_none
+  endtask
+  det d;
+  initial begin
+    d = new;
+    d.run();
+    mrun();
+  end
+endmodule
+"#;
+
+#[test]
+fn join_none_siblings_share_returned_task_locals() {
+    let sim = simulate(SIBLINGS_AFTER_RETURN, 200).expect("simulate failed");
+    assert_pass(&sim, "CSIB");
+    assert_pass(&sim, "MSIB");
+}
+
+/// A sibling parked in `wait` on a shared local wakes on the other
+/// sibling's write.
+const SIBLING_WAIT: &str = r#"
+module top;
+  task automatic t();
+    bit go = 0;
+    fork
+      begin
+        wait (go);
+        $display("SWAIT_PASS t=%0t", $time);
+      end
+      begin
+        #7 go = 1;
+      end
+    join_none
+  endtask
+  initial t();
+endmodule
+"#;
+
+#[test]
+fn join_none_sibling_wait_wakes_on_shared_local() {
+    let sim = simulate(SIBLING_WAIT, 200).expect("simulate failed");
+    assert_pass(&sim, "SWAIT");
+}
+
+/// Two `join` siblings update the same task local in turn; the second
+/// reads the first's write.
+const JOIN_SIBLINGS: &str = r#"
+module top;
+  task automatic t();
+    int n = 0;
+    fork
+      begin #5 n = n + 1; end
+      begin #10 n = n + 10; end
+    join
+    if (n == 11) $display("JSIB_PASS n=%0d", n);
+    else         $display("JSIB_FAIL n=%0d", n);
+  endtask
+  initial t();
+endmodule
+"#;
+
+#[test]
+fn join_siblings_share_task_locals() {
+    let sim = simulate(JOIN_SIBLINGS, 200).expect("simulate failed");
+    assert_pass(&sim, "JSIB");
+}

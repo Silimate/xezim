@@ -586,3 +586,5 @@ mod const_bits_compound;
 
 #[path = "types/unpacked_array_parameter_reference.rs"]
 mod unpacked_array_parameter_reference;
+#[path = "types/array_parameter_imported_dimension.rs"]
+mod array_parameter_imported_dimension;

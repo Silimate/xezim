@@ -290,7 +290,15 @@ impl Simulator {
                     .copied()
                     .unwrap_or(dskew);
                 if skew != 0 && skew != CB_SKEW_1STEP {
-                    hist.push((net.clone(), skew));
+                    // An unpacked-array input is sampled per element.
+                    if let Some((a, (lo, hi))) = [net, v]
+                        .into_iter()
+                        .find_map(|a| Some((a, self.unpacked_array_bounds(a)?)))
+                    {
+                        hist.extend((lo..=hi).map(|i| (format!("{a}[{i}]"), skew)));
+                    } else {
+                        hist.push((net.clone(), skew));
+                    }
                 }
             }
         }

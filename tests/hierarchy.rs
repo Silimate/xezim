@@ -352,3 +352,5 @@ mod nonansi_child_port_width_572;
 
 #[path = "hierarchy/generate_nested_instance_port.rs"]
 mod generate_nested_instance_port;
+#[path = "hierarchy/clocking_unpacked_array_input.rs"]
+mod clocking_unpacked_array_input;

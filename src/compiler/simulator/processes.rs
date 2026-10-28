@@ -1243,6 +1243,14 @@ impl Simulator {
                 }
             }
         }
+        let own_writes = Self::fork_frame_writes(
+            child_frames,
+            child_frames_gen,
+            self.fork_baselines.get(&pid),
+        );
+        if !own_writes.is_empty() {
+            written.extend(self.share_fork_writes(pid, &own_writes, &mut saved));
+        }
         if !written.is_empty() {
             // A child wrote a key a parked `wait` of the parent reads —
             // promote it to ready so a long-running edge cascade (which
@@ -2016,6 +2024,98 @@ impl Simulator {
                         }
                     }
                     None => continue,
+                }
+            }
+        }
+        written
+    }
+
+    /// `(slot, frame generation, key, value)` for each inherited local a fork
+    /// child changed since its baseline. Keys absent from the baseline are the
+    /// child's own declarations and stay private.
+    pub(super) fn fork_frame_writes(
+        child_frames: &[HashMap<String, Value>],
+        child_gens: &[u64],
+        baseline: Option<&Vec<HashMap<String, Value>>>,
+    ) -> Vec<(usize, u64, String, Value)> {
+        let mut out = Vec::new();
+        let Some(baseline) = baseline else {
+            return out;
+        };
+        for (i, frame) in child_frames.iter().enumerate() {
+            let (Some(base), Some(&g)) = (baseline.get(i), child_gens.get(i)) else {
+                continue;
+            };
+            for (k, v) in frame {
+                if base.get(k).is_some_and(|old| old != v) {
+                    out.push((i, g, k.clone(), v.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// §6.21: every process forked from one activation shares that
+    /// activation's variables, so a fork child's writes reach the other
+    /// processes holding a copy of the same frame (same generation), which
+    /// outlive the parent after `join_none`. Each sharer's baseline moves
+    /// with the value, and so does the writer's, so a write is carried once
+    /// and is not mistaken for the sharer's own. Returns the keys written.
+    pub(super) fn share_fork_writes(
+        &mut self,
+        pid: usize,
+        writes: &[(usize, u64, String, Value)],
+        saved: &mut ProcessContext,
+    ) -> Vec<String> {
+        let mut written = Vec::new();
+        let sharers: Vec<usize> = self
+            .fork_baselines
+            .keys()
+            .copied()
+            .filter(|&q| q != pid)
+            .collect();
+        for q in sharers {
+            let Some(ctx) = self.process_contexts.get_mut(&q) else {
+                continue;
+            };
+            let mut base = self.fork_baselines.get_mut(&q);
+            for (_, g, k, v) in writes {
+                let Some(j) = ctx.local_gen_stack.iter().position(|x| x == g) else {
+                    continue;
+                };
+                let Some(slot) = ctx.local_stack.get_mut(j).and_then(|f| f.get_mut(k)) else {
+                    continue;
+                };
+                if slot != v {
+                    *slot = v.clone();
+                    note_store_write(name_bit(k));
+                    written.push(k.clone());
+                }
+                if let Some(bv) = base
+                    .as_deref_mut()
+                    .and_then(|b| b.get_mut(j))
+                    .and_then(|f| f.get_mut(k))
+                {
+                    *bv = v.clone();
+                }
+            }
+        }
+        for (_, g, k, v) in writes {
+            let Some(j) = saved.local_gen_stack.iter().position(|x| x == g) else {
+                continue;
+            };
+            if let Some(slot) = saved.local_stack.get_mut(j).and_then(|f| f.get_mut(k)) {
+                if slot != v {
+                    *slot = v.clone();
+                    note_store_write(name_bit(k));
+                    written.push(k.clone());
+                }
+            }
+        }
+        if let Some(b) = self.fork_baselines.get_mut(&pid) {
+            for (i, _, k, v) in writes {
+                if let Some(bv) = b.get_mut(*i).and_then(|f| f.get_mut(k)) {
+                    *bv = v.clone();
                 }
             }
         }

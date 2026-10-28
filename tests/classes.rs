@@ -927,3 +927,5 @@ mod forward_class_string_member_compare;
 mod struct_prop_nested_member_copy;
 #[path = "classes/output_formal_local_array_elem_member.rs"]
 mod output_formal_local_array_elem_member;
+#[path = "classes/class_scoped_assoc_queue_element.rs"]
+mod class_scoped_assoc_queue_element;

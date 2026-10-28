@@ -226,3 +226,5 @@ mod assoc_queue_element_copy;
 mod dyn_array_of_dyn_array_rows;
 #[path = "collections/package_array_operand_in_method.rs"]
 mod package_array_operand_in_method;
+#[path = "collections/dyn_array_of_dyn_array_row_copy.rs"]
+mod dyn_array_of_dyn_array_row_copy;

@@ -382,17 +382,14 @@ endmodule
 }
 
 /// A monitor triggers its own event, a sequence waits on the sequencer's
-/// copy, and a connect function assigns one to the other. Without the alias
-/// the sequence waits forever.
+/// copy, and a connect function assigns one to the other.
 #[test]
 fn class_event_alias_across_monitor_and_sequencer() {
     let src = r#"
 `timescale 1ns/1ns
 module top;
-  class mon;
-    event tick;
-    task pulse(); -> tick; endtask
-  endclass
+  class other; function void m(); endfunction endclass
+  class mon; event tick; task pulse(); -> tick; endtask endclass
   class seqr; event tick; endclass
   class agent;
     mon m;
@@ -402,10 +399,7 @@ module top;
   class seq;
     seqr p_sequencer;
     int woke;
-    task body();
-      @p_sequencer.tick;
-      woke = $time;
-    endtask
+    task body(); @p_sequencer.tick; woke = $time; endtask
   endclass
   agent a;
   seq q;

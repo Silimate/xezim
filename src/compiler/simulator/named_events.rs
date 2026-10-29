@@ -351,38 +351,40 @@ impl Simulator {
     }
 
     /// `(handle, field)` of a class property declared `event`, or None.
-    /// Effect-free selects only: an index with a side effect must not be
-    /// evaluated twice when this probe misses and the value assign runs next.
-    pub(super) fn class_event_assign_key(&mut self, e: &Expression) -> Option<(usize, String)> {
-        if !self.select_free_event_expr(e) {
+    /// Reads only stored handles and effect-free selects (`eval_handle_expr`),
+    /// so a parenless function call or mutating index is not evaluated twice
+    /// when this probe misses and the value assign runs next.
+    pub(super) fn class_event_assign_key(&self, e: &Expression) -> Option<(usize, String)> {
+        if !Self::select_free_event_expr(e) {
             return None;
         }
         let key = match &e.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 self.resolve_this_event_field(&h.path[0].name.name)?
             }
-            _ => self.expr_instance_prop_field_general(e)?,
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_handle_expr(expr)?, member.name.clone())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
+            {
+                let mut recv = h.clone();
+                let field = recv.path.pop()?.name.name;
+                let expr = Expression::new(ExprKind::Ident(recv), e.span);
+                (self.eval_handle_expr(&expr)?, field)
+            }
+            _ => return None,
         };
         self.class_prop_declared_event(key.0, &key.1).then_some(key)
     }
 
-    fn select_free_event_expr(&self, e: &Expression) -> bool {
-        let methods = &self.class_member_names().methods;
+    fn select_free_event_expr(e: &Expression) -> bool {
         match &e.kind {
-            ExprKind::Ident(h) => {
-                h.path[..h.path.len().saturating_sub(1)]
-                    .iter()
-                    .all(|s| !methods.contains(&s.name.name))
-                    && (h.path.iter().flat_map(|s| &s.selects))
-                        .all(|x| Self::cond_expr_is_effect_free(x, false))
-            }
-            ExprKind::MemberAccess { expr, .. } => {
-                !self.chain_names_method(expr) && self.select_free_event_expr(expr)
-            }
+            ExprKind::Ident(h) => (h.path.iter().flat_map(|s| &s.selects))
+                .all(|x| Self::cond_expr_is_effect_free(x, false)),
+            ExprKind::MemberAccess { expr, .. } => Self::select_free_event_expr(expr),
             ExprKind::Index { expr, index } => {
-                !self.chain_names_method(expr)
-                    && Self::cond_expr_is_effect_free(index, false)
-                    && self.select_free_event_expr(expr)
+                Self::cond_expr_is_effect_free(index, false) && Self::select_free_event_expr(expr)
             }
             ExprKind::This => true,
             _ => false,

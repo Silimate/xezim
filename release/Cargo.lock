@@ -755,7 +755,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "sv-parser"
 version = "0.11.3"
-source = "git+https://github.com/aionhw/xezim-core.git?rev=aad16e4d3bc37d96f78414268fd563ac6300dda7#aad16e4d3bc37d96f78414268fd563ac6300dda7"
+source = "git+https://github.com/Silimate/xezim-core.git?rev=1c499c84fcf3f352486b6b13808de7a14253388b#1c499c84fcf3f352486b6b13808de7a14253388b"
 dependencies = [
  "serde",
  "serde_json",
@@ -1032,7 +1032,7 @@ dependencies = [
 [[package]]
 name = "xezim-core"
 version = "0.11.3"
-source = "git+https://github.com/aionhw/xezim-core.git?rev=aad16e4d3bc37d96f78414268fd563ac6300dda7#aad16e4d3bc37d96f78414268fd563ac6300dda7"
+source = "git+https://github.com/Silimate/xezim-core.git?rev=1c499c84fcf3f352486b6b13808de7a14253388b#1c499c84fcf3f352486b6b13808de7a14253388b"
 dependencies = [
  "ahash",
  "bincode",

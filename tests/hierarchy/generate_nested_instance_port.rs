@@ -131,3 +131,59 @@ endmodule
         "output: {msgs:?}"
     );
 }
+
+/// The concurrent assertion is a generate item of a module instantiated below
+/// the top, so it is renamed with the instance, not as a top-level item. Its
+/// property and its action block both read the instance port.
+#[test]
+fn relative_port_read_in_nested_generate_assertion_below_top() {
+    let src = r#"
+module leaf (
+  input logic v_i
+);
+endmodule
+module dut (
+  input logic clk,
+  input logic v
+);
+  logic one;
+  always_ff @(posedge clk) one <= 1'b1;
+  for (genvar i = 0; i < 2; i++) begin : g_loop
+    if (1) begin : g_on
+      leaf u_leaf (.v_i(one));
+      assert property (@(posedge clk) v |-> u_leaf.v_i)
+        $display("PASS %0d %b", i, u_leaf.v_i);
+      else
+        $display("FAIL %0d %b", i, u_leaf.v_i);
+    end
+  end
+endmodule
+module top;
+  logic clk = 0;
+  logic v = 0;
+  always #5 clk = ~clk;
+  dut u (.clk(clk), .v(v));
+  initial begin
+    repeat (2) @(negedge clk);
+    v = 1;
+    @(negedge clk);
+    v = 0;
+    @(negedge clk);
+    $display("DONE");
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("sim");
+    let msgs = messages(&sim);
+    for want in ["PASS 0 1", "PASS 1 1", "DONE"] {
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; output: {msgs:?}"
+        );
+    }
+    assert!(
+        msgs.iter().all(|m| !m.starts_with("FAIL")),
+        "output: {msgs:?}"
+    );
+}

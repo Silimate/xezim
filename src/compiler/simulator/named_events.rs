@@ -292,7 +292,7 @@ impl Simulator {
         rvalue: &Expression,
     ) -> bool {
         let Some(lkey) = self.event_ref_key(lvalue) else {
-            return false;
+            return self.try_class_event_handle_assign(lvalue, rvalue);
         };
         if matches!(rvalue.kind, ExprKind::Null) {
             self.event_aliases
@@ -324,6 +324,114 @@ impl Simulator {
         false
     }
 
+    /// §15.5.5 for a class-property event (`seqr.tick = mon.tick`, or `= null`).
+    /// Module-scope events are handled by `try_event_handle_assign` before
+    /// this runs. A non-event property returns false so the value assign
+    /// still copies it.
+    fn try_class_event_handle_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        let Some(linst) = self.class_event_assign_key(lvalue) else {
+            return false;
+        };
+        if matches!(rvalue.kind, ExprKind::Null) {
+            self.instance_event_aliases.insert(linst, None);
+            return true;
+        }
+        let Some(rinst) = self.class_event_assign_key(rvalue) else {
+            return false;
+        };
+        match self.canonical_instance_event(rinst) {
+            Some(target) if target == linst => {
+                self.instance_event_aliases.remove(&linst);
+            }
+            target => {
+                self.instance_event_aliases.insert(linst, target);
+            }
+        }
+        true
+    }
+
+    /// `(handle, field)` of a class property declared `event`, or None.
+    /// Reads only stored handles and effect-free selects (`eval_handle_expr`),
+    /// so a parenless function call or mutating index is not evaluated twice
+    /// when this probe misses and the value assign runs next.
+    pub(super) fn class_event_assign_key(&self, e: &Expression) -> Option<(usize, String)> {
+        if !Self::select_free_event_expr(e) {
+            return None;
+        }
+        let key = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                self.resolve_this_event_field(&h.path[0].name.name)?
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_handle_expr(expr)?, member.name.clone())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
+            {
+                let mut recv = h.clone();
+                let field = recv.path.pop()?.name.name;
+                let expr = Expression::new(ExprKind::Ident(recv), e.span);
+                (self.eval_handle_expr(&expr)?, field)
+            }
+            _ => return None,
+        };
+        self.class_prop_declared_event(key.0, &key.1).then_some(key)
+    }
+
+    fn select_free_event_expr(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => (h.path.iter().flat_map(|s| &s.selects))
+                .all(|x| Self::cond_expr_is_effect_free(x, false)),
+            ExprKind::MemberAccess { expr, .. } => Self::select_free_event_expr(expr),
+            ExprKind::Index { expr, index } => {
+                Self::cond_expr_is_effect_free(index, false) && Self::select_free_event_expr(expr)
+            }
+            ExprKind::This => true,
+            _ => false,
+        }
+    }
+
+    /// The synchronization object `key` currently names. `None` means the
+    /// handle was assigned null. One lookup, no chain: an assignment stores the
+    /// object itself, so a later assignment to the right-hand property does not
+    /// move the left-hand one.
+    pub(super) fn canonical_instance_event(&self, key: (usize, String)) -> Option<(usize, String)> {
+        match self.instance_event_aliases.get(&key) {
+            Some(target) => target.clone(),
+            None => Some(key),
+        }
+    }
+
+    /// Park `pid` on class events. §15.5.5.1: the waiter is bound to the
+    /// objects its events name now; a later handle assignment does not move
+    /// it. A null handle never triggers.
+    pub(super) fn park_instance_event_waiter(
+        &mut self,
+        key: InstanceEventKeys,
+        pid: usize,
+        continuation: ProcCont,
+    ) {
+        let key = match key {
+            InstanceEventKeys::One(k) if self.instance_event_aliases.is_empty() => {
+                InstanceEventKeys::One(k)
+            }
+            InstanceEventKeys::One(k) => match self.canonical_instance_event(k) {
+                Some(c) => InstanceEventKeys::One(c),
+                None => InstanceEventKeys::Any(Vec::new()),
+            },
+            InstanceEventKeys::Any(ks) => InstanceEventKeys::Any(
+                ks.into_iter()
+                    .filter_map(|k| self.canonical_instance_event(k))
+                    .collect(),
+            ),
+        };
+        self.instance_event_waiters.push(InstanceEventWaiter {
+            key,
+            pid,
+            continuation,
+        });
+    }
+
     /// Truth of a `wait` condition. A bare named-event operand (`wait(ev)`) is
     /// true only in the time slot the event was triggered, like
     /// `ev.triggered` (§15.5.3) — the reference simulator waits for each new
@@ -346,7 +454,12 @@ impl Simulator {
     pub(super) fn event_triggered_now(&mut self, e: &Expression) -> Option<bool> {
         let now = self.time;
         // `h.ce.triggered` / `this.ce.triggered` — a per-instance class event.
+        // Follow a handle assignment so the alias and the target share one
+        // `.triggered` bit. A null handle reads 0.
         if let Some(k) = self.expr_handle_event_field(e) {
+            let Some(k) = self.canonical_instance_event(k) else {
+                return Some(false);
+            };
             let stamp = Self::instance_event_stamp_key(&k);
             return Some(self.event_triggered_time.get(stamp.as_str()) == Some(&now));
         }
@@ -559,6 +672,34 @@ impl Simulator {
         true
     }
 
+    /// `class_prop_is_event` treats a missing type as an event. Assignment
+    /// must not: an untyped or integral property is a value, and consuming
+    /// the statement would drop the copy. True only for an explicit `event`.
+    pub(super) fn class_prop_declared_event(&self, handle: usize, field: &str) -> bool {
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur.filter(|c| seen.insert(c.clone())) {
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if let Some(dt) = cd.property_types.get(field) {
+                return matches!(
+                    dt,
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Event,
+                        ..
+                    }
+                );
+            }
+            cur = cd.extends.clone();
+        }
+        false
+    }
+
     /// `@prop` / `@(h.prop)` on a NON-event class property (§9.4.2: any
     /// change of the expression value triggers). Returns a condition that
     /// becomes true when the property differs from its value right now, to
@@ -685,8 +826,17 @@ impl Simulator {
         if matches!(e.kind, ExprKind::Null) {
             return Some(Self::EVENT_NULL_KEY.to_string());
         }
-        let k = self.event_ref_key(e)?;
-        Some(self.resolve_event_key(&k))
+        if let Some(k) = self.event_ref_key(e) {
+            return Some(self.resolve_event_key(&k));
+        }
+        // Class-property events have no module-scope name. Compare the
+        // canonical object, so `seqr.tick == mon.tick` is 1 after the
+        // handle assignment and 0 before it.
+        let k = self.class_event_assign_key(e)?;
+        match self.canonical_instance_event(k) {
+            Some(c) => Some(Self::instance_event_stamp_key(&c)),
+            None => Some(Self::EVENT_NULL_KEY.to_string()),
+        }
     }
 
     /// `.triggered` stamp key for a per-instance class event. Instance events
@@ -1059,20 +1209,37 @@ impl Simulator {
     /// the same slot's remaining active region — mirroring how a blocking
     /// `->e` resumes an `@e` waiter for a module-scope named event.
     pub(super) fn fire_instance_event(&mut self, key: (usize, String)) {
+        // §15.5.5: `-> seqr.tick` and `-> mon.tick` are one object after
+        // `seqr.tick = mon.tick`. A null handle triggers nothing.
+        if let Some(canon) = self.canonical_instance_event(key) {
+            self.fire_instance_event_object(canon);
+        }
+    }
+
+    /// §15.5.1: `->> h.ce` triggers the object `h.ce` names when it runs,
+    /// even if the handle is reassigned before the NBA region.
+    pub(super) fn defer_instance_trigger(&mut self, key: (usize, String)) {
+        if let Some(canon) = self.canonical_instance_event(key) {
+            self.pending_nba_instance_triggers.push(canon);
+        }
+    }
+
+    /// Trigger the already resolved synchronization object `canon`.
+    pub(super) fn fire_instance_event_object(&mut self, canon: (usize, String)) {
         let now = self.time;
         // §15.5.3: `<h>.<ev>.triggered` must read 1 for the rest of this slot.
         // Instance events have no backing signal, so stamp the same table the
         // name-keyed path uses, under a synthetic per-instance key.
-        let stamp = Self::instance_event_stamp_key(&key);
+        let stamp = Self::instance_event_stamp_key(&canon);
         self.event_triggered_time.insert(stamp, now);
         if !self.cg_instance_event_waiters.is_empty() {
-            if let Some(w) = self.cg_instance_event_waiters.get(&key).cloned() {
+            if let Some(w) = self.cg_instance_event_waiters.get(&canon).cloned() {
                 self.sample_event_covergroups(w);
             }
         }
         let mut woken = Vec::new();
         self.instance_event_waiters.retain(|w| {
-            if w.key.contains(&key) {
+            if w.key.contains(&canon) {
                 woken.push((w.pid, w.continuation.clone()));
                 false
             } else {

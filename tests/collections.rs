@@ -220,3 +220,6 @@ mod row_of_2d_array_assign;
 
 #[path = "collections/conditional_aggregate_659.rs"]
 mod conditional_aggregate_659;
+
+#[path = "collections/hierarchical_whole_array_assign.rs"]
+mod hierarchical_whole_array_assign;

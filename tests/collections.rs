@@ -204,3 +204,6 @@ mod review_package_collection_aliases;
 
 #[path = "collections/foreach_omitted_var_before_collection.rs"]
 mod foreach_omitted_var_before_collection;
+
+#[path = "collections/hierarchical_whole_array_assign.rs"]
+mod hierarchical_whole_array_assign;

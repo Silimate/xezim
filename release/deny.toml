@@ -44,4 +44,4 @@ multiple-versions = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/aionhw/xezim-core.git"]
+allow-git = ["https://github.com/aionhw/xezim-core.git", "https://github.com/Silimate/xezim-core.git"]

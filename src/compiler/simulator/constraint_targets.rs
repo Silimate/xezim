@@ -325,7 +325,7 @@ impl Simulator {
                         tn = Some(r);
                     }
                 }
-                return tn;
+                return tn.map(|t| self.resolved_class_key(&t).unwrap_or(t));
             }
             cur = cd.extends.clone();
         }
@@ -406,7 +406,7 @@ impl Simulator {
                         tn = Some(r);
                     }
                 }
-                return tn.filter(|t| self.module.classes.contains_key(t));
+                return tn.and_then(|t| self.resolved_class_key(&t));
             }
             cur = cd.extends.as_deref();
         }

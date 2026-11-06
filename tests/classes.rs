@@ -1122,3 +1122,6 @@ mod module_parameter_specialization_874;
 
 #[path = "classes/rand_bijective_eq.rs"]
 mod rand_bijective_eq;
+
+#[path = "classes/rand_typedef_handle.rs"]
+mod rand_typedef_handle;

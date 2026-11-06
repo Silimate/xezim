@@ -1122,3 +1122,6 @@ mod module_parameter_specialization_874;
 
 #[path = "classes/rand_bijective_eq.rs"]
 mod rand_bijective_eq;
+
+#[path = "classes/class_scoped_assoc_queue_element.rs"]
+mod class_scoped_assoc_queue_element;

@@ -92,7 +92,7 @@ impl Simulator {
         // §18.8: element handles whose rand_mode is off are not solved.
         let off = self.rand_mode_disabled.get(&handle);
         for p in rand_obj_props {
-            if !Self::csp_constraints_read(p, constraints) {
+            if !Self::csp_constraints_read(p, constraints) && !self.csp_points_back(handle, p) {
                 continue;
             }
             let scoped = format!("{}#{}", handle, p);
@@ -156,6 +156,17 @@ impl Simulator {
             return None;
         }
         Some(out)
+    }
+
+    /// Whether a constraint of the object in `p` reads a handle member holding `handle`.
+    fn csp_points_back(&self, handle: usize, p: &str) -> bool {
+        let sub = self.member_handle(handle, p).unwrap_or(0);
+        let cons = self.active_constraints(sub);
+        let back = |q: &String| {
+            self.member_handle(sub, q) == Some(handle) && Self::csp_constraints_read(q, &cons)
+        };
+        let inst = self.heap.get(sub).and_then(|o| o.as_ref());
+        inst.is_some_and(|i| i.properties.keys().any(back))
     }
 
     /// Whether some item of `constraints` may read member `prop`: a name or

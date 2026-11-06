@@ -1122,3 +1122,5 @@ mod module_parameter_specialization_874;
 
 #[path = "classes/rand_bijective_eq.rs"]
 mod rand_bijective_eq;
+#[path = "classes/concat_write_through_handle_member.rs"]
+mod concat_write_through_handle_member;

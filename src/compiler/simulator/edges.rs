@@ -1770,6 +1770,7 @@ impl Simulator {
             // inline swallows the follow-up pass the old event-queue path gave,
             // so loop until no waiter fires. Bounded against #0 event ping-pong.
             let mut settle_guard = 0u32;
+            let mut settle_state = 0;
             loop {
                 let mut conts = self.drain_triggered_event_waiters();
                 if conts.is_empty() {
@@ -1794,7 +1795,10 @@ impl Simulator {
                 }
                 self.recycle_conts(conts);
                 settle_guard += 1;
-                if self.finished || settle_guard > 10_000 {
+                if self.finished
+                    || (settle_guard > 10_000
+                        && !self.fixpoint_window_progressed(&mut settle_guard, &mut settle_state))
+                {
                     break;
                 }
             }
@@ -3250,6 +3254,7 @@ impl Simulator {
             // slot). Drain-and-run inline, re-draining because a resumed
             // continuation may fire further events.
             let mut settle_guard = 0u32;
+            let mut settle_state = 0;
             loop {
                 let mut conts = self.drain_triggered_event_waiters();
                 if conts.is_empty() {
@@ -3270,7 +3275,10 @@ impl Simulator {
                 }
                 self.recycle_conts(conts);
                 settle_guard += 1;
-                if self.finished || settle_guard > 10_000 {
+                if self.finished
+                    || (settle_guard > 10_000
+                        && !self.fixpoint_window_progressed(&mut settle_guard, &mut settle_state))
+                {
                     if env_set_cached!("XEZIM_TRACE_SPIN") && !self.finished {
                         eprintln!(
                             "[DRAINGUARD] t={} exhausted; {} waiters:",

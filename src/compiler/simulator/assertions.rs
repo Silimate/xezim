@@ -2552,6 +2552,9 @@ impl Simulator {
                     self.sva_collect_action_sampled_expr(item.expr(), out, sels);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => {
+                self.sva_collect_action_sampled_expr(pattern, out, sels)
+            }
             ExprKind::NamedArg {
                 expr: Some(expr), ..
             } => self.sva_collect_action_sampled_expr(expr, out, sels),
@@ -2579,19 +2582,41 @@ impl Simulator {
             return;
         }
         self.clocking_preponed_slot = Some(self.time);
-        let names: Vec<String> = self
-            .clocking_meta
-            .values()
-            .flat_map(|(_, sigs)| {
-                sigs.iter()
-                    .filter(|(_, is_input)| *is_input)
-                    .map(|(n, _)| n.clone())
-            })
-            .collect();
-        for n in names {
-            if let Some(v) = self.get_signal_value_by_name(&n) {
-                self.clocking_preponed.insert(n, v);
+        if self.clocking_preponed.is_empty() {
+            let names: Vec<String> = self
+                .clocking_meta
+                .values()
+                .flat_map(|(_, sigs)| {
+                    sigs.iter()
+                        .filter(|(_, is_input)| *is_input)
+                        .map(|(n, _)| n.clone())
+                })
+                .collect();
+            for n in names {
+                // §14.3: an unpacked-array clockvar has no signal of its own;
+                // its elements are sampled one by one.
+                if let Some(elems) = self.clocking_array_elems(&n) {
+                    for (_, e) in elems {
+                        if let Some(v) = self.get_signal_value_by_name(&e) {
+                            self.clocking_preponed.insert(e, v);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(v) = self.get_signal_value_by_name(&n) {
+                    self.clocking_preponed.insert(n, v);
+                }
             }
+        } else {
+            let mut preponed = std::mem::take(&mut self.clocking_preponed);
+            for (n, slot) in preponed.iter_mut() {
+                if let Some(&id) = self.signal_name_to_id.get(n.as_str()) {
+                    *slot = self.signal_table[id].clone();
+                } else if let Some(v) = self.get_signal_value_by_name(n) {
+                    *slot = v;
+                }
+            }
+            self.clocking_preponed = preponed;
         }
         if !self.clocking_hist.is_empty() {
             self.record_clocking_hist();
@@ -3028,7 +3053,7 @@ impl Simulator {
                                 signed: false,
                                 base: NumberBase::Decimal,
                                 value: id.to_string(),
-                                cached_val: Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             }),
                             span,
                         )],
@@ -3140,7 +3165,7 @@ impl Simulator {
                     signed: false,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )

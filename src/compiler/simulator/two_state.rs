@@ -4832,6 +4832,7 @@ impl Simulator {
                 insn,
                 Insn::StmtFallback(..)
                     | Insn::EvalExprFallback(..)
+                    | Insn::LoadDynElem(..)
                     | Insn::NbaAssignArray(..)
                     | Insn::BlockingAssignArray(..)
                     | Insn::NbaAssignArrayRange(..)
@@ -5002,6 +5003,7 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
             compiler.set_ast_fallback(true);
             // Edge blocks only: sensitivity is the explicit clock list, so a
             // read hidden inside an interpreted expression can't break wake-up
@@ -5025,6 +5027,7 @@ impl Simulator {
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            Self::set_pattern_type_tables(&self.module, &mut compiler);
             compiler.set_packed_struct_fields(
                 self.bc_packed_fields
                     .as_ref()
@@ -5409,6 +5412,7 @@ impl Simulator {
                     &self.module.arrays,
                     &self.widths,
                 );
+                compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                 compiler.set_ast_fallback(false);
                 compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_scope_hint(scope_hint);
@@ -5428,6 +5432,7 @@ impl Simulator {
                 compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 compiler.set_assoc_arrays(&self.module.associative_arrays);
                 compiler.set_packed_full_dims(&self.module.packed_full_dims);
+                Self::set_pattern_type_tables(&self.module, &mut compiler);
                 compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 compiler.set_arrays_2d(&self.module.arrays_2d);
                 compiler
@@ -5449,6 +5454,7 @@ impl Simulator {
                     &self.module.arrays,
                     &self.widths,
                 );
+                delay_compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
                 delay_compiler.set_ast_fallback(false);
                 delay_compiler.set_scope_hint(self.process_scope_hint.get(&pid).cloned());
                 delay_compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
@@ -5469,6 +5475,7 @@ impl Simulator {
                 delay_compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
                 delay_compiler.set_assoc_arrays(&self.module.associative_arrays);
                 delay_compiler.set_packed_full_dims(&self.module.packed_full_dims);
+                Self::set_pattern_type_tables(&self.module, &mut delay_compiler);
                 delay_compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
                 delay_compiler.set_arrays_2d(&self.module.arrays_2d);
                 delay_compiler
@@ -5938,6 +5945,7 @@ impl Simulator {
                         super::bytecode::Insn::StmtFallback(..)
                             | super::bytecode::Insn::CovHit(..)
                             | super::bytecode::Insn::EvalExprFallback(..)
+                            | super::bytecode::Insn::LoadDynElem(..)
                     )
                 })
             });
@@ -5968,6 +5976,7 @@ impl Simulator {
                         BcInsn::StmtFallback(..)
                         | BcInsn::CovHit(..)
                         | BcInsn::EvalExprFallback(..)
+                        | BcInsn::LoadDynElem(..)
                         | BcInsn::BlockingAssign(..)
                         | BcInsn::BlockingAssignRange(..)
                         | BcInsn::BlockingAssignRangeDyn(..)
@@ -6075,7 +6084,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     let c = match insn {
                         Insn::StmtFallback(..) => 0,
-                        Insn::EvalExprFallback(..) => 0,
+                        Insn::EvalExprFallback(..) | Insn::LoadDynElem(..) => 0,
                         Insn::BlockingAssign(..) => 1,
                         Insn::BlockingAssignRange(..)
                         | Insn::BlockingAssignRangeDyn(..)
@@ -6164,6 +6173,7 @@ impl Simulator {
                         Insn::StmtFallback(..)
                             | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
+                            | Insn::LoadDynElem(..)
                             | Insn::BlockingAssign(..)
                             | Insn::BlockingAssignRange(..)
                             | Insn::BlockingAssignRangeDyn(..)

@@ -827,22 +827,6 @@ impl Simulator {
     /// when a segment is not a plain property, so the general paths decide.
     #[inline(never)]
     pub(super) fn frame_handle_path_read(&self, expr: &Expression) -> Option<Value> {
-        fn names<'a>(e: &'a Expression, out: &mut Vec<&'a str>) -> Option<()> {
-            match &e.kind {
-                ExprKind::Ident(h)
-                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
-                {
-                    out.extend(h.path.iter().map(|s| s.name.name.as_str()));
-                    Some(())
-                }
-                ExprKind::MemberAccess { expr, member } => {
-                    names(expr, out)?;
-                    out.push(member.name.as_str());
-                    Some(())
-                }
-                _ => None,
-            }
-        }
         let root = match &expr.kind {
             ExprKind::Ident(h) if h.path.len() >= 2 => h.path[0].name.name.as_str(),
             ExprKind::MemberAccess { .. } => {
@@ -874,15 +858,38 @@ impl Simulator {
                 return None;
             }
         }
-        let mut cls = cls.to_string();
-        let mut path = Vec::new();
-        names(expr, &mut path)?;
-        let segs = &path[1..];
+        let mut path: [&str; 8] = [""; 8];
+        let mut path_len = 0;
+        fn collect_names<'a>(e: &'a Expression, out: &mut [&'a str; 8], len: &mut usize) -> Option<()> {
+            match &e.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    for s in &h.path {
+                        if *len >= 8 { return None; }
+                        out[*len] = s.name.name.as_str();
+                        *len += 1;
+                    }
+                    Some(())
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    collect_names(expr, out, len)?;
+                    if *len >= 8 { return None; }
+                    out[*len] = member.name.as_str();
+                    *len += 1;
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        collect_names(expr, &mut path, &mut path_len)?;
+        let segs = &path[1..path_len];
+        let mut cur_cls: &str = cls;
         for (i, seg) in segs.iter().enumerate() {
             // §8.10 / §8.14: the member is the one the handle's DECLARED
             // class sees. A static, or a property the object's class
             // re-declares, is stored elsewhere — the general paths decide.
-            let decl = self.prop_owners(&cls);
+            let decl = self.prop_owners(cur_cls);
             let (owner, cd) = decl.get(*seg)?;
             if cd.static_properties.contains(*seg) {
                 return None;
@@ -895,9 +902,10 @@ impl Simulator {
             if i + 1 == segs.len() {
                 return Some(v.clone());
             }
-            cls = self
+            let next_cls = self
                 .class_prop_type_named(owner, seg)
                 .filter(|t| self.module.classes.contains_key(t))?;
+            cur_cls = self.module.classes.get_key_value(&next_cls)?.0.as_str();
             h = v.to_u64()? as usize;
         }
         None
@@ -1228,7 +1236,15 @@ impl Simulator {
         if (Self::recv_chain_call(rvalue).is_some() || Self::recv_chain_call(lvalue).is_some())
             && let Some(base) = self.pin_stmt_recv_calls(&[rvalue, lvalue])
         {
-            self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+            // Rebuilt aggregate paths must retain the held receiver too;
+            // cloning a call would give it a new memo key (§11.4.11).
+            if self.is_unpacked_aggregate_operand(lvalue) || self.is_unpacked_aggregate_operand(rvalue) {
+                let rvalue = self.freeze_conditional_path(rvalue, true);
+                let lvalue = self.freeze_conditional_path(lvalue, true);
+                self.exec_stmt_blocking_assign_body(stmt, &lvalue, &rvalue);
+            } else {
+                self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+            }
             self.recv_call_memo.truncate(base);
             return;
         }
@@ -1352,6 +1368,20 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
+            return;
+        }
+        // §7.4.6, §7.6: a slice of an unpacked array on either side pairs
+        // its elements left to right with the other side's (#867).
+        if self.assign_unpacked_slice(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
+        if let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), rvalue) {
+            self.exec_stmt_blocking_assign(stmt, lvalue, &selected);
+            return;
+        }
         // §25.9: a static virtual-interface property binds by name before
         // any value path below stores (and returns).
         self.bind_static_vif(lvalue, rvalue);
@@ -1387,7 +1417,18 @@ impl Simulator {
                 }
             }
         }
+        // §15.5.5: a class-member event takes the other event's object.
+        self.bind_instance_event_assign(lvalue, rvalue);
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
+        {
+            return;
+        }
+        // §7.4.5/§25.10: `v2[0][1] = bus` — one element of a MULTI-dimensional
+        // vif array binds by name, ahead of the collection-row store below,
+        // which took the write as a value copy and bound nothing (#925).
+        if self.vif_nd_elem_lvalue(lvalue)
+            && !Self::lvalue_has_incdec_index(lvalue)
+            && self.try_bind_virtual_iface(lvalue, rvalue)
         {
             return;
         }
@@ -1491,6 +1532,26 @@ impl Simulator {
                 }
             }
         }
+        // §10.9.1, §7.6: a pattern written to a row of a multi-dimensional
+        // unpacked array spreads over the row's elements. Ahead of the
+        // packed-target store below, which took the row for one value.
+        if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(rvalue).kind
+            && self.assign_unpacked_row_pattern(lvalue, items)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
+        // §10.8, §10.9: a pattern written to a packed target takes the
+        // target's declared type. The element-wise
+        // spread below is for unpacked targets.
+        if has_pattern(rvalue)
+            && let Some(ty) = self.lvalue_pattern_type(lvalue)
+            && let Some(v) = self.eval_in_packed_type(rvalue, &ty)
+        {
+            self.assign_value(lvalue, &v);
+            self.settle_after_proc_write();
+            return;
+        }
         if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
             let spread = self.assign_class_fixed_array_pattern(lvalue, items)
                 || self.assign_class_collection_pattern(lvalue, items)
@@ -1509,27 +1570,6 @@ impl Simulator {
                         }
                 };
             if spread {
-                self.settle_after_proc_write();
-                return;
-            }
-        }
-        // A named/ordered/default pattern written to a PACKED struct
-        // must be laid out by member OFFSET, not blind-concatenated:
-        // an unsized `'0` (32 bits) or any other non-member-width item
-        // would otherwise shift every field. Fall through untouched when
-        // the lvalue is not a registered packed struct.
-        if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-            if self.try_assign_packed_struct_pattern(lvalue, items) {
-                self.settle_after_proc_write();
-                return;
-            }
-            // §10.9.2: the same per-ELEMENT expansion the continuous
-            // and nonblocking paths already do. Without it a BLOCKING
-            // `v = '{default:1'b1};` on a packed target fell through to
-            // the generic concat, which built a value out of the items'
-            // own widths (one bit) instead of one item per element.
-            if let Some(v) = self.packed_pattern_for_lhs(lvalue, items) {
-                self.assign_value(lvalue, &v);
                 self.settle_after_proc_write();
                 return;
             }
@@ -1655,12 +1695,16 @@ impl Simulator {
             v
         };
         if let Some(dst) = &lflat {
-            let su_opt = self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
-                match self.resolve_dt(&dt) {
-                    DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
-                    _ => None,
-                }
-            });
+            let su_opt = if !self.struct_root_possible(dst) {
+                None
+            } else {
+                self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
+                    match self.resolve_dt(&dt) {
+                        DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+                        _ => None,
+                    }
+                })
+            };
             if let Some(su) = su_opt {
                 let dst = dst.clone();
                 if let Some(src) = eval_rflat(self, &mut rflat_cache)
@@ -1924,13 +1968,13 @@ impl Simulator {
                 // Allocate here, before the class walk.
                 if let Some(kind) = self.lvalue_container_kind(lvalue) {
                     let handle = self.heap.len();
-                    self.heap.push(Some(ClassInstance {
+                    self.heap.push(Some(Box::new(ClassInstance {
                         class_name: kind.to_string(),
                         properties: PropMap::default(),
                         type_bindings: HashMap::default(),
                         spec: None,
                         creation_scope: self.active_instance_scope(),
-                    }));
+                    })));
                     let cargs: &[Expression] = match &rvalue.kind {
                         ExprKind::Call { args, .. } => args,
                         _ => &[],
@@ -1974,7 +2018,7 @@ impl Simulator {
                     ExprKind::Ident(ih) if ih.path.len() >= 3 => {
                         let mut p = ih.clone();
                         let member = p.path.pop().unwrap().name.name.clone();
-                        p.cached_signal_id = std::cell::Cell::new(None);
+                        p.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                         Some((Expression::new(ExprKind::Ident(p), lvalue.span), member))
                     }
                     _ => None,
@@ -2578,8 +2622,12 @@ impl Simulator {
             // A string QUEUE is in `string_signals` too (so its
             // elements render as strings), but `q = {...}` on it is a
             // QUEUE assignment — `q = {}` clears it — not a byte concat.
+            let in_frame = matches!(self.local_stack.last(), Some(f) if f.contains_key(&*lname));
             let lhs_is_queue = self.module.dynamic_arrays.contains(&*lname)
-                || self.module.arrays.contains_key(&*lname);
+                || self.module.arrays.contains_key(&*lname)
+                || self
+                    .instance_assoc_member(&lname)
+                    .is_some_and(|scoped| !in_frame && self.class_queue_prop(&scoped));
             if !lhs_is_queue
                 && (self.string_signals.contains(&*lname)
                     || self.string_signals.contains(
@@ -2626,8 +2674,13 @@ impl Simulator {
         // `assign_value`, which maps the base to its instance-
         // scoped store.
         if let ExprKind::Index { expr: base, .. } = &lvalue.kind {
-            if self.expr_assoc_name(base).is_some() {
-                let v = self.eval_expr(rvalue);
+            if let Some(an) = self.expr_assoc_name(base) {
+                // §11.6.1: the element's declared width is the context of
+                // the right-hand side (`aa[k] = (1 << 70) - 1`).
+                let v = match self.assoc_store_ctx_width(&an) {
+                    Some(w) => self.eval_expr_ctx(rvalue, w),
+                    None => self.eval_expr(rvalue),
+                };
                 self.assign_value(lvalue, &v);
                 self.settle_after_proc_write();
                 return;
@@ -2710,8 +2763,15 @@ impl Simulator {
                     for i in sz..old_sz {
                         self.signals.remove(&format!("{}[{}]", dst, i));
                     }
+                    // An unpacked-struct element has no `<src>[i]` signal,
+                    // only its member leaves.
+                    let member_wise = self.queue_elem_struct(&src).is_some();
                     for i in 0..sz {
-                        if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", src, i)) {
+                        if member_wise {
+                            self.queue_copy_elem(&src, i, &dst, i);
+                        } else if let Some(v) =
+                            self.get_signal_value_by_name(&format!("{}[{}]", src, i))
+                        {
                             self.set_signal_value_by_name(&format!("{}[{}]", dst, i), v);
                         }
                     }
@@ -3329,6 +3389,10 @@ impl Simulator {
             // None and passes through unchanged.
             let type_name =
                 type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn.clone()));
+            // §8.25: a member target (`other.h = new`) takes the binding of
+            // the object that owns the member, not the running
+            // specialization's (#596).
+            let type_name = self.member_target_class(lvalue).or(type_name);
             if let Some(tname) = type_name {
                 // §8.25: the type-parameter resolved to a SPECIALIZED
                 // class name `Base#(args)` (e.g. `T obj = new()` where
@@ -3610,28 +3674,26 @@ impl Simulator {
                     // real `new` runs. Plain class names are unchanged.
                     let type_name =
                         type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
-                    // §8.25: `o.h = new()` from outside the class, `h`
-                    // declared by a type parameter: the active specialization
-                    // is not `o`'s, so the name stayed the parameter's and an
-                    // opaque object of class `T` was built. Bind it through
-                    // the object that owns the member (#576).
-                    let type_name = match type_name {
-                        Some(tn) if !self.module.classes.contains_key(&tn) => {
-                            Some(self.member_target_class(lvalue).unwrap_or(tn))
-                        }
-                        None => self.member_target_class(lvalue),
-                        other => other,
-                    };
+                    // §8.25: `o.h = new()`, `h` declared by a type parameter:
+                    // the active specialization is not `o`'s (outside the
+                    // class, or inside another specialization), so the name
+                    // stayed the parameter's or took the wrong binding. Bind
+                    // it through the object that owns the member (#576).
+                    // The owner's binding comes first even when the running
+                    // specialization names a class: inside `W #(A)`,
+                    // `other.h = new()` with `other` a `W #(B)` builds a `B`
+                    // (#596).
+                    let type_name = self.member_target_class(lvalue).or(type_name);
                     if let Some(tname) = type_name {
                         if tname == "semaphore" {
                             let handle = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: tname.clone(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             let initial_count = args
                                 .first()
                                 .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
@@ -3640,13 +3702,13 @@ impl Simulator {
                             Value::from_u64(handle as u64, 32)
                         } else if tname == "mailbox" {
                             let handle = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: tname.clone(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             self.mailboxes
                                 .insert(handle, std::collections::VecDeque::new());
                             self.record_mailbox_bound(handle, args);
@@ -3704,13 +3766,13 @@ impl Simulator {
                                 // (`id_actions = new();`) recurses
                                 // new -> initialize -> new … forever.
                                 let h = self.heap.len();
-                                self.heap.push(Some(ClassInstance {
+                                self.heap.push(Some(Box::new(ClassInstance {
                                     class_name: tname.clone(),
                                     properties: PropMap::default(),
                                     type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
-                                }));
+                                })));
                                 Value::from_u64(h as u64, 32)
                             }
                         }
@@ -3731,13 +3793,13 @@ impl Simulator {
                             // enclosing class's constructor and
                             // recurses.
                             let h = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: String::new(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             Value::from_u64(h as u64, 32)
                         }
                     }
@@ -3835,8 +3897,15 @@ impl Simulator {
             // lives under "<handle>#member" — resolve it like element
             // accesses already do, else a whole-array copy involving
             // a property is silently dropped.
+            // A FIXED multi-dimensional member is not a collection: it
+            // copies element-wise by shape (`copy_multi_dim_array`).
             sim.expr_assoc_name(e)
                 .filter(|an| !sim.is_associative_array(an))
+                .filter(|an| {
+                    sim.module.dynamic_arrays.contains(an)
+                        || !(sim.module.arrays_2d.contains_key(an)
+                            || sim.module.arrays_nd.contains_key(an))
+                })
                 .map(|an| (an, true))
         };
         let l_res = resolve_coll(self, lvalue);
@@ -3858,7 +3927,9 @@ impl Simulator {
                 && (l_is_prop || self.module.dynamic_arrays.contains(&lname))
                 && (r_is_prop || self.module.dynamic_arrays.contains(&rname))
             {
-                self.copy_whole_queue(&lname, &rname);
+                // Rows that are themselves dynamic arrays or queues
+                // (`int d[][]`) are copied with their sizes and elements.
+                self.copy_dyn_tree(&lname, &rname);
                 self.settle_after_proc_write();
                 return;
             }
@@ -3968,6 +4039,23 @@ impl Simulator {
                 let (rlo, rhi, _) = self.module.arrays[&*rname];
                 let lsize = (lhi - llo + 1) as usize;
                 let rsize = (rhi - rlo + 1) as usize;
+                // §7.2 / §7.6: an unpacked struct element consists of
+                // member leaves; its container scalar carries no value.
+                if let Some(su) = self.queue_elem_struct(&rname) {
+                    let dynamic_dst = self.module.dynamic_arrays.contains(&*lname);
+                    let count = if dynamic_dst { self.get_queue_size(&rname) as usize }
+                        else { lsize.min(rsize) };
+                    let l_desc = self.module.descending_arrays.contains(&*lname);
+                    let r_desc = self.module.descending_arrays.contains(&*rname);
+                    for i in 0..count {
+                        let li = if dynamic_dst { i as i64 } else if l_desc { lhi-i as i64 } else { llo+i as i64 };
+                        let ri = if r_desc { rhi-i as i64 } else { rlo+i as i64 };
+                        self.copy_unpacked_struct(&format!("{lname}[{li}]"), &format!("{rname}[{ri}]"), &su);
+                    }
+                    if dynamic_dst { self.set_queue_size(&lname, count as u64); }
+                    self.settle_after_proc_write();
+                    return;
+                }
                 // §7.6: assigning a FIXED array to a DYNAMIC array
                 // resizes the destination to the source's size —
                 // the placeholder (0,63) registration made this look

@@ -894,3 +894,56 @@ fn fst_repack_wraps_the_dump_and_reads_back() {
     assert_eq!((a.start_time, a.end_time), (b.start_time, b.end_time));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--fst-repack` on a dump path that is a symbolic link repacks the link's
+/// target and keeps the link: renaming over the path made the link a regular
+/// file and left the target uncompressed (#598, reported by akashlevy). No
+/// temporary file is left beside the target.
+#[cfg(unix)]
+#[test]
+fn fst_repack_through_a_symbolic_link() {
+    let dir = std::env::temp_dir().join(format!("xezim_fst_repack_link_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let design = dir.join("top.sv");
+    std::fs::write(
+        &design,
+        "module top; reg [7:0] c = 0; always #5 c = c + 1; initial #50 $finish; endmodule\n",
+    )
+    .unwrap();
+    let target = dir.join("real.fst");
+    let link = dir.join("link.fst");
+    std::fs::write(&target, b"").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .arg(&design)
+        .args(["--simulate", "-s", "top", "--no-cache", "--fst"])
+        .arg(&link)
+        .arg("--fst-repack=4")
+        .output()
+        .expect("run xezim");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the dump path is no longer a link"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap()[0],
+        254,
+        "the target was not repacked"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".repack."))
+        .collect();
+    assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

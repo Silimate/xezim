@@ -86,7 +86,7 @@ impl Simulator {
                     v.is_signed = true;
                     vm_regs[*dest as usize] = v;
                 }
-                Insn::LoadProcessLocal(dest, _) => {
+                Insn::LoadProcessLocal(dest, _) | Insn::LoadProcessStatus(dest, _) => {
                     vm_regs[*dest as usize] = Value::new(1);
                 }
                 Insn::Resize(reg, width) => {
@@ -776,6 +776,7 @@ impl Simulator {
                 // These should never appear in parallel-eligible blocks
                 Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
+                | Insn::LoadDynElem(..)
                 | Insn::BlockingAssign(..)
                 | Insn::BlockingAssignString(..)
                 | Insn::BlockingAssignRange(..)
@@ -900,7 +901,7 @@ impl Simulator {
                     v.is_signed = true;
                     vm_regs[*dest as usize] = v;
                 }
-                Insn::LoadProcessLocal(dest, _) => {
+                Insn::LoadProcessLocal(dest, _) | Insn::LoadProcessStatus(dest, _) => {
                     vm_regs[*dest as usize] = Value::new(1);
                     unsupported = true;
                 }
@@ -1702,6 +1703,7 @@ impl Simulator {
                 | Insn::BlockingAssignArrayRange(..)
                 | Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
+                | Insn::LoadDynElem(..)
                 | Insn::CovHit(..) => {
                     unsupported = true;
                 }
@@ -2139,11 +2141,23 @@ impl Simulator {
                 // time (§8.15 super / §8.20 non-virtual bare call): run
                 // the body via the hierarchy walk from that class —
                 // non-virtual, ctor chaining included.
+                if let Some(v) =
+                    self.vm_try_direct_call_from(handle, Some(start_class), method, base, n)
+                {
+                    self.vm_regs[*dest as usize] = v;
+                    self.vm_ret_coll = self.pending_ret_collection.clone();
+                    local_count += 1;
+                    return local_count;
+                }
                 let (args, temps) = self.vm_args_with_writeback(start_class, method, base, n);
                 let result = if handle == 0 {
-                    // Null receiver (unreachable for instance frames;
-                    // a static frame never lowers a scoped call).
-                    Value::zero(32)
+                    // §8.23: a null receiver still has a legally callable
+                    // STATIC target — a static method neither needs nor
+                    // references `this` (§8.7), so it resolves on the
+                    // declared class. Anything else through a null handle
+                    // stays a silent zero.
+                    self.exec_static_method_via_object(start_class, method, &args, 0)
+                        .unwrap_or_else(|| Value::zero(32))
                 } else {
                     self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
                 };
@@ -2234,8 +2248,9 @@ impl Simulator {
                                     selects: Vec::new(),
                                 }],
                                 span: crate::ast::Span::dummy(),
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
                             }),
                             crate::ast::Span::dummy(),
                         ));
@@ -2332,7 +2347,11 @@ impl Simulator {
                 self.class_static_set(class, prop, v);
             }
             Insn::ConstructObject(dest, class, arg_start, n_args) => {
-                let class: &str = &class.0;
+                // `class\0mask`: positions of empty actuals (defaults).
+                let (class, empty_mask): (&str, u64) = match class.0.split_once('\u{0}') {
+                    Some((c, m)) => (c, m.parse().unwrap_or(0)),
+                    None => (&class.0, 0),
+                };
                 // Step 9g: `new(args)` / bare `new` — §8.8 constructor
                 // of the baked DEFINING class. Allocation, property
                 // inits, and the ctor chain all stay in
@@ -2349,7 +2368,14 @@ impl Simulator {
                 }
                 let args: Vec<Expression> = argvals
                     .iter()
-                    .map(|v| self.value_method_arg_expr(v))
+                    .enumerate()
+                    .map(|(i, v)| {
+                        if i < 64 && empty_mask & (1 << i) != 0 {
+                            Expression::new(ExprKind::Empty, crate::ast::Span::dummy())
+                        } else {
+                            self.value_method_arg_expr(v)
+                        }
+                    })
                     .collect();
                 let v = if let Some(cd) = self.module.classes.get(class).cloned() {
                     self.instantiate_class(&cd, &args)
@@ -2523,10 +2549,25 @@ impl Simulator {
                         // of `format!` — this runs once per element access on
                         // associative-array procedural loops.
                         let elem = Self::name_with_key(&an, &key);
-                        self.signals
-                            .get(&elem)
-                            .cloned()
-                            .unwrap_or_else(|| Value::zero(32))
+                        // §7.9 / §7.10.4: an element at or past a queue's or
+                        // dynamic array's current SIZE does not exist and
+                        // reads the element type's default. The store keeps
+                        // the cells a shrink (`delete()`, `delete(i)`,
+                        // `pop_*`) orphaned, so the map hit below returned
+                        // the retired element. Same default as this arm's
+                        // own miss path.
+                        let idx = idx_val.to_i64().unwrap_or(-1);
+                        if !self.is_associative_array(&an)
+                            && (idx < 0 || idx as u64 >= self.get_queue_size(&an))
+                        {
+                            self.coll_missing_elem_value(&an)
+                                .unwrap_or_else(|| Value::zero(32))
+                        } else {
+                            self.signals
+                                .get(&elem)
+                                .cloned()
+                                .unwrap_or_else(|| Value::zero(32))
+                        }
                     }
                     None => Value::zero(32),
                 };
@@ -2600,8 +2641,9 @@ impl Simulator {
                                         selects: Vec::new(),
                                     }],
                                     span: crate::ast::Span::dummy(),
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 }),
                                 crate::ast::Span::dummy(),
                             );
@@ -2734,7 +2776,7 @@ impl Simulator {
                     .iter()
                     .map(|key| {
                         if is_str {
-                            Value::from_string(key)
+                            Self::name_key_value(key)
                         } else {
                             let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
                             v.is_signed = ks_sign;
@@ -3001,6 +3043,16 @@ impl Simulator {
                         .cloned()
                         .unwrap_or_else(|| Value::new(1));
                     self.vm_regs[*dest as usize] = value;
+                }
+                Insn::LoadProcessStatus(dest, handle) => {
+                    let hreg = *handle as usize;
+                    let h = self.vm_regs[hreg].to_u64().unwrap_or(0);
+                    // A null (or non-process) handle reads like the
+                    // interpreter's `p.status` on it: the 32-bit zero of a
+                    // member read through a null handle, not RUNNING.
+                    let st =
+                        Self::proc_handle_to_pid(h).map_or(0, |pid| self.proc_status(pid) as u64);
+                    self.vm_regs[*dest as usize] = Value::from_u64(st, 32);
                 }
                 // class-perf tier-1 opcodes: read/write an object member off
                 // the heap, addressed by a register-held handle. `this` is
@@ -4009,6 +4061,10 @@ impl Simulator {
                         }
                     }
                 }
+                Insn::LoadDynElem(dest, op, idx_reg) => {
+                    let v = self.load_dyn_elem(op, *idx_reg);
+                    self.vm_regs[*dest as usize] = v;
+                }
                 Insn::EvalExprFallback(payload, r, ctxw) => {
                     // Expression-level AST escape hatch: interpret one
                     // sub-expression; the rest of the statement stays
@@ -4762,5 +4818,46 @@ impl Simulator {
             pc += 1;
         }
         self.prof_insns_executed += local_count;
+    }
+
+    /// `Insn::LoadDynElem`: element `idx_reg` of a design-scope dynamic array
+    /// or queue, read as the interpreter reads it (§7.5, §7.10, §7.4.6). An
+    /// index inside both the live size and the placeholder element cells
+    /// reads its cell, as the interpreter's own first lookup does; anything
+    /// else (an x index, past `size()`, past the cells) takes that same
+    /// interpreter read.
+    #[inline]
+    pub(super) fn load_dyn_elem(
+        &mut self,
+        op: &super::bytecode::DynElemOp,
+        idx_reg: super::bytecode::RegId,
+    ) -> Value {
+        let ir = &self.vm_regs[idx_reg as usize];
+        if let Some((first, lo, hi)) = op.cells
+            && !ir.has_xz()
+            && let (Some(i), Some(ix)) = (ir.to_i64(), ir.to_index())
+            && i >= 0
+            && ix >= lo
+            && ix <= hi
+            && *self.spec_static_coll_key(&op.name) == *op.name
+        {
+            let size = match self.signals.get(&*op.size_key) {
+                Some(v) => v.to_u64().unwrap_or(0),
+                None => self.get_queue_size(&op.name),
+            };
+            // `get_queue_size`'s clamp of a garbage size.
+            let size = if size > 1 << 26 { 0 } else { size };
+            let eid = first + (ix - lo) as usize;
+            if (i as u64) < size && !is_packed_id(eid) {
+                let mut v = self.signal_table[eid].clone();
+                if self.signal_signed[eid] {
+                    v.is_signed = true;
+                }
+                return v;
+            }
+        }
+        let idx_val = self.vm_regs[idx_reg as usize].clone();
+        let store = self.spec_static_coll_key(&op.name).into_owned();
+        self.coll_elem_read(&op.name, &store, idx_val, op.ctx_width)
     }
 }

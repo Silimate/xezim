@@ -4,6 +4,10 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// Entries kept by the per-(object, property) shape memos before they are
+/// dropped and rebuilt.
+pub(super) const CLASS_PROP_MEMO_CAP: usize = 1 << 16;
+
 impl Simulator {
     /// §7.4.1: bit offset of ELEMENT `idx` of the packed multi-D signal
     /// `name`, normalized against the declared outer dimension — a descending
@@ -28,6 +32,25 @@ impl Simulator {
         handle: usize,
         prop: &str,
     ) -> Option<Vec<(i64, i64)>> {
+        let key = (handle, prop.to_string());
+        if let Some(cached) = self.class_prop_dims_memo.borrow().get(&key) {
+            return cached.clone();
+        }
+        let r = self.class_prop_packed_dims_uncached(handle, prop);
+        let mut memo = self.class_prop_dims_memo.borrow_mut();
+        // Keyed per object: a long run allocates objects without bound.
+        if memo.len() >= CLASS_PROP_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(key, r.clone());
+        r
+    }
+
+    fn class_prop_packed_dims_uncached(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Vec<(i64, i64)>> {
         let cn = self
             .heap
             .get(handle)
@@ -47,12 +70,22 @@ impl Simulator {
                 // of the type this object binds to it; the declared `T`
                 // has none, so `o.w[1] = 7` wrote nothing (#576).
                 let bound = self.bind_type_params_in(dt, &|n| self.obj_type_param(handle, &c, n));
-                let dims = super::elaborate::packed_full_dims_chained(
-                    bound.as_ref().unwrap_or(dt),
+                let bdt = bound.as_ref().unwrap_or(dt);
+                if let Some(dims) = super::elaborate::packed_full_dims_chained(
+                    bdt,
                     &self.module.parameters,
                     &self.module.typedef_types,
-                )?;
-                return if dims.len() >= 2 { Some(dims) } else { None };
+                ) {
+                    return if dims.len() >= 2 { Some(dims) } else { None };
+                }
+                // §7.4.1: a packed ARRAY of packed structs (`cand_t [0:2] a`):
+                // the array dimensions alone — the struct is the element, so
+                // one dimension already selects elements, not bits (#928).
+                let su = self.packed_struct_with_dims(bdt)?;
+                if !su.packed || su.dimensions.is_empty() {
+                    return None;
+                }
+                return Self::packed_range_bounds(&su.dimensions, &self.module.parameters);
             }
             cur = cd.extends.clone();
         }
@@ -401,7 +434,7 @@ impl Simulator {
         matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::Paren(_)
-        )
+        ) || matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
     }
 
     /// A select of a select of a variable the innermost call frame owns (a
@@ -455,11 +488,10 @@ impl Simulator {
             return None;
         }
         let name = h.path[0].name.name.as_str();
-        if !self
-            .local_stack
-            .last()
-            .is_some_and(|f| f.contains_key(name))
-            && !self.hoisted_sub_static_names.contains(name)
+        if !self.local_stack.last().is_some_and(|f| {
+            f.contains_key(name)
+                || (self.any_struct_formal_markers && f.contains_key(&format!("{name}.")))
+        }) && !self.hoisted_sub_static_names.contains(name)
         {
             return None;
         }
@@ -482,8 +514,8 @@ impl Simulator {
             let mut identifier = h.clone();
             identifier.path.truncate(1);
             identifier.path[0].selects.clear();
-            identifier.cached_signal_id = Cell::new(None);
-            identifier.cached_resolved_name = std::cell::OnceCell::new();
+            identifier.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            identifier.cached_resolved_name = crate::ast::cache::NameCache::new();
             std::borrow::Cow::Owned(Expression::new(ExprKind::Ident(identifier), cur.span))
         };
         if steps.is_empty() {
@@ -516,9 +548,66 @@ impl Simulator {
         {
             return None;
         }
-        let dt = self.module.var_decl_types.get(name)?;
-        let (hops, total, two) = self.packed_hops(dt, &steps)?;
-        let valid = if let Some(cur) = self.local_stack.last().and_then(|f| f.get(name)) {
+        // A suspended task keeps its typedef in the process-local frame.
+        // Another task may meanwhile bind a same-named formal of a different
+        // type, replacing the shared var_decl_types / packed-element tables.
+        // Resolve the active declaration before consulting those tables.
+        // The frame records a local's typedef name only, which is not the
+        // whole type of a packed array of it (`e8_t [1:0] a`), so a type
+        // whose geometry does not fit the cell falls back to the module's
+        // declaration.
+        let (dt, unpacked, _) = self.query_root_decl_type(name)?;
+        if !unpacked.is_empty() {
+            return None;
+        }
+        let (root, steps, hops, two) = self
+            .frame_packed_geometry(dt, root.clone(), name, &steps)
+            .or_else(|| {
+            let dt = self.module.var_decl_types.get(name)?.clone();
+            self.frame_packed_geometry(dt, root, name, &steps)
+        })?;
+        Some((root, name, steps, hops, two))
+    }
+
+    /// `frame_packed_target`'s layout of the selects `steps` of frame
+    /// variable `name` declared `dt`, when it fits the variable's cell.
+    #[allow(clippy::type_complexity)]
+    fn frame_packed_geometry<'e>(
+        &self,
+        mut dt: DataType,
+        mut root: std::borrow::Cow<'e, Expression>,
+        name: &'e str,
+        steps: &[PendingSel<'e>],
+    ) -> Option<(
+        std::borrow::Cow<'e, Expression>,
+        Vec<PendingSel<'e>>,
+        Vec<PackedHop>,
+        bool,
+    )> {
+        let mut steps = steps.to_vec();
+        let mut cell = std::borrow::Cow::Borrowed(name);
+        // Unpacked structs are stored as individual frame leaves (`req.data`),
+        // not as a packed value at `req`. Walk to that leaf, then use the
+        // member's declared packed geometry for the remaining selects. Never
+        // derive its shape from a different activation's name-keyed metadata.
+        while matches!(self.resolve_dt_ref(&dt), DataType::Struct(su) if !su.packed) {
+            let PendingSel::Member(member) = steps.first()? else {
+                return None;
+            };
+            let (member_dt, dims) = self.member_decl_type(&dt, member)?;
+            if !dims.is_empty() {
+                return None;
+            }
+            cell = std::borrow::Cow::Owned(format!("{cell}.{member}"));
+            root = std::borrow::Cow::Owned(Self::append_member_expr(root.as_ref(), member));
+            dt = member_dt;
+            steps.remove(0);
+        }
+        if steps.is_empty() {
+            return None;
+        }
+        let (hops, total, two) = self.packed_hops(&dt, &steps)?;
+        let valid = if let Some(cur) = self.local_stack.last().and_then(|f| f.get(cell.as_ref())) {
             !cur.is_real && cur.width == total
         } else if self.hoisted_sub_static_names.contains(name) {
             self.get_signal_value_by_name(name)
@@ -529,7 +618,7 @@ impl Simulator {
         if !valid {
             return None;
         }
-        Some((root, name, steps, hops, two))
+        Some((root, steps, hops, two))
     }
 
     /// The packed layout of `dt`: its packed dimensions, outermost first and
@@ -941,17 +1030,70 @@ impl Simulator {
         &self,
         dt: &DataType,
     ) -> Option<(DataType, Vec<(i64, i64)>, u32)> {
-        let width = super::elaborate::resolve_type_width(
-            dt,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        );
+        self.declared_packed_type_in(dt, &self.module.parameters)
+    }
+
+    /// §23.10: the parameter table a declaration stored under `name` is sized
+    /// against. A declaration inside an instantiated module names ITS
+    /// parameters bare (`s_t [N-1:0] par`), while the design-wide table keys
+    /// them by instance (`u.N`); evaluating the declaration against that table
+    /// misses `N` (or hits an unrelated top-level `N`). Overlay every
+    /// parameter of the signal's instance path — outer scopes first, so a
+    /// generate block's or the instance's own binding wins — on the table.
+    /// `None` for a top-scope name or a prefix that owns no parameters.
+    pub(super) fn decl_param_scope(
+        &self,
+        name: &str,
+    ) -> Option<std::rc::Rc<HashMap<String, Value>>> {
+        let (prefix, _) = name.rsplit_once('.')?;
+        if let Some((cached, scope)) = self.decl_param_scope_cache.borrow().as_ref()
+            && cached == prefix
+        {
+            return scope.clone();
+        }
+        // Every enclosing scope of the prefix, outermost first: `u.g.par`
+        // sees `u.N` as `N` and a generate-block constant `u.g.L` as `L`.
+        let scopes: Vec<&str> = prefix
+            .match_indices('.')
+            .map(|(i, _)| &prefix[..i])
+            .chain(std::iter::once(prefix))
+            .collect();
+        let mut overlay: Vec<(usize, &str, &Value)> = Vec::new();
+        for (k, v) in &self.module.parameters {
+            for (depth, scope) in scopes.iter().enumerate() {
+                if let Some(rest) = k.strip_prefix(scope).and_then(|r| r.strip_prefix('.')) {
+                    overlay.push((depth, rest, v));
+                }
+            }
+        }
+        let scope = if overlay.is_empty() {
+            None
+        } else {
+            // Innermost last, so its binding wins over an outer same-named one.
+            overlay.sort_by_key(|(depth, ..)| *depth);
+            let mut params = self.module.parameters.clone();
+            for (_, bare, v) in overlay {
+                params.insert(bare.to_string(), v.clone());
+            }
+            Some(std::rc::Rc::new(params))
+        };
+        *self.decl_param_scope_cache.borrow_mut() = Some((prefix.to_string(), scope.clone()));
+        scope
+    }
+
+    pub(super) fn declared_packed_type_in(
+        &self,
+        dt: &DataType,
+        params: &HashMap<String, Value>,
+    ) -> Option<(DataType, Vec<(i64, i64)>, u32)> {
+        let width =
+            super::elaborate::resolve_type_width(dt, Some(params), Some(&self.module.typedefs));
         if width == 0 {
             return None;
         }
         let query = super::elaborate::type_query_dims_of(
             dt,
-            Some(&self.module.parameters),
+            Some(params),
             Some(&self.module.typedefs),
             Some(&self.module.typedef_types),
         );
@@ -965,14 +1107,8 @@ impl Simulator {
                         return None;
                     };
                     dimensions.push((
-                        super::elaborate::const_eval_i64_with_params(
-                            left,
-                            Some(&self.module.parameters),
-                        )?,
-                        super::elaborate::const_eval_i64_with_params(
-                            right,
-                            Some(&self.module.parameters),
-                        )?,
+                        super::elaborate::const_eval_i64_with_params(left, Some(params))?,
+                        super::elaborate::const_eval_i64_with_params(right, Some(params))?,
                     ));
                 }
                 su.dimensions.clear();
@@ -1073,6 +1209,7 @@ impl Simulator {
             }
             Some(DeclaredPackedAccess {
                 storage: String::new(),
+                params: None,
                 is_signed: super::elaborate::is_type_signed_resolved(
                     &dt,
                     &self.module.typedef_types,
@@ -1114,14 +1251,20 @@ impl Simulator {
                     return None;
                 }
                 let dt = self.module.var_decl_types.get(&name)?;
-                let (element_type, mut dimensions, mut width) = self.declared_packed_type(dt)?;
                 // §23.10: a declaration inside an instantiated module sizes its
-                // dimensions with THAT instance's parameters. The declaration
-                // above was evaluated against the design-wide table, where a
-                // child's `N` is stored as `<inst>.N`: a bare `N` misses (the
-                // shape collapses to a plain 2-bit vector, so `mv[1][0]` read
-                // one bit) or hits an unrelated top-level `N`. Elaboration
-                // recorded this signal's dimensions per instance; use them.
+                // dimensions with THAT instance's parameters, which the
+                // design-wide table keys as `<inst>.N`. Evaluated against that
+                // table a bare `N` misses or hits an unrelated top-level `N`:
+                // `s_t [N-1:0] par` collapsed to a 1-bit element, so
+                // `par[i].a` (1-bit first member) read and wrote bit `i` of
+                // the array (#816). Size the declaration in its own scope.
+                let scope = self.decl_param_scope(&name);
+                let (element_type, mut dimensions, mut width) = match &scope {
+                    Some(params) => self.declared_packed_type_in(dt, params)?,
+                    None => self.declared_packed_type(dt)?,
+                };
+                // Elaboration recorded a vector's dimensions per instance;
+                // prefer them (a `[N-1:0]` of an unresolvable `N` is width 0).
                 if let Some(recorded) = self.module.packed_full_dims.get(&name)
                     && matches!(
                         element_type,
@@ -1148,6 +1291,7 @@ impl Simulator {
                 };
                 Some(DeclaredPackedAccess {
                     storage: name,
+                    params: scope,
                     is_signed: super::elaborate::is_type_signed_resolved(
                         dt,
                         &self.module.typedef_types,
@@ -1286,9 +1430,42 @@ impl Simulator {
                 let DataType::Struct(su) = &access.element_type else {
                     return None;
                 };
+                // Memoized per declaration position: the root variable, the
+                // offset and width already selected into it, and the member.
+                // (A source span alone is not unique across files.) Not for
+                // instance-parameterized or static roots.
+                let memo_key = (access.params.is_none()
+                    && access.static_target.is_none()
+                    && !access.storage.is_empty())
+                .then(|| {
+                    (
+                        access.storage.clone(),
+                        access.offset,
+                        access.width,
+                        member.name.clone(),
+                    )
+                });
+                if let Some(memo_key) = &memo_key {
+                    if let Some(cached) = self.packed_struct_member_memo.borrow().get(memo_key) {
+                        if let Some((offset, width, is_signed, element, dimensions)) = cached {
+                            access.offset = access.offset.checked_add(*offset)?;
+                            access.width = *width;
+                            access.is_signed = *is_signed;
+                            access.dimensions = dimensions.clone();
+                            access.element_type = element.clone();
+                            return Some(access);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
                 let mut remaining = access.width;
                 for m in &su.members {
-                    let (element, dimensions, width) = self.declared_packed_type(&m.data_type)?;
+                    // A member sized by the instance's parameters too.
+                    let (element, dimensions, width) = match &access.params {
+                        Some(params) => self.declared_packed_type_in(&m.data_type, params)?,
+                        None => self.declared_packed_type(&m.data_type)?,
+                    };
                     for d in &m.declarators {
                         if !d.dimensions.is_empty() {
                             return None;
@@ -1300,17 +1477,35 @@ impl Simulator {
                             remaining
                         };
                         if d.name.name == member.name {
-                            access.offset = access.offset.checked_add(offset)?;
-                            access.width = width;
-                            access.is_signed = super::elaborate::is_type_signed_resolved(
+                            let is_signed = super::elaborate::is_type_signed_resolved(
                                 &m.data_type,
                                 &self.module.typedef_types,
                             );
+                            if let Some(memo_key) = memo_key {
+                                self.packed_struct_member_memo.borrow_mut().insert(
+                                    memo_key,
+                                    Some((
+                                        offset,
+                                        width,
+                                        is_signed,
+                                        element.clone(),
+                                        dimensions.clone(),
+                                    )),
+                                );
+                            }
+                            access.offset = access.offset.checked_add(offset)?;
+                            access.width = width;
+                            access.is_signed = is_signed;
                             access.dimensions = dimensions;
                             access.element_type = element;
                             return Some(access);
                         }
                     }
+                }
+                if let Some(memo_key) = memo_key {
+                    self.packed_struct_member_memo
+                        .borrow_mut()
+                        .insert(memo_key, None);
                 }
                 None
             }
@@ -2251,6 +2446,66 @@ impl Simulator {
         sys_result
     }
 
+    /// §20.6.2: `$bits` of a class-member queue or dynamic array — bare in
+    /// a method of its class, or reached through a handle (`h.q`) — is its
+    /// element bits times its CURRENT size, 0 when empty. The bare form
+    /// returned one element's width and the dotted form sized a module
+    /// variable of the same leaf name. None for anything else (string
+    /// elements included).
+    fn member_dyn_coll_bits(&mut self, arg: &Expression) -> Option<u64> {
+        let (handle, field, key) = match &arg.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let n = h.path[0].name.name.as_str();
+                if self.local_stack.last().is_some_and(|l| l.contains_key(n)) {
+                    return None;
+                }
+                let handle = self.this_stack.last().copied().flatten()?;
+                let key = self.instance_assoc_member(n)?;
+                (handle, n.to_string(), key)
+            }
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                let (handle, field) = self.expr_handle_prop_any(arg)?;
+                let key = Self::handle_member_key(handle, &field);
+                (handle, field, key)
+            }
+            _ => return None,
+        };
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        for _ in 0..64 {
+            let cd = self.module.classes.get(cur.as_deref()?)?;
+            if cd.string_properties.contains(&field) || cd.static_properties.contains(&field) {
+                return None;
+            }
+            if let Some(&(ew, _)) = cd.queue_properties.get(&field) {
+                // The object's specialization types a type-parameter element.
+                let ew = self.coll_elem_width(&key).unwrap_or(ew);
+                return Some(self.get_queue_size(&key) * ew as u64);
+            }
+            if cd.properties.contains_key(&field) {
+                return None;
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Whether `base` names a dynamic array, queue or associative array,
+    /// whose rows' shape the declared dimensions do not give (§7.5, §7.8).
+    fn query_base_is_collection(&mut self, base: &Expression) -> bool {
+        if self.assoc_operand_name(base).is_some() {
+            return true;
+        }
+        self.array_operand_name(base).is_some_and(|n| {
+            self.module.dynamic_arrays.contains(&n) || self.module.queue_vars.contains(&n)
+        })
+    }
+
     pub(super) fn eval_expr_system_call_body(
         &mut self,
         expr: &Expression,
@@ -2258,6 +2513,48 @@ impl Simulator {
         name: &String,
         args: &Vec<Expression>,
     ) -> Value {
+        if matches!(
+            name.as_str(),
+            "$bits"
+                | "$size"
+                | "$left"
+                | "$right"
+                | "$low"
+                | "$high"
+                | "$increment"
+                | "$dimensions"
+                | "$unpacked_dimensions"
+        ) && let Some(first) = args.first()
+        {
+            let mut operand = first;
+            while let ExprKind::Paren(inner) = &operand.kind {
+                operand = inner;
+            }
+            // §7.4.6, §20.7: a slice of an unpacked array has the size of its
+            // range, not its width in bits (#867).
+            if name == "$size"
+                && args.len() == 1
+                && let Some(n) = self.unpacked_slice_size(operand)
+            {
+                return Value::from_u64(n as u64, 32);
+            }
+            if let ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } = &operand.kind
+                && self.is_unpacked_aggregate_operand(then_expr)
+                && self.is_unpacked_aggregate_operand(else_expr)
+            {
+                let mut args = args.clone();
+                // §20.7 queries the current value of a dynamic dimension;
+                // fixed dimensions and §20.6.2 $bits are type-only probes.
+                args[0] = if matches!(name.as_str(), "$size" | "$left" | "$right" | "$low" | "$high" | "$increment") && self.aggregate_query_needs_value(operand) {
+                    self.selected_aggregate_rhs(None, operand).unwrap_or_else(|| (**then_expr).clone())
+                } else { (**then_expr).clone() };
+                return self.eval_expr_system_call_body(expr, ctx_width, name, &args);
+            }
+        }
         match name.as_str() {
             COV_COND_FN => return self.cov_cond(args),
             COV_EXPR_FN => return self.cov_expr(args),
@@ -2272,6 +2569,10 @@ impl Simulator {
                     .remove(&idx)
                     .unwrap_or_else(|| Value::zero(32))
             }
+            VIF_VALUE_MARKER => {
+                let token = args.first().map_or(0, |a| self.vif_handle_value(a));
+                Value::from_u64(token, 32)
+            }
             // `@prop` on a non-event class property: true once the property
             // differs from the value captured when the wait was armed.
             VC_CHANGED_MARKER => {
@@ -2285,6 +2586,67 @@ impl Simulator {
                     .unwrap_or_else(|| Value::zero(1));
                 let changed = self.vc_saved.get(&idx).is_none_or(|(_, prev)| *prev != cur);
                 Value::from_u64(changed as u64, 1)
+            }
+            // `@(posedge prop)` / `@(negedge prop)` on a non-signal operand:
+            // true once the operand made the requested transition away from
+            // the value captured when the wait was armed. Bit 0 is the edge
+            // operand (§9.4.2 an edge on a multi-bit value is the LSB), and
+            // an unknown bit counts as 0 for posedge / as 1 for negedge so the
+            // LRM's x→1 / 1→x / x→0 / 1→z transitions still fire.
+            VC_EDGE_MARKER => {
+                let idx = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
+                    .unwrap_or(0);
+                // Latch by removal: a fired wait must stay true when the
+                // resumed `wait` re-evaluates this condition before the body
+                // runs. `vc_release` clears the entry (already gone).
+                let Some((owner, prev)) = self.vc_saved.get(&idx).cloned() else {
+                    return Value::from_u64(1, 1);
+                };
+                let cur = args
+                    .get(1)
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or_else(|| Value::zero(1));
+                let kind = args
+                    .get(2)
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(3))
+                    .unwrap_or(3);
+                // §9.4.2: an edge is detected on the LSB only. LSB state: 0,
+                // 1, or 2 for x/z; Table 9-2: posedge is 0→x/z/1 and x/z→1,
+                // negedge is 1→x/z/0 and x/z→0.
+                let state = |v: &Value| -> u8 {
+                    let b = v.bit_select(0);
+                    if b.has_xz() {
+                        2
+                    } else {
+                        b.to_u64().unwrap_or(0) as u8 & 1
+                    }
+                };
+                let (p, c) = (state(&prev), state(&cur));
+                let posedge = (p == 0 && c != 0) || (p == 2 && c == 1);
+                let negedge = (p == 1 && c != 1) || (p == 2 && c == 0);
+                let mut hit = match kind {
+                    0 => prev != cur,
+                    1 => posedge,
+                    2 => negedge,
+                    _ => posedge || negedge,
+                };
+                // `iff`: an edge while the guard is false is consumed without
+                // triggering (§9.4.2), so it re-baselines instead of latching.
+                if hit && let Some(guard) = args.get(3) {
+                    hit = self.eval_expr(guard).is_true();
+                }
+                if hit {
+                    self.vc_saved.remove(&idx);
+                    Value::from_u64(1, 1)
+                } else {
+                    // Re-baseline: the operand may move through several values
+                    // between two re-evaluations, and the edge is relative to
+                    // the value LAST SEEN, not to the arming value.
+                    self.vc_saved.insert(idx, (owner, cur));
+                    Value::from_u64(0, 1)
+                }
             }
             // §9.4.5 marker reached from a context that cannot suspend
             // (always-block settle, function body, bytecode fallback):
@@ -2519,6 +2881,18 @@ impl Simulator {
             }
             "$bits" => {
                 if let Some(arg) = args.first() {
+                    // §10.9: a typed pattern sizes as its type, `$bits(T)`.
+                    let named;
+                    let arg = match &arg.kind {
+                        ExprKind::TypedPattern { ty, .. } => match type_name_expr(ty) {
+                            Some(e) => {
+                                named = e;
+                                &named
+                            }
+                            None => arg,
+                        },
+                        _ => arg,
+                    };
                     // §5.9: the empty string literal `""` is equivalent to
                     // `"\0"` — one character, 8 bits (its VALUE stays a
                     // width-0 zero elsewhere; only the size query sees the
@@ -2567,6 +2941,9 @@ impl Simulator {
                             }
                         }
                     }
+                    if let Some(bits) = self.member_dyn_coll_bits(arg) {
+                        return Value::from_u64(bits, 32);
+                    }
                     if let ExprKind::Ident(hier) = &arg.kind {
                         let name = self.resolve_hier_name(hier);
                         // A bare TYPE PARAMETER of the enclosing class
@@ -2583,6 +2960,7 @@ impl Simulator {
                                         span: arg.span,
                                     },
                                     span: arg.span,
+                                    bound: Default::default(),
                                 },
                                 dimensions: Vec::new(),
                                 type_args: Vec::new(),
@@ -2599,6 +2977,12 @@ impl Simulator {
                                 .max(1);
                                 return Value::from_u64(w as u64, 32);
                             }
+                        }
+                        // §20.6.2: a string is sized by its current text —
+                        // 8 bits a character, 0 when empty.
+                        if self.expr_is_string_valued(arg) {
+                            let n = self.eval_expr(arg).to_sv_string().len() as u64;
+                            return Value::from_u64(8 * n, 32);
                         }
                         // IEEE 1800-2017 §23.8 name resolution: inside a
                         // class method, an unqualified identifier resolves
@@ -2861,6 +3245,28 @@ impl Simulator {
                                 self.unpacked_nd_bits(&Self::handle_member_key(h, &prop))
                         {
                             return Value::from_u64(bits, 32);
+                        }
+                    }
+                    // §20.6.2: a ROW of a dynamic array or queue is an unpacked
+                    // array too: a dynamic row (`d[i]` on `int d[][]`) counts
+                    // its current elements, a fixed one (`r[i]` on `bit [7:0]
+                    // r[][2]`) its declared ones. Sized by the evaluated row,
+                    // both read one element's width.
+                    if let ExprKind::Index { expr: base, .. } = &arg.kind {
+                        if let Some(row) = self
+                            .array_operand_name(arg)
+                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            && let Some(&(_, _, ew)) = self.module.arrays.get(&row)
+                        {
+                            return Value::from_u64(self.get_queue_size(&row) * ew as u64, 32);
+                        }
+                        if let Some(nm) = self
+                            .array_operand_name(base)
+                            .filter(|n| self.module.dynamic_arrays.contains(n))
+                            && let Some(&(_, (b0, b1), ew)) = self.module.arrays_2d.get(&nm)
+                        {
+                            let n = (b1 - b0).unsigned_abs() + 1;
+                            return Value::from_u64(n * ew as u64, 32);
                         }
                     }
                     Value::from_u64(self.eval_expr(arg).width as u64, 32)
@@ -3332,132 +3738,73 @@ impl Simulator {
                     .unwrap_or(0);
                 Value::from_u64(self.rng_range_u64(a.min(b), a.max(b)), 32)
             }
-            // `$random` (no seed) keeps its legacy deterministic value; with a
-            // seed it produces a reproducible stream (updating the seed).
-            // §20.15.2 probabilistic distribution functions. Each takes an
-            // inout `seed` it advances in place, so the same seed replays
-            // the same stream.
-            "$dist_uniform" | "$dist_normal" | "$dist_exponential" | "$dist_poisson"
-            | "$dist_chi_square" | "$dist_t" | "$dist_erlang" => {
-                let Some(seed_arg) = args.first() else {
+            // §20.15.1, §20.15.2: `$random` and the distribution functions
+            // run the Annex N generators. Each takes an inout `seed` it
+            // advances in place, so the same seed replays the same stream
+            // in every simulator that follows the standard.
+            "$random" | "$dist_uniform" | "$dist_normal" | "$dist_exponential"
+            | "$dist_poisson" | "$dist_chi_square" | "$dist_t" | "$dist_erlang" => {
+                use super::annex_n;
+                let seed_arg = args.first();
+                if seed_arg.is_none() && name != "$random" {
                     return Value::zero(32);
+                }
+                // A no-seed `$random` draws from one simulation-wide seed
+                // that starts at 0 (Annex N's `$random` static seed).
+                let mut seed = match seed_arg {
+                    Some(a) => self.eval_expr(a).to_u64().unwrap_or(0) as u32 as i32,
+                    None => self.annex_n_seed,
                 };
-                let mut seed = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
-                // Advance the caller's seed exactly once per call.
-                let next_u32 = |sd: &mut u32| -> u32 {
-                    *sd = Self::prng_next(*sd);
-                    *sd
-                };
-                let unit = |sd: &mut u32| -> f64 {
-                    // (0,1) — never exactly 0, so ln() stays finite.
-                    (next_u32(sd) as f64 + 1.0) / (u32::MAX as f64 + 2.0)
-                };
-                let arg_i = |sim: &mut Self, i: usize| -> i64 {
+                let arg_i = |sim: &mut Self, i: usize| -> i32 {
                     args.get(i)
-                        .map(|a| sim.eval_expr(a).to_i64().unwrap_or(0))
+                        .map(|a| sim.eval_expr(a).to_i64().unwrap_or(0) as i32)
                         .unwrap_or(0)
                 };
-                let out: i64 = match name.as_str() {
+                let out = match name.as_str() {
+                    "$random" => annex_n::random(&mut seed),
                     "$dist_uniform" => {
-                        let lo = arg_i(self, 1);
-                        let hi = arg_i(self, 2);
-                        if hi <= lo {
-                            lo
-                        } else {
-                            let span = (hi - lo + 1) as u64;
-                            lo + (next_u32(&mut seed) as u64 % span) as i64
-                        }
+                        let (lo, hi) = (arg_i(self, 1), arg_i(self, 2));
+                        annex_n::dist_uniform(&mut seed, lo, hi)
                     }
                     "$dist_normal" => {
-                        let mean = arg_i(self, 1) as f64;
-                        let sd = arg_i(self, 2) as f64;
-                        // Box-Muller.
-                        let u1 = unit(&mut seed);
-                        let u2 = unit(&mut seed);
-                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                        (mean + sd * z).round() as i64
+                        let (mean, sd) = (arg_i(self, 1), arg_i(self, 2));
+                        annex_n::dist_normal(&mut seed, mean, sd)
                     }
                     "$dist_exponential" => {
-                        let mean = arg_i(self, 1).max(1) as f64;
-                        (-mean * unit(&mut seed).ln()).round() as i64
+                        let mean = arg_i(self, 1);
+                        annex_n::dist_exponential(&mut seed, mean)
                     }
                     "$dist_poisson" => {
-                        let mean = arg_i(self, 1).max(0) as f64;
-                        // Knuth.
-                        let l = (-mean).exp();
-                        let mut k = 0i64;
-                        let mut p = 1.0f64;
-                        loop {
-                            p *= unit(&mut seed);
-                            if p <= l || k > 10_000 {
-                                break;
-                            }
-                            k += 1;
-                        }
-                        k
+                        let mean = arg_i(self, 1);
+                        annex_n::dist_poisson(&mut seed, mean)
                     }
                     "$dist_chi_square" => {
-                        // Sum of `df` squared standard normals.
-                        let df = arg_i(self, 1).max(1);
-                        let mut acc = 0.0f64;
-                        for _ in 0..df.min(1000) {
-                            let u1 = unit(&mut seed);
-                            let u2 = unit(&mut seed);
-                            let z =
-                                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                            acc += z * z;
-                        }
-                        acc.round() as i64
+                        let df = arg_i(self, 1);
+                        annex_n::dist_chi_square(&mut seed, df)
                     }
                     "$dist_t" => {
-                        let df = arg_i(self, 1).max(1);
-                        let u1 = unit(&mut seed);
-                        let u2 = unit(&mut seed);
-                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                        let mut chi = 0.0f64;
-                        for _ in 0..df.min(1000) {
-                            let a = unit(&mut seed);
-                            let b = unit(&mut seed);
-                            let zz =
-                                (-2.0 * a.ln()).sqrt() * (2.0 * std::f64::consts::PI * b).cos();
-                            chi += zz * zz;
-                        }
-                        (z / (chi / df as f64).sqrt()).round() as i64
+                        let df = arg_i(self, 1);
+                        annex_n::dist_t(&mut seed, df)
                     }
                     _ => {
-                        // $dist_erlang(seed, k, mean)
-                        let k = arg_i(self, 1).max(1);
-                        let mean = arg_i(self, 2).max(1) as f64;
-                        let mut acc = 0.0f64;
-                        for _ in 0..k.min(1000) {
-                            acc += -unit(&mut seed).ln();
-                        }
-                        (acc * mean / k as f64).round() as i64
+                        let (k, mean) = (arg_i(self, 1), arg_i(self, 2));
+                        annex_n::dist_erlang(&mut seed, k, mean)
                     }
                 };
-                self.assign_value(seed_arg, &Value::from_u64(seed as u64, 32));
-                let mut v = Value::from_u64(out as u64, 32);
+                match seed_arg {
+                    Some(a) => {
+                        let mut sv = Value::from_u64(seed as u32 as u64, 32);
+                        sv.is_signed = true;
+                        self.assign_value(a, &sv);
+                    }
+                    None => self.annex_n_seed = seed,
+                }
+                let mut v = Value::from_u64(out as u32 as u64, 32);
                 v.is_signed = true;
                 v
             }
-            "$random" => {
-                if let Some(seed_arg) = args.first() {
-                    let s = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
-                    let next = Self::prng_next(s);
-                    self.assign_value(seed_arg, &Value::from_u64(next as u64, 32));
-                    let mut v = Value::from_u64(next as u64, 32);
-                    v.is_signed = true;
-                    v
-                } else {
-                    // §20.15.1: no-seed `$random` draws from the global RNG
-                    // (same stream as no-arg `$urandom`) and returns a SIGNED
-                    // 32-bit value. It used to return a constant 0, so every
-                    // `$random` stimulus was stuck at 0.
-                    let mut v = Value::from_u64(self.rng_u32() as u64, 32);
-                    v.is_signed = true;
-                    v
-                }
-            }
+            // §3.14.3: a `1step` delay value, one global tick (#615).
+            n if n == super::elaborate::ONE_STEP_DELAY => Value::from_f64(1.0),
             "$isunknown" => {
                 let v = args
                     .first()
@@ -3669,10 +4016,13 @@ impl Simulator {
                 // 8-bit operands sums at 32 bits, and a streaming operand
                 // left-justifies in it (§11.4.14.2).
                 let ctx_w = self.cast_context_width(&dt);
-                let mut v = match args.get(1) {
-                    Some(a) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
-                    Some(a) => self.eval_expr(a),
-                    None => Value::zero(1),
+                // §10.8: a pattern operand takes the cast type.
+                let typed = args.get(1).and_then(|a| self.eval_in_packed_type(a, &dt));
+                let mut v = match (typed, args.get(1)) {
+                    (Some(v), _) => v,
+                    (None, Some(a)) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
+                    (None, Some(a)) => self.eval_expr(a),
+                    (None, None) => Value::zero(1),
                 };
                 // §6.24.1: cast of a CALL returning a dynamic array/queue
                 // packs the returned elements, element 0 most significant,
@@ -3783,10 +4133,21 @@ impl Simulator {
                         None => 0,
                     }
                 };
-                let mut inner_v = match args.get(1) {
-                    Some(a) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
-                    Some(a) => self.eval_expr(a),
-                    None => Value::zero(1),
+                // §10.8: a pattern operand takes the cast type.
+                let typed = match (args.get(1), target.as_deref()) {
+                    (Some(a), Some(nm)) if has_pattern(a) => {
+                        match self.module.typedef_types.get(nm).cloned() {
+                            Some(dt) => self.eval_in_packed_type(a, &dt),
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let mut inner_v = match (typed, args.get(1)) {
+                    (Some(v), _) => v,
+                    (None, Some(a)) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
+                    (None, Some(a)) => self.eval_expr(a),
+                    (None, None) => Value::zero(1),
                 };
                 // §6.24.1: a cast whose operand is a CALL returning a
                 // dynamic array/queue packs the returned elements —
@@ -3935,6 +4296,26 @@ impl Simulator {
                         let n = super::elaborate::type_query_bound(name, &q, 1).unwrap_or(0);
                         return Value::from_u64(n as u64, 32);
                     }
+                    // §7.4.5: a select of `k` elements leaves the dimensions
+                    // after the first `k` (`$dimensions(a3[1])` of `logic
+                    // [1:0][3:0][7:0] a3` is 2). A select that leaves one
+                    // dimension or none keeps the answers below.
+                    if name == "$dimensions"
+                        && let Some((base, k)) = Self::peel_index_selects(arg)
+                        && !self.query_base_is_collection(&base)
+                    {
+                        let probe = Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$dimensions".to_string(),
+                                args: vec![base.clone()],
+                            },
+                            base.span,
+                        );
+                        let nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                        if nd > k + 1 {
+                            return Value::from_u64((nd - k) as u64, 32);
+                        }
+                    }
                     // A class property or a struct member path (`m`,
                     // `this.m`, `a.w`): its declared type, unpacked and
                     // packed dimensions alike. A multi-dimensional packed
@@ -3947,7 +4328,16 @@ impl Simulator {
                         return Value::from_u64(n as u64, 32);
                     }
                     if let ExprKind::Ident(hier) = &arg.kind {
-                        let aname = self.resolve_hier_name(hier);
+                        let mut aname = self.resolve_hier_name(hier);
+                        // A class-member collection (`h.raw`) is shaped under
+                        // its instance store (see the bound queries below).
+                        if self.foreach_dims(&aname).is_none()
+                            && let Some(nm) = self
+                                .array_operand_name(arg)
+                                .filter(|n| self.foreach_dims(n).is_some())
+                        {
+                            aname = std::borrow::Cow::Owned(nm);
+                        }
                         // §20.7: EVERY unpacked dimension counts, not just
                         // the first — `int m[2][3]` has two, `int n[2][3][4]`
                         // three. Only the 1-D table was consulted.
@@ -4016,7 +4406,24 @@ impl Simulator {
                         },
                         base.span,
                     );
-                    let nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    let mut nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    if nd <= k && !self.query_base_is_collection(&base) {
+                        // §7.4.5: past the unpacked dimensions the selects
+                        // name elements of the packed ones, numbered on from
+                        // them: `$size(a3[1])` of `logic [1:0][3:0][7:0] a3`
+                        // is `$size(a3, 2)`, 4, not the 32 bits of `a3[1]`.
+                        // A dynamic array, queue or associative array keeps
+                        // its own row answers below (its rows' shape is not
+                        // in the declared dimensions).
+                        let probe = Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$dimensions".to_string(),
+                                args: vec![base.clone()],
+                            },
+                            base.span,
+                        );
+                        nd = self.eval_expr(&probe).to_u64().unwrap_or(0) as usize;
+                    }
                     if nd > k {
                         let call = Expression::new(
                             ExprKind::SystemCall {
@@ -4175,6 +4582,21 @@ impl Simulator {
                             aname = Some(std::borrow::Cow::Owned(scoped));
                         }
                     }
+                    // A class-member QUEUE / dynamic array of fixed rows
+                    // (`h.raw` on `bit [7:0] raw[][2]`) has its shape under
+                    // its instance store `<h>#raw` too; unfound, `$size(h.raw,
+                    // 2)` reported the element's 8 bits (§20.7).
+                    if aname
+                        .as_deref()
+                        .is_none_or(|n| self.foreach_dims(n).is_none())
+                    {
+                        if let Some(nm) = self
+                            .array_operand_name(arg)
+                            .filter(|n| self.foreach_dims(n).is_some())
+                        {
+                            aname = Some(std::borrow::Cow::Owned(nm));
+                        }
+                    }
                     if let Some(aname) = aname {
                         // Every unpacked dimension, outermost first. Only the
                         // 1-D table was consulted, so `$size(m, 2)` — and even
@@ -4291,6 +4713,10 @@ impl Simulator {
                 Value::from_string(&self.rng.to_state_string())
             }
             "$typename" => {
+                // §20.6.1: a typed pattern has the type that prefixes it.
+                if let Some(ExprKind::TypedPattern { ty, .. }) = args.first().map(|a| &a.kind) {
+                    return Value::from_string(&self.typename_of_dt(ty));
+                }
                 if let Some(arg) = args.first() {
                     if let ExprKind::Ident(hier) = &arg.kind {
                         // IEEE 1800-2017 §20.6.1: $typename of a built-in

@@ -127,6 +127,8 @@ mod generate_item_restrictions;
 mod generate_loop_genvar;
 #[path = "misc/generate_region_contents.rs"]
 mod generate_region_contents;
+#[path = "misc/generate_scope_param_sized_array.rs"]
+mod generate_scope_param_sized_array;
 #[path = "misc/iface_functions_and_vif_locals.rs"]
 mod iface_functions_and_vif_locals;
 #[path = "misc/ifu_ibuf_casez_dispatch_c910.rs"]
@@ -163,6 +165,8 @@ mod ivtest_tail2_cluster;
 mod ivtest_tail_cluster;
 #[path = "misc/library_flags.rs"]
 mod library_flags;
+#[path = "misc/local_name_geometry_leak_916.rs"]
+mod local_name_geometry_leak_916;
 #[path = "misc/local_shadow_select.rs"]
 mod local_shadow_select;
 #[path = "misc/log_redirect.rs"]
@@ -548,3 +552,73 @@ mod include_intra_delay_567;
 mod override_timescale_package_delay_571;
 #[path = "misc/macro_args_next_line_578.rs"]
 mod macro_args_next_line_578;
+#[path = "misc/annex_n_random.rs"]
+mod annex_n_random;
+#[path = "misc/array_pattern_and_monitor_errors.rs"]
+mod array_pattern_and_monitor_errors;
+#[path = "misc/resetall_after_one_line_module_600.rs"]
+mod resetall_after_one_line_module_600;
+#[path = "misc/args_file_bare_top_601.rs"]
+mod args_file_bare_top_601;
+#[path = "misc/macro_formals_multiline_606.rs"]
+mod macro_formals_multiline_606;
+#[path = "misc/until_with_604.rs"]
+mod until_with_604;
+#[path = "misc/cover_bin_iff_605.rs"]
+mod cover_bin_iff_605;
+#[path = "misc/config_declaration_603.rs"]
+mod config_declaration_603;
+#[path = "misc/sva_delay_count_609.rs"]
+mod sva_delay_count_609;
+#[path = "misc/cover_bin_with_611.rs"]
+mod cover_bin_with_611;
+#[path = "misc/restrict_property_614.rs"]
+mod restrict_property_614;
+#[path = "misc/sva_local_array_618.rs"]
+mod sva_local_array_618;
+#[path = "misc/macro_usage_before_paste_616.rs"]
+mod macro_usage_before_paste_616;
+#[path = "misc/undef_followed_by_text_619.rs"]
+mod undef_followed_by_text_619;
+#[path = "misc/opt_in_relaxations.rs"]
+mod opt_in_relaxations;
+#[path = "misc/parser_gaps_651_658.rs"]
+mod parser_gaps_651_658;
+#[path = "misc/macro_empty_actual.rs"]
+mod macro_empty_actual;
+#[path = "misc/package_ref_signature.rs"]
+mod package_ref_signature;
+#[path = "misc/always_star_spacing.rs"]
+mod always_star_spacing;
+#[path = "misc/artifact_with_sources_738.rs"]
+mod artifact_with_sources_738;
+#[path = "misc/checkpoint_save_restore.rs"]
+mod checkpoint_save_restore;
+
+#[path = "misc/block_local_array_for_loop.rs"]
+mod block_local_array_for_loop;
+#[path = "misc/array_formal_element_types.rs"]
+mod array_formal_element_types;
+
+#[path = "misc/struct_resolver_scalarized.rs"]
+mod struct_resolver_scalarized;
+
+#[path = "misc/packed_comb_cache_844.rs"]
+mod packed_comb_cache_844;
+#[path = "misc/prepared_scope_memory_721.rs"]
+mod prepared_scope_memory_721;
+
+#[path = "misc/read_before_decl_819.rs"]
+mod read_before_decl_819;
+
+#[path = "misc/nonvhdl_issue_regressions.rs"]
+mod nonvhdl_issue_regressions;
+
+#[path = "misc/import_sized_dimension_895.rs"]
+mod import_sized_dimension_895;
+#[path = "misc/macro_actual_count_888.rs"]
+mod macro_actual_count_888;
+#[path = "misc/typed_localparam_dimension_894.rs"]
+mod typed_localparam_dimension_894;
+#[path = "misc/review_class_param_undeclared_888.rs"]
+mod review_class_param_undeclared_888;

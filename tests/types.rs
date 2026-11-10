@@ -21,6 +21,8 @@ mod array_parameter;
 mod array_query_multidim_packed;
 #[path = "types/array_query_of_declared_variable.rs"]
 mod array_query_of_declared_variable;
+#[path = "types/array_query_packed_element_select.rs"]
+mod array_query_packed_element_select;
 #[path = "types/array_read_unknown_index_is_x.rs"]
 mod array_read_unknown_index_is_x;
 #[path = "types/ascending_indexed_part_select.rs"]
@@ -45,6 +47,8 @@ mod block_local_width_in_index_shift;
 mod block_local_size_query_scope;
 #[path = "types/byte_local_narrow.rs"]
 mod byte_local_narrow;
+#[path = "types/call_result_member_element_select.rs"]
+mod call_result_member_element_select;
 #[path = "types/callback_typedef_static.rs"]
 mod callback_typedef_static;
 #[path = "types/callee_local_keeps_caller_type.rs"]
@@ -133,6 +137,8 @@ mod generate_with_array_queries;
 mod header_parameter_declared_signedness;
 #[path = "types/hierarchy_and_type_overrides.rs"]
 mod hierarchy_and_type_overrides;
+#[path = "types/implicit_net_in_submodule.rs"]
+mod implicit_net_in_submodule;
 #[path = "types/implicit_port_net_and_packed_typedef_array.rs"]
 mod implicit_port_net_and_packed_typedef_array;
 #[path = "types/inc_dec_result_signedness.rs"]
@@ -169,6 +175,8 @@ mod nba_context_width;
 mod nested_packed_member_lvalue;
 #[path = "types/nested_packed_struct_array_access.rs"]
 mod nested_packed_struct_array_access;
+#[path = "types/nested_packed_struct_pattern.rs"]
+mod nested_packed_struct_pattern;
 #[path = "types/nested_packed_typedefs.rs"]
 mod nested_packed_typedefs;
 #[path = "types/nonzero_based_vector_reads.rs"]
@@ -179,6 +187,8 @@ mod nonzero_based_vector_writes;
 mod package_base_constraint_inherited;
 #[path = "types/package_scope_resolution.rs"]
 mod package_scope_resolution;
+#[path = "types/package_struct_formal_layout_reuse.rs"]
+mod package_struct_formal_layout_reuse;
 #[path = "types/package_typedef_scoping.rs"]
 mod package_typedef_scoping;
 #[path = "types/packed_2d_element_in_size_cast.rs"]
@@ -191,6 +201,8 @@ mod packed_3d_chained_select;
 mod packed_array_typedef_element_width;
 #[path = "types/packed_assignment_patterns.rs"]
 mod packed_assignment_patterns;
+#[path = "types/packed_pattern_context_type.rs"]
+mod packed_pattern_context_type;
 #[path = "types/packed_elem_shift_context_width.rs"]
 mod packed_elem_shift_context_width;
 #[path = "types/packed_element_range_select.rs"]
@@ -199,10 +211,14 @@ mod packed_element_range_select;
 mod packed_local_nested_select;
 #[path = "types/packed_multidim_unpacked_select.rs"]
 mod packed_multidim_unpacked_select;
+#[path = "types/packed_struct_array_elem_member_in_instance.rs"]
+mod packed_struct_array_elem_member_in_instance;
 #[path = "types/packed_struct_array_elem_write.rs"]
 mod packed_struct_array_elem_write;
 #[path = "types/packed_struct_array_local.rs"]
 mod packed_struct_array_local;
+#[path = "types/packed_struct_array_param_pattern_in_instance.rs"]
+mod packed_struct_array_param_pattern_in_instance;
 #[path = "types/packed_struct_formal_member.rs"]
 mod packed_struct_formal_member;
 #[path = "types/packed_struct_member_width.rs"]
@@ -221,6 +237,8 @@ mod param_sized_array;
 mod param_struct_widths_and_nba_patterns;
 #[path = "types/parameter_const_eval_corners.rs"]
 mod parameter_const_eval_corners;
+#[path = "types/pattern_context_in_child_ports.rs"]
+mod pattern_context_in_child_ports;
 #[path = "types/pattern_params_and_call_member.rs"]
 mod pattern_params_and_call_member;
 #[path = "types/power_operator_signedness.rs"]
@@ -243,6 +261,8 @@ mod scoped_type_cast;
 mod shift_context_width;
 #[path = "types/shift_width_and_scope_hint.rs"]
 mod shift_width_and_scope_hint;
+#[path = "types/compiled_member_operand_width.rs"]
+mod compiled_member_operand_width;
 #[path = "types/signedness_and_power_context.rs"]
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
@@ -257,6 +277,8 @@ mod streaming_and_typedef_array_width;
 mod struct_copy_and_queue_ops;
 #[path = "types/struct_member_array_of_structs_copy.rs"]
 mod struct_member_array_of_structs_copy;
+#[path = "types/struct_member_typedef_element_dims.rs"]
+mod struct_member_typedef_element_dims;
 #[path = "types/struct_named_patterns.rs"]
 mod struct_named_patterns;
 #[path = "types/struct_unpacked_array_member.rs"]
@@ -305,6 +327,10 @@ mod union_shared_storage;
 mod unit_scope_user_type_var;
 #[path = "types/unpacked_array_ports_and_vif_arrays.rs"]
 mod unpacked_array_ports_and_vif_arrays;
+#[path = "types/unpacked_array_slices_867.rs"]
+mod unpacked_array_slices_867;
+#[path = "types/unpacked_indexed_slice_size_869.rs"]
+mod unpacked_indexed_slice_size_869;
 #[path = "types/unpacked_struct_array_members.rs"]
 mod unpacked_struct_array_members;
 #[path = "types/unpacked_struct_func_arg.rs"]
@@ -436,6 +462,8 @@ mod real_to_int_wraps;
 mod real_to_int_wide;
 #[path = "types/real_to_integral_local.rs"]
 mod real_to_integral_local;
+#[path = "types/real_to_integral_stores_889.rs"]
+mod real_to_integral_stores_889;
 #[path = "types/rtoi_out_of_range.rs"]
 mod rtoi_out_of_range;
 #[path = "types/ref_formal_element_write.rs"]
@@ -532,6 +560,8 @@ mod arithmetic_shift_xz;
 
 #[path = "types/child_param_packed_elem_width.rs"]
 mod child_param_packed_elem_width;
+#[path = "types/packed_localparam_element_select.rs"]
+mod packed_localparam_element_select;
 
 #[path = "types/unsigned_context_501.rs"]
 mod unsigned_context_501;
@@ -553,6 +583,8 @@ mod struct_param_override;
 
 #[path = "types/const_fn_type_cast_localparam.rs"]
 mod const_fn_type_cast_localparam;
+#[path = "types/const_fn_value_param_size_cast.rs"]
+mod const_fn_value_param_size_cast;
 #[path = "types/param_array_pattern_forms.rs"]
 mod param_array_pattern_forms;
 #[path = "types/tagged_union_whole_copy_keeps_tag.rs"]
@@ -583,3 +615,84 @@ mod const_bits_of_cast;
 mod literal_whitespace_580;
 #[path = "types/const_bits_compound.rs"]
 mod const_bits_compound;
+#[path = "types/package_struct_array_index_584.rs"]
+mod package_struct_array_index_584;
+#[path = "types/review_nested_pattern_default.rs"]
+mod review_nested_pattern_default;
+#[path = "types/package_net_602.rs"]
+mod package_net_602;
+#[path = "types/package_net_kinds_610.rs"]
+mod package_net_kinds_610;
+#[path = "types/unit_wildcard_import_order_620.rs"]
+mod unit_wildcard_import_order_620;
+#[path = "types/nonzero_formal_bitselect_650.rs"]
+mod nonzero_formal_bitselect_650;
+
+#[path = "types/unpacked_array_parameter_reference.rs"]
+mod unpacked_array_parameter_reference;
+
+#[path = "types/array_parameter_imported_dimension.rs"]
+mod array_parameter_imported_dimension;
+
+#[path = "types/packed_package_parameter_element.rs"]
+mod packed_package_parameter_element;
+
+#[path = "types/module_struct_localparam_first_instance.rs"]
+mod module_struct_localparam_first_instance;
+
+#[path = "types/enum_scope_677.rs"]
+mod enum_scope_677;
+
+#[path = "types/typedef_overlay_674.rs"]
+mod typedef_overlay_674;
+
+#[path = "types/unit_subroutine_usage_675.rs"]
+mod unit_subroutine_usage_675;
+#[path = "types/body_typedef_first_instance_680.rs"]
+mod body_typedef_first_instance_680;
+
+#[path = "types/return_expr_context_width.rs"]
+mod return_expr_context_width;
+#[path = "types/return_expr_unary_context_width.rs"]
+mod return_expr_unary_context_width;
+#[path = "types/type_param_header_defaults.rs"]
+mod type_param_header_defaults;
+
+#[path = "types/packed_member_array_patterns_771.rs"]
+mod packed_member_array_patterns_771;
+
+#[path = "types/type_param_array_queries.rs"]
+mod type_param_array_queries;
+
+#[path = "types/logical_operand_self_determined_810.rs"]
+mod logical_operand_self_determined_810;
+#[path = "types/unpacked_struct_procedural_copy.rs"]
+mod unpacked_struct_procedural_copy;
+#[path = "types/unpacked_struct_output_port_whole_write.rs"]
+mod unpacked_struct_output_port_whole_write;
+
+#[path = "types/function_result_member_defaults.rs"]
+mod function_result_member_defaults;
+
+#[path = "types/nettype_no_resolver_ports.rs"]
+mod nettype_no_resolver_ports;
+#[path = "types/review_nettype_partial_driver.rs"]
+mod review_nettype_partial_driver;
+#[path = "types/review_nettype_multi_top.rs"]
+mod review_nettype_multi_top;
+
+
+#[path = "types/function_local_ascending_packed.rs"]
+mod function_local_ascending_packed;
+#[path = "types/nonansi_typedef_packed_port_942.rs"]
+mod nonansi_typedef_packed_port_942;
+#[path = "types/two_state_local_in_fallback.rs"]
+mod two_state_local_in_fallback;
+#[path = "types/packed_struct_elem_store_width.rs"]
+mod packed_struct_elem_store_width;
+#[path = "types/unpacked_elem_packed_select_read.rs"]
+mod unpacked_elem_packed_select_read;
+#[path = "types/unpacked_elem_select_followups.rs"]
+mod unpacked_elem_select_followups;
+#[path = "types/struct_array_member_elem_select.rs"]
+mod struct_array_member_elem_select;

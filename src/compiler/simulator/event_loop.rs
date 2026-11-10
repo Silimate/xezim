@@ -41,6 +41,16 @@ impl Simulator {
         if self.condition_waiters.is_empty() {
             return;
         }
+        // §6.21: an automatic of the running process's own call frame is
+        // private storage. No parked waiter can read it here — another
+        // process sees it only once the fork merge copies it into its frame,
+        // and that merge promotes the waiters reading it. Re-evaluating every
+        // waiter that merely names the same identifier (a loop counter `f`
+        // against a parked `wait (f.go)`) cost a context switch per waiter
+        // per write.
+        if self.lvalue_is_frame_private(lhs) {
+            return;
+        }
         // Cheap reject first: nothing the lvalue names is read by any parked
         // waiter. The union is rebuilt only after the waiter set changed.
         if self.cond_read_union_dirty {
@@ -68,6 +78,32 @@ impl Simulator {
         }
 
         self.promote_condition_waiters_for_names(&target_names);
+    }
+
+    /// Whether `lhs` (`x`, `x[i]`, `x[a:b]`) writes an automatic that lives
+    /// in the running process's current call frame and is not bound by
+    /// `ref` to another variable.
+    fn lvalue_is_frame_private(&self, lhs: &Expression) -> bool {
+        let mut base = lhs;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &base.kind {
+            base = expr;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return false;
+        };
+        if h.root.is_some() || h.path.len() != 1 {
+            return false;
+        }
+        let name = h.path[0].name.name.as_str();
+        // A `static` local's frame entry is a copy of one cell that every
+        // call of the subroutine shares (§6.21), so another process can be
+        // parked on it.
+        if self.static_local_names.contains(name) {
+            return false;
+        }
+        self.local_stack.last().is_some_and(|frame| frame.contains_key(name))
+            && !self.ref_binding_stack.last().is_some_and(|m| m.contains_key(name))
+            && !self.ref_alias_stack.last().is_some_and(|m| m.contains_key(name))
     }
 
     /// Re-check parked condition waiters whose condition names one of
@@ -1415,19 +1451,22 @@ impl Simulator {
             // ~40 µs per tick, most of a 5 GHz-clock UVM run. A gated
             // waiter (`cond_gate_for`) is skipped until one of the names it
             // reads is written.
-            let parked = std::mem::take(&mut self.condition_waiters);
+            let mut parked = std::mem::take(&mut self.condition_waiters);
             let written = take_store_writes();
-            let mut still_parked: Vec<(usize, ProcCont)> = Vec::new();
-            for (cpid, cont) in parked {
-                if let Some(Some(bits)) = self.cond_waiter_gate.get(&cpid) {
-                    if !bits.iter().any(|&b| written & b == b) {
-                        still_parked.push((cpid, cont));
-                        continue;
+            // Decide first, then move only the woken entries out: the ones
+            // that stay parked keep their place and their pid counts.
+            let wake: Vec<bool> = parked
+                .iter()
+                .map(|(cpid, _)| {
+                    if let Some(Some(bits)) = self.cond_waiter_gate.get(cpid) {
+                        bits.iter().any(|&b| written & b == b)
+                    } else {
+                        !(from_repass && self.cond_repass_recheck.get(cpid) == Some(&self.time))
                     }
-                } else if from_repass && self.cond_repass_recheck.get(&cpid) == Some(&self.time) {
-                    still_parked.push((cpid, cont));
-                    continue;
-                }
+                })
+                .collect();
+            let woken = parked.take_marked(&wake);
+            for (cpid, cont) in woken {
                 if from_repass {
                     // Entries only matter for the current time slot; drop
                     // older ones so the map stays bounded.
@@ -1441,10 +1480,11 @@ impl Simulator {
                 self.cond_waiter_reads.remove(&cpid);
                 self.cond_read_union_dirty = true;
                 self.cond_waiter_conditions.remove(&cpid);
+                self.cond_waiter_rechecks += 1;
                 self.event_queue.schedule(self.time, cpid, cont);
             }
             let newly = std::mem::take(&mut self.condition_waiters);
-            self.condition_waiters = still_parked;
+            self.condition_waiters = parked;
             self.condition_waiters.extend(newly);
             while self.event_queue.next_time() == Some(self.time)
                 && !self.finished
@@ -1523,7 +1563,11 @@ impl Simulator {
         }
         // §14.4: #1step samples precede every callback/active-region write
         // at this time, and remain fixed across this slot's later deltas.
+        let _t_cb = profile_timing.then(std::time::Instant::now);
         self.refresh_clocking_preponed();
+        if let Some(t) = _t_cb {
+            accum.t_clocking += t.elapsed().as_nanos() as u64;
+        }
         // LRM §16.5.1: the same holds for the Preponed samples of every
         // SVA-referenced signal: taken before the slot's Pre-Active VPI
         // callbacks (cbAtStartOfSimTime, cbAfterDelay; §4.4.3.2) and its
@@ -1663,6 +1707,21 @@ impl Simulator {
                 // Pending same-time activations remain in the timing wheel.
                 break;
             }
+            // §23.3.3, §10.3.3: the time-0 update of an input port or an
+            // identity net reaches its readers once every process has
+            // started and parked, and before the inactive region: a `#0`
+            // write of the source then moves them a second time, as in the
+            // reference simulator.
+            if self.time == 0
+                && (!self.edge_t0_pending.is_empty()
+                    || !self.time0_port_edges.is_empty()
+                    || !self.time0_alias_edges.is_empty())
+            {
+                self.deliver_time0_port_edges();
+                if self.event_queue.next_time() == Some(self.time) {
+                    continue;
+                }
+            }
             // IEEE 1800-2017 §4.5: once the ACTIVE region empties, the
             // INACTIVE region (`#0` continuations) activates and runs BEFORE
             // the NBA region — a `#0`-resumed read must see pre-NBA values
@@ -1728,6 +1787,15 @@ impl Simulator {
                 self.fire_named_event(&ev);
             }
         }
+        // §23.3.3: a time-0 port or alias update the active loop above did
+        // not reach (it left early) is delivered no later than here.
+        if self.time == 0
+            && (!self.edge_t0_pending.is_empty()
+                || !self.time0_port_edges.is_empty()
+                || !self.time0_alias_edges.is_empty())
+        {
+            self.deliver_time0_port_edges();
+        }
 
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
@@ -1776,6 +1844,7 @@ impl Simulator {
         } else {
             self.check_edges();
         }
+        self.toggled_clock_positions.clear();
         if let Some(t) = _t {
             accum.t_edges += t.elapsed().as_nanos() as u64;
         }
@@ -1809,6 +1878,7 @@ impl Simulator {
         // LRM §14.3 clocking-block input snapshot — refresh per-cycle
         // sample state so subsequent `cb.<sig>` reads see the pre-edge
         // value (`#1step` input skew).
+        let _t_cb = profile_timing.then(std::time::Instant::now);
         self.tick_clocking_blocks();
         // §14.13: deliver `@(cb.sig)` events for samples just published. The
         // publish happens after this slot's edge pass, so run one more.
@@ -1825,9 +1895,13 @@ impl Simulator {
         // region — so they observe post-edge state and this cycle's samples.
         let tick_late_epoch_start = self.late_resume_epoch;
         self.drain_deferred_clocking_conts();
+        if let Some(t) = _t_cb {
+            accum.t_clocking += t.elapsed().as_nanos() as u64;
+        }
         if self.finished {
             return;
         }
+        let _t_late = profile_timing.then(std::time::Instant::now);
         self.drain_reactive_region();
         if self.finished {
             return;
@@ -1843,9 +1917,16 @@ impl Simulator {
         self.check_monitor();
         self.drain_pending_strobes();
         self.dump_write_changes();
+        if let Some(t) = _t_late {
+            accum.t_late += t.elapsed().as_nanos() as u64;
+        }
 
         // Condition-waiter fixpoint (level-sensitive `wait(expr)` resume).
+        let _t_cond = profile_timing.then(std::time::Instant::now);
         self.drain_condition_waiters(false, false);
+        if let Some(t) = _t_cond {
+            accum.t_cond += t.elapsed().as_nanos() as u64;
+        }
 
         // LRM §4.4/§4.7: every late-region resume above (clocking conts,
         // reactive initials, Re-NBA waiters, condition waiters re-queued at
@@ -1871,23 +1952,43 @@ impl Simulator {
             loop {
                 let epoch_before = self.late_resume_epoch;
                 if self.dirty_any {
+                    let _t_ls = profile_timing.then(std::time::Instant::now);
                     self.settle_combinatorial();
+                    if let Some(t) = _t_ls {
+                        accum.t_settle += t.elapsed().as_nanos() as u64;
+                    }
                 }
+                let _t_le = profile_timing.then(std::time::Instant::now);
                 self.check_edges();
                 let _ = self.drain_edge_cascade(cascade_limit);
+                if let Some(t) = _t_le {
+                    accum.t_edges += t.elapsed().as_nanos() as u64;
+                }
+                let _t_lc = profile_timing.then(std::time::Instant::now);
                 self.drain_deferred_clocking_conts();
+                if let Some(t) = _t_lc {
+                    accum.t_clocking += t.elapsed().as_nanos() as u64;
+                }
                 if self.finished {
                     return;
                 }
+                let _t_lr = profile_timing.then(std::time::Instant::now);
                 self.drain_reactive_region();
                 if self.finished {
                     return;
                 }
                 self.drain_nba_region_waiters();
+                if let Some(t) = _t_lr {
+                    accum.t_late += t.elapsed().as_nanos() as u64;
+                }
                 if self.finished {
                     return;
                 }
+                let _t_lcond = profile_timing.then(std::time::Instant::now);
                 self.drain_condition_waiters(false, true);
+                if let Some(t) = _t_lcond {
+                    accum.t_cond += t.elapsed().as_nanos() as u64;
+                }
                 late_passes += 1;
                 if self.finished || late_passes > 10_000 || self.late_resume_epoch == epoch_before {
                     break;
@@ -2092,11 +2193,15 @@ impl Simulator {
         // clock is caught whatever phase the periodic check lands on.
         let mut wd_toggled = false;
         let mut wd_warned = false;
+        // Memoized "every awaited signal has no live driver" (a static property
+        // of the design). `None` until first computed for the current window.
+        let mut wd_all_dead: Option<bool> = None;
         // O1 flop-fire skip is default-ON (correct-by-construction snapshot
         // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
         let event_skip = std::env::var("XEZIM_EVENT_EDGE").ok().as_deref() != Some("0");
         let event_meas = std::env::var("XEZIM_EVENT_EDGE_MEASURE").ok().as_deref() == Some("1");
-        if event_skip || event_meas {
+        // A restored run carries the measure state its checkpoint saved.
+        if (event_skip || event_meas) && !self.checkpoint_restored {
             self.event_measure = true; // enables stamping + state + phase clock
             self.event_skip = event_skip;
             self.event_after = std::env::var("XEZIM_EVENT_AFTER")
@@ -2133,7 +2238,9 @@ impl Simulator {
         // APPENDED while the batch runs (wakeups, continuations) are not
         // starts; plain FIFO keeps them behind the batch anyway, and
         // `schedule_front` fork children are exempted at pop time.
-        self.t0_starts_remaining = self.event_queue.slot_len(0);
+        if !self.checkpoint_restored {
+            self.t0_starts_remaining = self.event_queue.slot_len(0);
+        }
         while !self.finished && iters < max_iters {
             iters += 1;
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
@@ -2191,48 +2298,68 @@ impl Simulator {
                         let d_edges = self.prof_edges_fired.saturating_sub(wd_ref_edges);
                         let d_wall = sim_start.elapsed().saturating_sub(wd_ref_wall);
                         if d_ticks >= sc_ticks && d_edges >= sc_edges && d_wall >= sc_wall {
-                            let sig = self.name_for_id(cur_sigs[0]).to_string();
-                            let pid = w.pid;
-                            eprintln!(
-                                "\n=================== xezim: DEAD-CLOCK WATCHDOG ==================="
-                            );
-                            eprintln!(
-                                "Process pid {} has been parked on '{}' for {} sim tick(s) with NO\n\
+                            // Liveness gate: a genuinely dead clock has NO live
+                            // driver anywhere in its cone (an undriven net /
+                            // unresolved cell / ungenerated behavioural PLL VCO).
+                            // A control signal held stable during a long
+                            // reset/power-up is driven by a flop that is itself
+                            // clocked by a live clock, so it is LIVE even though
+                            // its value has not moved yet — the sim is making
+                            // progress, just slowly. Memoize the (static) answer
+                            // so the cone is walked at most once per window.
+                            if wd_all_dead.unwrap_or_else(|| {
+                                let dead = {
+                                    let mut visited = std::collections::HashSet::new();
+                                    !cur_sigs
+                                        .iter()
+                                        .any(|&id| self.has_live_driver(id, &mut visited))
+                                };
+                                wd_all_dead = Some(dead);
+                                dead
+                            }) {
+                                let sig = self.name_for_id(cur_sigs[0]).to_string();
+                                let pid = w.pid;
+                                eprintln!(
+                                    "\n=================== xezim: DEAD-CLOCK WATCHDOG ==================="
+                                );
+                                eprintln!(
+                                    "Process pid {} has been parked on '{}' for {} sim tick(s) with NO\n\
                                  change to its awaited signal(s), while the design fired {} edges in\n\
                                  {:.0}s of wall time. '{}' looks like a DEAD clock/reset.",
-                                pid,
-                                sig,
-                                d_ticks,
-                                d_edges,
-                                d_wall.as_secs_f64(),
-                                sig
-                            );
-                            eprintln!(
-                                "Likely cause: an undriven net, an unresolved/black-boxed cell, or an\n\
+                                    pid,
+                                    sig,
+                                    d_ticks,
+                                    d_edges,
+                                    d_wall.as_secs_f64(),
+                                    sig
+                                );
+                                eprintln!(
+                                    "Likely cause: an undriven net, an unresolved/black-boxed cell, or an\n\
                                  ungenerated behavioral clock (PLL VCO) upstream — search the log for\n\
                                  '[IMPLICIT NET' and '-v resolution summary' / 'unresolved definition'.\n\
                                  The simulation is making no functional progress (X-churn)."
-                            );
-                            self.report_parked_waiters(8);
-                            if sc_abort {
-                                eprintln!(
-                                    "Aborting (XEZIM_STUCK_CLOCK=abort). Fix the dead clock/reset, or\n\
+                                );
+                                self.report_parked_waiters(8);
+                                if sc_abort {
+                                    eprintln!(
+                                        "Aborting (XEZIM_STUCK_CLOCK=abort). Fix the dead clock/reset, or\n\
                                            set XEZIM_STUCK_CLOCK=warn to continue."
-                                );
-                                eprintln!(
-                                    "=================================================================\n"
-                                );
-                                self.finished = true;
-                                self.stuck_clock_aborted = true;
-                            } else {
-                                eprintln!(
-                                    "Continuing (set XEZIM_STUCK_CLOCK=abort to stop here; =off to silence)."
-                                );
-                                eprintln!(
-                                    "=================================================================\n"
-                                );
+                                    );
+                                    eprintln!(
+                                        "=================================================================\n"
+                                    );
+                                    self.finished = true;
+                                    self.stuck_clock_aborted = true;
+                                } else {
+                                    eprintln!(
+                                        "Continuing (set XEZIM_STUCK_CLOCK=abort to stop here; =off to silence)."
+                                    );
+                                    eprintln!(
+                                        "=================================================================\n"
+                                    );
+                                }
+                                wd_warned = true; // report once
                             }
-                            wd_warned = true; // report once
                         }
                     } else {
                         // Progress (signal changed or a different waiter is
@@ -2244,6 +2371,7 @@ impl Simulator {
                         wd_ref_wall = sim_start.elapsed();
                         wd_ref_phase = self.event_phase;
                         wd_toggled = false;
+                        wd_all_dead = None;
                     }
                 }
             }
@@ -2472,6 +2600,18 @@ impl Simulator {
             }
             if next_time > self.time {
                 self.dump_slot_end();
+                // The slot is complete and every process is parked in traced
+                // scheduler state: a safe point for class reclamation.
+                self.maybe_collect_class_heap();
+                // ... and for a checkpoint; after a `$restart` the queues
+                // are the checkpoint's, so look at them again.
+                if self.checkpoint_audit.is_some() {
+                    super::checkpoint::audit::slot(self);
+                }
+                if self.checkpoint_due(next_time) && self.serve_checkpoints(next_time) {
+                    continue;
+                }
+                self.growth_trace();
                 self.time = next_time;
                 publish_sim_time(next_time);
                 // Lines printed near the end of a burst stay buffered until the
@@ -2573,15 +2713,21 @@ impl Simulator {
         let t_process = accum.t_process;
         let t_snap = accum.t_snap;
         let t_sched = accum.t_sched;
+        let t_clocking = accum.t_clocking;
+        let t_cond = accum.t_cond;
+        let t_late = accum.t_late;
         let sim_elapsed = sim_start_rt.elapsed();
         chatter!(
-            "[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms",
+            "[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms clocking={:.1}ms cond={:.1}ms late={:.1}ms",
             t_settle as f64 / 1e6,
             t_edges as f64 / 1e6,
             t_nba as f64 / 1e6,
             t_process as f64 / 1e6,
             t_snap as f64 / 1e6,
-            t_sched as f64 / 1e6
+            t_sched as f64 / 1e6,
+            t_clocking as f64 / 1e6,
+            t_cond as f64 / 1e6,
+            t_late as f64 / 1e6
         );
         if std::env::var("XEZIM_CACHE_FIT").is_ok() {
             let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
@@ -2729,6 +2875,17 @@ impl Simulator {
             .iter()
             .filter(|e| e.has_unresolved_reads)
             .count();
+        chatter!(
+            "[PROF] condition_waiter_rechecks={}",
+            self.cond_waiter_rechecks
+        );
+        chatter!("[PROF] vm_direct_calls={}", self.vm_direct_calls);
+        chatter!("[PROF] local_meta_reapplies={}", self.local_meta_reapplies);
+        chatter!(
+            "[PROF] local_meta_swaps={} local_meta_scans={}",
+            self.local_meta_swaps,
+            self.local_meta_scans
+        );
         chatter!(
             "[PROF] edge_waiters={:.1}ms edge_cg={:.1}ms waiter_iters={}",
             self.prof_edge_waiters as f64 / 1e6,

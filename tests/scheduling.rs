@@ -15,6 +15,9 @@
 mod comb_whole_struct_read_sensitivity;
 #[path = "scheduling/function_callee_read_beside_formal.rs"]
 mod function_callee_read_beside_formal;
+#[path = "scheduling/concurrent_struct_formal_geometry.rs"]
+mod concurrent_struct_formal_geometry;
+
 #[path = "scheduling/named_branch_frames.rs"]
 mod named_branch_frames;
 
@@ -265,6 +268,8 @@ mod always_value_change_after_edge_continuation;
 mod bare_randomize_in_method;
 #[path = "scheduling/class_event_member_wait.rs"]
 mod class_event_member_wait;
+#[path = "scheduling/class_event_parked_watchers.rs"]
+mod class_event_parked_watchers;
 #[path = "scheduling/class_nonevent_prop_wait.rs"]
 mod class_nonevent_prop_wait;
 #[path = "scheduling/clock_gen_dotted_target.rs"]
@@ -273,6 +278,8 @@ mod clock_gen_dotted_target;
 mod clock_gen_fifo_rank;
 #[path = "scheduling/clocking_cont_trigger_same_step.rs"]
 mod clocking_cont_trigger_same_step;
+#[path = "scheduling/comb_packed_element_sensitivity.rs"]
+mod comb_packed_element_sensitivity;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
 #[path = "scheduling/delay_always_compound_body.rs"]
@@ -309,6 +316,8 @@ mod nested_delay_slot_servicing;
 mod object_event_paths;
 #[path = "scheduling/package_and_unit_delays_scale_by_timescale.rs"]
 mod package_and_unit_delays_scale_by_timescale;
+#[path = "scheduling/package_cli_timescale_delay.rs"]
+mod package_cli_timescale_delay;
 #[path = "scheduling/phase_jump_static_latch.rs"]
 mod phase_jump_static_latch;
 #[path = "scheduling/release_from_level_sensitive_block.rs"]
@@ -413,3 +422,51 @@ mod function_formal_not_in_sensitivity;
 mod port_handshake_t0_550;
 #[path = "scheduling/armed_edge_dynamic_offset_read.rs"]
 mod armed_edge_dynamic_offset_read;
+#[path = "scheduling/clocking_output_clockvar_read.rs"]
+mod clocking_output_clockvar_read;
+#[path = "scheduling/comb_sensitivity_591_592.rs"]
+mod comb_sensitivity_591_592;
+#[path = "scheduling/one_step_delay_615.rs"]
+mod one_step_delay_615;
+#[path = "scheduling/clocking_select_clockvars.rs"]
+mod clocking_select_clockvars;
+
+#[path = "scheduling/always_property.rs"]
+mod always_property;
+#[path = "scheduling/class_collection_named_wait.rs"]
+mod class_collection_named_wait;
+
+#[path = "scheduling/class_or_value_change.rs"]
+mod class_or_value_change;
+
+#[path = "scheduling/preprocessor_linear_join.rs"]
+mod preprocessor_linear_join;
+
+#[path = "scheduling/review_parked_wait_writes.rs"]
+mod review_parked_wait_writes;
+
+#[path = "scheduling/labeled_block_local_events.rs"]
+mod labeled_block_local_events;
+
+#[path = "scheduling/program_implicit_finish.rs"]
+mod program_implicit_finish;
+
+#[path = "scheduling/delay_always_constant_scaled_delay.rs"]
+mod delay_always_constant_scaled_delay;
+
+#[path = "scheduling/packed_comb_sensitivity_844.rs"]
+mod packed_comb_sensitivity_844;
+
+#[path = "scheduling/review_fork_baseline_935.rs"]
+mod review_fork_baseline_935;
+
+#[path = "scheduling/review_watchdog_drivers_938.rs"]
+mod review_watchdog_drivers_938;
+
+#[path = "scheduling/fork_child_hidden_locals_943.rs"]
+mod fork_child_hidden_locals_943;
+
+#[path = "scheduling/unpacked_struct_copy_chain.rs"]
+mod unpacked_struct_copy_chain;
+#[path = "scheduling/unpacked_struct_array_sens.rs"]
+mod unpacked_struct_array_sens;

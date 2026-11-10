@@ -481,6 +481,9 @@ impl Simulator {
                             let hi = self.comb_dep_offsets[id + 1] as usize;
                             for k in lo..hi {
                                 let dep = self.comb_dep_entries[k] as usize;
+                                if dep == eidx && self.comb_self_exempt[eidx] {
+                                    continue;
+                                }
                                 if !self.settle_triggered[dep] {
                                     self.settle_triggered[dep] = true;
                                     let dl = self.comb_level[dep] as usize;
@@ -659,19 +662,10 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 }
                 let w = self.infer_lhs_width(lhs);
-                // §7.4.2/§10.9: `assign x = '{...}` (or `assign x[i] = '{...}`
-                // on an array of packed vectors) converts each item to the
-                // ELEMENT type. The generic eval concatenates items at their
-                // own widths, which scrambles any item that is not exactly
-                // element-sized.
-                //
-                let val = if let ExprKind::AssignmentPattern(items) = &rhs.kind {
-                    self.packed_pattern_for_lhs(lhs, items)
-                        .or_else(|| self.eval_packed_struct_pattern(lhs, items))
-                        .unwrap_or_else(|| self.eval_expr_ctx(rhs, w))
-                        .resize(w)
-                } else {
-                    self.eval_expr_ctx(rhs, w).resize(w)
+                // §10.8, §10.9: a pattern takes the net's declared type.
+                let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
+                    Some(v) => v.resize(w),
+                    None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
                 let delay = if *explicit_delay > 0 {
                     *explicit_delay
@@ -1307,6 +1301,9 @@ impl Simulator {
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
         }
+        if self.comb_self_exempt.len() != self.comb_entries.len() {
+            self.build_comb_self_exempt();
+        }
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
         }
@@ -1696,6 +1693,20 @@ impl Simulator {
                             continue;
                         }
                         if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        // An `always @*` that reads a packed element it also
+                        // writes after packed-region exclusion, the one
+                        // kind the arm above lets through. Precomputed; only
+                        // a self-dependency gets this far, and only an entry
+                        // added since the table was built misses it.
+                        if __dep == $eidx
+                            && self
+                                .comb_self_exempt
+                                .get(__dep)
+                                .copied()
+                                .unwrap_or_else(|| entries[__dep].reads_own_writes())
+                        {
                             continue;
                         }
                         if lane_on {

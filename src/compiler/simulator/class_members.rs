@@ -772,10 +772,11 @@ impl Simulator {
             return None;
         }
         // §8.10 / §13.3: the running subroutine's own formal or automatic
-        // local of this name (an entry in its rename frame) shadows a
-        // same-named property — `uvm_packer::put_bits(ref bit bitstream[])`
+        // local of this name (an entry in its rename frame, or a scalar in
+        // its local frame) shadows a same-named property:
+        // `uvm_packer::put_bits(ref bit bitstream[])`
         // must read its formal, not the class's `static bit bitstream[]`.
-        if self.dyn_name_lookup_innermost(name).is_some() {
+        if self.dyn_name_lookup_innermost(name).is_some() || self.frame_scalar_shadows(name) {
             return None;
         }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
@@ -1166,9 +1167,14 @@ impl Simulator {
         while let Some(cn) = cur {
             match self.module.classes.get(cn) {
                 Some(cd) => {
+                    // §7.4.2: a fixed multi-dimensional member (`int m [2][3]`)
+                    // stores under `<handle>#m` as a 1-D one does; without
+                    // it every whole-member write (`c.m = a`, a pattern, a
+                    // row `c.m[1] = '{..}`) resolved nowhere and was dropped.
                     if cd.assoc_properties.contains_key(member)
                         || cd.queue_properties.contains_key(member)
                         || cd.array_properties.contains_key(member)
+                        || cd.array_nd_properties.contains_key(member)
                     {
                         return true;
                     }
@@ -1206,6 +1212,13 @@ impl Simulator {
             // chain names the class-qualified shared store.
             self.static_fixed_key_in(&cn, member)
         }
+    }
+
+    /// Storage key of `ClassName::q` for a static queue or dynamic array
+    /// (§8.9): the store the class's own methods use.
+    fn class_scoped_static_coll(&self, class: &str, member: &str) -> Option<String> {
+        self.member_is_static_coll(class, member)
+            .then(|| self.spec_static_coll_key_in_class(member, class))
     }
 
     /// Instance-scoped storage name for an associative-array access whose
@@ -1362,6 +1375,11 @@ impl Simulator {
                         {
                             return Some(k);
                         }
+                        if let Some(k) =
+                            self.class_scoped_static_coll(&bh.path[0].name.name, &member.name)
+                        {
+                            return Some(k);
+                        }
                     }
                     obj_member(self, &bh.path[0].name.name, &member.name)
                 }
@@ -1495,8 +1513,9 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span: h.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         h.span,
                     );
@@ -1512,6 +1531,12 @@ impl Simulator {
                     }
                     let hd = self.eval_expr(&base_expr).to_u64().unwrap_or(0) as usize;
                     return self.handle_collection_name(hd, &h.path[1].name.name);
+                }
+                if self.module.classes.contains_key(&h.path[0].name.name)
+                    && let Some(k) =
+                        self.class_scoped_static_coll(&h.path[0].name.name, &h.path[1].name.name)
+                {
+                    return Some(k);
                 }
                 obj_member(self, &h.path[0].name.name, &h.path[1].name.name)
             }
@@ -1566,16 +1591,23 @@ impl Simulator {
             }
             // Flattened nested OBJECT handle: `a.mid.base` (path.len() >= 3).
             // The receiver is an object chain (`a.mid`), not a static handle.
-            // Evaluate the receiver to a handle and scope the leaf member to it.
+            // Evaluate the complete receiver, including intermediate selects
+            // (`sys.targets[i].ports`), and scope the leaf collection to it.
+            // §12.7.3: foreach must use that collection's bounds, not the
+            // bounds of an earlier array in the receiver chain.
             ExprKind::Ident(h)
                 if h.path.len() >= 3
                     && !self.module.classes.contains_key(&h.path[0].name.name)
-                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+                    && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
             {
                 let n = h.path.len();
                 let member = h.path[n - 1].name.name.clone();
                 let recv = hier_prefix(h);
-                let recv_expr = Expression::new(ExprKind::Ident(recv), h.span);
+                let recv_expr = if recv.path.iter().any(|s| !s.selects.is_empty()) {
+                    Self::hier_select_chain(&recv, h.span)
+                } else {
+                    Expression::new(ExprKind::Ident(recv), h.span)
+                };
                 let hh = self.eval_handle_expr(&recv_expr).unwrap_or(0);
                 if hh != 0 {
                     if let Some(cn) = self
@@ -1609,23 +1641,14 @@ impl Simulator {
     pub(super) fn indexed_coll_roots(&self) -> &HashSet<String> {
         self.indexed_coll_roots.get_or_init(|| {
             let mut set: HashSet<String> = HashSet::default();
-            let names = self
-                .module
-                .dynamic_arrays
-                .iter()
-                .chain(self.module.associative_arrays.keys());
-            for n in names {
-                if let Some((root, _)) = n.split_once('[')
-                    && !root.contains('#')
-                    && (self.module.var_decl_types.contains_key(root)
-                        || self.module.arrays.contains_key(root)
-                        || self.module.arrays_2d.contains_key(root)
-                        || self.module.arrays_nd.contains_key(root))
-                {
-                    // §12.7.3 / §23.8: a hierarchical module array is a
-                    // declared root too; leaf names are only probe hints.
-                    set.insert(root.to_string());
-                    if let Some((_, leaf)) = root.rsplit_once('.') {
+            // §7.4.5, §12.7.3, §23.8: every declared collection of
+            // collections whose rows are built row by row: queue or dynamic
+            // rows, or any rows under a fixed, dynamic or queue outer
+            // dimension. Hierarchical names add their leaf as a probe hint.
+            for (n, shape) in &self.module.coll_shapes {
+                if Self::has_queue_rows(shape) || !matches!(shape.dims[0], Dim::Assoc(_)) {
+                    set.insert(n.clone());
+                    if let Some((_, leaf)) = n.rsplit_once('.') {
                         set.insert(leaf.to_string());
                     }
                 }
@@ -1636,6 +1659,11 @@ impl Simulator {
                 // collections (`int q[3][$]`): its elements are stored
                 // per object (see `class_array_of_coll_key`).
                 set.extend(cd.array_of_coll_properties.keys().cloned());
+                set.extend(
+                    (cd.prop_coll_shapes.iter())
+                        .filter(|(_, shape)| Self::has_queue_rows(shape))
+                        .map(|(n, _)| n.clone()),
+                );
                 work.extend(cd.property_types.values().cloned());
             }
             work.extend(self.module.typedef_types.values().cloned());
@@ -1672,7 +1700,9 @@ impl Simulator {
     /// every indexed-collection probe.
     #[inline(always)]
     pub(super) fn indexed_colls_live(&self) -> bool {
-        self.indexed_coll_mask.get() != 0 || self.indexed_coll_roots.get().is_none()
+        self.indexed_coll_mask.get() != 0
+            || self.indexed_coll_roots.get().is_none()
+            || self.local_coll_rows_live
     }
 
     /// Whether `name` may be one of [`indexed_coll_roots`]: the length
@@ -1694,12 +1724,16 @@ impl Simulator {
         let ExprKind::Index { expr: base, .. } = &e.kind else {
             return false;
         };
-        if self.indexed_coll_mask.get() == 0 && self.indexed_coll_roots.get().is_some() {
+        if self.indexed_coll_mask.get() == 0
+            && self.indexed_coll_roots.get().is_some()
+            && !self.local_coll_rows_live
+        {
             return false;
         }
-        let mut cur = base.as_ref();
+        let (mut cur, mut selects) = (base.as_ref(), 1);
         while let ExprKind::Index { expr, .. } = &cur.kind {
             cur = expr;
+            selects += 1;
         }
         let name = match &cur.kind {
             ExprKind::Ident(h) => match h.path.last() {
@@ -1709,7 +1743,29 @@ impl Simulator {
             ExprKind::MemberAccess { member, .. } => member.name.as_str(),
             _ => return false,
         };
+        if self.local_coll_rows_live {
+            return self.indexed_coll_root(name) || self.local_coll_root(name);
+        }
+        // A select as deep as a module-scope declaration's dimensions is an
+        // element (or a bit of one), never a row: `d[i][j] = v` on
+        // `int d[][]` is a plain element write.
         self.indexed_coll_root(name)
+            && !(matches!(&cur.kind, ExprKind::Ident(h) if h.path.len() == 1)
+                && self
+                    .module
+                    .coll_shapes
+                    .get(name)
+                    .is_some_and(|shape| selects >= shape.dims.len()))
+    }
+
+    /// Whether `bare` names a subroutine-local collection of collections,
+    /// stored under its per-call key with a declared shape (§7.4.5).
+    fn local_coll_root(&self, bare: &str) -> bool {
+        let shape = match self.dyn_name_lookup(bare) {
+            Some(key) if key.starts_with('@') => self.local_coll_shapes.get(key),
+            _ => self.module.coll_shapes.get(bare),
+        };
+        shape.is_some_and(Self::has_queue_rows)
     }
 
     /// §7.4.5/§7.6/§7.10: `q3[0] = q3[1]`, `s.sp[3] = '{..}`, `r = q3[1]` —
@@ -1727,6 +1783,10 @@ impl Simulator {
             let Some(name) = self.indexed_coll_name(lvalue) else {
                 return false;
             };
+            // §7.8.7, §7.4.5: create the target row, or ignore the write.
+            if !self.ensure_row(&name) {
+                return true;
+            }
             let dt = self
                 .struct_member_coll_of(&name)
                 .map(|(_, dt, _)| dt)
@@ -1793,16 +1853,119 @@ impl Simulator {
     #[cold]
     #[inline(never)]
     pub(super) fn indexed_coll_name(&mut self, e: &Expression) -> Option<String> {
+        // §13.5.2 (#854): identify a fixed class-row actual before
+        // flattening it. The bare flat name is not the object's store;
+        // trying it and then resolving the class row evaluated every
+        // selector twice (including function calls and increments).
+        let mut indices = Vec::new();
+        let mut root = e;
+        while let ExprKind::Index { expr, index } = &root.kind {
+            indices.push(index.as_ref());
+            root = expr;
+        }
+        // The shape probes below may inspect a member receiver more than
+        // once before finding its collection store. Capture a side-effectful
+        // object receiver once, including for dynamic outer rows that do not
+        // take the fixed-row fast path (§11.4.1 / §13.5.2, #854).
+        if let ExprKind::MemberAccess { expr: recv, member } = &root.kind
+            && !Self::cond_expr_is_effect_free(recv, false)
+        {
+            let value = self.eval_expr(recv);
+            let mut selected = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.value_method_arg_expr(&value)),
+                    member: member.clone(),
+                },
+                root.span,
+            );
+            for index in indices.iter().rev() {
+                selected = Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(selected),
+                        index: Box::new((**index).clone()),
+                    },
+                    e.span,
+                );
+            }
+            return self.indexed_coll_name(&selected);
+        }
+        if let Some((mut key, bounds)) = self.class_fixed_array_of_coll_base(root)
+            && bounds.len() == indices.len()
+        {
+            for (index, &(lo, hi)) in indices.into_iter().rev().zip(&bounds) {
+                let value = self.eval_expr(index).to_i64()?;
+                if !(lo.min(hi)..=lo.max(hi)).contains(&value) {
+                    return None;
+                }
+                key.push('[');
+                Self::push_i64(&mut key, value);
+                key.push(']');
+            }
+            return Some(key);
+        }
         if let Some(n) = self.flat_member_name(e)
             && (self.module.dynamic_arrays.contains(&n)
                 || self.module.associative_arrays.contains_key(&n)
+                || self.is_existing_row(&n)
                 || (self.struct_colls_possible() && self.ensure_struct_member_coll(&n)))
         {
             return Some(n);
         }
         // An element of a class property that is a fixed array of
-        // collections lives under the object-scoped key `<h>#q[i]`.
-        self.class_fixed_array_of_coll_key(e)
+        // collections lives under the object-scoped key `<h>#q[i]`; a row
+        // of any other collection property under `<h>#m[k]`.
+        self.class_fixed_array_of_coll_key(e).or_else(|| {
+            self.coll_elem_expr_key(e)
+                .filter(|k| self.is_existing_row(k))
+        })
+    }
+
+    /// A declared row (see [`is_declared_row`]) that exists — one past the
+    /// size of a queue or dynamic array above it does not (§7.8.6) — or the
+    /// `$+1` slot of a queue, which a write creates (§7.10.1).
+    pub(super) fn is_existing_row(&self, name: &str) -> bool {
+        self.is_declared_row(name)
+            && (self.declared_dim(name).is_some() || self.is_queue_append_slot(name))
+    }
+
+    /// Whether `name` (`q[i]`) selects index `q.size()` of the queue of
+    /// collections `q`.
+    fn is_queue_append_slot(&self, name: &str) -> bool {
+        let Some((shape, depth)) = self.coll_shape_at(name) else {
+            return false;
+        };
+        let Some(p) = name.rfind('[') else {
+            return false;
+        };
+        depth >= 1
+            && shape.dims[depth - 1] == Dim::Queue
+            && name[p + 1..name.len() - 1].parse::<u64>().ok()
+                == Some(self.get_queue_size(&name[..p]))
+    }
+
+    /// §7.4.5: whether `name` is a row of a declared collection of
+    /// collections — selected below its root, above its leaf elements —
+    /// whether or not it exists yet.
+    pub(super) fn is_declared_row(&self, name: &str) -> bool {
+        self.coll_shape_at(name).is_some_and(|(shape, depth)| {
+            depth >= 1
+                && shape
+                    .dims
+                    .get(depth)
+                    .is_some_and(|d| !matches!(d, Dim::Fixed(_)))
+        })
+    }
+
+    /// Whether `shape` has a row that is a queue or dynamic array, which a
+    /// whole assignment (`m[k] = q`) builds element by element. A fixed row
+    /// is laid out by its bounds, and an associative row by the
+    /// multidimensional associative paths.
+    pub(super) fn has_queue_rows(shape: &CollShape) -> bool {
+        shape
+            .dims
+            .iter()
+            .skip(1)
+            .any(|d| matches!(d, Dim::Queue | Dim::Dyn))
     }
 
     /// Evaluate a scalar expression to an i64 in a `&self` context (literals,
@@ -1864,21 +2027,111 @@ impl Simulator {
                 return Some(v);
             }
         }
-        if let ExprKind::Ident(h) = &e.kind {
-            if h.path.len() == 1 {
-                let name = &h.path[0].name.name;
-                if let Some(locals) = self.local_stack.last() {
-                    if let Some(v) = locals.get(name) {
-                        return v.to_u64().map(|x| x as i64);
-                    }
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => self
+                .scalar_name_value_self(&h.path[0].name.name)?
+                .to_u64()
+                .map(|x| x as i64),
+            // `cfg.idx`, `this.idx`: a property read through a handle.
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let recv = Expression::new(ExprKind::Ident(hier_prefix(h)), e.span);
+                let oh = self.eval_handle_expr(&recv).filter(|&oh| oh != 0)?;
+                let leaf = &h.path.last()?.name.name;
+                self.read_member_value(oh, leaf)?.to_u64().map(|x| x as i64)
+            }
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let oh = self.eval_handle_expr(recv).filter(|&oh| oh != 0)?;
+                self.read_member_value(oh, &member.name)?
+                    .to_u64()
+                    .map(|x| x as i64)
+            }
+            ExprKind::Paren(inner) => self.eval_scalar_self(inner),
+            // §11.4: an index computed from such names (`q[n-1]`).
+            ExprKind::Unary { op, operand } => {
+                let v = self.eval_scalar_self(operand)?;
+                match op {
+                    UnaryOp::Plus => Some(v),
+                    UnaryOp::Minus => Some(v.wrapping_neg()),
+                    UnaryOp::BitNot => Some(!v),
+                    _ => None,
                 }
-                return self
-                    .get_signal_value_by_name(name)
-                    .and_then(|v| v.to_u64())
-                    .map(|x| x as i64);
+            }
+            ExprKind::Binary { op, left, right } => {
+                let (l, r) = (self.eval_scalar_self(left)?, self.eval_scalar_self(right)?);
+                match op {
+                    BinaryOp::Add => Some(l.wrapping_add(r)),
+                    BinaryOp::Sub => Some(l.wrapping_sub(r)),
+                    BinaryOp::Mul => Some(l.wrapping_mul(r)),
+                    BinaryOp::Div if r != 0 => Some(l.wrapping_div(r)),
+                    BinaryOp::Mod if r != 0 => Some(l.wrapping_rem(r)),
+                    BinaryOp::BitAnd => Some(l & r),
+                    BinaryOp::BitOr => Some(l | r),
+                    BinaryOp::BitXor => Some(l ^ r),
+                    BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft if (0..64).contains(&r) => {
+                        Some(l << r)
+                    }
+                    BinaryOp::ShiftRight if (0..64).contains(&r) => Some(((l as u64) >> r) as i64),
+                    BinaryOp::ArithShiftRight if (0..64).contains(&r) => Some(l >> r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The value of a bare name in a `&self` context, resolved the way the
+    /// running scope sees it: a local of the innermost frame, else — inside a
+    /// class method — a property of `this` or a static property of the class
+    /// (§8.11, a class member hides a module-scope name), else a signal or
+    /// variable. Without the class tier an index naming a property
+    /// (`dst[j] = src[j]` with `j` a property, `@(posedge vifs[idx].clk)`)
+    /// read nothing, so the virtual-interface element it selected resolved
+    /// to no instance.
+    fn scalar_name_value_self(&self, name: &str) -> Option<Value> {
+        if let Some(v) = self.local_stack.last().and_then(|l| l.get(name)) {
+            return Some(v.clone());
+        }
+        if let Some(th) = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .filter(|&h| h != 0)
+            && let Some(inst) = self.heap.get(th).and_then(|o| o.as_ref())
+        {
+            let key = self.shadowed_prop_key(name, false);
+            if let Some(v) = inst.properties.get(key.as_deref().unwrap_or(name)) {
+                return Some(v.clone());
             }
         }
-        None
+        if let Some(ctx) = self.class_context_stack.last().and_then(|c| c.as_deref())
+            && let Some(key) = self.static_prop_key(ctx, name)
+        {
+            if let Some(v) = self.class_statics.get(&key) {
+                return Some(v.clone());
+            }
+            // A static cell is materialized on its first `&mut` access; until
+            // then it holds its declaration's constant initializer (§8.9).
+            let head = key
+                .strip_suffix(name)
+                .and_then(|k| k.strip_suffix("::"))
+                .unwrap_or(&key);
+            let seed = self
+                .module
+                .classes
+                .get(head.split('#').next().unwrap_or(head))
+                .and_then(|cd| match cd.property_inits.get(name) {
+                    Some(init) => super::elaborate::const_eval_i64_with_params(init, None)
+                        .map(|v| Value::from_u64(v as u64, 64)),
+                    None => cd.properties.get(name).map(|sig| sig.value.clone()),
+                });
+            if seed.is_some() {
+                return seed;
+            }
+        }
+        self.get_signal_value_by_name(name)
     }
 
     /// §8.9: whether `member`, looked up from class `cn` up its chain, is a
@@ -2403,6 +2656,187 @@ impl Simulator {
         }
     }
 
+    /// Whether the nearest declaration of `member` from class `cn` up is a
+    /// class constant (a `localparam` or `parameter` in the class body).
+    pub(super) fn nearest_decl_is_constant(&self, cn: &str, member: &str) -> bool {
+        let mut cur: Option<&str> = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let Some(cd) = self.module.classes.get(c) else {
+                return false;
+            };
+            if cd.param_defaults.iter().any(|(p, _)| p == member) {
+                return true;
+            }
+            if cd.properties.contains_key(member)
+                || cd.static_properties.contains(member)
+                || guard > 64
+            {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// The nearest class from `cn` up that declares `member` as an INSTANCE
+    /// property, passing over static and constant declarations.
+    pub(super) fn nearest_instance_declarer(&self, cn: &str, member: &str) -> Option<String> {
+        let mut cur: Option<&str> = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let cd = self.module.classes.get(c)?;
+            if guard > 64 {
+                return None;
+            }
+            if cd.properties.contains_key(member)
+                && !cd.static_properties.contains(member)
+                && !cd.param_defaults.iter().any(|(p, _)| p == member)
+            {
+                return Some(c.to_string());
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// The class whose method is executing: the scope `this`, `super` and a
+    /// bare member name resolve in (§8.14, §8.15, §8.23).
+    pub(super) fn lexical_class(&self) -> Option<String> {
+        self.class_context_stack.last().cloned().flatten()
+    }
+
+    /// §8.14/§8.23: the class a class-handle expression is DECLARED as, the
+    /// scope its members resolve in, whatever class the object is: `this` is
+    /// the class of the running method, `super` its base, and a variable, a
+    /// property, a collection element or a member chain has its declared
+    /// type. None when no declaration is at hand (a function result, a name
+    /// whose type is not recorded); callers then keep the object's class.
+    pub(super) fn ref_view_class(&self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::This => self.lexical_class(),
+            ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
+                self.path_view_class(&h.path)
+            }
+            // An element of a collection of handles has the collection's
+            // declared element class, which is what the walk records for it.
+            ExprKind::Index { expr, .. } => self.ref_view_class(expr),
+            ExprKind::MemberAccess { expr, member } => {
+                let c = self.ref_view_class(expr)?;
+                self.prop_class_type_from_class(&c, &member.name, None)
+            }
+            ExprKind::Paren(inner) => self.ref_view_class(inner),
+            _ => None,
+        }
+    }
+
+    /// `ref_view_class` of a flattened handle path (`this.child`, `q[0]`,
+    /// `Box::slot.child`): the head's declared class, then each segment's
+    /// declared property type.
+    pub(super) fn path_view_class(&self, path: &[HierPathSegment]) -> Option<String> {
+        let head = path.first()?.name.name.as_str();
+        let mut rest = &path[1..];
+        let mut cls = match head {
+            "this" => self.lexical_class()?,
+            "super" => {
+                let ctx = self.lexical_class()?;
+                self.module.classes.get(&ctx)?.extends.clone()?
+            }
+            _ if !rest.is_empty() && path[0].selects.is_empty() && self.class_scope_head(head) => {
+                // `Class::static_prop...`: the class itself, through a
+                // typedef of a specialization as well.
+                let c = self
+                    .resolve_typeref_class_name_str(head)
+                    .filter(|c| self.module.classes.contains_key(c))
+                    .unwrap_or_else(|| head.to_string());
+                let c = self.class_origin(&c).to_string();
+                let first = &rest[0].name.name;
+                rest = &rest[1..];
+                self.prop_class_type_from_class(&c, first, None)?
+            }
+            _ => self.var_view_class(head)?,
+        };
+        for seg in rest {
+            cls = self.prop_class_type_from_class(&cls, &seg.name.name, None)?;
+        }
+        Some(cls)
+    }
+
+    /// The object a `Class::static_handle.member...` path (a flattened
+    /// identifier, `Box::slot` or `Box::slot.next`) reaches: the static cell's
+    /// handle, then each member's.
+    pub(super) fn static_head_handle(&self, e: &Expression) -> Option<usize> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() < 2 || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let head = h.path[0].name.name.as_str();
+        if !self.class_scope_head(head) {
+            return None;
+        }
+        let cls = self
+            .resolve_typeref_class_name_str(head)
+            .filter(|c| self.module.classes.contains_key(c))
+            .unwrap_or_else(|| head.to_string());
+        let key = self.static_prop_key(&cls, &h.path[1].name.name)?;
+        let mut cur = self.class_statics.get(&key)?.to_u64()? as usize;
+        for seg in &h.path[2..] {
+            if cur == 0 {
+                return None;
+            }
+            cur = self.member_handle(cur, &seg.name.name)?;
+        }
+        Some(cur)
+    }
+
+    /// Does `head` name a class (or a typedef of one) rather than a variable,
+    /// as the head of `head::member`?
+    fn class_scope_head(&self, head: &str) -> bool {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|m| m.contains_key(head))
+        {
+            return false;
+        }
+        self.module.classes.contains_key(head)
+            || self
+                .resolve_typeref_class_name_str(head)
+                .is_some_and(|c| self.module.classes.contains_key(&c))
+                && !self.signal_name_to_id.contains_key(head)
+    }
+
+    /// The declared class of a handle VARIABLE `name` (a local, a module
+    /// variable, a formal or a property of the running method's class),
+    /// collection variables giving their element class.
+    pub(super) fn var_view_class(&self, name: &str) -> Option<String> {
+        if let Some(ctx) = self.lexical_class() {
+            let local = self
+                .local_stack
+                .last()
+                .is_some_and(|m| m.contains_key(name));
+            if !local && let Some(c) = self.prop_class_type_from_class(&ctx, name, None) {
+                return Some(c);
+            }
+        }
+        let c = self
+            .class_of_var(name)
+            .or_else(|| self.elem_class_of_arr(name))
+            .or_else(|| self.declared_collection_elem_class(name))?;
+        let base = c.split('#').next().unwrap_or(&c);
+        // A package-qualified declaration (`pkg::base_c h`) names the class
+        // by its own key.
+        let leaf = base.rsplit("::").next().unwrap_or(base);
+        [leaf, base]
+            .into_iter()
+            .find(|c| self.module.classes.contains_key(*c))
+            .map(str::to_string)
+    }
+
     /// §8.9: the class and specialization whose static `member` an object
     /// reference names. The reference's declared type decides (`var`, when
     /// the reference is a variable), so a static is reachable through a null
@@ -2424,7 +2858,22 @@ impl Simulator {
             .get(handle)
             .and_then(|o| o.as_ref())
             .filter(|_| handle != 0);
-        let decl = var.and_then(|v| self.declared_class_spec(v, resolved));
+        // §8.9/§8.14: `this.s` names what the running method's class sees.
+        // That differs from the object's class only when a derived class
+        // hides a static of the method's class with an instance property.
+        let decl = if var == Some("this") {
+            live.and_then(|inst| {
+                let ctx = self.lexical_class()?;
+                (!self.member_is_static_prop(&inst.class_name, member)
+                    && self.member_is_static_prop(&ctx, member))
+                .then(|| {
+                    let spec = self.inherited_param_spec(&ctx);
+                    (ctx, spec)
+                })
+            })
+        } else {
+            var.and_then(|v| self.declared_class_spec(v, resolved))
+        };
         let (cn, spec) = match (live, decl) {
             (Some(inst), Some((dc, dspec))) if self.class_is_a(&inst.class_name, &dc) => {
                 // The object knows its specialization; the declaration's
@@ -2621,7 +3070,15 @@ impl Simulator {
             _ => return None,
         };
         if live(self, h) {
-            return self.static_write_via_handle(h, None, None, member, val.clone());
+            let via = match &lhs.kind {
+                ExprKind::MemberAccess { expr: recv, .. }
+                    if matches!(recv.kind, ExprKind::This) =>
+                {
+                    Some("this")
+                }
+                _ => None,
+            };
+            return self.static_write_via_handle(h, via, None, member, val.clone());
         }
         let (owner, prop) = null_in?;
         let (cn, spec) = self.null_property_static_target(owner, &prop, member)?;
@@ -2714,6 +3171,41 @@ impl Simulator {
 
     /// Resolve a handle-valued expression (`h`, `arr[i]`) to its heap handle in
     /// a `&self` context, applying instance scoping for member-array bases.
+    /// The object handle held by the variable a dotted name denotes, when
+    /// the name is one of the simulator's flat keys: as written (absolute),
+    /// under the current resolve or process scope hint, or with the top
+    /// module's name stripped (§23.6). A name the heuristics would have to
+    /// guess at is not a handle here.
+    fn hier_var_handle(&self, name: &str) -> Option<usize> {
+        let read = |key: &str| -> Option<usize> {
+            if let Some(&id) = self.signal_name_to_id.get(key) {
+                return self.signal_table[id].to_u64().map(|h| h as usize);
+            }
+            self.signals
+                .get(key)
+                .and_then(|v| v.to_u64())
+                .map(|h| h as usize)
+        };
+        if let Some(h) = read(name) {
+            return Some(h);
+        }
+        if let Some(scoped) = self.hint_scoped(name) {
+            if let Some(h) = read(&scoped) {
+                return Some(h);
+            }
+        }
+        if let Some(scope) = self.process_scope_hint.get(&self.current_pid) {
+            if !scope.is_empty() {
+                if let Some(h) = read(&format!("{scope}.{name}")) {
+                    return Some(h);
+                }
+            }
+        }
+        name.strip_prefix(self.module.name.as_str())
+            .and_then(|rest| rest.strip_prefix('.'))
+            .and_then(read)
+    }
+
     pub(super) fn eval_handle_expr(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
             // `this` resolves to the current object handle. Needed so
@@ -2724,14 +3216,39 @@ impl Simulator {
             // Flattened multi-segment handle path (`a.b.c`): resolve the head
             // handle, then walk the remaining segments as property reads.
             ExprKind::Ident(h) if h.path.len() >= 2 => {
-                let mut handle = self.eval_ident_handle(&h.path[0].name.name)?;
-                for seg in &h.path[1..] {
-                    if handle == 0 {
-                        return None;
+                let walk = |mut handle: usize, rest: &[HierPathSegment]| -> Option<usize> {
+                    for seg in rest {
+                        if handle == 0 {
+                            return None;
+                        }
+                        handle = self.member_handle(handle, &seg.name.name)?;
                     }
-                    handle = self.member_handle(handle, &seg.name.name)?;
+                    Some(handle)
+                };
+                if let Some(found) = self
+                    .eval_ident_handle(&h.path[0].name.name)
+                    .and_then(|handle| walk(handle, &h.path[1..]))
+                {
+                    return Some(found);
                 }
-                Some(handle)
+                // §23.6 / §23.8: the head is an INSTANCE, not a variable — a
+                // hierarchical handle (`u_n.obj`, or an upward name the
+                // elaborator rewrote to its absolute path). An instance name
+                // has a placeholder signal, so the head-first walk above
+                // starts from a null handle and finds nothing. The longest
+                // prefix that names a declared variable is the handle, the
+                // remaining segments are property reads. Without this every
+                // collection reached through such a handle (`u_n.obj.arr[k]`)
+                // read x and dropped its stores (#890).
+                (2..=h.path.len()).rev().find_map(|k| {
+                    let name = h.path[..k]
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let handle = self.hier_var_handle(&name)?;
+                    walk(handle, &h.path[k..])
+                })
             }
             // `<expr>.member` — resolve the base to a handle, then read the
             // member property (also a handle). Enables deep object chains
@@ -2938,6 +3455,30 @@ impl Simulator {
             .unwrap_or(false)
     }
 
+    /// Base name of a class, dropping one specialization.
+    ///
+    /// Entries made for a virtual-interface type argument are `base<sig>`
+    /// and `sig` may itself contain `#(...)`
+    /// (`uvm_resource<virtual mon_if#(32)>`). A split on `#` stops inside
+    /// that signature and the hierarchy walk no longer sees `base`.
+    fn class_key_base(s: &str) -> &str {
+        if let Some(i) = s.find('<') {
+            if s.ends_with('>') && i > 0 {
+                let head = &s[..i];
+                if head
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                {
+                    return head;
+                }
+            }
+        }
+        if let Some(i) = s.find("#(") {
+            return &s[..i];
+        }
+        s.split('#').next().unwrap_or(s)
+    }
+
     /// Is class `derived` the same as, or a subclass of, `base`? Walks the
     /// `extends` chain; compares parameter-stripped names (IEEE 1800-2023 §8.25).
     pub(super) fn typedef_unroll(&self, name: &str) -> String {
@@ -2954,13 +3495,19 @@ impl Simulator {
         let mut guard = 0;
         while guard < 16 {
             guard += 1;
-            let stripped = cur.split('#').next().unwrap_or(cur);
+            // A specialized entry (`base<sig>`) is itself a class. Keep
+            // that name so `class_origin` can map it back; splitting on
+            // `#` inside `sig` produces a key that is not a class.
+            if self.module.classes.contains_key(cur) {
+                return cur.to_string();
+            }
+            let stripped = Self::class_key_base(cur);
             if self.module.classes.contains_key(stripped) {
                 return stripped.to_string();
             }
             match self.module.typedef_types.get(cur) {
                 Some(DataType::TypeReference { name, .. }) => {
-                    let base = name.name.name.split('#').next().unwrap_or(&name.name.name);
+                    let base = Self::class_key_base(&name.name.name);
                     if self.module.classes.contains_key(base) {
                         return base.to_string();
                     }
@@ -2973,29 +3520,96 @@ impl Simulator {
     }
 
     pub(super) fn class_is_a(&self, derived: &str, base: &str) -> bool {
+        if derived == base {
+            return true;
+        }
+        // Memoized per (derived, base): class tables are immutable during simulation.
+        let key = (derived.to_string(), base.to_string());
+        if let Some(&ans) = self.class_is_a_cache.borrow().get(&key) {
+            return ans;
+        }
+        let ans = self.class_is_a_uncached(derived, base);
+        self.class_is_a_cache.borrow_mut().insert(key, ans);
+        ans
+    }
+
+    fn class_is_a_uncached(&self, derived: &str, base: &str) -> bool {
         // Class names are keyed bare (the parser keeps only the leaf segment
         // of a scoped name), so the comparison strips just the `#(params)`
-        // specialization suffix, not a package prefix.
+        // specialization suffix, not a package prefix. An object built from a
+        // class declared inside a scoped unit can record its `class_name`
+        // under a DIFFERENT spelling than a `$cast` destination resolves to
+        // (e.g. object `test.reg_rw` vs dest `reg_rw`, or a nested
+        // `transaction` vs `UVC::transaction`). Those are the SAME class, but
+        // the ancestor walk below (which only follows `extends`) can never
+        // join a class to its own other-spelled name.
+        //
+        // Detect that sameness from the DECLARATION NAME: every registry key
+        // that aliases one class (the dual bare/scoped keys the elaborator
+        // inserts) resolves to an `ElaboratedClass` whose canonical `name`
+        // string is the SAME, even when the entries are separate Arc copies.
+        // Two genuinely different same-named classes in different scopes
+        // (`pkg1::Foo` / `pkg2::Foo`) resolve to entries whose `name` strings
+        // differ, so they stay distinct (a legal downcast must not conflate
+        // cross-scope classes). This joins only declaration-identical
+        // classes, never coincidentally same-named ones.
+        let canon = |s: &str| {
+            self.module
+                .classes
+                .get(s.split('#').next().unwrap_or(s))
+                .map(|a| a.name.clone())
+        };
         let strip = |s: &str| s.split('#').next().unwrap_or(s).to_string();
-        let base = strip(base);
+        let base_d = self.typedef_unroll(&base);
+        let base = strip(base_d.as_str());
+        let base_canon = canon(&base).or_else(|| canon(&base_d));
         let mut cur = Some(self.typedef_unroll(derived));
         let mut guard = 0;
+        // §8.26: a class is also every interface class it or a base class
+        // implements, and every one those extend.
+        let mut ifaces: Vec<String> = Vec::new();
         while let Some(c) = cur {
             guard += 1;
             if guard > 128 {
                 break;
             }
-            if strip(&c) == base || self.class_origin(&c) == base {
+            let c_stripped = strip(&c);
+            let same_entry = base_canon.is_some()
+                && (canon(&c) == base_canon
+                    || canon(&c_stripped) == base_canon
+                    || canon(&self.typedef_unroll(&c)) == base_canon);
+            if c_stripped == base || self.class_origin(&c) == base || same_entry {
                 return true;
             }
-            let nxt = self
+            let cd = self
                 .module
                 .classes
                 .get(&c)
-                .or_else(|| self.module.classes.get(&strip(&c)))
+                .or_else(|| self.module.classes.get(&c_stripped));
+            if let Some(cd) = cd {
+                ifaces.extend(cd.implements.iter().cloned());
+            }
+            cur = cd
                 .and_then(|cd| cd.extends.clone())
                 .map(|e| self.typedef_unroll(&e));
-            cur = nxt;
+        }
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(i) = ifaces.pop() {
+            if seen.len() > 128 || !seen.insert(i.clone()) {
+                continue;
+            }
+            let i = self.typedef_unroll(&i);
+            if strip(&i) == base {
+                return true;
+            }
+            if let Some(cd) = self
+                .module
+                .classes
+                .get(&i)
+                .or_else(|| self.module.classes.get(&strip(&i)))
+            {
+                ifaces.extend(cd.extends.iter().chain(&cd.implements).cloned());
+            }
         }
         false
     }
@@ -3239,7 +3853,7 @@ impl Simulator {
             if guard > 128 {
                 break;
             }
-            if c == entry {
+            if c == entry || self.same_class_id(c, entry) {
                 return true;
             }
             cur = self
@@ -3249,6 +3863,47 @@ impl Simulator {
                 .and_then(|cd| cd.extends.as_deref());
         }
         false
+    }
+
+    /// Do `a` and `b` name the SAME class declaration (under possibly
+    /// different scoped spellings) with the SAME specialization suffix?
+    ///
+    /// A class declared inside a scoped unit can be referred to as its scoped
+    /// name (`test.wrap_c`) or its bare leaf (`wrap_c`), and the elaborator
+    /// dually-keys both to an `ElaboratedClass` whose canonical `name` is the
+    /// same. This node check lets a specialization-identity walk (used by the
+    /// `$cast` dep-class and dep-typedef checks) join those spellings the way
+    /// `class_is_a` already does, while preserving the specialization
+    /// distinction: names with different `#(...)`/`<...>` suffixes stay
+    /// distinct (a `wrap_c#(1)` is never the same class as `wrap_c#(2)`).
+    fn same_class_id(&self, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let split = |s: &str| {
+            if let Some(i) = s.find('#') {
+                (s[..i].to_string(), Some(s[i..].to_string()))
+            } else if let Some(i) = s.find('<') {
+                let rest = &s[i..];
+                let inner = rest
+                    .strip_suffix('>')
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| rest.to_string());
+                (s[..i].to_string(), Some(inner))
+            } else {
+                (s.to_string(), None)
+            }
+        };
+        let (ba, sa) = split(a);
+        let (bb, sb) = split(b);
+        if sa != sb {
+            return false;
+        }
+        match (self.module.classes.get(&ba).map(|x| x.name.clone()),
+               self.module.classes.get(&bb).map(|x| x.name.clone())) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
     }
 
     /// Parse a value-parameter spec fragment (decimal or based literal)
@@ -3581,7 +4236,17 @@ impl Simulator {
             let sval_resolved = self
                 .typedef_alias_frag(sval)
                 .unwrap_or_else(|| sval.to_string());
-            if canon(&dfrag_resolved) != canon(&sval_resolved) {
+            // `virtual mon_if` and `virtual mon_if#(32)` are one type when
+            // 32 is the interface's default parameter (IEEE 1800-2017
+            // §25.9). Compare the canonical spelling the specialization entry
+            // records.
+            let vif_canon = |s: &str| -> String {
+                match self.parse_vif_frag(s) {
+                    Some((name, args, modport)) => self.canonical_vif_frag(&name, args, modport),
+                    None => canon(s),
+                }
+            };
+            if vif_canon(&dfrag_resolved) != vif_canon(&sval_resolved) {
                 return false;
             }
         }
@@ -3710,6 +4375,15 @@ impl Simulator {
             // `this.req.get_type()` (receiver = `this.req`) — resolve the
             // declared member type through the current `this` class.
             ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                // The parser spells the keyword receiver as `ExprKind::This`,
+                // not as a one-segment `Ident("this")`; both spellings reach
+                // here, so accept either.
+                ExprKind::This => self
+                    .this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .and_then(|th| self.prop_class_type(th, &member.name)),
                 ExprKind::Ident(b) if b.path.len() == 1 && b.path[0].selects.is_empty() => {
                     let bname = &b.path[0].name.name;
                     if bname == "this" || bname == "super" {
@@ -4279,8 +4953,9 @@ impl Simulator {
                             root: None,
                             path,
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         span,
                     ));

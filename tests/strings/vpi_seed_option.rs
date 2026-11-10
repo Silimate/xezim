@@ -84,12 +84,12 @@ fn vpi_plusargs(out: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The seed a `random` run drew and printed for replay.
-fn drawn_seed(err: &str) -> String {
-    let rest = err
+/// The seed a `random` run drew and printed on stdout for replay.
+fn drawn_seed(out: &str) -> String {
+    let rest = out
         .split("random seed: ")
         .nth(1)
-        .unwrap_or_else(|| panic!("no random seed printed:\n{}", err));
+        .unwrap_or_else(|| panic!("no random seed printed:\n{}", out));
     rest.split_whitespace().next().unwrap().to_string()
 }
 
@@ -114,14 +114,14 @@ fn seed_options_seed_without_a_plusarg() {
         assert_eq!(line(&out, "RAND|"), line(&native, "RAND|"), "{:?}", args);
     }
     // `random` draws a seed and prints it; the printed option replays the run.
-    let (out, err) = run(&d, &so, "tb.sv", &["-sv_seed", "random"]);
+    let (out, _) = run(&d, &so, "tb.sv", &["-sv_seed", "random"]);
     assert!(vpi_plusargs(&out).is_empty(), "{}", out);
     assert_eq!(line(&out, "SV_TEST|"), "SV_TEST|0");
-    let seed = drawn_seed(&err);
+    let seed = drawn_seed(&out);
     assert!(
-        err.contains(&format!("replay with -sv_seed {}", seed)),
+        out.contains(&format!("replay with -sv_seed {}", seed)),
         "{}",
-        err
+        out
     );
     let (replay, _) = run(&d, &so, "tb.sv", &["-sv_seed", &seed]);
     assert_eq!(line(&replay, "RAND|"), line(&out, "RAND|"));
@@ -143,14 +143,14 @@ fn seed_plusarg_stays_a_plusarg() {
     let (other, _) = run(&d, &so, "tb.sv", &["+seed=124"]);
     assert_ne!(line(&out, "RAND|"), line(&other, "RAND|"));
 
-    let (out, err) = run(&d, &so, "tb.sv", &["+seed=random"]);
+    let (out, _) = run(&d, &so, "tb.sv", &["+seed=random"]);
     assert_eq!(vpi_plusargs(&out), ["+seed=random"]);
     assert_eq!(line(&out, "SV_VALUE|"), "SV_VALUE|random");
-    let seed = drawn_seed(&err);
+    let seed = drawn_seed(&out);
     assert!(
-        err.contains(&format!("replay with +seed={}", seed)),
+        out.contains(&format!("replay with +seed={}", seed)),
         "{}",
-        err
+        out
     );
     let (replay, _) = run(&d, &so, "tb.sv", &[&format!("+seed={}", seed)]);
     assert_eq!(line(&replay, "RAND|"), line(&out, "RAND|"));

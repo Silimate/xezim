@@ -220,3 +220,57 @@ fn every_labelled_assertion_form_carries_name() {
     assert!(json.contains("\"assertion_sites\": 7"), "{json}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A labelled immediate assertion in an `initial` block keeps its label
+/// under `--code-coverage` (§9.3.1, §16.3): the statement marker the
+/// instrumentation adds beside it made the label's block look like two
+/// statements, so the label was dropped (#586, reported by hernloh).
+#[test]
+fn labelled_assertions_keep_their_label_under_code_coverage() {
+    let d = scratch("initial_lbl");
+    let f = d.join("tb3.sv");
+    std::fs::write(
+        &f,
+        "module tb3;\n\
+         \x20 logic clk=0; always #5 clk=~clk;\n\
+         \x20 logic [1:0] s=0, t=0;\n\
+         \x20 always @(posedge clk) s <= s+1;\n\
+         \x20 always @(posedge clk) begin m_lbl: assert (s<4); t <= s; end\n\
+         \x20 initial begin one_lbl: assert (1); end\n\
+         \x20 initial begin #1 after_lbl: assert (1); end\n\
+         \x20 initial begin two_lbl: assert (1); #60 $finish; end\n\
+         endmodule\n",
+    )
+    .unwrap();
+    let db = d.join("cov.json");
+    let out = Command::new(xezim())
+        .env("XEZIM_COV_DB", &db)
+        .args(["--code-coverage", "-s", "tb3"])
+        .arg(&f)
+        .output()
+        .expect("run xezim");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = std::fs::read_to_string(&db).expect("coverage file");
+    for (name, line) in [
+        ("m_lbl", 5),
+        ("one_lbl", 6),
+        ("after_lbl", 7),
+        ("two_lbl", 8),
+    ] {
+        let head = format!(
+            "{{\"name\": \"{}\", \"file\": \"{}\", \"line\": {}, ",
+            name,
+            f.display(),
+            line
+        );
+        assert!(
+            json.lines().any(|l| l.trim().starts_with(&head)),
+            "{name}: {json}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

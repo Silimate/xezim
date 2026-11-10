@@ -822,7 +822,7 @@ impl Walk<'_> {
                     signed: false,
                     base: NumberBase::Decimal,
                     value: c.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 e.span,
             );
@@ -1145,6 +1145,7 @@ impl Walk<'_> {
 }
 
 /// A recognised FSM: what recognition found and what the run counts.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Fsm {
     pub(super) scope: u32,
     /// The state variable's name within the scope.
@@ -1183,6 +1184,7 @@ pub(crate) struct Fsm {
 /// One thing a state process's input check reads: a whole variable, from
 /// the signal table, or a constant select of one (a port connected to one
 /// bit of a vector), evaluated.
+#[derive(serde::Serialize, serde::Deserialize)]
 enum Input {
     Sig(usize),
     Expr(Expression),
@@ -1191,6 +1193,7 @@ enum Input {
 /// A state process: the variables (or constant selects of them, such as a
 /// port connected to one bit of a vector) its body reads or writes, and
 /// their values when it last ran.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Proc {
     inputs: Vec<Input>,
     /// The variables `inputs` read.
@@ -1214,6 +1217,7 @@ struct Proc {
     dirty: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct FsmCov {
     pub(super) fsms: Vec<Fsm>,
     procs: Vec<Proc>,
@@ -1380,7 +1384,7 @@ fn mark(id: u32, span: Span) -> Statement {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: (FSM_MARK + id).to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 )],
@@ -2121,8 +2125,9 @@ impl Simulator {
                             selects: Vec::new(),
                         }],
                         span: body.span,
-                        cached_signal_id: Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     }),
                     body.span,
                 )

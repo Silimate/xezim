@@ -335,8 +335,8 @@ impl<'a> Names<'a> {
             match self.step(&cur, seg) {
                 Step::Item => return Ok(()),
                 Step::Scope(s) => cur = s,
-                // §27.6: an unnamed generate block's implicit name. Its
-                // declarations are flattened into the enclosing scope.
+                // §27.6: an implicit block name the lint has no record of (a
+                // block of processes only). Core rejects one naming no block.
                 Step::Missing if implicit(&seg.name) => {}
                 Step::Missing => {
                     let declared = self
@@ -654,7 +654,8 @@ fn expr_refs(e: &Expression, out: &mut Vec<Ref>) {
         | ExprKind::MemberAccess { expr: x, .. }
         | ExprKind::RandomizeWith { call: x, .. }
         | ExprKind::Tagged { inner: Some(x), .. }
-        | ExprKind::ShallowCopy { source: x } => each(x),
+        | ExprKind::ShallowCopy { source: x }
+        | ExprKind::TypedPattern { pattern: x, .. } => each(x),
         ExprKind::Inside { expr, ranges } => {
             each(expr);
             ranges.iter().for_each(each);

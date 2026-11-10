@@ -5,24 +5,191 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 thread_local! {
+    /// Origins used to exclude self-written members and packed selections
+    /// before their surviving dependencies resolve to backing signal ids.
+    static WHOLE_READS: RefCell<Option<ImplicitReadOrigins>> = const { RefCell::new(None) };
     /// While a function body's reads are collected: the reads of the
     /// functions it calls, kept apart from its own (`collect_callee_reads`).
     static CALLEE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
-    /// While set (`collect_stmt_reads_whole`): the names read as a whole value,
-    /// not only as the base of a member read.
-    static WHOLE_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+}
+
+#[derive(Default)]
+pub(super) struct ImplicitReadOrigins {
+    whole: HashSet<String>,
+    whole_writes: HashSet<String>,
+    packed: HashMap<String, PackedAccesses>,
+}
+
+#[derive(Default)]
+struct PackedAccesses {
+    width: u64,
+    reads: Vec<(u64, u64)>,
+    writes: Vec<(u64, u64)>,
+}
+
+struct PackedSelection {
+    name: String,
+    offset: u64,
+    width: u64,
+    total_width: u64,
+    dims: Vec<(i64, i64)>,
+    dynamic: bool,
 }
 
 /// Record `name` as read whole, when `collect_stmt_reads_whole` is collecting.
 fn note_whole_read(name: &str) {
     WHOLE_READS.with(|c| {
         if let Some(set) = c.borrow_mut().as_mut() {
-            set.insert(name.to_string());
+            set.whole.insert(name.to_string());
+        }
+    });
+}
+
+fn note_packed_access(selection: &PackedSelection, write: bool) {
+    WHOLE_READS.with(|c| {
+        if let Some(origins) = c.borrow_mut().as_mut() {
+            let access = origins.packed.entry(selection.name.clone()).or_default();
+            access.width = selection.total_width;
+            let ranges = if write {
+                &mut access.writes
+            } else {
+                &mut access.reads
+            };
+            ranges.push((selection.offset, selection.offset + selection.width));
         }
     });
 }
 
 impl Simulator {
+    /// §9.2.2.2.1 / §11.5 (#844): keep the longest static packed prefix
+    /// until self-written regions have been excluded. Signal ids alone lose
+    /// the distinction between, for example, `ds[0]` and `ds[1]`.
+    fn packed_sensitivity_selection(
+        expr: &Expression,
+        module: &ElaboratedModule,
+    ) -> Option<PackedSelection> {
+        match &expr.kind {
+            ExprKind::Paren(e) => Self::packed_sensitivity_selection(e, module),
+            ExprKind::Ident(h) => {
+                let name = Self::resolve_hier_name_static(h, module);
+                if module.arrays.contains_key(&name)
+                    || module.arrays_2d.contains_key(&name)
+                    || module.arrays_nd.contains_key(&name)
+                    || module.dynamic_arrays.contains(&name)
+                    || module.queue_vars.contains(&name)
+                    || module.associative_arrays.contains_key(&name)
+                {
+                    return None;
+                }
+                let mut dims = module
+                    .packed_full_dims
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                let width = if !dims.is_empty() {
+                    dims.iter().try_fold(1u64, |w, &(l, r)| {
+                        w.checked_mul(l.abs_diff(r).checked_add(1)?)
+                    })?
+                } else {
+                    let w = module.signals.get(&name).map(|s| s.width).or_else(|| {
+                        module.var_decl_types.get(&name).map(|dt| {
+                            super::elaborate::resolve_type_width(
+                                dt,
+                                Some(&module.parameters),
+                                Some(&module.typedefs),
+                            )
+                        })
+                    })?;
+                    dims.push(
+                        module
+                            .ascending_packed
+                            .get(&name)
+                            .copied()
+                            .unwrap_or((i64::from(w).checked_sub(1)?, 0)),
+                    );
+                    u64::from(w)
+                };
+                (width > 0).then_some(PackedSelection {
+                    name,
+                    offset: 0,
+                    width,
+                    total_width: width,
+                    dims,
+                    dynamic: false,
+                })
+            }
+            ExprKind::Index { expr: base, index } => {
+                let mut selection = Self::packed_sensitivity_selection(base, module)?;
+                if selection.dynamic {
+                    return Some(selection);
+                }
+                let Some(index) = Self::constant_array_index(index, module) else {
+                    selection.dynamic = true;
+                    return Some(selection);
+                };
+                let (left, right) = *selection.dims.first()?;
+                if !(left.min(right)..=left.max(right)).contains(&index) {
+                    return None;
+                }
+                let element = selection
+                    .width
+                    .checked_div(left.abs_diff(right).checked_add(1)?)?;
+                let pos = if left < right {
+                    right - index
+                } else {
+                    index - right
+                };
+                selection.offset += u64::try_from(pos).ok()?.checked_mul(element)?;
+                selection.width = element;
+                selection.dims.remove(0);
+                if selection.dims.is_empty() && element > 1 {
+                    selection.dims.push((i64::try_from(element).ok()? - 1, 0));
+                }
+                Some(selection)
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                kind,
+                left,
+                right,
+            } => {
+                let mut selection = Self::packed_sensitivity_selection(base, module)?;
+                if selection.dynamic {
+                    return Some(selection);
+                }
+                let (Some(a), Some(b)) = (
+                    Self::constant_array_index(left, module),
+                    Self::constant_array_index(right, module),
+                ) else {
+                    selection.dynamic = true;
+                    return Some(selection);
+                };
+                use crate::ast::expr::RangeKind;
+                let (l, r) = *selection.dims.first()?;
+                let (a, b) = match kind {
+                    RangeKind::Constant => (a, b),
+                    RangeKind::IndexedUp if b > 0 && l >= r => (a.checked_add(b - 1)?, a),
+                    RangeKind::IndexedUp if b > 0 => (a, a.checked_add(b - 1)?),
+                    RangeKind::IndexedDown if b > 0 && l >= r => (a, a.checked_sub(b - 1)?),
+                    RangeKind::IndexedDown if b > 0 => (a.checked_sub(b - 1)?, a),
+                    _ => return None,
+                };
+                let lo = a.min(b);
+                let hi = a.max(b);
+                if lo < l.min(r) || hi > l.max(r) || (a != b && (a > b) != (l > r)) {
+                    return None;
+                }
+                let element = selection.width.checked_div(l.abs_diff(r).checked_add(1)?)?;
+                let pos = if l < r { r - hi } else { lo - r };
+                selection.offset += u64::try_from(pos).ok()?.checked_mul(element)?;
+                selection.width = lo.abs_diff(hi).checked_add(1)?.checked_mul(element)?;
+                selection.dims[0] = (a, b);
+                Some(selection)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn collect_leaf_idents(expr: &Expression, out: &mut HashSet<String>) {
         match &expr.kind {
             ExprKind::Ident(hier) if hier.path.len() == 1 => {
@@ -65,6 +232,7 @@ impl Simulator {
                     Self::collect_leaf_idents(p.expr(), out);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => Self::collect_leaf_idents(pattern, out),
             ExprKind::Replication { count, exprs } => {
                 Self::collect_leaf_idents(count, out);
                 for e in exprs {
@@ -280,8 +448,7 @@ impl Simulator {
     /// Inside another function's body they go to that function's
     /// `CALLEE_READS` sink, apart from its own reads, so its frame names
     /// (formals, locals) do not filter them (§13.4: the callee's `x` is not
-    /// the caller's formal `x`). Fork patch over upstream's frame filter;
-    /// drop it when upstream filters before merging callee reads.
+    /// the caller's formal `x`).
     fn collect_callee_reads(name: &str, module: &ElaboratedModule, reads: &mut HashSet<String>) {
         let mut got: HashSet<String> = HashSet::default();
         Self::collect_function_reads(name, module, &mut got);
@@ -331,6 +498,11 @@ impl Simulator {
         if !entered {
             return;
         }
+        // Callee frame writes must not classify a caller's same-named
+        // packed signal as wholly written (#844). Collect the function with
+        // ordinary conservative dependencies, then record only its external
+        // reads after removing formals and locals below.
+        let outer_origins = WHOLE_READS.with(|c| c.replace(None));
         let mut scratch_writes: HashSet<String> = HashSet::default();
         let mut body_reads: HashSet<String> = HashSet::default();
         let outer = CALLEE_READS.with(|c| c.replace(Some(HashSet::default())));
@@ -373,6 +545,7 @@ impl Simulator {
         // spelling resolves to a nonexistent top-level signal and drops out of
         // the sensitivity set. Qualify it wherever only the scoped one exists.
         let scope = name.rsplit_once('.').map(|(s, _)| s);
+        WHOLE_READS.with(|c| c.replace(outer_origins));
         for r in body_reads {
             if let Some(scope) = scope {
                 // The body may be unrewritten (bare spellings), and a same-named
@@ -380,9 +553,12 @@ impl Simulator {
                 // a superset sensitivity is always safe, and the sensitivity
                 // builder drops whichever spelling resolves to no signal.
                 if !r.contains('.') {
-                    reads.insert(format!("{}.{}", scope, r));
+                    let scoped = format!("{}.{}", scope, r);
+                    note_whole_read(&scoped);
+                    reads.insert(scoped);
                 }
             }
+            note_whole_read(&r);
             reads.insert(r);
         }
         ACTIVE.with(|a| {
@@ -538,24 +714,6 @@ impl Simulator {
                 return Some(id);
             }
         }
-        // §27.6: an UNNAMED generate branch exposes its declarations through
-        // the implicit `genblk<N>` scope (the runtime resolver strips that
-        // segment and reads the bare name). A continuous-assignment RHS that
-        // reads `u_mod.genblk1.x` must therefore depend on the SAME signal the
-        // value comes from, not on the `u_mod` instance (which is not a
-        // readable scalar and never re-triggers, so the entry evaluates once
-        // and stays X). Retry the resolved (`<top>.` popped) name with every
-        // `genblk<N>` segment removed.
-        if let Some(stripped) = strip_genblk_segments(name) {
-            if let Some(&id) = self.signal_name_to_id.get(&stripped) {
-                return Some(id);
-            }
-            if let Some(tpop) = stripped.strip_prefix(top_prefix) {
-                if let Some(&id) = self.signal_name_to_id.get(tpop) {
-                    return Some(id);
-                }
-            }
-        }
         let mut rest = name;
         while let Some(cut) = rest.rfind('.') {
             rest = &rest[..cut];
@@ -648,6 +806,9 @@ impl Simulator {
                     Self::collect_rooted_ident_names(it.expr(), out);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => {
+                Self::collect_rooted_ident_names(pattern, out)
+            }
             ExprKind::Inside { expr, ranges } => {
                 Self::collect_rooted_ident_names(expr, out);
                 for r in ranges {
@@ -682,6 +843,17 @@ impl Simulator {
         module: &ElaboratedModule,
         reads: &mut HashSet<String>,
     ) {
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && WHOLE_READS.with(|c| c.borrow().is_some())
+            && let Some(selection) = Self::packed_sensitivity_selection(expr, module)
+        {
+            note_packed_access(&selection, false);
+            reads.insert(selection.name);
+            Self::collect_lhs_index_reads(expr, module, reads);
+            return;
+        }
         // §14.13: a clocking-signal read (`cb.sig`, `iface.cb.sig`, either the
         // flat-Ident or MemberAccess shape) depends on the hidden sample mirror,
         // NOT on the underlying net — the sample only moves at the block's clock
@@ -755,6 +927,12 @@ impl Simulator {
                     }
                 }
                 note_whole_read(&name);
+                // §9.2.2.2.1, §7.6: a whole fixed unpacked array, or a slice
+                // of one (the range arm recurses here), has no signal of its
+                // own: its elements are the signals that change, so depend on
+                // them. `always_comb s = b;` never re-fired after time zero
+                // (#867).
+                Self::insert_unpacked_elem_reads(&name, module, reads);
                 reads.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
@@ -886,6 +1064,9 @@ impl Simulator {
                 for p in parts {
                     Self::collect_expr_reads(p.expr(), module, reads);
                 }
+            }
+            ExprKind::TypedPattern { pattern, .. } => {
+                Self::collect_expr_reads(pattern, module, reads)
             }
             ExprKind::Replication { count, exprs } => {
                 Self::collect_expr_reads(count, module, reads);
@@ -1117,9 +1298,25 @@ impl Simulator {
         writes: &mut HashSet<String>,
         mut arrays: Option<&mut HashSet<String>>,
     ) {
+        if matches!(
+            lhs.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && WHOLE_READS.with(|c| c.borrow().is_some())
+            && let Some(selection) = Self::packed_sensitivity_selection(lhs, module)
+        {
+            note_packed_access(&selection, true);
+            writes.insert(selection.name);
+            return;
+        }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
-                writes.insert(Self::resolve_hier_name_static(hier, module));
+                let name = Self::resolve_hier_name_static(hier, module);
+                WHOLE_READS.with(|c| {
+                    if let Some(origins) = c.borrow_mut().as_mut() {
+                        origins.whole_writes.insert(name.clone());
+                    }
+                });
+                writes.insert(name);
             }
             ExprKind::Index { expr: base, index } => {
                 if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
@@ -1189,6 +1386,41 @@ impl Simulator {
             }
             _ => {}
         }
+    }
+
+    /// The element names of the fixed unpacked array `name` (`a[3]`,
+    /// `m[1][4]`), when it is one with at most 65,536 elements.
+    fn insert_unpacked_elem_reads(
+        name: &str,
+        module: &ElaboratedModule,
+        reads: &mut HashSet<String>,
+    ) {
+        if module.dynamic_arrays.contains(name) || module.associative_arrays.contains_key(name) {
+            return;
+        }
+        let dims: Vec<(i64, i64)> = if let Some(&(lo, hi, _)) = module.arrays.get(name) {
+            vec![(lo, hi)]
+        } else if let Some(&(d0, d1, _)) = module.arrays_2d.get(name) {
+            vec![d0, d1]
+        } else if let Some((d, _)) = module.arrays_nd.get(name) {
+            d.clone()
+        } else {
+            return;
+        };
+        let count = dims
+            .iter()
+            .try_fold(1u64, |n, &(l, r)| n.checked_mul(l.abs_diff(r) + 1));
+        if !count.is_some_and(|n| n <= 1 << 16) {
+            return;
+        }
+        let mut names = vec![name.to_string()];
+        for (l, r) in dims {
+            names = names
+                .iter()
+                .flat_map(|p| (l.min(r)..=l.max(r)).map(move |i| format!("{p}[{i}]")))
+                .collect();
+        }
+        reads.extend(names);
     }
 
     /// Collect reads/writes from a statement (for always @* / always_comb blocks).
@@ -1613,26 +1845,50 @@ impl Simulator {
                 let id = self.resolve_ident_id(hier, scope_hint)?;
                 let bit = Self::try_const_u64(index)?;
                 // §7.4.1: `bit` is a DECLARED index but `BitRef` addresses a
-                // PHYSICAL bit, so a non-zero-based vector needs rebasing —
-                // `logic [3:1] w` keeps declared bit 1 at offset 0. Fusing
-                // `assign y = w[1]` without this read declared bit 2 instead.
-                //
-                // Only the low index was wrong: `w[3]` failed the range check
-                // below, fell through to the bytecode path (which rebases) and
-                // came out right, so the two forms disagreed with each other.
-                let base_lo = self
+                // PHYSICAL bit. A descending `logic [3:1] w` keeps declared
+                // bit 1 at offset 0. An ascending `logic [0:N] v` mirrors:
+                // label 0 is the MSB. Subtracting only the low bound wrote
+                // `v[0] = in_valid` into the LSB, which the interpreter then
+                // read back as `v[N]` — a one-stage pipeline's out_valid
+                // tracked in_valid and its ready bit stayed x.
+                let scoped = scope_hint.map(|sc| format!("{}.{}", sc, name));
+                let dim = self
                     .module
                     .packed_full_dims
                     .get(&name)
+                    .or_else(|| {
+                        scoped
+                            .as_ref()
+                            .and_then(|k| self.module.packed_full_dims.get(k))
+                    })
                     .or_else(|| {
                         hier.path
                             .last()
                             .and_then(|s| self.module.packed_full_dims.get(s.name.name.as_str()))
                     })
                     .and_then(|d| d.first())
-                    .map(|&(l, r)| l.min(r))
-                    .unwrap_or(0);
-                let phys = (bit as i64) - base_lo;
+                    .copied()
+                    .or_else(|| {
+                        self.module
+                            .ascending_packed
+                            .get(&name)
+                            .or_else(|| {
+                                scoped
+                                    .as_ref()
+                                    .and_then(|k| self.module.ascending_packed.get(k))
+                            })
+                            .or_else(|| {
+                                hier.path.last().and_then(|s| {
+                                    self.module.ascending_packed.get(s.name.name.as_str())
+                                })
+                            })
+                            .copied()
+                    });
+                let phys = match dim {
+                    Some((l, r)) if l < r => r - bit as i64,
+                    Some((l, r)) => bit as i64 - l.min(r),
+                    None => bit as i64,
+                };
                 if phys >= 0 && (phys as u32) < self.signal_widths[id] {
                     Some(BitRef {
                         sig_id: id as u32,
@@ -1821,8 +2077,8 @@ impl Simulator {
         module: &ElaboratedModule,
         reads: &mut HashSet<String>,
         writes: &mut HashSet<String>,
-    ) -> HashSet<String> {
-        let outer = WHOLE_READS.with(|c| c.replace(Some(HashSet::default())));
+    ) -> ImplicitReadOrigins {
+        let outer = WHOLE_READS.with(|c| c.replace(Some(ImplicitReadOrigins::default())));
         Self::collect_stmt_reads(stmt, module, reads, writes);
         WHOLE_READS.with(|c| c.replace(outer)).unwrap_or_default()
     }
@@ -1841,7 +2097,7 @@ impl Simulator {
         r: &str,
         reads: &HashSet<String>,
         writes: &HashSet<String>,
-        whole: &HashSet<String>,
+        origins: &ImplicitReadOrigins,
     ) -> bool {
         fn direct(r: &str, writes: &HashSet<String>) -> bool {
             if writes.contains(r) {
@@ -1857,12 +2113,42 @@ impl Simulator {
             false
         }
         if direct(r, writes) {
+            // Packed reads and writes share a signal id, but only overlapping
+            // static regions are excluded. Keep any portion read from outside
+            // this block, including a whole read beside a partial write.
+            if writes.contains(r)
+                && !origins.whole_writes.contains(r)
+                && let Some(access) = origins.packed.get(r)
+                && !access.writes.is_empty()
+            {
+                let covered = |(mut lo, end): (u64, u64)| {
+                    while lo < end {
+                        let next = access
+                            .writes
+                            .iter()
+                            .filter(|&&(a, b)| a <= lo && b > lo)
+                            .map(|&(_, b)| b)
+                            .max()
+                            .unwrap_or(lo);
+                        if next == lo {
+                            return false;
+                        }
+                        lo = next;
+                    }
+                    true
+                };
+                if access.reads.iter().any(|&range| !covered(range))
+                    || (origins.whole.contains(r) && !covered((0, access.width)))
+                {
+                    return false;
+                }
+            }
             return true;
         }
-        // Fork patch (drop when upstream keeps whole-value reads): a base the
-        // block also reads as a whole (`out = s` beside `s.a = …`) stays, as
-        // every member it does not write reaches `out` through it.
-        if whole.contains(r) {
+        // A base the block also reads as a whole (`out = s` beside
+        // `s.a = ...`) stays: every member it does not write reaches `out`
+        // through it.
+        if origins.whole.contains(r) {
             return false;
         }
         let prefix = format!("{r}.");
@@ -1960,8 +2246,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let saved = self.name_resolve_hint.borrow().clone();
                 *self.name_resolve_hint.borrow_mut() = hint.clone();
@@ -2313,6 +2600,31 @@ impl Simulator {
                                 span: ee.span,
                             };
                             &ee_norm
+                        }
+                        None => ee,
+                    };
+                    // §23.6/§27.5: the same normalisation for a path that
+                    // enters a scope through an INDEXED one
+                    // (`always @(posedge gen_blk[0].u.sig)`).
+                    // `rewrite_expr_impl` leaves such a path as
+                    // `MemberAccess{MemberAccess{Index{MemberAccess{Ident}}}}`;
+                    // neither `collect_ident_names` (no `MemberAccess` arm) nor
+                    // `member_chain_as_flat_ident_for_sens` (bails on the
+                    // `Index` base) collects an `Ident` from it, so the block
+                    // armed on an EMPTY sensitivity, woke once at t=0 through
+                    // the no-signal fallback, and never fired again — every
+                    // flop inside a generate-array instance whose clock the
+                    // parent substitutes as a hierarchical name was dead.
+                    let ee_idx;
+                    let ee = match self.fold_indexed_hier_path(&ee.expr) {
+                        Some(folded) => {
+                            ee_idx = crate::ast::stmt::EventExpr {
+                                edge: ee.edge,
+                                expr: folded,
+                                iff: ee.iff.clone(),
+                                span: ee.span,
+                            };
+                            &ee_idx
                         }
                         None => ee,
                     };
@@ -2844,6 +3156,93 @@ impl Simulator {
         }
     }
 
+    /// True when `sig_id`'s driver cone reaches a live driver — a free-running
+    /// clock generator, or an edge block / continuous assign whose own fan-in
+    /// (transitively) reaches one — or bottoms out in a VARIABLE with no
+    /// continuous driver (a testbench `reg` driven once by an `initial` block,
+    /// e.g. a stable reset or constant). A signal whose cone bottoms out in a
+    /// NET with no driver — an undriven wire, an unresolved/black-boxed cell,
+    /// an ungenerated behavioural PLL VCO output — is the signature of a DEAD
+    /// clock and returns false.
+    ///
+    /// The distinction matters for the dead-clock watchdog: a control signal
+    /// held stable during a long reset/power-up sequence is driven by a flop
+    /// clocked by a live clock (live), and a held reset is a `reg` written by
+    /// an `initial` block (live) — neither has moved its value yet, but neither
+    /// is dead. Only a NET with no driver is unambiguously dead. Cycle-safe via
+    /// `visited`.
+    pub(super) fn has_live_driver(
+        &self,
+        sig_id: usize,
+        visited: &mut std::collections::HashSet<usize>,
+    ) -> bool {
+        if !visited.insert(sig_id) {
+            return false;
+        }
+        // A free-running clock generator always toggles — live.
+        if self.clock_generators.iter().any(|c| c.signal_id == sig_id) {
+            return true;
+        }
+        // Any one live driver makes it live; the first one found does not
+        // decide alone.
+        let mut driven = false;
+        // An edge block (flop) writing it is live iff any of ITS sensitivities
+        // (clock/reset) is live — the flop fires when that clock toggles.
+        for (bi, cb) in self.compiled_edge_blocks.iter().enumerate() {
+            let Some(cb) = cb else { continue };
+            use super::bytecode::Insn;
+            let writes = cb.instructions.iter().any(|i| {
+                matches!(i,
+                    Insn::NbaAssign(id, ..) | Insn::NbaAssignConst(id, ..)
+                    | Insn::NbaAssignRange(id, ..) | Insn::NbaAssignRangeDyn(id, ..)
+                    | Insn::NbaAssignBitDyn(id, ..) | Insn::NbaAssignArrayRead(id, ..)
+                    | Insn::BlockingAssign(id, ..) | Insn::BlockingAssignRange(id, ..)
+                    | Insn::BlockingAssignRangeDyn(id, ..) | Insn::BlockingAssignBitDyn(id, ..)
+                        if *id as usize == sig_id)
+            });
+            if !writes {
+                continue;
+            }
+            driven = true;
+            let live = self.edge_blocks.get(bi).is_some_and(|block| {
+                block
+                    .resolved_sensitivities
+                    .iter()
+                    .any(|sid| self.has_live_driver(sid.signal_id, visited))
+            });
+            if live {
+                return true;
+            }
+        }
+        // A continuous assign / combinational entry writing it is live iff any
+        // of its read fan-in is live — it recomputes when an input changes.
+        for e in &self.comb_entries {
+            if !e.cold.write_signal_ids.contains(&sig_id) {
+                continue;
+            }
+            driven = true;
+            if e.cold
+                .read_signal_ids
+                .iter()
+                .any(|&r| self.has_live_driver(r, visited))
+            {
+                return true;
+            }
+        }
+        // Every driver found is dead.
+        if driven {
+            return false;
+        }
+        // No continuous driver (no clock generator, edge block, or continuous
+        // assign writes it). A NET with no driver is the dead-clock signature —
+        // an undriven wire / unresolved cell / ungenerated PLL VCO output. A
+        // VARIABLE with no continuous driver is normal: a `reg` driven once by
+        // an `initial` block (a stable reset or constant) — treat it as live so
+        // a held reset does not trip the watchdog.
+        let name = self.name_for_id(sig_id);
+        !(self.module.nets.contains(name) || self.module.implicit_nets.contains(name))
+    }
+
     /// Hang diagnosis: print the longest-parked event waiters — who is
     /// stuck, on which signals, since when, and whether those signals have
     /// EVER changed since the waiter parked (`arm_bits` comparison). A
@@ -2994,6 +3393,7 @@ impl Simulator {
                         value_of: s.value_of.clone(),
                         wake_rank: self.wake_rank_of(name, id),
                         cell: false,
+                        alias_t0: self.alias_t0_kind(name, id),
                     });
                 }
                 self.resolve_sens_cell(s)
@@ -3027,6 +3427,7 @@ impl Simulator {
             value_of: s.value_of.clone(),
             wake_rank: 0,
             cell,
+            alias_t0: 0,
         })
     }
 
@@ -3202,7 +3603,7 @@ impl Simulator {
                         signed: v.is_signed,
                         base: NumberBase::Binary,
                         value: v.to_bin(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }
                 };
                 *e = Expression::new(ExprKind::Number(lit), e.span);
@@ -3482,6 +3883,7 @@ impl Simulator {
                     value_of: Some(e.clone()),
                     wake_rank: src.wake_rank,
                     cell: true,
+                    alias_t0: src.alias_t0,
                 });
             }
         }
@@ -3664,6 +4066,11 @@ impl Simulator {
                     Self::collect_condition_read_names(a, out);
                 }
             }
+            ExprKind::SystemCall { name, args } if name == VC_EDGE_MARKER => {
+                if let Some(a) = args.get(1) {
+                    Self::collect_condition_read_names(a, out);
+                }
+            }
             _ => {}
         }
     }
@@ -3733,10 +4140,66 @@ impl Simulator {
                 .clone(),
             None => self.class_context_stack.last().cloned().flatten()?,
         };
-        if !self.cond_operand_gated(cond, handle.unwrap_or(0), &cls) {
+        if !Self::cond_triggered_monotone(cond)
+            || !self.cond_operand_gated(cond, handle.unwrap_or(0), &cls)
+        {
             return None;
         }
         Some(reads.iter().map(|n| name_bit(n)).collect())
+    }
+
+    /// `<ev>.triggered` as a whole operand: a two-or-more segment name ending
+    /// in `triggered`, or a member access of it. Returns the event operand.
+    fn cond_triggered_event(e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path
+                        .last()
+                        .is_some_and(|s| s.name.name == "triggered" && s.selects.is_empty()) =>
+            {
+                Some(Expression::new(ExprKind::Ident(hier_prefix(h)), e.span))
+            }
+            ExprKind::MemberAccess { expr, member } if member.name == "triggered" => {
+                Some((**expr).clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// §15.5.3: `.triggered` turns false at the end of its time slot with no
+    /// write anyone could note, so a gated waiter may only depend on it where
+    /// that change cannot make the condition true: as an operand of `&&`,
+    /// `||` or parentheses. A trigger, which can, notes `triggered`.
+    fn cond_triggered_monotone(e: &Expression) -> bool {
+        fn mentions_triggered(e: &Expression) -> bool {
+            let mut names = HashSet::default();
+            Simulator::collect_condition_read_names(e, &mut names);
+            names.contains("triggered")
+        }
+        if Self::cond_triggered_event(e).is_some() {
+            return true;
+        }
+        match &e.kind {
+            ExprKind::Binary {
+                op: BinaryOp::LogAnd | BinaryOp::LogOr,
+                left,
+                right,
+            } => Self::cond_triggered_monotone(left) && Self::cond_triggered_monotone(right),
+            ExprKind::Paren(inner) => Self::cond_triggered_monotone(inner),
+            _ => !mentions_triggered(e),
+        }
+    }
+
+    /// §6.19 / §8.23 / §26.3: `scope::lit` names an enum literal declared by
+    /// class or package `scope`. A literal is a constant, so a wait reading
+    /// it never needs a re-check for it.
+    fn scoped_enum_literal(&self, scope: &str, lit: &str) -> bool {
+        if self.module.classes.contains_key(scope) {
+            self.class_enum_member(scope, lit).is_some()
+        } else {
+            self.package_enum_member(scope, lit).is_some()
+        }
     }
 
     /// `cond_gate_for`'s operand check.
@@ -3775,6 +4238,11 @@ impl Simulator {
                     .and_then(|o| o.as_ref())
                     .is_some_and(|i| i.properties.contains_key(n))
         };
+        // `ev.triggered` re-checks on every trigger (`note_event_trigger`)
+        // and on writes to the names reaching the event.
+        if let Some(ev) = Self::cond_triggered_event(e) {
+            return self.cond_operand_gated(&ev, this_h, this_cls);
+        }
         match &e.kind {
             ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::This => true,
             ExprKind::Ident(h) => {
@@ -3782,6 +4250,15 @@ impl Simulator {
                     return false;
                 }
                 let head = h.path[0].name.name.as_str();
+                // `Cls::LIT` / `pkg::LIT` outside a subroutine body.
+                if h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && !method_local(head)
+                    && !this_member(head)
+                    && self.scoped_enum_literal(head, &h.path[1].name.name)
+                {
+                    return true;
+                }
                 let head_ok = if method_local(head) {
                     !self.vif_local_names.contains(head)
                 } else {
@@ -3812,18 +4289,43 @@ impl Simulator {
                 true
             }
             ExprKind::MemberAccess { expr, member } => {
+                // `Cls::LIT` / `pkg::LIT` inside a subroutine body, which the
+                // elaborator leaves as a member access of the scope name.
+                if let ExprKind::Ident(h) = &expr.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && !method_local(&h.path[0].name.name)
+                    && !this_member(&h.path[0].name.name)
+                    && self.scoped_enum_literal(&h.path[0].name.name, &member.name)
+                {
+                    return true;
+                }
                 self.cond_operand_gated(expr, this_h, this_cls)
                     && obj_prop(self.eval_handle_expr(expr).unwrap_or(0), &member.name)
             }
-            // A collection builtin on a gated operand (`m_q.size()`).
+            // A collection builtin on a gated operand (`m_q.size()`). A
+            // user-defined method with the same name can read other fields;
+            // gating only on its receiver misses those dependencies and can
+            // repeatedly resume a false wait when call setup notes writes.
             ExprKind::Call { func, args } => {
                 let ExprKind::MemberAccess { expr, member } = &func.kind else {
                     return false;
                 };
+                // A mailbox's `num()` changes on put and get, which note no
+                // write (§15.4.3).
+                if member.name == "num"
+                    && self
+                        .eval_handle_expr(expr)
+                        .is_some_and(|h| self.mailboxes.contains_key(&h))
+                {
+                    return false;
+                }
                 matches!(
                     member.name.as_str(),
                     "size" | "num" | "exists" | "first" | "last" | "next" | "prev"
-                ) && self.cond_operand_gated(expr, this_h, this_cls)
+                ) && !self.class_expr_has_method(expr, &member.name)
+                    && self.cond_operand_gated(expr, this_h, this_cls)
                     && args
                         .iter()
                         .all(|a| self.cond_operand_gated(a, this_h, this_cls))
@@ -3849,6 +4351,9 @@ impl Simulator {
                     && self.cond_operand_gated(else_expr, this_h, this_cls)
             }
             ExprKind::SystemCall { name, args } if name == VC_CHANGED_MARKER => args
+                .get(1)
+                .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
+            ExprKind::SystemCall { name, args } if name == VC_EDGE_MARKER => args
                 .get(1)
                 .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
             _ => false,

@@ -1120,6 +1120,11 @@ pub fn repack_on_close(path: &str, level: u8) -> std::io::Result<(u64, u64)> {
     use miniz_oxide::{MZFlush, MZStatus};
     use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
+    // A linked dump path is repacked into the link's target: renaming over
+    // the link itself made it a regular file and left the target holding
+    // the uncompressed dump (#598). The FST writer writes through links too.
+    let resolved = std::fs::canonicalize(path)?;
+    let path = resolved.to_str().unwrap_or(path);
     let src_len = std::fs::metadata(path)?.len();
     let tmp = format!("{path}.repack.{}", std::process::id());
     let result = (|| -> std::io::Result<u64> {
@@ -1172,11 +1177,10 @@ pub fn repack_on_close(path: &str, level: u8) -> std::io::Result<(u64, u64)> {
         f.sync_all()?;
         Ok(1 + 8 + 8 + gz_len)
     })();
-    match result {
-        Ok(total) => {
-            std::fs::rename(&tmp, path)?;
-            Ok((src_len, total))
-        }
+    // A failed rename is cleaned up like a failed compression, so repeated
+    // failures do not leave dump-sized files beside the dump (#598).
+    match result.and_then(|total| std::fs::rename(&tmp, path).map(|()| total)) {
+        Ok(total) => Ok((src_len, total)),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)

@@ -250,7 +250,7 @@ fn number(n: u32, span: Span) -> Expression {
             signed: false,
             base: NumberBase::Decimal,
             value: n.to_string(),
-            cached_val: Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     )
@@ -302,7 +302,7 @@ fn unparen_mut(mut e: &mut Expression) -> &mut Expression {
 }
 
 /// One operator of a condition or expression item's logic tree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Op {
     /// Input term `n`. With `inv` set the node is `t == 0` (or `t != 1`) on
     /// a 1-bit `t`, and the term is `t`: its value is the node's, negated.
@@ -331,7 +331,7 @@ pub(crate) enum Op {
 /// A node of an item's logic tree, in pre-order; `kids` index the tree.
 /// `value`: a `Const` node's value (0 or 1) when the plan folded it to a
 /// known one, `UNEVALUATED` otherwise.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub(crate) struct Node {
     op: Op,
     kids: [u32; 3],
@@ -343,6 +343,7 @@ const X: u8 = 2;
 const UNEVALUATED: u8 = 3;
 
 /// A condition or expression item.
+#[derive(serde::Serialize)]
 pub(crate) struct ExprSite {
     scope: u32,
     span: Span,
@@ -1268,6 +1269,7 @@ fn pure(e: &Expression) -> bool {
 
 /// A reported scope: a module instance, or the package (or `$unit`, or the
 /// declaring module) that holds classes and subroutines outside instances.
+#[derive(serde::Serialize)]
 struct Scope {
     /// Printed name: the hierarchical instance path, or the package name.
     name: String,
@@ -1276,6 +1278,7 @@ struct Scope {
     src: Option<u32>,
 }
 
+#[derive(serde::Serialize)]
 struct StmtSite {
     scope: u32,
     span: Span,
@@ -1285,6 +1288,7 @@ struct StmtSite {
     excluded: bool,
 }
 
+#[derive(serde::Serialize)]
 struct Arm {
     span: Span,
     label: &'static str,
@@ -1295,6 +1299,7 @@ struct Arm {
     excluded: bool,
 }
 
+#[derive(serde::Serialize)]
 struct BranchSite {
     scope: u32,
     span: Span,
@@ -1403,8 +1408,37 @@ struct Decision {
     conds: Vec<Region>,
 }
 
-/// One 64-bit word of a tracked signal, as toggle coverage last saw it.
+/// A data type keyword (`logic`, `int`, `enum`, ...) kept in a checkpoint:
+/// read back as the same `&'static str`, interned once per distinct keyword.
 #[derive(Clone, Copy)]
+struct TypeName(&'static str);
+
+impl serde::Serialize for TypeName {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TypeName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use std::sync::{Mutex, OnceLock};
+        static KNOWN: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+        let name = String::deserialize(d)?;
+        let mut known = KNOWN
+            .get_or_init(|| Mutex::new(HashSet::default()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(&k) = known.get(name.as_str()) {
+            return Ok(TypeName(k));
+        }
+        let k: &'static str = Box::leak(name.into_boxed_str());
+        known.insert(k);
+        Ok(TypeName(k))
+    }
+}
+
+/// One 64-bit word of a tracked signal, as toggle coverage last saw it.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Word {
     /// Value at the last sample.
     v: u64,
@@ -1418,6 +1452,7 @@ struct Word {
 }
 
 /// Per-bit rise/fall counts of the tracked signals.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Toggle {
     /// Signal id -> tracked index, `u32::MAX` when not tracked.
     slot: Vec<u32>,
@@ -1432,7 +1467,7 @@ pub(crate) struct Toggle {
     fall: Vec<u32>,
     /// (scope, name within the scope, tracked index, data type); aliases of
     /// one signal share the tracked index.
-    names: Vec<(u32, String, u32, &'static str)>,
+    names: Vec<(u32, String, u32, TypeName)>,
     /// `--no-toggle-tied`: the bits (indexed like `rise`) whose only drivers
     /// are constants; empty without it.
     tied: Vec<bool>,
@@ -1519,6 +1554,11 @@ impl Toggle {
     }
 }
 
+/// What a checkpoint holds of `CodeCov` besides `toggle`: the FSM
+/// tracking, the evaluations not counted yet and the block runs.
+pub(super) type Rest = (Option<FsmCov>, HashMap<u32, Pending>, Vec<u64>);
+
+#[derive(serde::Serialize)]
 pub(crate) struct CodeCov {
     kinds: u8,
     /// `--code-coverage-constant=keep`: nothing is excluded.
@@ -1541,7 +1581,9 @@ pub(crate) struct CodeCov {
     ca_counter: HashMap<(usize, usize, String), u32>,
     /// Instance paths below the top.
     inst_paths: HashSet<String>,
-    /// Decisions constants may make, until `cov_resolve_constants`.
+    /// Decisions constants may make, until `cov_resolve_constants`: setup
+    /// state, empty by the time a run can be saved.
+    #[serde(skip)]
     decisions: Vec<Decision>,
     pub(crate) toggle: Option<Toggle>,
     pub(crate) fsm: Option<FsmCov>,
@@ -1558,12 +1600,12 @@ pub(crate) struct CodeCov {
     /// The targets of `assign` statements (name, scope), for `cov_steps`.
     assigned: Vec<(String, String)>,
     /// Item evaluations not counted yet, by item (see `Simulator::cov_expr`).
-    pending: HashMap<u32, Pending>,
+    pub(super) pending: HashMap<u32, Pending>,
     /// The combinational `always` blocks with items, by source offset and
     /// scope (`ExprSite::comb`), and the runs of each a process's writes
     /// made while evaluations were pending (`Simulator::cov_block_ran`).
     blocks: HashMap<usize, HashMap<String, u32>>,
-    ran: Vec<u64>,
+    pub(super) ran: Vec<u64>,
     /// The last `if` of an `else if` chain, by branch site: where block
     /// granularity puts the chain's implicit `else`, as without branch
     /// coverage.
@@ -1578,7 +1620,8 @@ pub(crate) struct CodeCov {
 /// block that had ended by then (`CodeCov::ran`), and each evaluation's
 /// node values and term and constant values.
 #[allow(clippy::type_complexity)]
-struct Pending {
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct Pending {
     pid: usize,
     run: u64,
     ended: u64,
@@ -4128,38 +4171,17 @@ impl ToggleTypes<'_> {
     }
 }
 
-/// The generate scopes of each module, interface or program, read from the
-/// sources (§27.5): the names declared in an unlabeled branch of a generate
-/// `if` or `case`, which elaboration keeps bare in the instance, and the
-/// names of the generate blocks whose declarations are hierarchical (`g.x`,
-/// `g[1].x`): labeled branches and loops. An unnamed loop's block is
-/// `genblk<n>`, `n` its construct's number in the scope (§27.6).
-#[allow(clippy::type_complexity)]
-fn generate_decls(
-    module: &ElaboratedModule,
-) -> HashMap<String, (HashSet<String>, HashSet<String>)> {
+/// The generate blocks of each module, interface or program, read from the
+/// sources (§27.5, §27.6): the names of the blocks whose declarations are
+/// hierarchical under them (`g.x`, `g[1].x`, `genblk1.x`). An unlabeled
+/// block, a branch of a generate `if` or `case` or a loop's, is named
+/// `genblk<n>`, `n` its construct's number in the scope.
+fn generate_decls(module: &ElaboratedModule) -> HashMap<String, HashSet<String>> {
     use crate::ast::Description;
     use crate::ast::decl::ModuleItem;
-    type Sets = (HashSet<String>, HashSet<String>);
-    // Declarations in `items`, an unlabeled branch: bare names. Its
-    // generate constructs are numbered in a scope of their own.
-    fn names(items: &[ModuleItem], out: &mut Sets) {
-        let mut n = 0;
-        for it in items {
-            match it {
-                ModuleItem::DataDeclaration(dd) => out
-                    .0
-                    .extend(dd.declarators.iter().map(|d| d.name.name.clone())),
-                ModuleItem::NetDeclaration(nd) => out
-                    .0
-                    .extend(nd.declarators.iter().map(|d| d.name.name.clone())),
-                _ => constructs(std::slice::from_ref(it), out, &mut n),
-            }
-        }
-    }
+    type Sets = HashSet<String>;
     // The generate constructs among `items`, at any depth of regions; `n`
-    // numbers the scope's constructs (§27.6), which names an unnamed loop's
-    // block `genblk<n>`.
+    // numbers the scope's constructs (§27.6).
     fn constructs(items: &[ModuleItem], out: &mut Sets, n: &mut u32) {
         for it in items {
             if matches!(
@@ -4170,31 +4192,22 @@ fn generate_decls(
             ) {
                 *n += 1;
             }
+            let unnamed = format!("genblk{n}");
             match it {
                 ModuleItem::GenerateRegion(gr) => constructs(&gr.items, out, n),
                 ModuleItem::GenerateIf(gi) => {
-                    for (bi, (_, items)) in gi.branches.iter().enumerate() {
-                        match gi.branch_labels.get(bi).and_then(|l| l.as_ref()) {
-                            None => names(items, out),
-                            Some(l) => {
-                                out.1.insert(l.clone());
-                            }
-                        }
+                    for bi in 0..gi.branches.len() {
+                        let label = gi.branch_labels.get(bi).and_then(|l| l.clone());
+                        out.insert(label.unwrap_or_else(|| unnamed.clone()));
                     }
                 }
                 ModuleItem::GenerateCase(gc) => {
                     for arm in &gc.arms {
-                        match &arm.label {
-                            None => names(&arm.items, out),
-                            Some(l) => {
-                                out.1.insert(l.clone());
-                            }
-                        }
+                        out.insert(arm.label.clone().unwrap_or_else(|| unnamed.clone()));
                     }
                 }
                 ModuleItem::GenerateFor(gf) => {
-                    out.1
-                        .insert(gf.name.clone().unwrap_or_else(|| format!("genblk{n}")));
+                    out.insert(gf.name.clone().unwrap_or(unnamed));
                 }
                 _ => {}
             }
@@ -4203,10 +4216,8 @@ fn generate_decls(
     fn add(name: &str, items: &[ModuleItem], out: &mut HashMap<String, Sets>) {
         let mut sets = Sets::default();
         constructs(items, &mut sets, &mut 0);
-        if !sets.0.is_empty() || !sets.1.is_empty() {
-            let e = out.entry(name.to_string()).or_default();
-            e.0.extend(sets.0);
-            e.1.extend(sets.1);
+        if !sets.is_empty() {
+            out.entry(name.to_string()).or_default().extend(sets);
         }
         for it in items {
             if let ModuleItem::NestedModule(m) = it {
@@ -4386,7 +4397,7 @@ impl Simulator {
                         // The function's name is its result variable.
                         let ret = ctx.local(&fd.return_type, false);
                         ins.here.locals.insert(fd.name.name.name.clone(), ret);
-                        fd.items = ins.stmts(items);
+                        fd.items = ins.stmts(items.into_vec()).into();
                     }
                 }
                 for (key, td) in tasks.iter_mut() {
@@ -4399,7 +4410,7 @@ impl Simulator {
                         td.items =
                             Instr::new(&mut cov, &ctx, &inst_paths, sc, key, subr_consts(key))
                                 .args(&td.ports, &inst_paths)
-                            .stmts(items);
+                            .stmts(items.into_vec()).into();
                     }
                 }
             }
@@ -4918,7 +4929,7 @@ impl Simulator {
                 let none = HashSet::default();
                 *items = Instr::new(&mut *cov, &ctx, &none, sc, "", None)
                     .args(ports, &none)
-                    .stmts(body);
+                    .stmts(body.into_vec()).into();
             }
             done.insert(ptr, arc.clone());
             classes.insert(key, arc);
@@ -5808,12 +5819,11 @@ impl Simulator {
             .filter(|(_, ty, _)| cfg.enums || *ty != "enum")
             .collect();
         if !cfg.generate {
-            // §27.5: a labeled generate block or a loop's names are
-            // hierarchical (`g.x`, `g[1].x`); an unlabeled `if` or `case`
-            // branch's stay bare in its instance, so they are found in the
+            // §27.5, §27.6: a generate block's names are hierarchical
+            // (`g.x`, `g[1].x`, `genblk1.x`), so its blocks are found in the
             // source.
             let decls = generate_decls(module);
-            let none = (HashSet::default(), HashSet::default());
+            let none = HashSet::default();
             let top = xezim_core::bind_spec_base(&module.name).to_string();
             out.retain(|(n, _, _)| {
                 // The instance the signal belongs to: the longest instance
@@ -5826,11 +5836,11 @@ impl Simulator {
                     .unwrap_or("");
                 let rel = n[inst.len()..].trim_start_matches('.');
                 let def = types.defs.get(inst).copied().unwrap_or(top.as_str());
-                let (bare, blocks) = decls.get(def).unwrap_or(&none);
+                let blocks = decls.get(def).unwrap_or(&none);
                 // A member (`s.m`) goes with its variable; a block's names
-                // are hierarchical under it (an unnamed loop's, `genblk<n>`).
+                // are hierarchical under it.
                 let first = rel.split(['.', '[']).next().unwrap_or(rel);
-                !(bare.contains(first) || (rel.contains('.') && blocks.contains(first)))
+                !(rel.contains('.') && blocks.contains(first))
             });
         }
         out.sort();
@@ -6334,7 +6344,7 @@ impl Simulator {
                 }
                 k
             };
-            t.names.push((sc, rest.to_string(), k, ty));
+            t.names.push((sc, rest.to_string(), k, TypeName(ty)));
         }
         t
     }
@@ -6487,7 +6497,7 @@ impl Simulator {
             }
         }
         if let Some(t) = &cov.toggle {
-            for (sc, name, k, ty) in &t.names {
+            for (sc, name, k, TypeName(ty)) in &t.names {
                 let k = *k as usize;
                 let (b, w) = (t.bit0[k] as usize, t.width[k] as usize);
                 reports[*sc as usize].toggles.push(ToggleRow {

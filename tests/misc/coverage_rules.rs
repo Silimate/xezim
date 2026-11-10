@@ -118,13 +118,12 @@ endmodule
 
 /// `--no-toggle-enums` leaves enum variables out of toggle coverage;
 /// `--no-toggle-generate` leaves out the signals declared in a generate
-/// block: an unlabeled branch's (`ub`, bare in its instance, and the
-/// members of its struct `gs`), a labeled one's (`lb.lab`), a named loop's
-/// (`fl[0].f`) and an unnamed loop's (`genblk1[0].g2`, in a module with no
-/// other generate block). Module-scope signals, ports and the members of a
-/// module-scope unpacked struct stay, `genblk_status` too: only an unnamed
-/// loop's own `genblk<n>` (§27.6) names a block. By default both are
-/// counted.
+/// block: an unlabeled branch's (`genblk1.ub`, and the members of its struct
+/// `genblk1.gs`), a labeled one's (`lb.lab`), a named loop's (`fl[0].f`) and
+/// an unnamed loop's (`genblk1[0].g2`, in a module with no other generate
+/// block). Module-scope signals, ports and the members of a module-scope
+/// unpacked struct stay, `genblk_status` too: only an unnamed block's own
+/// `genblk<n>` (§27.6) names a block. By default both are counted.
 #[test]
 fn toggle_enums_and_generate_blocks_left_out() {
     let d = scratch("toggles");
@@ -145,7 +144,14 @@ fn toggle_enums_and_generate_blocks_left_out() {
     assert_eq!(
         strings(scope(&all, "tb.u"), "signal"),
         [
-            "clk", "fl[0].f", "fl[1].f", "gs.m", "lb.lab", "o", "r", "ub"
+            "clk",
+            "fl[0].f",
+            "fl[1].f",
+            "genblk1.gs.m",
+            "genblk1.ub",
+            "lb.lab",
+            "o",
+            "r"
         ]
     );
     assert_eq!(

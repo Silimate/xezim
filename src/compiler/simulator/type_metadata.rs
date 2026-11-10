@@ -121,7 +121,9 @@ impl Simulator {
             } else {
                 None
             };
-        if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type {
+        if let Some(ta) = self.scoped_class_type_args(data_type) {
+            self.var_type_args.insert(name.to_string(), ta);
+        } else if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type {
             if !type_args.is_empty() {
                 self.var_type_args
                     .insert(name.to_string(), type_args.clone());
@@ -222,6 +224,325 @@ impl Simulator {
         frames.iter().rev().find_map(|(_, t)| t.get(name).cloned())
     }
 
+    /// The typedef `name` has in the innermost active frame that declares
+    /// it, None when that frame gives it none (a class-handle formal). Unlike
+    /// `local_typedef_type_of`, a callee's formal hides a caller's same-named
+    /// enum local.
+    pub(super) fn declaring_frame_typedef_of(&self, name: &str) -> Option<String> {
+        let base = self.method_local_base.last().copied().unwrap_or(0);
+        let top = self.local_stack.len().min(self.local_type_stack.len());
+        (base..top)
+            .rev()
+            .find(|&i| {
+                self.local_stack[i].contains_key(name)
+                    || self.local_type_stack[i].1.contains_key(name)
+            })
+            .and_then(|i| self.local_type_stack[i].1.get(name).cloned())
+    }
+
+    /// The name-keyed metadata registered for local `name` now. Only a
+    /// struct-typed local has `name.member` entries. The first capture of a
+    /// declaration scans the tables for them; a later one (`known`, the same
+    /// declaration's last capture) reads just the keys that one found, so a
+    /// swap costs the local's own entries, not the size of the tables (#943).
+    fn capture_local_meta(&self, name: &str, known: Option<&LocalMeta>) -> LocalMeta {
+        let m = &self.module;
+        let members =
+            m.struct_members.contains_key(name) || m.packed_struct_fields.contains_key(name);
+        let known = known.filter(|k| k.members == members);
+        let pfx = format!("{name}.");
+        fn pick<V: Clone, W>(
+            map: &HashMap<String, V>,
+            name: &str,
+            pfx: &str,
+            members: bool,
+            known: Option<&[(String, W)]>,
+        ) -> Vec<(String, V)> {
+            let bare = map.get(name).map(|v| (name.to_string(), v.clone()));
+            match known {
+                _ if !members => bare.into_iter().collect(),
+                Some(keys) => {
+                    bare.into_iter()
+                        .chain(keys.iter().filter(|(k, _)| k != name).filter_map(|(k, _)| {
+                            map.get(k.as_str()).map(|v| (k.clone(), v.clone()))
+                        }))
+                        .collect()
+                }
+                None => (map.iter())
+                    .filter(|(k, _)| *k == name || k.starts_with(pfx))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            }
+        }
+        LocalMeta {
+            members,
+            typedef: self.var_typedef_types.get(name).cloned(),
+            class: self.var_class_types.get(name).cloned(),
+            container: self.var_container_types.get(name).cloned(),
+            type_args: self.var_type_args.get(name).cloned(),
+            decl_types: pick(
+                &m.var_decl_types,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.decl_types[..]),
+            ),
+            struct_members: pick(
+                &m.struct_members,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.struct_members[..]),
+            ),
+            packed_fields: pick(
+                &m.packed_struct_fields,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.packed_fields[..]),
+            ),
+            elem_widths: pick(
+                &m.packed_signal_elem_widths,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.elem_widths[..]),
+            ),
+            full_dims: pick(
+                &m.packed_full_dims,
+                name,
+                &pfx,
+                members,
+                known.map(|k| &k.full_dims[..]),
+            ),
+            width: self.widths.get(name).copied(),
+            signed: self.signed_signals.contains(name),
+            real: self.real_signals.contains(name),
+            string: self.string_signals.contains(name),
+        }
+    }
+
+    /// Make `meta` the name-keyed metadata of local `name` again, replacing
+    /// `out`, the installed declaration's entries just captured.
+    fn apply_local_meta(&mut self, name: &str, meta: &LocalMeta, out: &LocalMeta) {
+        fn put<V: Clone>(map: &mut HashMap<String, V>, k: &str, v: &Option<V>) {
+            match v {
+                Some(v) => {
+                    map.insert(k.to_string(), v.clone());
+                }
+                None => {
+                    map.remove(k);
+                }
+            }
+        }
+        fn flag(set: &mut HashSet<String>, k: &str, on: bool) {
+            if on {
+                set.insert(k.to_string());
+            } else {
+                set.remove(k);
+            }
+        }
+        fn keyed<V: Clone>(
+            map: &mut HashMap<String, V>,
+            name: &str,
+            out: &[(String, V)],
+            v: &[(String, V)],
+        ) {
+            map.remove(name);
+            for (k, _) in out {
+                map.remove(k.as_str());
+            }
+            map.extend(v.iter().cloned());
+        }
+        put(&mut self.var_typedef_types, name, &meta.typedef);
+        put(&mut self.var_class_types, name, &meta.class);
+        put(&mut self.var_container_types, name, &meta.container);
+        put(&mut self.var_type_args, name, &meta.type_args);
+        put(&mut self.widths, name, &meta.width);
+        flag(&mut self.signed_signals, name, meta.signed);
+        flag(&mut self.real_signals, name, meta.real);
+        flag(&mut self.string_signals, name, meta.string);
+        let m = &mut self.module;
+        keyed(
+            &mut m.var_decl_types,
+            name,
+            &out.decl_types,
+            &meta.decl_types,
+        );
+        keyed(
+            &mut m.struct_members,
+            name,
+            &out.struct_members,
+            &meta.struct_members,
+        );
+        keyed(
+            &mut m.packed_struct_fields,
+            name,
+            &out.packed_fields,
+            &meta.packed_fields,
+        );
+        keyed(
+            &mut m.packed_signal_elem_widths,
+            name,
+            &out.elem_widths,
+            &meta.elem_widths,
+        );
+        keyed(
+            &mut m.packed_full_dims,
+            name,
+            &out.full_dims,
+            &meta.full_dims,
+        );
+    }
+
+    /// Capture the installed metadata of `name`, which declaration `origin`
+    /// registered, into `local_meta_cache` and return a copy of it.
+    fn save_installed_meta(&mut self, name: &str, origin: u32) -> LocalMeta {
+        let list = self.local_meta_cache.entry(name.to_string()).or_default();
+        let at = list.iter().position(|(o, _)| *o == origin);
+        let known = at.map(|i| std::mem::take(&mut list[i].1));
+        let meta = self.capture_local_meta(name, known.as_ref());
+        if meta.members && known.is_none_or(|k| k.members != meta.members) {
+            self.local_meta_scans += 1;
+        }
+        let list = self
+            .local_meta_cache
+            .get_mut(name)
+            .expect("entry made above");
+        match at {
+            Some(i) => list[i].1 = meta.clone(),
+            None => list.push((origin, meta.clone())),
+        }
+        meta
+    }
+
+    /// A frame-local `name` declared by `stmt` is being declared in the
+    /// current frame: record the claim in the running process's context, and
+    /// when another declaration's metadata is installed under the name, save
+    /// it before this one registers its own. Frames running the same
+    /// declaration share the installed entries.
+    pub(super) fn claim_local_meta(&mut self, name: &str, stmt: &Statement) {
+        let Some(&g) = self.local_gen_stack.last() else {
+            return;
+        };
+        let origin = MetaOrigin {
+            span: (stmt.span.start, stmt.span.end),
+            class: self.class_context_stack.last().cloned().flatten(),
+            spec: self.current_spec.clone(),
+        };
+        let id = match self.local_meta_origin_ids.get(&origin) {
+            Some(&id) => id,
+            None => {
+                let id = self.local_meta_origins.len() as u32;
+                self.local_meta_origins.push(origin.clone());
+                self.local_meta_origin_ids.insert(origin, id);
+                id
+            }
+        };
+        // The frame's claims are the tail of the list (deeper frames popped
+        // theirs). A declaration run again (a loop body) moves its claim to
+        // the end, so the list stays bounded by the frame's declarations and
+        // the one executed last wins.
+        let tail = self
+            .local_meta_claims
+            .iter()
+            .rposition(|c| c.frame != g)
+            .map_or(0, |i| i + 1);
+        let again = self.local_meta_claims[tail..]
+            .iter()
+            .position(|c| c.name == name && c.origin == id);
+        match again {
+            Some(i) if tail + i + 1 == self.local_meta_claims.len() => {}
+            Some(i) => {
+                let c = self.local_meta_claims.remove(tail + i);
+                self.local_meta_claims.push(c);
+            }
+            None => self.local_meta_claims.push(MetaClaim {
+                frame: g,
+                name: name.to_string(),
+                origin: id,
+            }),
+        }
+        match self.local_meta_owner.get(name).copied() {
+            Some(o) if o == id => {}
+            Some(o) => {
+                self.save_installed_meta(name, o);
+                self.local_meta_owner.insert(name.to_string(), id);
+            }
+            None => {
+                self.local_meta_owner.insert(name.to_string(), id);
+            }
+        }
+    }
+
+    /// The running process's frames may hold locals whose metadata another
+    /// process's declaration displaced since: install them again, a later
+    /// claim of a name (an inner frame's, or the declaration executed last in
+    /// a frame) winning over an earlier one. Only contested names (those with
+    /// a `local_meta_cache` entry) are looked at, and a swap moves just the
+    /// name's own entries, so the work is bounded by the process's claims of
+    /// contested names, whatever the size of the tables (#943).
+    pub(super) fn reapply_local_meta(&mut self) {
+        if self.local_meta_cache.is_empty() || self.local_meta_claims.is_empty() {
+            return;
+        }
+        self.local_meta_reapplies += 1;
+        let claims = std::mem::take(&mut self.local_meta_claims);
+        for (i, c) in claims.iter().enumerate().rev() {
+            if !self.local_meta_cache.contains_key(&c.name)
+                || claims[i + 1..].iter().any(|d| d.name == c.name)
+            {
+                continue;
+            }
+            self.install_local_meta(&c.name, c.origin);
+        }
+        self.local_meta_claims = claims;
+    }
+
+    /// Install the cached metadata of declaration `origin` under `name`,
+    /// saving the installed declaration's first.
+    fn install_local_meta(&mut self, name: &str, origin: u32) {
+        let Some(cur) = self.local_meta_owner.get(name).copied() else {
+            return;
+        };
+        if cur == origin {
+            return;
+        }
+        let Some(at) = (self.local_meta_cache.get(name))
+            .and_then(|l| l.iter().position(|(o, _)| *o == origin))
+        else {
+            return;
+        };
+        let out = self.save_installed_meta(name, cur);
+        let list = self.local_meta_cache.get_mut(name).expect("checked above");
+        let meta = std::mem::take(&mut list[at].1);
+        self.apply_local_meta(name, &meta, &out);
+        let list = self.local_meta_cache.get_mut(name).expect("checked above");
+        list[at].1 = meta;
+        if let Some(o) = self.local_meta_owner.get_mut(name) {
+            *o = origin;
+        }
+        self.local_meta_swaps += 1;
+    }
+
+    /// Frame generation `g` is gone: drop its claims (and any of a frame
+    /// above it). True when one was of a contested name: the process's
+    /// remaining claims may need their own declaration's metadata back.
+    /// Re-checking after every other pop rescanned every live frame per
+    /// call, so a displaced outer local made each later call pay for the
+    /// whole stack (#833).
+    fn release_local_meta(&mut self, g: u64) -> bool {
+        let mut restorable = false;
+        while let Some(c) = self.local_meta_claims.last() {
+            if c.frame < g {
+                break;
+            }
+            restorable = restorable || self.local_meta_cache.contains_key(&c.name);
+            self.local_meta_claims.pop();
+        }
+        restorable
+    }
+
     /// Push a local frame, keeping the type overlay in lockstep.
     /// Monotonic frame-generation source for `local_gen_stack`. Each pushed
     /// frame slot gets a distinct generation so separate activations that
@@ -270,11 +591,32 @@ impl Simulator {
     /// interpreted declaration makes and a compiled one never did; they are
     /// set for the statement's duration and restored after it. Returns the
     /// frame depth and the mark of the saved registrations.
-    pub(super) fn fb_frame_push(&mut self, locals: &[super::bytecode::FbLocal]) -> (usize, usize) {
+    pub(super) fn fb_frame_push(
+        &mut self,
+        locals: &[super::bytecode::FbLocal],
+    ) -> (usize, usize, usize) {
         use super::bytecode::LocalKind;
         let depth = self.local_stack.len();
         let mark = self.fb_meta_saves.len();
+        let geom_mark = self.fb_geom_saves.len();
 
+        // A compiled method's output / ref formal lives in its register; the
+        // carried frame is its only copy for the statement's duration, so the
+        // call's ref redirection of the name is set aside until it ends (the
+        // method epilogue writes the register back as usual).
+        let mut unbound = Vec::new();
+        for l in locals.iter().filter(|l| l.via_binding) {
+            let name = l.name.as_ref();
+            let binding = self
+                .ref_binding_stack
+                .last_mut()
+                .and_then(|m| m.remove(name));
+            let alias = self.ref_alias_stack.last_mut().and_then(|m| m.remove(name));
+            if binding.is_some() || alias.is_some() {
+                unbound.push((name.to_string(), binding, alias));
+            }
+        }
+        self.fb_unbound_refs.push(unbound);
         let mut f = self.take_pooled_frame();
         for l in locals {
             let v = Self::fb_fit(self.vm_regs[l.reg as usize].clone(), l.kind);
@@ -291,16 +633,67 @@ impl Simulator {
                 LocalKind::Real => (Some(64), false, true, false),
                 // Text is exempt from width fitting; leave `widths` alone.
                 LocalKind::Str => (cur.0, false, false, true),
+                LocalKind::Handle => cur,
             };
             if cur != want {
                 self.fb_meta_saves
                     .push((name.to_string(), cur.0, cur.1, cur.2, cur.3));
                 self.fb_meta_apply(name, want);
             }
+            // §23.9/#916: a register-bound local is a plain vector, real or
+            // string (`local_kind_of` binds nothing else), so any geometry
+            // registered under its bare name — `packed_full_dims` and the
+            // element width of an interpreted subroutine's packed-of-packed
+            // `v`, a struct layout, a typedef'd declared type — belongs to
+            // ANOTHER declaration of the name (that subroutine may be the
+            // caller, still live). The interpreter would slice this local by
+            // it (`v[col*8 +: 8] = …` on a `logic [63:0] v` became a one-byte
+            // element write), so it is set aside for the statement's duration.
+            if !matches!(l.kind, LocalKind::Handle) {
+                self.fb_strip_geometry(name);
+            }
         }
         self.fb_frame_depths.push(depth);
+        // §6.11.1: each write to a 2-state carried local drops X/Z then and
+        // there (`lvalue_is_two_state_local`), not only at the copy-back: a
+        // loop run as one fallback (`foreach (m[i]) s += m[i];`) otherwise
+        // carried `s = x` into every later trip.
+        self.fb_two_state_marks.push(self.fb_two_state_names.len());
+        for l in locals {
+            if let LocalKind::Int {
+                two_state: true, ..
+            } = l.kind
+            {
+                self.fb_two_state_names.push(l.name.clone());
+            }
+        }
         self.push_local_frame(f);
-        (depth, mark)
+        for l in locals {
+            if let Some(class) = &l.class {
+                self.record_local_class_type(&l.name, class);
+            }
+        }
+        (depth, mark, geom_mark)
+    }
+
+    /// Take the bare-name geometry of carried local `name` out of the type
+    /// tables for a fallback's duration (see `fb_frame_push`); the common
+    /// case — nothing registered — costs the lookups only.
+    fn fb_strip_geometry(&mut self, name: &str) {
+        let m = &self.module;
+        let non_plain = m
+            .var_decl_types
+            .get(name)
+            .is_some_and(|dt| !Self::decl_type_is_plain(dt));
+        if !non_plain
+            && !m.packed_full_dims.contains_key(name)
+            && !m.packed_signal_elem_widths.contains_key(name)
+            && !m.packed_struct_fields.contains_key(name)
+        {
+            return;
+        }
+        let meta = self.take_formal_metadata(name);
+        self.fb_geom_saves.push(meta);
     }
 
     pub(super) fn fb_meta_apply(&mut self, name: &str, m: (Option<u32>, bool, bool, bool)) {
@@ -331,9 +724,21 @@ impl Simulator {
 
     /// Pop the frame `fb_frame_push` made and copy each local back to its
     /// register, fitted to its declaration as a compiled assignment would.
-    pub(super) fn fb_frame_pop(&mut self, locals: &[super::bytecode::FbLocal], at: (usize, usize)) {
-        let (depth, mark) = at;
+    pub(super) fn fb_frame_pop(
+        &mut self,
+        locals: &[super::bytecode::FbLocal],
+        at: (usize, usize, usize),
+    ) {
+        let (depth, mark, geom_mark) = at;
         self.fb_frame_depths.pop();
+        if let Some(m) = self.fb_two_state_marks.pop() {
+            self.fb_two_state_names.truncate(m);
+        }
+        while self.fb_geom_saves.len() > geom_mark {
+            if let Some(meta) = self.fb_geom_saves.pop() {
+                self.restore_formal_metadata(meta);
+            }
+        }
         while self.fb_meta_saves.len() > mark {
             if let Some((name, w, sg, re, st)) = self.fb_meta_saves.pop() {
                 self.fb_meta_apply(&name, (w, sg, re, st));
@@ -361,6 +766,14 @@ impl Simulator {
             if self.frame_pool.len() < 64 {
                 f.clear();
                 self.frame_pool.push(f);
+            }
+        }
+        for (name, binding, alias) in self.fb_unbound_refs.pop().unwrap_or_default() {
+            if let (Some(b), Some(m)) = (binding, self.ref_binding_stack.last_mut()) {
+                m.insert(name.clone(), b);
+            }
+            if let (Some(a), Some(m)) = (alias, self.ref_alias_stack.last_mut()) {
+                m.insert(name, a);
             }
         }
     }
@@ -396,6 +809,7 @@ impl Simulator {
                 }
             }
             LocalKind::Str => v,
+            LocalKind::Handle => v,
         }
     }
 
@@ -553,6 +967,9 @@ impl Simulator {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
         if let Some(g) = self.local_gen_stack.pop() {
+            if !self.local_meta_claims.is_empty() && self.release_local_meta(g) {
+                self.reapply_local_meta();
+            }
             if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
                 self.task_string_formals.pop();
             }
@@ -570,6 +987,9 @@ impl Simulator {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
         if let Some(g) = self.local_gen_stack.pop() {
+            if !self.local_meta_claims.is_empty() && self.release_local_meta(g) {
+                self.reapply_local_meta();
+            }
             if self.task_string_formals.last().is_some_and(|e| e.fgen == g) {
                 self.task_string_formals.pop();
             }
@@ -757,9 +1177,18 @@ impl Simulator {
         if name == "this" || name == "super" {
             return true;
         }
-        if self
-            .var_typedef_types
-            .get(name)
+        // The declared typedef of `name` in the ACTIVE frames: the flat
+        // `var_typedef_types` map keeps whatever an earlier, finished
+        // activation declared under the name (`uvm_severity s;` in a report
+        // method), which turned every later `s.f = v` through an unrelated
+        // class handle `s` into a dropped write.
+        let declared_td = if self.local_stack.is_empty() {
+            self.var_typedef_types.get(name).cloned()
+        } else {
+            self.declaring_frame_typedef_of(name)
+        };
+        if declared_td
+            .as_ref()
             .is_some_and(|tn| self.module.enum_members.contains_key(tn))
         {
             return false;
@@ -775,7 +1204,7 @@ impl Simulator {
         // module/package-scope variables are only in `var_decl_types`.
         // (id-collision-in-heap review regression 2 — resolved here, in
         // the classification helper, not in `class_of_var`.)
-        let declared_tn = self.var_typedef_types.get(name).cloned().or_else(|| {
+        let declared_tn = declared_td.or_else(|| {
             self.module
                 .var_decl_types
                 .get(name)
@@ -1105,6 +1534,122 @@ impl Simulator {
         self.dotted_segments_denote_class_object(segs)
     }
 
+    /// §7.2: every unpacked-struct variable with a container signal, keyed by
+    /// that signal's id, listing its scalar member leaves (nested structs
+    /// flattened, `m.n`). A struct with an array or union member gets an
+    /// empty list: the compiler then leaves its whole-struct copies to the
+    /// interpreter.
+    pub(super) fn build_unpacked_struct_leaves(&self) -> super::bytecode::UnpackedStructLeaves {
+        fn flatten(
+            sim: &Simulator,
+            full: &str,
+            rel: &str,
+            dt: &DataType,
+            out: &mut Vec<(String, String)>,
+        ) -> bool {
+            match sim.resolve_dt(dt) {
+                DataType::Struct(su) if !su.packed => {
+                    if !matches!(su.kind, crate::ast::types::StructUnionKind::Struct) {
+                        return false;
+                    }
+                    for m in &su.members {
+                        for d in &m.declarators {
+                            if !d.dimensions.is_empty() {
+                                return false;
+                            }
+                            let n = &d.name.name;
+                            let rel = if rel.is_empty() {
+                                n.clone()
+                            } else {
+                                format!("{rel}.{n}")
+                            };
+                            if !flatten(sim, &format!("{full}.{n}"), &rel, &m.data_type, out) {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                }
+                _ => {
+                    if sim.signal_name_to_id.get(full).is_none() {
+                        return false;
+                    }
+                    out.push((rel.to_string(), full.to_string()));
+                    true
+                }
+            }
+        }
+        let mut map = super::bytecode::UnpackedStructLeaves::default();
+        for (name, dt) in &self.module.var_decl_types {
+            let DataType::Struct(su) = self.resolve_dt(dt) else {
+                continue;
+            };
+            if su.packed || !matches!(su.kind, crate::ast::types::StructUnionKind::Struct) {
+                continue;
+            }
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                continue;
+            };
+            let mut leaves = Vec::new();
+            if !flatten(self, name, "", dt, &mut leaves) {
+                leaves.clear();
+            }
+            map.insert(id, leaves);
+        }
+        map
+    }
+
+    /// Every signal below each unpacked-struct VARIABLE (`s.a`, `s.arr[1]`,
+    /// `s.in.x`), keyed by the variable's name: what a whole-struct read
+    /// depends on. An unpacked array of structs is keyed by each element
+    /// (`pa[0]`) and by the array (`pa`). Covers instance-scoped structs too,
+    /// which have member leaves but no container signal. One pass over the
+    /// signal names.
+    pub(super) fn build_unpacked_struct_sens(&self) -> HashMap<String, Vec<usize>> {
+        let mut names: HashSet<&str> = HashSet::default();
+        for (name, dt) in &self.module.var_decl_types {
+            if let DataType::Struct(su) = self.resolve_dt(dt)
+                && !su.packed
+                && matches!(su.kind, crate::ast::types::StructUnionKind::Struct)
+            {
+                names.insert(name.as_str());
+            }
+        }
+        let mut out: HashMap<String, Vec<usize>> = HashMap::default();
+        if names.is_empty() {
+            return out;
+        }
+        for (name, &id) in self.signal_name_to_id.iter() {
+            let name: &str = name.as_ref();
+            for (pos, _) in name.match_indices('.') {
+                let prefix = &name[..pos];
+                if names.contains(prefix) {
+                    out.entry(prefix.to_string()).or_default().push(id);
+                    continue;
+                }
+                // §7.2, §9.2.2.2: a member of an element of an unpacked
+                // array of unpacked structs (`pa[0].a`). A read of the
+                // element (`c = pa[0]`) or of the whole array (`ra = pa`)
+                // depends on it, as a whole-struct read does on its members.
+                let mut base = prefix;
+                while base.ends_with(']')
+                    && let Some(open) = base.rfind('[')
+                {
+                    base = &base[..open];
+                }
+                if base.len() < prefix.len() && names.contains(base) {
+                    out.entry(prefix.to_string()).or_default().push(id);
+                    out.entry(base.to_string()).or_default().push(id);
+                }
+            }
+        }
+        for v in out.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        out
+    }
+
     /// Follow a typedef chain to the underlying type.
     pub(super) fn resolve_dt(&self, dt: &DataType) -> DataType {
         self.resolve_dt_ref(dt).clone()
@@ -1118,6 +1663,13 @@ impl Simulator {
         for _ in 0..16 {
             if let DataType::TypeReference { name, .. } = cur {
                 if let Some(next) = self.module.typedef_types.get(&name.name.name) {
+                    // §8.27: `typedef class C;` leaves a void placeholder
+                    // under C. The class itself is the type.
+                    if matches!(next, DataType::Void(_))
+                        && self.module.classes.contains_key(&name.name.name)
+                    {
+                        break;
+                    }
                     cur = next;
                     continue;
                 }
@@ -1125,6 +1677,47 @@ impl Simulator {
             break;
         }
         cur
+    }
+
+    /// §7.4.1/§6.20.2: the packed struct or union `dt` denotes, with the
+    /// packed dimensions written on the typedef references that lead to it
+    /// folded into its `dimensions`, outermost first — `cand_t [0:2]` is a
+    /// packed array of three `cand_t`, and so is `carr_t` for `typedef cand_t
+    /// [0:2] carr_t`; `carr_t [1:0] x` is `[1:0][0:2]` of `cand_t`. Borrowed
+    /// when no reference adds dimensions, so the common scalar struct costs
+    /// no clone. `None` when the chain does not end in a struct or union.
+    pub(super) fn packed_struct_with_dims<'a>(
+        &'a self,
+        dt: &'a DataType,
+    ) -> Option<std::borrow::Cow<'a, crate::ast::types::StructUnionType>> {
+        use crate::ast::types::PackedDimension;
+        let mut outer: Vec<PackedDimension> = Vec::new();
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    outer.extend(dimensions.iter().cloned());
+                    let next = self.module.typedef_types.get(&name.name.name)?;
+                    if matches!(next, DataType::Void(_)) {
+                        return None;
+                    }
+                    cur = next;
+                }
+                DataType::Struct(su) => {
+                    if outer.is_empty() {
+                        return Some(std::borrow::Cow::Borrowed(su));
+                    }
+                    let mut out = su.clone();
+                    outer.append(&mut out.dimensions);
+                    out.dimensions = outer;
+                    return Some(std::borrow::Cow::Owned(out));
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// §20.6.1 `$typename` of a virtual-interface operand: a variable (module
@@ -1436,6 +2029,7 @@ impl Simulator {
                     span,
                 },
                 span,
+                bound: Default::default(),
             },
             dimensions: Vec::new(),
             type_args: Vec::new(),
@@ -1782,13 +2376,13 @@ impl Simulator {
                 }
                 let mut base = h.clone();
                 let last = base.path.pop()?;
-                base.cached_signal_id = std::cell::Cell::new(None);
-                base.cached_resolved_name = std::cell::OnceCell::new();
+                base.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                base.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Some((
                     Expression {
                         kind: ExprKind::Ident(base),
                         span: e.span,
-                        cached_width: std::cell::Cell::new(None),
+                        cached_width: crate::ast::cache::WidthCache::new(None),
                     },
                     last.name.name,
                 ))

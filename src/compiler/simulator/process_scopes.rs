@@ -215,13 +215,115 @@ impl Simulator {
     /// was forked inside, or any process parked inside it. That process
     /// resumes at the end of the block, and every process forked inside the
     /// block, the disabling one included, is terminated.
+    /// §9.6.2, §23.8: the process whose top-level block a `disable` target
+    /// names. The target's path is looked up as `<scope>.<path>` from the
+    /// disabling process's scope outward, so `disable g1.blk` and
+    /// `disable r[0].w` find that block and not a namesake in another
+    /// generate block. A target found no other way falls back to its label.
+    pub(super) fn disable_label_pid(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<usize> {
+        let mut path = String::new();
+        for (i, seg) in target.path.iter().enumerate() {
+            if i > 0 {
+                path.push('.');
+            }
+            path.push_str(&seg.name.name);
+            for sel in &seg.selects {
+                use std::fmt::Write as _;
+                let _ = write!(path, "[{}]", Self::try_const_u64(sel)?);
+            }
+        }
+        if target.root.is_none() {
+            let mut scope = self
+                .process_scope_hint
+                .get(&self.current_pid)
+                .map(String::as_str)
+                .unwrap_or("");
+            loop {
+                if !scope.is_empty()
+                    && let Some(&pid) = self.disable_labels.get(&format!("{scope}.{path}"))
+                {
+                    return Some(pid);
+                }
+                if scope.is_empty() {
+                    break;
+                }
+                scope = scope.rfind('.').map_or("", |i| &scope[..i]);
+            }
+        }
+        if let Some(&pid) = self.disable_labels.get(&path) {
+            return Some(pid);
+        }
+        // `top.blk`: the top module's own block, registered by its label.
+        let rest = match target.path.split_first() {
+            Some((head, rest)) if !rest.is_empty() && head.name.name == self.module.name => rest,
+            _ => &target.path[target.path.len().saturating_sub(1)..],
+        };
+        match rest {
+            [only] => self.disable_labels.get(&only.name.name).copied(),
+            _ => None,
+        }
+    }
+
+    /// §9.6.2: register a process's top-level block label for `disable`,
+    /// under `<scope>.<label>` when the process belongs to a scope. The bare
+    /// label keeps the first top-module block, then the first scoped one.
+    pub(super) fn register_disable_label(&mut self, label: &str, pid: usize) {
+        match self.process_scope_hint.get(&pid).filter(|s| !s.is_empty()) {
+            Some(scope) => {
+                let key = format!("{scope}.{label}");
+                self.disable_labels.insert(key, pid);
+                self.disable_labels.entry(label.to_string()).or_insert(pid);
+            }
+            None => {
+                self.disable_labels.insert(label.to_string(), pid);
+            }
+        }
+    }
+
     pub(super) fn disable_remote_block(&mut self, x: &str) {
+        self.disable_remote_block_of(x, None);
+    }
+
+    /// §9.6.2: whether a `disable` of `target` may name a block or task this
+    /// process is executing: a named block it is inside, its own top-level
+    /// label or an active task. Inside a subroutine the caller's blocks are
+    /// not on `m_scope_stack`, so any target may be one.
+    pub(super) fn disable_may_be_own(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> bool {
+        let name = crate::ast::stmt::disable_name(target);
+        let pid = self.current_pid;
+        self.m_scope_stack
+            .iter()
+            .any(|n| n.starts_with([M_ROOT_MARK, M_SUBR_MARK]) || Self::block_name_matches(name, n))
+            || self
+                .process_m_label
+                .get(&pid)
+                .is_some_and(|l| Self::block_name_matches(name, l))
+            || self.active_task_pids.values().any(|s| s.contains(&pid))
+    }
+
+    /// `disable_remote_block` for a block of process `only`, when the target's
+    /// path names its process (`disable lab.sub`).
+    pub(super) fn disable_remote_block_of(&mut self, x: &str, only: Option<usize>) {
         let me = self.current_pid;
         let mut owner: Option<usize> = None;
         let mut task_owner = false;
         let mut c = me;
         let mut steps = 0;
         while let Some(&a) = self.process_parents.get(&c) {
+            if only.is_some_and(|o| o != a) {
+                c = a;
+                steps += 1;
+                if steps > 100_000 {
+                    break;
+                }
+                continue;
+            }
             if self
                 .fork_spawn_cont
                 .get(&c)
@@ -258,6 +360,7 @@ impl Simulator {
             cands.dedup();
             owner = cands.into_iter().find(|&p| {
                 p != me
+                    && only.is_none_or(|o| o == p)
                     && !self.killed_pids.contains(&p)
                     && self
                         .parked_cont_of(p)
@@ -618,8 +721,9 @@ impl Simulator {
                                         selects: vec![],
                                     }],
                                     span: d.span,
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 }),
                                 d.span,
                             );
@@ -752,7 +856,7 @@ impl Simulator {
                             } else {
                                 "x".repeat(w as usize)
                             },
-                            cached_val: std::cell::Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         port.span,
                     )
@@ -776,7 +880,7 @@ impl Simulator {
         let mut ordinal = 0usize;
         let mut functions: Vec<_> = module.functions.keys().cloned().collect();
         functions.sort();
-        let mut rewritten: HashMap<String, Vec<Statement>> = HashMap::default();
+        let mut rewritten: HashMap<String, crate::ast::shared_vec::SharedVec<Statement>> = HashMap::default();
         for key in functions {
             let Some(original) = module.functions.get(&key) else {
                 continue;
@@ -1270,6 +1374,7 @@ impl Simulator {
             return None;
         }
         let mut sv = BlockScopeSave {
+            scope_gen: self.next_frame_gen(),
             frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
             pid_mark: self.next_pid,
             ..Default::default()
@@ -1325,6 +1430,7 @@ impl Simulator {
             let plain = Self::type_is_plain_scalar(data_type);
             for d in declarators {
                 let nm = d.name.name.as_str();
+                sv.declared_names.push(nm.to_string());
                 if d.dimensions.is_empty() && self.is_virtual_iface_type(data_type) {
                     // §6.21 / §25.9: hiding a variable also hides its binding.
                     // Values alone cannot restore the enclosing vif after a
@@ -1368,6 +1474,14 @@ impl Simulator {
                             .push((nm.to_string(), self.task_frame_string_flag(nm)));
                     }
                 }
+                // §23.9 (#856): a scalar block local also hides a
+                // same-named enclosing collection. Its rename is restored
+                // with the rest of the block's declarations on exit.
+                if let Some(ld) = self.local_dyn.last_mut() {
+                    if let Some(pos) = ld.iter().rposition(|(k, _)| k == nm) {
+                        sv.dyn_shadowed.push(ld.remove(pos));
+                    }
+                }
                 if plain && d.dimensions.is_empty() {
                     continue;
                 }
@@ -1378,12 +1492,6 @@ impl Simulator {
                         if k.starts_with(&marker) && !sv.shadowed.iter().any(|(n, _)| n == k) {
                             sv.shadowed.push((k.clone(), v.clone()));
                         }
-                    }
-                }
-                // A collection local: move the enclosing rename aside.
-                if let Some(ld) = self.local_dyn.last_mut() {
-                    if let Some(pos) = ld.iter().rposition(|(k, _)| k == nm) {
-                        sv.dyn_shadowed.push(ld.remove(pos));
                     }
                 }
             }
@@ -2265,6 +2373,7 @@ impl Simulator {
             body.span,
         ));
         let cont: Arc<[Statement]> = Arc::from(cont);
+        self.exec_cache_pids.insert(key.0);
         self.forever_cont_cache.insert(key, cont.clone());
         cont
     }
@@ -2352,10 +2461,16 @@ impl Simulator {
                                 let is_clk_ev = self.is_clocking_event(event);
                                 let resolved = self.resolve_sens_ids(&sens);
                                 if !sens.is_empty() && resolved.len() == sens.len() {
+                                    self.exec_cache_pids.insert(pid);
                                     self.forever_sens_cache
                                         .insert(key, (resolved.clone(), is_clk_ev));
                                 }
-                                if sens.is_empty() {
+                                // A term naming no signal (`@(posedge clk or
+                                // posedge h.rst)`, a class property) needs the
+                                // general path, which arms it by value: a
+                                // waiter on the resolved terms alone never
+                                // saw it change (§9.4.2).
+                                if sens.is_empty() || (!is_star && resolved.len() != sens.len()) {
                                     (Vec::new(), is_clk_ev)
                                 } else {
                                     (resolved, is_clk_ev)
@@ -2380,6 +2495,21 @@ impl Simulator {
                             }
                             return;
                         }
+                        // §15.5: an event with no signal-table slot — a class
+                        // event (`@ev` on `this`, `@(h.ev)`, a static class
+                        // event) — parks through `run_process_stmts`, which
+                        // knows those identities. Executed synchronously below
+                        // it never waited, and the loop never saw the trigger.
+                        let cont = self.forever_cont(pid, body, body_stmts, i, 2, s);
+                        let contp = pc.pushed_frame(cont, resume_at);
+                        if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                            self.event_queue.schedule(self.time, pid, contp);
+                            return;
+                        }
+                        self.forever_depth += 1;
+                        self.run_process_stmts(pid, &contp);
+                        self.forever_depth -= 1;
+                        return;
                     }
                 }
             }
@@ -2509,6 +2639,14 @@ impl Simulator {
     /// that collection (§11.4.12). None when the base is not an indexable
     /// collection, in which case there is no bound to install.
     pub(super) fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
+        // §7.10.1: an object's queue is stored under its handle, not the
+        // source spelling (`list.contents`). Resolve that store before
+        // looking up the last index, including for a class-handle formal.
+        if let Some(n) = self.expr_assoc_name(base) {
+            if self.module.dynamic_arrays.contains(&n) {
+                return Some(self.get_queue_size(&n) as i64 - 1);
+            }
+        }
         let n = match &base.kind {
             ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
             _ => self.flat_member_name(base).map(std::borrow::Cow::Owned),
@@ -2520,30 +2658,36 @@ impl Simulator {
         }
     }
 
-    /// Does any INDEX or RANGE bound inside this lvalue mention `$`? Scans the
-    /// whole lvalue tree, unlike `expr_contains_dollar`, which only looks at
+    /// Does any INDEX or RANGE bound of this select chain mention `$`? Scans
+    /// the whole chain, unlike `expr_contains_dollar`, which only looks at
     /// one index expression.
-    pub(super) fn lvalue_mentions_dollar(e: &Expression) -> bool {
+    pub(crate) fn select_mentions_dollar(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Index { expr, index } => {
-                Self::expr_contains_dollar(index) || Self::lvalue_mentions_dollar(expr)
+                Self::expr_contains_dollar(index) || Self::select_mentions_dollar(expr)
             }
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
                 Self::expr_contains_dollar(left)
                     || Self::expr_contains_dollar(right)
-                    || Self::lvalue_mentions_dollar(expr)
+                    || Self::select_mentions_dollar(expr)
             }
-            ExprKind::Paren(i) => Self::lvalue_mentions_dollar(i),
-            ExprKind::MemberAccess { expr, .. } => Self::lvalue_mentions_dollar(expr),
+            ExprKind::Paren(i) => Self::select_mentions_dollar(i),
+            ExprKind::MemberAccess { expr, .. } => Self::select_mentions_dollar(expr),
+            // `$root.top.q[$].f`: a select inside the path.
+            ExprKind::Ident(h) => h
+                .path
+                .iter()
+                .flat_map(|seg| &seg.selects)
+                .any(Self::expr_contains_dollar),
             _ => false,
         }
     }
 
     /// Rewrite every `$`-bearing index/range bound in an lvalue into a literal,
     /// each evaluated against ITS OWN base's bound. Returns a clone; only
-    /// called when `lvalue_mentions_dollar` says there is work to do.
+    /// called when `select_mentions_dollar` says there is work to do.
     pub(super) fn resolve_dollar_in_lvalue(&mut self, e: &Expression) -> Expression {
         let lit = |v: i64, span| {
             Expression::new(
@@ -2552,7 +2696,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((v as u64, 0u64, 64u32))),
                 }),
                 span,
             )
@@ -2624,38 +2768,96 @@ impl Simulator {
                     e.span,
                 )
             }
+            // §7.10.1/§11.4.12: the queue select may be the receiver of
+            // a property write (`list.contents[$].flags = v`). The scan
+            // above detects it; descend here too so the bound is installed
+            // before the assignment paths evaluate the object handle.
+            ExprKind::MemberAccess { expr, member } => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.resolve_dollar_in_lvalue(expr)),
+                    member: member.clone(),
+                },
+                e.span,
+            ),
+            ExprKind::Paren(expr) => Expression::new(
+                ExprKind::Paren(Box::new(self.resolve_dollar_in_lvalue(expr))),
+                e.span,
+            ),
             _ => e.clone(),
         }
     }
 
-    /// Does this expression mention `$` (§11.4.12 — the last index of the
-    /// collection being indexed)? Used to decide whether an lvalue index has to
-    /// be evaluated with a `dollar_bound` installed.
+    /// Does this index expression mention `$` (§7.10), the last index of the
+    /// collection it indexes? The index of a nested select binds its own `$`,
+    /// so the walk takes only that select's base. Every kind is listed, so a
+    /// new one has to decide.
     pub(super) fn expr_contains_dollar(e: &Expression) -> bool {
+        let one = |x: &Expression| Self::expr_contains_dollar(x);
+        let opt = |x: &Option<Box<Expression>>| x.as_deref().is_some_and(one);
+        let any = |xs: &[Expression]| xs.iter().any(one);
         match &e.kind {
             ExprKind::Dollar => true,
-            ExprKind::Paren(i) => Self::expr_contains_dollar(i),
-            ExprKind::Unary { operand, .. } => Self::expr_contains_dollar(operand),
-            ExprKind::Binary { left, right, .. } => {
-                Self::expr_contains_dollar(left) || Self::expr_contains_dollar(right)
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => one(expr),
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Specialization { base: x, .. }
+            | ExprKind::Matches { expr: x, .. }
+            | ExprKind::ShallowCopy { source: x }
+            | ExprKind::TypedPattern { pattern: x, .. }
+            | ExprKind::RandomizeWith { call: x, .. }
+            | ExprKind::SvaClocked { body: x, .. } => one(x),
+            ExprKind::Binary {
+                left: a, right: b, ..
             }
+            | ExprKind::Range(a, b)
+            | ExprKind::WithClause { expr: a, filter: b }
+            | ExprKind::AssignExpr {
+                lvalue: a,
+                rvalue: b,
+            } => one(a) || one(b),
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
-            } => {
-                Self::expr_contains_dollar(condition)
-                    || Self::expr_contains_dollar(then_expr)
-                    || Self::expr_contains_dollar(else_expr)
-            }
-            _ => false,
+            } => one(condition) || one(then_expr) || one(else_expr),
+            // Casts (`int'($)`, `$signed($)`) parse as calls.
+            ExprKind::Call { func, args } => one(func) || any(args),
+            ExprKind::SystemCall { args, .. } | ExprKind::Concatenation(args) => any(args),
+            ExprKind::Replication { count, exprs } => one(count) || any(exprs),
+            ExprKind::Inside { expr, ranges } => one(expr) || any(ranges),
+            ExprKind::StreamOp {
+                slice_size, exprs, ..
+            } => opt(slice_size) || any(exprs),
+            ExprKind::NamedArg { expr, .. } => opt(expr),
+            ExprKind::Tagged { inner, .. } => opt(inner),
+            ExprKind::AssignmentPattern(items) => items.iter().any(|item| match item {
+                AssignmentPatternItem::Ordered(x)
+                | AssignmentPatternItem::Named(_, x)
+                | AssignmentPatternItem::Typed(_, x)
+                | AssignmentPatternItem::Default(x) => one(x),
+                AssignmentPatternItem::Keyed(k, x) => one(k) || one(x),
+            }),
+            // A select in a hierarchical path segment binds its own `$`.
+            ExprKind::Ident(_)
+            | ExprKind::Number(_)
+            | ExprKind::StringLiteral(_)
+            | ExprKind::TypeLiteral(_)
+            | ExprKind::Null
+            | ExprKind::This
+            | ExprKind::Empty => false,
         }
     }
 
     /// §10.4.2 (#569): the root name of a member/element NBA target when it
-    /// is a frame local or formal holding a live object handle, with the
-    /// handle value, so the apply site writes THAT object.
-    pub(super) fn nba_root_frame(&self, lvalue: &Expression) -> Option<(String, Value)> {
+    /// holds a live object handle, with the handle value, so the apply site
+    /// writes THAT object. The root may be a frame local or formal, a
+    /// property of `this`, or a module or block variable (#613): any
+    /// class-typed name, read as the statement executes.
+    pub(super) fn nba_root_frame(
+        &self,
+        lvalue: &Expression,
+    ) -> Option<(String, Value, Option<String>)> {
         if !matches!(
             lvalue.kind,
             ExprKind::MemberAccess { .. } | ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
@@ -2680,12 +2882,21 @@ impl Simulator {
         if root == "this" {
             return None;
         }
-        let v = self.local_stack.last()?.get(root)?;
-        let handle = v.to_u64()? as usize;
+        // Only a class-typed root holds a handle: an integer local whose value
+        // happens to index a live object is not one.
+        let class = self.class_of_var(root)?;
+        let handle = match self.local_stack.last().and_then(|f| f.get(root)) {
+            Some(v) => v.to_u64()? as usize,
+            None => self.eval_ident_handle(root)?,
+        };
         if handle == 0 || !self.heap.get(handle).is_some_and(|o| o.is_some()) {
             return None;
         }
-        Some((root.clone(), v.clone()))
+        Some((
+            root.clone(),
+            Value::from_u64(handle as u64, 64),
+            Some(class),
+        ))
     }
 
     pub(super) fn freeze_lvalue_indices(&mut self, e: &Expression) -> Expression {
@@ -2696,7 +2907,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(Some((v as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((v as u64, 0u64, 64u32))),
                 }),
                 span,
             )
@@ -2895,10 +3106,30 @@ impl Simulator {
                 .is_some_and(|o| o.properties.contains_key(name))
     }
 
+    /// §8.4: in a method, a target rooted at a property of `this` (`s.f <=
+    /// v`, `v[1] <= x`) is the property, not a same-named module variable,
+    /// so it has no signal id; the queued path commits it with `this`
+    /// restored. A virtual-interface property keeps its own redirect.
+    fn nba_root_is_this_prop(&self, h: &HierarchicalIdentifier) -> bool {
+        let name = h.path[0].name.name.as_str();
+        h.root.is_none()
+            && self.this_prop_hides(name)
+            && !self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|th| self.heap.get(th)?.as_ref().map(|i| i.class_name.clone()))
+                .is_some_and(|cn| self.class_vif_decl(&cn, name).is_some())
+    }
+
     pub(super) fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 if self.bare_selected_storage_shadows_signal(hier) {
+                    return None;
+                }
+                if self.nba_root_is_this_prop(hier) {
                     return None;
                 }
                 let is_ambiguous_leaf =
@@ -2935,6 +3166,15 @@ impl Simulator {
                             return self.signal_name_to_id.get(leaf.as_str()).copied();
                         }
                     }
+                }
+                let mut root = expr.as_ref();
+                while let ExprKind::Index { expr, .. } = &root.kind {
+                    root = expr;
+                }
+                if let ExprKind::Ident(h) = &root.kind
+                    && self.nba_root_is_this_prop(h)
+                {
+                    return None;
                 }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
@@ -3045,6 +3285,50 @@ impl Simulator {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+                // A leaf of an unpacked struct (`storage[0].value`,
+                // `field.r1[0].f.value`) is its own signal. Inside an
+                // instance the table key carries the instance prefix
+                // (`u.storage[0].value`); the bare flat name misses, and
+                // the queued-lvalue path commits later with the scope hint
+                // already popped, so the write never landed. Resolve it
+                // now, while this block's hint is still installed.
+                //
+                // Not for an element of a dynamic array, queue or associative
+                // array, whose readers watch the collection (see the Index arm
+                // above), nor in a class method, where a property can hide a
+                // module name.
+                let mut root = expr.as_ref();
+                while let ExprKind::Index { expr: e, .. } | ExprKind::MemberAccess { expr: e, .. } =
+                    &root.kind
+                {
+                    root = e;
+                }
+                let dynamic_root = match &root.kind {
+                    ExprKind::Ident(h) => {
+                        let name = self.resolve_hier_name(h).into_owned();
+                        let scoped = self.hint_scoped(&name);
+                        [Some(name), scoped].into_iter().flatten().any(|n| {
+                            self.module.dynamic_arrays.contains(&n)
+                                || self.module.queue_vars.contains(&n)
+                                || self.module.associative_arrays.contains_key(&n)
+                        })
+                    }
+                    _ => true,
+                };
+                let in_method = matches!(self.this_stack.last(), Some(Some(_)));
+                if !dynamic_root
+                    && !in_method
+                    && let Some(flat) = self.flat_member_name(lhs)
+                {
+                    if let Some(&id) = self.signal_name_to_id.get(flat.as_str()) {
+                        return Some(id);
+                    }
+                    if let Some(scoped) = self.hint_scoped(&flat) {
+                        if let Some(&id) = self.signal_name_to_id.get(scoped.as_str()) {
+                            return Some(id);
                         }
                     }
                 }
@@ -3321,10 +3605,23 @@ impl Simulator {
                 if let Some(h) = entry.this_handle {
                     self.this_stack.push(Some(h));
                 }
-                let pushed_root = if let Some((name, val)) = entry.root_frame {
+                // The frame declares the root's class (its declared one, else
+                // the object's own), so a member write resolves without
+                // whichever call frame the event loop still holds (#613).
+                let pushed_root = if let Some((name, val, declared)) = entry.root_frame {
+                    let class = declared.or_else(|| {
+                        val.to_u64()
+                            .and_then(|h| self.heap.get(h as usize))
+                            .and_then(|o| o.as_ref())
+                            .map(|o| o.class_name.clone())
+                    });
                     let mut frame: HashMap<String, Value> = HashMap::default();
+                    let mut types = self.take_pooled_types();
+                    if let Some(c) = class {
+                        types.0.insert(name.clone(), c);
+                    }
                     frame.insert(name, val);
-                    self.local_stack.push(frame);
+                    self.push_local_frame_typed(frame, types);
                     true
                 } else {
                     false
@@ -3338,7 +3635,7 @@ impl Simulator {
                 };
                 self.assign_value(&lhs, &value);
                 if pushed_root {
-                    self.local_stack.pop();
+                    self.pop_local_frame();
                 }
                 if entry.this_handle.is_some() {
                     self.this_stack.pop();

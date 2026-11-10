@@ -4,6 +4,26 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// One item of an evaluated `dist` (a resolved `Value` or a `lo..=hi` span),
+/// paired with its mass. Built by `resolve_dist_geometry` and cached in hot
+/// foreach loops so the scalar bounds/weights are not re-evaluated per element.
+#[derive(Clone)]
+pub(super) enum DistItem {
+    One(Value),
+    /// lo, hi, width
+    Span(i64, i64, u32),
+}
+
+/// A fully resolved `dist`: its items with masses, the mass vector, and the
+/// total mass. Cheap to clone (the per-solve memo holds one per distinct
+/// `dist`); the deal + value draw keep using `deal_dist_item`/the RNG per call.
+#[derive(Clone)]
+pub(super) struct ResolvedDist {
+    pub(super) items: Vec<(DistItem, u128)>,
+    pub(super) masses: Vec<u128>,
+    pub(super) total: u128,
+}
+
 impl Simulator {
     pub(super) fn randomize_check_items(
         &mut self,
@@ -231,6 +251,26 @@ impl Simulator {
                     .last()
                     .is_some_and(|f| f.contains_key(first))
         }
+    }
+
+    /// §11.4.13: an unpacked array in an inside set contributes its values,
+    /// including associative arrays with sparse or string keys.
+    pub(super) fn inside_operand_keys(&mut self, expr: &Expression) -> Option<Vec<String>> {
+        if let Some(name) = self.expr_assoc_name(expr)
+            && self.is_associative_array(&name)
+        {
+            return Some(
+                self.assoc_top_level_keys(&name)
+                    .into_iter()
+                    .map(|key| format!("{}[{}]", name, key))
+                    .collect(),
+            );
+        }
+        self.array_operand_name(expr).map(|name| {
+            (0..self.get_queue_size(&name))
+                .map(|i| format!("{}[{}]", name, i))
+                .collect()
+        })
     }
 
     pub(super) fn array_operand_name(&mut self, expr: &Expression) -> Option<String> {
@@ -552,6 +592,28 @@ impl Simulator {
         Some(format!("{}[{}]", an, key))
     }
 
+    /// The text of key `kv` selecting into `level` of the nested associative
+    /// array rooted at `root`: a row registered as an associative array of
+    /// its own (`ensure_assoc_row`) uses its declared key type, a queue or
+    /// dynamic row takes an element index, and an unregistered level (a row
+    /// a whole copy made) is keyed like the root. §7.4.4: a declared level
+    /// is keyed as declared, whether or not it is registered yet.
+    fn nested_level_key(&self, level: &str, root: &str, kv: &Value) -> String {
+        match self.declared_dim(level) {
+            Some(Dim::Assoc(_)) => self.assoc_key_str(level, kv),
+            Some(_) => kv.to_i64().unwrap_or(0).to_string(),
+            // No declared shape (a level past a row's size): keyed as
+            // registered, else as the root it hangs from.
+            None if level != root && self.module.dynamic_arrays.contains(level) => {
+                kv.to_i64().unwrap_or(0).to_string()
+            }
+            None if self.module.associative_arrays.contains_key(level) => {
+                self.assoc_key_str(level, kv)
+            }
+            None => self.assoc_key_str(root, kv),
+        }
+    }
+
     pub(super) fn nested_index_name(&mut self, expr: &Expression) -> Option<String> {
         // Peel every Index level: `expr` is `Index(...Index(base, k1),...,kn)`.
         // Collect indices leaf-first, then resolve the root `Ident` to its
@@ -617,14 +679,18 @@ impl Simulator {
                 .inner_assoc_compound_key(start, &rev, 1)
                 .map(|(_, k)| k);
         }
-        let mut name = bn.clone();
-        // Build root→leaf so the string reads `base[K1][K2]...[Kn]`.
+        let mut name = bn.to_string();
+        // Build root→leaf so the string reads `base[K1][K2]...[Kn]`. Each key
+        // takes the key type of the array it selects into: a row registered
+        // as an associative array of its own (`ensure_assoc_row`) has its
+        // declared one; an unregistered level (a row a whole copy made, say)
+        // is keyed like the root.
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
-            let ks = self.assoc_key_str(&bn, &kv);
-            name = std::borrow::Cow::Owned(format!("{}[{}]", name, ks));
+            let ks = self.nested_level_key(&name, &bn, &kv);
+            name = format!("{}[{}]", name, ks);
         }
-        Some(name.to_string())
+        Some(name)
     }
 
     /// Resolve a base expression to its associative-array STORAGE name if it
@@ -712,11 +778,16 @@ impl Simulator {
         {
             return None;
         }
-        // Build the compound key inner→outer so it reads base[K1][K2]...[Kn].
+        // Build the compound key inner→outer so it reads base[K1][K2]...[Kn],
+        // each key in the key type of the array it selects into (see
+        // `nested_index_name`; an unregistered level is keyed like the
+        // root). Below a queue row (`q["x"][5][0]` of
+        // `int q[string][int][$]`) the last key is the element index, and
+        // the compound key is that row's element name.
         let mut key = base_name.clone();
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
-            let ks = self.assoc_key_str(&base_name, &kv);
+            let ks = self.nested_level_key(&key, &base_name, &kv);
             key = format!("{}[{}]", key, ks);
         }
         Some((base_name, key))
@@ -877,6 +948,22 @@ impl Simulator {
                     } else if self.is_select_of_target(right, targets) {
                         let v = self.eval_expr(left);
                         self.assign_value(right, &v);
+                    } else {
+                        // §18.5.12: a target reached through `^`, `~^`, `~`,
+                        // `+` or `-` (`(sd ^ 32'hf0) == 32'h3`) takes the
+                        // equality's one solution. Only interval narrowing
+                        // saw these, and it reads `+`/`-` alone; the joint
+                        // search gave up on a 32-bit `^`.
+                        for (_, lv) in targets {
+                            let is_var = |x: &Expression| {
+                                !matches!(x.kind, ExprKind::Paren(_))
+                                    && Self::expr_same_ignoring_span(x, lv)
+                            };
+                            if let Some(v) = self.solve_bijective_eq(left, right, &is_var) {
+                                self.assign_value(lv, &v);
+                                break;
+                            }
+                        }
                     }
                 }
                 ExprKind::Inside {
@@ -1882,6 +1969,48 @@ impl Simulator {
         false
     }
 
+    /// Match an element reference with an optional constant offset:
+    /// `arr[idx]` -> Some(0), `arr[idx] + C` / `C + arr[idx]` -> Some(C),
+    /// `arr[idx] - C` -> Some(-C).
+    pub(super) fn inline_foreach_affine_ref(
+        &mut self,
+        e: &Expression,
+        arr: &str,
+        idx: i64,
+    ) -> Option<i64> {
+        let e = match &e.kind {
+            ExprKind::Paren(inner) => inner.as_ref(),
+            _ => e,
+        };
+        if self.inline_foreach_elem_ref(e, arr, idx) {
+            return Some(0);
+        }
+        if let ExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } = &e.kind
+        {
+            if self.inline_foreach_elem_ref(left, arr, idx) {
+                return self.eval_expr(right).to_i64();
+            }
+            if self.inline_foreach_elem_ref(right, arr, idx) {
+                return self.eval_expr(left).to_i64();
+            }
+        }
+        if let ExprKind::Binary {
+            op: BinaryOp::Sub,
+            left,
+            right,
+        } = &e.kind
+        {
+            if self.inline_foreach_elem_ref(left, arr, idx) {
+                return self.eval_expr(right).to_i64().map(|c| -c);
+            }
+        }
+        None
+    }
+
     /// §18.5.7: solve one inline-`foreach` body item for element `arr[idx]`.
     /// The loop index variable is already bound in the top local_stack frame,
     /// so index expressions (`i`, `i+1`) and value expressions (`i + 5`)
@@ -1931,8 +2060,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: crate::ast::Span::dummy(),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 crate::ast::Span::dummy(),
             );
@@ -2115,9 +2245,9 @@ impl Simulator {
             &mut excl,
         );
         // Phase 2: equality / inside / dist pins.
-        let pinned = self.apply_inline_foreach_pins(item, arr, idx, w);
+        let _ = self.apply_inline_foreach_pins(item, arr, idx, w);
         // Phase 3: repair against the accumulated interval / exclusions.
-        if pinned || !(any_rel || !excl.is_empty()) || lo > hi {
+        if lo > hi {
             return;
         }
         let cur = self
@@ -2160,51 +2290,135 @@ impl Simulator {
         match item {
             CI::Expr(e) => {
                 if let ExprKind::Binary { op, left, right } = &e.kind {
-                    if !matches!(
+                    if matches!(
                         op,
                         BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq | BinaryOp::Neq
                     ) {
-                        return;
+                        let off_l = self.inline_foreach_affine_ref(left, arr, idx);
+                        let off_r = self.inline_foreach_affine_ref(right, arr, idx);
+                        if off_l.is_some() && off_r.is_none() {
+                            let off = off_l.unwrap();
+                            let b = self
+                                .eval_expr(right)
+                                .to_i64()
+                                .unwrap_or(0)
+                                .saturating_sub(off);
+                            match op {
+                                BinaryOp::Lt => {
+                                    *hi = (*hi).min(b.saturating_sub(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Leq => {
+                                    *hi = (*hi).min(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Gt => {
+                                    *lo = (*lo).max(b.saturating_add(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Geq => {
+                                    *lo = (*lo).max(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Neq => excl.push(b),
+                                _ => {}
+                            }
+                        } else if off_r.is_some() && off_l.is_none() {
+                            let off = off_r.unwrap();
+                            let b = self
+                                .eval_expr(left)
+                                .to_i64()
+                                .unwrap_or(0)
+                                .saturating_sub(off);
+                            match op {
+                                BinaryOp::Lt => {
+                                    *lo = (*lo).max(b.saturating_add(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Leq => {
+                                    *lo = (*lo).max(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Gt => {
+                                    *hi = (*hi).min(b.saturating_sub(1));
+                                    *any = true;
+                                }
+                                BinaryOp::Geq => {
+                                    *hi = (*hi).min(b);
+                                    *any = true;
+                                }
+                                BinaryOp::Neq => excl.push(b),
+                                _ => {}
+                            }
+                        }
                     }
-                    let on_l = self.inline_foreach_elem_ref(left, arr, idx);
-                    let on_r = self.inline_foreach_elem_ref(right, arr, idx);
-                    if on_l == on_r {
-                        return;
+                }
+                if let ExprKind::Inside {
+                    expr: inner,
+                    ranges,
+                } = &e.kind
+                {
+                    if let Some(off) = self.inline_foreach_affine_ref(inner, arr, idx) {
+                        let mut in_lo = i64::MAX;
+                        let mut in_hi = i64::MIN;
+                        for r in ranges {
+                            match &r.kind {
+                                ExprKind::Range(lo_e, hi_e) => {
+                                    if let (Some(l), Some(h)) = (
+                                        self.eval_expr(lo_e).to_i64(),
+                                        self.eval_expr(hi_e).to_i64(),
+                                    ) {
+                                        in_lo = in_lo.min(l.saturating_sub(off));
+                                        in_hi = in_hi.max(h.saturating_sub(off));
+                                    }
+                                }
+                                _ => {
+                                    if let Some(v) = self.eval_expr(r).to_i64() {
+                                        in_lo = in_lo.min(v.saturating_sub(off));
+                                        in_hi = in_hi.max(v.saturating_sub(off));
+                                    }
+                                }
+                            }
+                        }
+                        if in_lo <= in_hi {
+                            *lo = (*lo).max(in_lo);
+                            *hi = (*hi).min(in_hi);
+                            *any = true;
+                        }
                     }
-                    // Normalize to `arr[i] OP bound` (mirror the op when the
-                    // element sits on the right: `5 < arr[i]` ≡ `arr[i] > 5`).
-                    let (bound_side, eff) = if on_l {
-                        (right, *op)
-                    } else {
-                        let m = match op {
-                            BinaryOp::Lt => BinaryOp::Gt,
-                            BinaryOp::Gt => BinaryOp::Lt,
-                            BinaryOp::Leq => BinaryOp::Geq,
-                            BinaryOp::Geq => BinaryOp::Leq,
-                            other => *other,
-                        };
-                        (left, m)
-                    };
-                    let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
-                    match eff {
-                        BinaryOp::Lt => {
-                            *hi = (*hi).min(b.saturating_sub(1));
-                            *any = true;
+                }
+            }
+            CI::Inside {
+                expr,
+                range,
+                is_dist: false,
+                ..
+            } => {
+                if let Some(off) = self.inline_foreach_affine_ref(expr, arr, idx) {
+                    let mut in_lo = i64::MAX;
+                    let mut in_hi = i64::MIN;
+                    for r in range {
+                        match r {
+                            ConstraintRange::Range { lo: lo_e, hi: hi_e } => {
+                                if let (Some(l), Some(h)) =
+                                    (self.eval_expr(lo_e).to_i64(), self.eval_expr(hi_e).to_i64())
+                                {
+                                    in_lo = in_lo.min(l.saturating_sub(off));
+                                    in_hi = in_hi.max(h.saturating_sub(off));
+                                }
+                            }
+                            ConstraintRange::Value(v_e) => {
+                                if let Some(v) = self.eval_expr(v_e).to_i64() {
+                                    in_lo = in_lo.min(v.saturating_sub(off));
+                                    in_hi = in_hi.max(v.saturating_sub(off));
+                                }
+                            }
                         }
-                        BinaryOp::Leq => {
-                            *hi = (*hi).min(b);
-                            *any = true;
-                        }
-                        BinaryOp::Gt => {
-                            *lo = (*lo).max(b.saturating_add(1));
-                            *any = true;
-                        }
-                        BinaryOp::Geq => {
-                            *lo = (*lo).max(b);
-                            *any = true;
-                        }
-                        BinaryOp::Neq => excl.push(b),
-                        _ => {}
+                    }
+                    if in_lo <= in_hi {
+                        *lo = (*lo).max(in_lo);
+                        *hi = (*hi).min(in_hi);
+                        *any = true;
                     }
                 }
             }
@@ -2277,6 +2491,19 @@ impl Simulator {
                         let target = self
                             .get_signal_value_by_name(&elem_name)
                             .unwrap_or_else(|| Value::zero(w));
+                        let cr: Vec<_> = ranges
+                            .iter()
+                            .map(|r| match &r.kind {
+                                ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                    lo: (**lo).clone(),
+                                    hi: (**hi).clone(),
+                                },
+                                _ => ConstraintRange::Value(r.clone()),
+                            })
+                            .collect();
+                        if !target.has_xz() && self.value_in_ranges(&target, &cr) {
+                            return false;
+                        }
                         if let Some(v) = self.pick_inside_value(ranges, &target) {
                             self.set_signal_value_by_name(&elem_name, v);
                             return true;
@@ -2294,6 +2521,13 @@ impl Simulator {
                 ..
             } => {
                 if self.inline_foreach_elem_ref(expr, arr, idx) {
+                    if !*is_dist {
+                        if let Some(cv) = self.get_signal_value_by_name(&elem_name) {
+                            if !cv.has_xz() && self.value_in_ranges(&cv, range) {
+                                return false;
+                            }
+                        }
+                    }
                     let picked = if *is_dist && !dist_weights.is_empty() {
                         // Per-element target: no stable key, draw independently.
                         self.pick_dist_value(None, range, dist_weights)
@@ -3125,8 +3359,8 @@ impl Simulator {
                             },
                             selects: Vec::new(),
                         });
-                        fh.cached_signal_id = std::cell::Cell::new(None);
-                        fh.cached_resolved_name = std::cell::OnceCell::new();
+                        fh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        fh.cached_resolved_name = crate::ast::cache::NameCache::new();
                         return Some(self.resolve_hier_name(&fh).into_owned());
                     }
                 }
@@ -3147,8 +3381,9 @@ impl Simulator {
                             })
                             .collect(),
                         span: e.span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     };
                     return Some(self.resolve_hier_name(&fh).into_owned());
                 }
@@ -3207,17 +3442,100 @@ impl Simulator {
         ranges: &[ConstraintRange],
         weights: &[Option<crate::ast::decl::DistWeight>],
     ) -> Option<Value> {
-        use crate::ast::decl::DistWeight;
+        let g = self.resolve_dist_geometry(ranges, weights)?;
+        self.pick_dist_draw(key, &g)
+    }
+
+    /// Memoized twin of `pick_dist_value` for hot foreach fast paths where
+    /// the scalar bounds/weights are loop-invariant. `item_ptr` identifies the
+    /// constraint site; the resolved geometry is cached per solve (cleared at
+    /// the fast-path entry) so re-evaluation + Vec building happen once per
+    /// array rather than once per element. The per-element deal + value draw
+    /// still consume the RNG stream identically to `pick_dist_value`.
+    pub(super) fn pick_dist_value_memoized(
+        &mut self,
+        item_ptr: (usize, usize, usize, usize, usize),
+        key: Option<(usize, String)>,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<Value> {
+        let g = {
+            let memo = self.dist_geometry_memo.borrow();
+            memo.get(&item_ptr).map(Clone::clone)
+        };
+        let g = match g {
+            Some(g) => g,
+            None => {
+                let resolved = self.resolve_dist_geometry(ranges, weights);
+                if let Some(r) = resolved {
+                    self.dist_geometry_memo.borrow_mut().insert(item_ptr, r.clone());
+                    r
+                } else {
+                    return None;
+                }
+            }
+        };
+        self.pick_dist_draw(key, &g)
+    }
+
+    /// Deal and draw one value from a resolved `dist` geometry.
+    fn pick_dist_draw(
+        &mut self,
+        key: Option<(usize, String)>,
+        g: &ResolvedDist,
+    ) -> Option<Value> {
         use rand::Rng;
+        let dealt = match key {
+            Some(k) => self.deal_dist_item(k, &g.masses),
+            None => None,
+        };
+        let idx = match dealt {
+            Some(i) => i,
+            None => {
+                // No stable identity for the target (a foreach element, say)
+                // or weights too fine to schedule: an independent draw.
+                let mut draw = match u64::try_from(g.total) {
+                    Ok(t) => (self.cur_rng().r#gen::<u64>() % t) as u128,
+                    Err(_) => self.cur_rng().gen_range(0..g.total),
+                };
+                let mut pick = g.masses.len() - 1;
+                for (i, m) in g.masses.iter().enumerate() {
+                    if draw < *m {
+                        pick = i;
+                        break;
+                    }
+                    draw -= *m;
+                }
+                pick
+            }
+        };
+        match g.items[idx].0.clone() {
+            DistItem::One(v) => Some(v),
+            DistItem::Span(l, h, bw) => {
+                // §18.5.4: the values inside one item are equiprobable under
+                // both `:=` and `:/`.
+                let v = if h > l {
+                    self.cur_rng().gen_range(l..=h)
+                } else {
+                    l
+                };
+                Some(Value::from_u64(v as u64, bw))
+            }
+        }
+    }
+
+    /// Resolve a `dist`'s items + masses once (the scalar bounds/weights are
+    /// re-evaluated by `pick_dist_value` on every call); callers in hot
+    /// foreach loops memoize the `ResolvedDist` so the re-evaluation and Vec
+    /// building happen once per solve rather than once per element.
+    pub(super) fn resolve_dist_geometry(
+        &mut self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Option<ResolvedDist> {
+        use crate::ast::decl::DistWeight;
         // Fixed-point scaler: keeps `Total(w)` masses exact for small w.
         const SCALER: u128 = 1024;
-
-        #[derive(Clone)]
-        enum DistItem {
-            One(Value),
-            /// lo, hi, width
-            Span(i64, i64, u32),
-        }
         let mut items: Vec<(DistItem, u128)> = Vec::new();
         for (i, r) in ranges.iter().enumerate() {
             let w_kind = weights.get(i).and_then(|w| w.as_ref());
@@ -3260,53 +3578,35 @@ impl Simulator {
         }
         let masses: Vec<u128> = items.iter().map(|(_, m)| *m).collect();
         let total: u128 = masses.iter().fold(0u128, |a, m| a.saturating_add(*m));
-        // Every weight is 0 — the constraint admits no value; keep the first
-        // item so the caller still makes progress.
+        // §18.5.4: an item of weight 0 is not in the set, so when every
+        // weight is 0 the dist admits no value and nothing is picked.
         if total == 0 {
-            return Some(match &items[0].0 {
-                DistItem::One(v) => v.clone(),
-                DistItem::Span(l, _, bw) => Value::from_u64(*l as u64, *bw),
-            });
+            return None;
         }
+        Some(ResolvedDist { items, masses, total })
+    }
 
-        let dealt = match key {
-            Some(k) => self.deal_dist_item(k, &masses),
-            None => None,
-        };
-        let idx = match dealt {
-            Some(i) => i,
-            None => {
-                // No stable identity for the target (a foreach element, say)
-                // or weights too fine to schedule: an independent draw.
-                let mut draw = match u64::try_from(total) {
-                    Ok(t) => (self.cur_rng().r#gen::<u64>() % t) as u128,
-                    Err(_) => self.cur_rng().gen_range(0..total),
-                };
-                let mut pick = masses.len() - 1;
-                for (i, m) in masses.iter().enumerate() {
-                    if draw < *m {
-                        pick = i;
-                        break;
-                    }
-                    draw -= *m;
+    /// §18.5.4: the items of a `dist` whose weight is not 0, the values it
+    /// admits. Weights are read as `pick_dist_value` reads them.
+    pub(super) fn dist_weighted_ranges(
+        &mut self,
+        ranges: &[ConstraintRange],
+        weights: &[Option<crate::ast::decl::DistWeight>],
+    ) -> Vec<ConstraintRange> {
+        use crate::ast::decl::DistWeight;
+        let mut kept = Vec::with_capacity(ranges.len());
+        for (i, r) in ranges.iter().enumerate() {
+            let w = match weights.get(i).and_then(|w| w.as_ref()) {
+                Some(DistWeight::Each(e)) | Some(DistWeight::Total(e)) => {
+                    self.eval_expr(e).to_u64().unwrap_or(1)
                 }
-                pick
-            }
-        };
-
-        match items[idx].0.clone() {
-            DistItem::One(v) => Some(v),
-            DistItem::Span(l, h, bw) => {
-                // §18.5.4: the values inside one item are equiprobable under
-                // both `:=` and `:/`.
-                let v = if h > l {
-                    self.cur_rng().gen_range(l..=h)
-                } else {
-                    l
-                };
-                Some(Value::from_u64(v as u64, bw))
+                None => 1,
+            };
+            if w != 0 {
+                kept.push(r.clone());
             }
         }
+        kept
     }
 
     /// §18.5.4/§18.10 — deal the next dist ITEM index for `key` from its
@@ -3335,7 +3635,16 @@ impl Simulator {
             .and_then(|ds| ds.iter().find(|d| d.0 == sig))
             .is_some_and(|(_, deck, pos)| *pos < deck.len());
         if !live {
-            let deck = self.build_dist_deck(masses)?;
+            let mut deck = self.build_dist_deck(masses)?;
+            // The schedule opens on its heaviest item: start it at a random
+            // phase, so each deal has its item's probability, including an
+            // object's first. A testbench that randomizes a fresh object per
+            // call drew a 9:1 dist's light item never.
+            if deck.len() > 1 {
+                use rand::Rng;
+                let phase = self.cur_rng().gen_range(0..deck.len());
+                deck.rotate_left(phase);
+            }
             let decks = self.dist_decks.entry(key.clone()).or_default();
             decks.retain(|d| d.0 != sig);
             if decks.len() >= MAX_DECKS {
@@ -3435,7 +3744,7 @@ impl Simulator {
                     _ => ConstraintRange::Value(r.clone()),
                 })
                 .collect();
-            let (choices, ws) = self.cons_ranges_i128_ws(&cr, target.width);
+            let (choices, ws) = self.cons_ranges_i128_typed(&cr, target.width, target.is_signed);
             if ws.is_some() {
                 let choices =
                     Self::fit_cons_ranges_for_target(choices, ws, target.width, target.is_signed);
@@ -3637,10 +3946,16 @@ impl Simulator {
                     .strip_prefix(self.module.name.as_str())
                     .and_then(|rest| rest.strip_prefix('.'))
                     .unwrap_or(s);
-                self.module
-                    .instances
-                    .iter()
-                    .find(|i| i.path == rel || i.path == *s)
+                // §3.2, §3.14.2.1: time units belong to design elements; a
+                // generate block is not one. An instance may share the top
+                // module's name, so the unstripped path is tried as well.
+                let instance = |scope| {
+                    self.scopes_to_instance(scope)
+                        .last()
+                        .and_then(|p| self.instance_by_path(p))
+                };
+                instance(rel)
+                    .or_else(|| instance(s))
                     .map(|i| i.def_name.as_str())
                     .unwrap_or(self.module.name.as_str())
             }

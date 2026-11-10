@@ -196,6 +196,11 @@ fn design_cache_key(
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
     // §6.21: the accepted initializer's lifetime changes elaboration.
     hash.bytes(&[xezim_core::elaborate::relax_implicit_static() as u8]);
+    // An opt-in parser relaxation or keyword set accepts other source.
+    for f in sv_parser::relax_flags() {
+        hash.bytes(&[f.get() as u8]);
+    }
+    hash.bytes(&[sv_parser::lexer::scanner::default_keywords_key()]);
 
     // Invalidate after a local rebuild even when the package version did not
     // change, since the executable may contain elaboration fixes.
@@ -583,8 +588,9 @@ fn make_bare_ident(name: &str, span: ast::Span) -> ast::expr::Expression {
                 selects: Vec::new(),
             }],
             span,
-            cached_signal_id: std::cell::Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         span,
     )

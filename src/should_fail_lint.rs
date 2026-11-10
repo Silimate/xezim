@@ -12,6 +12,7 @@
 //! and the whole pass is validated to hold the static-suite baseline (1005).
 
 use xezim_core::SourceDefinition;
+use xezim_core::Value;
 use xezim_core::ast::decl::{
     ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, ParameterDeclaration,
     ParameterKind, TypedefDeclaration,
@@ -25,6 +26,9 @@ use xezim_core::ast::types::{
 };
 use xezim_core::elaborate::ElaboratedModule;
 
+/// The elaboration's parameter table type (`ElaboratedModule::parameters`).
+type ParamMap = xezim_core::hasher::HashMap<String, Value>;
+
 /// Run the second-pass lint over every top-level definition. Returns a list of
 /// error messages (empty == clean).
 pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
@@ -34,11 +38,22 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     let port_map = build_port_map(defs);
     let pkg_decls = package_decls(defs);
     let pkg_names: HashSet<String> = pkg_decls.values().flatten().cloned().collect();
+    // Built once per run, not per identifier and per module (#872): the last
+    // segments of the parameter keys and the classes every unit sees.
+    let _leaves = ParamLeaves::install(elab);
+    let global = global_classes(defs);
+    let views = InstanceViews::build(elab);
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
             SourceDefinition::Typedef(t) => {
-                check_typedef(t, elab, &Default::default(), &mut errs);
+                // §3.12.1: `$unit` folds in the top's table.
+                let unit = ConstScope {
+                    elab,
+                    top: true,
+                    inst: None,
+                };
+                check_typedef(t, unit, &Default::default(), &mut errs);
                 // Width-identifier check is restricted to TOP-LEVEL typedefs
                 // (no enclosing module scope), where every value parameter is
                 // global and present in `elab.parameters` — so an unresolved
@@ -52,16 +67,25 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     ports: &m.ports,
                     items: &m.items,
                 };
-                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
+                check_unit(
+                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
-                for it in &m.items {
-                    check_module_item(it, elab, &local_types, true, &mut errs);
-                }
+                let scope = ConstScope::of(elab, &m.name.name);
+                check_items_in_scopes(
+                    &m.name.name,
+                    &m.items,
+                    scope,
+                    &views,
+                    &local_types,
+                    &mut errs,
+                );
                 check_proc_net_assign(&m.ports, &m.items, &mut errs);
-                check_dynarray_assign(&m.items, elab, &mut errs);
-                check_stream_widths(&m.items, elab, &mut errs);
+                check_monitor_automatic(&m.items, &mut errs);
+                check_unpacked_pattern_counts(&m.items, &mut errs);
+                check_stream_widths(&m.items, scope, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
@@ -73,15 +97,25 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     ports: &m.ports,
                     items: &m.items,
                 };
-                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
+                check_unit(
+                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
-                for it in &m.items {
-                    check_module_item(it, elab, &local_types, true, &mut errs);
-                }
-                check_stream_widths(&m.items, elab, &mut errs);
+                let scope = ConstScope::of(elab, &m.name.name);
+                check_items_in_scopes(
+                    &m.name.name,
+                    &m.items,
+                    scope,
+                    &views,
+                    &local_types,
+                    &mut errs,
+                );
+                check_stream_widths(&m.items, scope, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
+                check_monitor_automatic(&m.items, &mut errs);
+                check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
@@ -92,26 +126,44 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     ports: &m.ports,
                     items: &m.items,
                 };
-                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
+                check_unit(
+                    &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
+                );
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
-                for it in &m.items {
-                    check_module_item(it, elab, &local_types, true, &mut errs);
-                }
-                check_stream_widths(&m.items, elab, &mut errs);
+                let scope = ConstScope::of(elab, &m.name.name);
+                check_items_in_scopes(
+                    &m.name.name,
+                    &m.items,
+                    scope,
+                    &views,
+                    &local_types,
+                    &mut errs,
+                );
+                check_stream_widths(&m.items, scope, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_program_items(&m.items, &mut errs);
+                check_monitor_automatic(&m.items, &mut errs);
+                check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
             SourceDefinition::Package(p) => {
                 use xezim_core::ast::decl::PackageItem;
+                // A package's own bare names are not resolved here.
+                let scope = ConstScope {
+                    elab,
+                    top: false,
+                    inst: None,
+                };
                 for it in &p.items {
                     match it {
                         PackageItem::Class(c) => check_class(c, &mut errs),
-                        PackageItem::Data(d) => check_enum_type(&d.data_type, elab, &mut errs),
-                        PackageItem::Typedef(td) => check_enum_type(&td.data_type, elab, &mut errs),
+                        PackageItem::Data(d) => check_enum_type(&d.data_type, scope, &mut errs),
+                        PackageItem::Typedef(td) => {
+                            check_enum_type(&td.data_type, scope, &mut errs)
+                        }
                         _ => {}
                     }
                 }
@@ -120,6 +172,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
             SourceDefinition::Udp(_) => {}
         }
     }
+    check_class_and_package_undeclared(defs, elab, &pkg_names, &mut errs);
+    check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
         errs.extend(crate::type_lint::check(defs, elab));
@@ -140,15 +194,16 @@ struct Unit<'a> {
 /// The declaration and reference checks shared by modules, interfaces and
 /// programs. Checks that resolve names against the elaborated design run on
 /// the top unit only, whose names the elaboration holds.
-fn check_unit(
-    u: &Unit,
+fn check_unit<'a>(
+    u: &Unit<'a>,
     defs: &[&SourceDefinition],
     elab: &ElaboratedModule,
+    global: &HashMap<&'a str, &'a ClassDeclaration>,
     pkg_decls: &HashMap<String, HashSet<String>>,
     pkg_names: &HashSet<String>,
     errs: &mut Vec<String>,
 ) {
-    let is_top = u.name == elab.name;
+    let is_top = ConstScope::of(elab, u.name).top;
     check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
     check_pattern_counts(defs, u.items, elab, is_top, errs);
     check_foreach_dims(u.items, errs);
@@ -158,7 +213,7 @@ fn check_unit(
     check_system_task_values(u.items, errs);
     check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
     check_imported_hier_refs(defs, u.items, pkg_decls, errs);
-    let classes = visible_classes(defs, u.items);
+    let classes = visible_classes(global, u.items);
     check_inherited_local_access(&classes, u.items, errs);
     check_unspecialized_class_scope(&classes, u.items, errs);
     check_udp_instance_delays(defs, u.items, errs);
@@ -170,6 +225,42 @@ fn check_unit(
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
 }
 
+/// The per-item value checks of a definition, in every scope its constants
+/// fold in: the top's own table, or the table of each instance of any other
+/// definition (#893) — a child's constants are checked for every instance,
+/// since an override may make one instance illegal. The same message from
+/// several instances is reported once. A definition nothing instantiates
+/// keeps the definition-only fold (`ConstScope::of`).
+fn check_items_in_scopes(
+    name: &str,
+    items: &[ModuleItem],
+    scope: ConstScope,
+    views: &InstanceViews,
+    local_types: &std::collections::HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    let views = if scope.top { &[][..] } else { views.of(name) };
+    if views.is_empty() {
+        for it in items {
+            check_module_item(it, scope, local_types, true, errs);
+        }
+        return;
+    }
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut found = Vec::new();
+    for view in views {
+        let scope = ConstScope::instance(scope.elab, view);
+        for it in items {
+            check_module_item(it, scope, local_types, true, &mut found);
+        }
+        for e in found.drain(..) {
+            if seen.insert(e.clone()) {
+                errs.push(e);
+            }
+        }
+    }
+}
+
 /// Classes can appear nested inside module/interface/program bodies.
 ///
 /// `live` is false inside a generate branch that is not (provably) the one
@@ -177,26 +268,26 @@ fn check_unit(
 /// since §27.5 never elaborates an unselected branch.
 fn check_module_item(
     item: &ModuleItem,
-    elab: &ElaboratedModule,
+    scope: ConstScope,
     local_types: &std::collections::HashSet<String>,
     live: bool,
     errs: &mut Vec<String>,
 ) {
     match item {
         ModuleItem::ClassDeclaration(c) => check_class(c, errs),
-        ModuleItem::TypedefDeclaration(t) => check_typedef(t, elab, local_types, errs),
+        ModuleItem::TypedefDeclaration(t) => check_typedef(t, scope, local_types, errs),
         ModuleItem::DataDeclaration(d) => {
-            check_enum_type(&d.data_type, elab, errs);
-            check_packed_dims(&d.data_type, elab, errs);
+            check_enum_type(&d.data_type, scope, errs);
+            check_packed_dims(&d.data_type, scope.elab, errs);
             for decl in &d.declarators {
-                check_array_flat_init(decl, elab, errs);
-                check_unpacked_dims(&decl.name.name, &decl.dimensions, elab, errs);
+                check_array_flat_init(decl, scope, errs);
+                check_unpacked_dims(&decl.name.name, &decl.dimensions, scope, errs);
                 check_new_array_target(&d.data_type, decl, errs);
             }
         }
         ModuleItem::NetDeclaration(d) => {
-            check_enum_type(&d.data_type, elab, errs);
-            check_packed_dims(&d.data_type, elab, errs);
+            check_enum_type(&d.data_type, scope, errs);
+            check_packed_dims(&d.data_type, scope.elab, errs);
             // §7.4: a net array has fixed-size dimensions only.
             for decl in &d.declarators {
                 let kind = decl.dimensions.iter().find_map(|dim| match dim {
@@ -220,20 +311,20 @@ fn check_module_item(
         }
         ModuleItem::AlwaysConstruct(a) => {
             if live {
-                for_each_stmt_expr(&a.stmt, &mut |e| check_zero_slice(e, elab, errs));
+                for_each_stmt_expr(&a.stmt, &mut |e| check_zero_slice(e, scope, errs));
             }
-            check_always_has_timing_control(a, elab, errs);
+            check_always_has_timing_control(a, scope.elab, errs);
         }
         ModuleItem::InitialConstruct(i) => {
             if live {
-                for_each_stmt_expr(&i.stmt, &mut |e| check_zero_slice(e, elab, errs));
+                for_each_stmt_expr(&i.stmt, &mut |e| check_zero_slice(e, scope, errs));
             }
         }
         ModuleItem::ContinuousAssign(ca) => {
             if live {
                 for (l, r) in &ca.assignments {
-                    for_each_expr(l, &mut |e| check_zero_slice(e, elab, errs));
-                    for_each_expr(r, &mut |e| check_zero_slice(e, elab, errs));
+                    for_each_expr(l, &mut |e| check_zero_slice(e, scope, errs));
+                    for_each_expr(r, &mut |e| check_zero_slice(e, scope, errs));
                 }
             }
         }
@@ -244,7 +335,7 @@ fn check_module_item(
         // the library resolver's).
         ModuleItem::GenerateRegion(gr) => {
             for it in &gr.items {
-                check_module_item(it, elab, local_types, live, errs);
+                check_module_item(it, scope, local_types, live, errs);
             }
         }
         ModuleItem::GenerateIf(gi) => {
@@ -256,13 +347,7 @@ fn check_module_item(
                 let this_live = match c {
                     _ if !decided || taken => false,
                     None => true,
-                    Some(c) => match (
-                        width_is_confident(c, elab),
-                        xezim_core::elaborate::const_eval_i64_with_params(
-                            c,
-                            Some(&elab.parameters),
-                        ),
-                    ) {
+                    Some(c) => match (width_is_confident(c, scope), scope.value(c)) {
                         (true, Some(v)) => v != 0,
                         _ => {
                             decided = false;
@@ -272,19 +357,19 @@ fn check_module_item(
                 };
                 taken |= this_live;
                 for it in items {
-                    check_module_item(it, elab, local_types, this_live, errs);
+                    check_module_item(it, scope, local_types, this_live, errs);
                 }
             }
         }
         ModuleItem::GenerateFor(gf) => {
             for it in &gf.items {
-                check_module_item(it, elab, local_types, live, errs);
+                check_module_item(it, scope, local_types, live, errs);
             }
         }
         ModuleItem::GenerateCase(gc) => {
             for arm in &gc.arms {
                 for it in &arm.items {
-                    check_module_item(it, elab, local_types, false, errs);
+                    check_module_item(it, scope, local_types, false, errs);
                 }
             }
         }
@@ -333,23 +418,19 @@ fn check_gate_terminals(g: &xezim_core::ast::decl::GateInstantiation, errs: &mut
 /// only single-dimension arrays with an all-ordered, all-scalar pattern whose
 /// element count differs from the (constant-folded) array size are flagged —
 /// nested patterns, default/replication, and non-const sizes are skipped.
-fn check_array_flat_init(d: &VarDeclarator, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+fn check_array_flat_init(d: &VarDeclarator, scope: ConstScope, errs: &mut Vec<String>) {
     if d.dimensions.len() != 1 {
         return;
     }
     let UnpackedDimension::Range { left, right, .. } = &d.dimensions[0] else {
         return;
     };
-    let p = Some(&elab.parameters);
-    let (Some(l), Some(r)) = (
-        xezim_core::elaborate::const_eval_i64_with_params(left, p),
-        xezim_core::elaborate::const_eval_i64_with_params(right, p),
-    ) else {
+    let (Some(l), Some(r)) = (scope.value(left), scope.value(right)) else {
         return;
     };
     let n = (l - r).abs() + 1;
     let Some(init) = &d.init else { return };
-    let ExprKind::AssignmentPattern(items) = &init.kind else {
+    let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
         return;
     };
     let mut m: i64 = 0;
@@ -359,7 +440,9 @@ fn check_array_flat_init(d: &VarDeclarator, elab: &ElaboratedModule, errs: &mut 
                 // a nested pattern/replication is a proper per-entry init, not flat
                 if matches!(
                     e.kind,
-                    ExprKind::AssignmentPattern(_) | ExprKind::Replication { .. }
+                    ExprKind::AssignmentPattern(_)
+                        | ExprKind::TypedPattern { .. }
+                        | ExprKind::Replication { .. }
                 ) {
                     return;
                 }
@@ -452,56 +535,6 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
     }
 }
 
-/// A definitely-scalar RHS: an integer literal or a scalar operator expression
-/// (arithmetic / shift / bitwise / comparison / reduction). Excludes idents,
-/// assignment patterns, concatenations and calls — the shapes that legally
-/// produce an aggregate — so only an unambiguous scalar fires the array check.
-fn is_scalar_rhs(e: &Expression) -> bool {
-    match &e.kind {
-        ExprKind::Number(_) => true,
-        ExprKind::Binary { .. } | ExprKind::Unary { .. } => true,
-        ExprKind::Paren(inner) => is_scalar_rhs(inner),
-        _ => false,
-    }
-}
-
-/// §6.24 / §10.7: a scalar value cannot be implicitly assigned to an unpacked
-/// (dynamic / queue) array target — it needs an assignment pattern or a cast.
-/// Narrow: only a whole dynamic-array LHS with a clearly-scalar RHS fires.
-fn check_dynarray_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
-    if elab.dynamic_arrays.is_empty() {
-        return;
-    }
-    fn flag(lv: &Expression, rv: &Expression, elab: &ElaboratedModule, errs: &mut Vec<String>) {
-        if matches!(lv.kind, ExprKind::Ident(_)) {
-            if let Some(b) = base_ident(lv) {
-                if elab.dynamic_arrays.contains(&b) && is_scalar_rhs(rv) {
-                    errs.push(format!(
-                        "scalar expression cannot be implicitly cast to unpacked-array \
-                         variable '{}' (LRM 1800-2017 §10.7)",
-                        b
-                    ));
-                }
-            }
-        }
-    }
-    for it in items {
-        let stmt = match it {
-            ModuleItem::AlwaysConstruct(a) => &a.stmt,
-            ModuleItem::InitialConstruct(i) => &i.stmt,
-            _ => continue,
-        };
-        for_each_assign_pair(stmt, &mut |lv, rv| flag(lv, rv, elab, errs));
-    }
-    for it in items {
-        if let ModuleItem::ContinuousAssign(ca) = it {
-            for (l, r) in &ca.assignments {
-                flag(l, r, elab, errs);
-            }
-        }
-    }
-}
-
 /// Call `f(lvalue, rvalue)` for each procedural blocking/nonblocking assignment.
 fn for_each_assign_pair(stmt: &Statement, f: &mut dyn FnMut(&Expression, &Expression)) {
     match &stmt.kind {
@@ -587,6 +620,256 @@ fn for_each_proc_assign_lhs(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
     }
 }
 
+thread_local! {
+    /// The last segments (after `.` and after `::`) of every parameter key of
+    /// the design being linted, built once per `lint_should_fail` run. An
+    /// instance's parameter is keyed `inst.NAME` and a package one
+    /// `pkg::NAME`, and splitting every key for every width identifier cost
+    /// identifiers x instances (#872).
+    static PARAM_LEAVES: std::cell::RefCell<Option<(usize, HashSet<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs `PARAM_LEAVES` for one lint run and removes it when dropped.
+struct ParamLeaves;
+
+impl ParamLeaves {
+    fn install(elab: &ElaboratedModule) -> Self {
+        let mut leaves = HashSet::default();
+        for k in elab.parameters.keys() {
+            for leaf in [k.rsplit('.').next(), k.rsplit("::").next()]
+                .into_iter()
+                .flatten()
+            {
+                if !leaves.contains(leaf) {
+                    leaves.insert(leaf.to_string());
+                }
+            }
+        }
+        PARAM_LEAVES.with(|c| *c.borrow_mut() = Some((elab as *const _ as usize, leaves)));
+        ParamLeaves
+    }
+
+    /// Whether some parameter key of `elab` ends in `leaf`.
+    fn contains(elab: &ElaboratedModule, leaf: &str) -> bool {
+        PARAM_LEAVES.with(|c| match c.borrow().as_ref() {
+            Some((id, leaves)) if *id == elab as *const _ as usize => leaves.contains(leaf),
+            _ => elab
+                .parameters
+                .keys()
+                .any(|k| k.rsplit('.').next() == Some(leaf) || k.rsplit("::").next() == Some(leaf)),
+        })
+    }
+}
+
+impl Drop for ParamLeaves {
+    fn drop(&mut self) {
+        PARAM_LEAVES.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Folds a value check's constants in one definition (§23.9).
+///
+/// The top folds against `elab.parameters`. Another definition folds against
+/// the parameters of ONE of its instances (`inst`, see [`InstanceViews`]):
+/// the elaboration registers a child's constants under the instance path
+/// (`u.N`), so a bare name in the definition is read from that table (#893).
+/// Without an instance only literals and `pkg::N` (§26.3) fold; a bare name
+/// there may be its own.
+#[derive(Clone, Copy)]
+struct ConstScope<'a> {
+    elab: &'a ElaboratedModule,
+    top: bool,
+    inst: Option<&'a ParamMap>,
+}
+
+/// The parameters of every instance of each non-top definition, keyed by the
+/// definition's name, each with the instance path stripped from its keys
+/// (`u.v.N` of instance `u.v` is `N`) and joined by the package and class
+/// constants (`pkg::N`), which every scope reads by that spelling (§26.3).
+/// A bare top-level key is NOT part of a child's view: the child's own `N`
+/// is registered as `u.N`, and a `$unit` or top-module `N` it could see is
+/// told apart from nothing by the flat table.
+struct InstanceViews {
+    by_def: HashMap<String, Vec<ParamMap>>,
+}
+
+impl InstanceViews {
+    fn build(elab: &ElaboratedModule) -> Self {
+        let mut by_def: HashMap<String, Vec<ParamMap>> = HashMap::default();
+        if elab.instances.is_empty() {
+            return InstanceViews { by_def };
+        }
+        // Instance path -> (definition, index of its view in `by_def`).
+        let mut slots: HashMap<&str, (&str, usize)> = HashMap::default();
+        for inst in &elab.instances {
+            let views = by_def.entry(inst.def_name.clone()).or_default();
+            views.push(ParamMap::default());
+            slots.insert(
+                inst.path.as_str(),
+                (inst.def_name.as_str(), views.len() - 1),
+            );
+        }
+        let mut scoped: Vec<(&String, &Value)> = Vec::new();
+        for (key, value) in &elab.parameters {
+            if key.contains("::") {
+                scoped.push((key, value));
+                continue;
+            }
+            // The longest instance path the key starts with owns it.
+            let mut pos = key.len();
+            while let Some(dot) = key[..pos].rfind('.') {
+                if let Some(&(def, idx)) = slots.get(&key[..dot]) {
+                    by_def.get_mut(def).expect("views of a definition")[idx]
+                        .insert(key[dot + 1..].to_string(), value.clone());
+                    break;
+                }
+                pos = dot;
+            }
+        }
+        if !scoped.is_empty() {
+            for views in by_def.values_mut() {
+                for view in views.iter_mut() {
+                    for (key, value) in &scoped {
+                        view.insert((*key).clone(), (*value).clone());
+                    }
+                }
+            }
+        }
+        InstanceViews { by_def }
+    }
+
+    /// The views of the instances of `def`, empty when it is not instantiated.
+    fn of(&self, def: &str) -> &[ParamMap] {
+        self.by_def.get(def).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// A fold in a `ConstScope`.
+enum Folded {
+    Value(i64),
+    /// Reads a name whose value this definition does not know.
+    Hidden,
+    /// Not a constant expression (§11.2.1).
+    NotConstant,
+}
+
+impl<'a> ConstScope<'a> {
+    /// The scope of the module, interface or program `name`.
+    fn of(elab: &'a ElaboratedModule, name: &str) -> Self {
+        ConstScope {
+            elab,
+            top: name == elab.name,
+            inst: None,
+        }
+    }
+
+    /// The scope of one instance of a non-top definition (#893).
+    fn instance(elab: &'a ElaboratedModule, view: &'a ParamMap) -> Self {
+        ConstScope {
+            elab,
+            top: false,
+            inst: Some(view),
+        }
+    }
+
+    /// The table a constant of this scope folds against.
+    fn params(&self) -> &'a ParamMap {
+        match self.inst {
+            Some(view) if !self.top => view,
+            _ => &self.elab.parameters,
+        }
+    }
+
+    /// The parameter `name` of this scope, when the scope knows it.
+    fn param(&self, name: &str) -> Option<&'a Value> {
+        if self.top || self.inst.is_some() {
+            self.params().get(name)
+        } else {
+            None
+        }
+    }
+
+    fn fold(&self, e: &Expression) -> Folded {
+        if !self.top {
+            let known = match self.inst {
+                Some(_) => width_is_confident(e, *self),
+                None => self.reads_only_package_constants(e),
+            };
+            if !known {
+                return Folded::Hidden;
+            }
+        }
+        match xezim_core::elaborate::const_eval_i64_with_params(e, Some(self.params())) {
+            Some(v) => Folded::Value(v),
+            None => Folded::NotConstant,
+        }
+    }
+
+    fn value(&self, e: &Expression) -> Option<i64> {
+        match self.fold(e) {
+            Folded::Value(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The width of `dt`, 0 when it is not known here.
+    fn type_width(&self, dt: &DataType) -> u32 {
+        let bound_known = |e: &Expression| match self.inst {
+            Some(_) => width_is_confident(e, *self),
+            None => self.reads_only_package_constants(e),
+        };
+        let known = self.top
+            || match dt {
+                DataType::IntegerAtom { .. } => true,
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. } => dimensions.iter().all(|d| {
+                    matches!(d, PackedDimension::Range { left, right, .. }
+                            if bound_known(left) && bound_known(right))
+                }),
+                _ => false,
+            };
+        if !known {
+            return 0;
+        }
+        xezim_core::elaborate::resolve_type_width(
+            dt,
+            Some(self.params()),
+            Some(&self.elab.typedefs),
+        )
+    }
+
+    /// Whether `e` reads no name but a package constant.
+    fn reads_only_package_constants(&self, e: &Expression) -> bool {
+        let only = |x: &Expression| self.reads_only_package_constants(x);
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            // `pkg::N` names one constant wherever it is read (§26.3). It
+            // parses as a member of the package name.
+            ExprKind::MemberAccess { expr: base, .. } => {
+                let ExprKind::Ident(h) = &base.kind else {
+                    return false;
+                };
+                let [pkg] = h.path.as_slice() else {
+                    return false;
+                };
+                h.root.is_none()
+                    && pkg.selects.is_empty()
+                    && self.elab.packages.contains(&pkg.name.name)
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => only(x),
+            ExprKind::Binary { left, right, .. } => only(left) && only(right),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => only(condition) && only(then_expr) && only(else_expr),
+            ExprKind::SystemCall { args, .. } => args.iter().all(only),
+            _ => false,
+        }
+    }
+}
+
 /// §11.5.1: the width of an indexed part-select (`[base +: w]` / `[base -: w]`)
 /// must be a positive constant — a width that constant-folds to 0 is illegal.
 /// Is this width expression one we can const-fold with CONFIDENCE?
@@ -601,24 +884,28 @@ fn for_each_proc_assign_lhs(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
 /// per-instance, e.g. `u.Cfg`). Only literals and references that genuinely
 /// resolve are trusted; anything else leaves the select alone, which is the
 /// right bias for a lint that produces a hard error.
-fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
+///
+/// In an instance scope (#893) a name is trusted only when that instance's
+/// own table holds it: the leaf fallbacks of the flat table would read
+/// another instance's parameter of the same name.
+fn width_is_confident(e: &Expression, scope: ConstScope) -> bool {
     match &e.kind {
         ExprKind::Number(_) => true,
-        ExprKind::Paren(i) => width_is_confident(i, elab),
-        ExprKind::Unary { operand, .. } => width_is_confident(operand, elab),
+        ExprKind::Paren(i) => width_is_confident(i, scope),
+        ExprKind::Unary { operand, .. } => width_is_confident(operand, scope),
         ExprKind::Binary { left, right, .. } => {
-            width_is_confident(left, elab) && width_is_confident(right, elab)
+            width_is_confident(left, scope) && width_is_confident(right, scope)
         }
         ExprKind::Conditional {
             condition,
             then_expr,
             else_expr,
         } => {
-            width_is_confident(condition, elab)
-                && width_is_confident(then_expr, elab)
-                && width_is_confident(else_expr, elab)
+            width_is_confident(condition, scope)
+                && width_is_confident(then_expr, scope)
+                && width_is_confident(else_expr, scope)
         }
-        ExprKind::SystemCall { args, .. } => args.iter().all(|a| width_is_confident(a, elab)),
+        ExprKind::SystemCall { args, .. } => args.iter().all(|a| width_is_confident(a, scope)),
         ExprKind::Ident(h) => {
             let raw = h
                 .path
@@ -627,11 +914,10 @@ fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
                 .collect::<Vec<_>>()
                 .join(".");
             let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            elab.parameters.contains_key(&raw)
-                || elab.parameters.contains_key(leaf)
-                || elab.parameters.keys().any(|k| {
-                    k.rsplit('.').next() == Some(leaf) || k.rsplit("::").next() == Some(leaf)
-                })
+            let params = scope.params();
+            params.contains_key(&raw)
+                || params.contains_key(leaf)
+                || (scope.inst.is_none() && ParamLeaves::contains(scope.elab, leaf))
         }
         // A struct/interface member or an index: only trusted when the exact
         // dotted key was seeded (interface-port parameters do this).
@@ -640,25 +926,21 @@ fn width_is_confident(e: &Expression, elab: &ElaboratedModule) -> bool {
                 return false;
             };
             let b = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            elab.parameters
-                .contains_key(&format!("{b}.{}", member.name))
-                || elab
-                    .parameters
-                    .contains_key(&format!("{b}::{}", member.name))
+            let params = scope.params();
+            params.contains_key(&format!("{b}.{}", member.name))
+                || params.contains_key(&format!("{b}::{}", member.name))
         }
         _ => false,
     }
 }
 
-fn check_zero_slice(e: &Expression, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+fn check_zero_slice(e: &Expression, scope: ConstScope, errs: &mut Vec<String>) {
     if let ExprKind::RangeSelect { kind, right, .. } = &e.kind {
         if matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown) {
-            if !width_is_confident(right, elab) {
+            if !width_is_confident(right, scope) {
                 return;
             }
-            if let Some(0) =
-                xezim_core::elaborate::const_eval_i64_with_params(right, Some(&elab.parameters))
-            {
+            if let Some(0) = scope.value(right) {
                 errs.push("indexed part-select has zero width (LRM 1800-2017 §11.5.1)".to_string());
             }
         }
@@ -841,11 +1123,11 @@ fn for_each_stmt(stmt: &Statement, f: &mut dyn FnMut(&Statement)) {
 ///    queues resize, so they are never an error and are skipped);
 ///  - the source width is taken ONLY when every operand is a plain in-scope
 ///    identifier of known fixed width — any unresolved operand bails the check.
-fn check_stream_widths(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
+fn check_stream_widths(items: &[ModuleItem], scope: ConstScope, errs: &mut Vec<String>) {
     // Raw-AST width scan: suppress clamp warnings (elaboration re-resolves
     // every kept declaration and warns there; dead ones get elided instead).
     let vw =
-        xezim_core::elaborate::with_width_warnings_suppressed(|| build_var_widths(items, elab));
+        xezim_core::elaborate::with_width_warnings_suppressed(|| build_var_widths(items, scope));
     for it in items {
         match it {
             ModuleItem::DataDeclaration(d) => {
@@ -856,16 +1138,16 @@ fn check_stream_widths(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut
                         &decl.init,
                         &decl.name.name,
                         &vw,
-                        elab,
+                        scope,
                         errs,
                     );
                 }
             }
             ModuleItem::AlwaysConstruct(a) => {
-                for_each_stmt(&a.stmt, &mut |s| check_stmt_stream(s, &vw, elab, errs));
+                for_each_stmt(&a.stmt, &mut |s| check_stmt_stream(s, &vw, scope, errs));
             }
             ModuleItem::InitialConstruct(i) => {
-                for_each_stmt(&i.stmt, &mut |s| check_stmt_stream(s, &vw, elab, errs));
+                for_each_stmt(&i.stmt, &mut |s| check_stmt_stream(s, &vw, scope, errs));
             }
             _ => {}
         }
@@ -875,7 +1157,7 @@ fn check_stream_widths(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut
 fn check_stmt_stream(
     s: &Statement,
     vw: &std::collections::HashMap<String, u32>,
-    elab: &ElaboratedModule,
+    scope: ConstScope,
     errs: &mut Vec<String>,
 ) {
     if let StatementKind::VarDecl {
@@ -891,7 +1173,7 @@ fn check_stmt_stream(
                 &decl.init,
                 &decl.name.name,
                 vw,
-                elab,
+                scope,
                 errs,
             );
         }
@@ -904,7 +1186,7 @@ fn check_stream_decl(
     init: &Option<Expression>,
     name: &str,
     vw: &std::collections::HashMap<String, u32>,
-    elab: &ElaboratedModule,
+    scope: ConstScope,
     errs: &mut Vec<String>,
 ) {
     if !dims_empty {
@@ -914,7 +1196,7 @@ fn check_stream_decl(
     let ExprKind::StreamOp { exprs, .. } = &init.kind else {
         return;
     };
-    let Some(target_w) = fixed_int_width(dt, elab) else {
+    let Some(target_w) = fixed_int_width(dt, scope) else {
         return;
     };
     let Some(stream_w) = stream_width(exprs, vw) else {
@@ -931,7 +1213,7 @@ fn check_stream_decl(
 /// Map of in-module scalar identifier -> fixed integral width.
 fn build_var_widths(
     items: &[ModuleItem],
-    elab: &ElaboratedModule,
+    scope: ConstScope,
 ) -> std::collections::HashMap<String, u32> {
     let mut m = std::collections::HashMap::new();
     for it in items {
@@ -939,7 +1221,7 @@ fn build_var_widths(
             ModuleItem::DataDeclaration(d) => {
                 for decl in &d.declarators {
                     if decl.dimensions.is_empty() {
-                        if let Some(w) = fixed_int_width(&d.data_type, elab) {
+                        if let Some(w) = fixed_int_width(&d.data_type, scope) {
                             m.insert(decl.name.name.clone(), w);
                         }
                     }
@@ -948,7 +1230,7 @@ fn build_var_widths(
             ModuleItem::NetDeclaration(d) => {
                 for decl in &d.declarators {
                     if decl.dimensions.is_empty() {
-                        if let Some(w) = fixed_int_width(&d.data_type, elab) {
+                        if let Some(w) = fixed_int_width(&d.data_type, scope) {
                             m.insert(decl.name.name.clone(), w);
                         }
                     }
@@ -961,15 +1243,14 @@ fn build_var_widths(
 }
 
 /// Width of a fixed-size integral data type; None for non-integral or 0-width.
-fn fixed_int_width(dt: &DataType, elab: &ElaboratedModule) -> Option<u32> {
+fn fixed_int_width(dt: &DataType, scope: ConstScope) -> Option<u32> {
     if !matches!(
         dt,
         DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }
     ) {
         return None;
     }
-    let w =
-        xezim_core::elaborate::resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs));
+    let w = scope.type_width(dt);
     if w == 0 { None } else { Some(w) }
 }
 
@@ -1003,19 +1284,19 @@ fn stream_width(exprs: &[Expression], vw: &std::collections::HashMap<String, u32
 /// instance-qualified key (`u_fifo.DW`), so `enum logic [DW-1:0] { A = 96'h0 }`
 /// measured 1 bit and §6.19 REJECTED a perfectly legal design. A lint must not
 /// fire on a width it could not determine.
-fn dim_names_resolve(dt: &DataType, elab: &ElaboratedModule) -> bool {
-    fn expr_known(e: &Expression, elab: &ElaboratedModule) -> bool {
+fn dim_names_resolve(dt: &DataType, scope: ConstScope) -> bool {
+    fn expr_known(e: &Expression, params: &ParamMap) -> bool {
         match &e.kind {
             ExprKind::Number(_) => true,
-            ExprKind::Paren(x) => expr_known(x, elab),
-            ExprKind::Unary { operand, .. } => expr_known(operand, elab),
+            ExprKind::Paren(x) => expr_known(x, params),
+            ExprKind::Unary { operand, .. } => expr_known(operand, params),
             ExprKind::Binary { left, right, .. } => {
-                expr_known(left, elab) && expr_known(right, elab)
+                expr_known(left, params) && expr_known(right, params)
             }
             ExprKind::Ident(h) => h
                 .path
                 .last()
-                .is_some_and(|s| elab.parameters.contains_key(&s.name.name)),
+                .is_some_and(|s| params.contains_key(&s.name.name)),
             // Anything else is not something this lint should judge.
             _ => false,
         }
@@ -1025,9 +1306,10 @@ fn dim_names_resolve(dt: &DataType, elab: &ElaboratedModule) -> bool {
         // A non-vector base carries no dimension to be unsure about.
         _ => return true,
     };
+    let params = scope.params();
     dims.iter().all(|d| match d {
         PackedDimension::Range { left, right, .. } => {
-            expr_known(left, elab) && expr_known(right, elab)
+            expr_known(left, params) && expr_known(right, params)
         }
         _ => false,
     })
@@ -1035,16 +1317,12 @@ fn dim_names_resolve(dt: &DataType, elab: &ElaboratedModule) -> bool {
 
 /// §6.19: in an enum with an explicit base type, a member whose value is a
 /// *sized* literal constant must match the base-type width.
-fn check_enum_type(dt: &DataType, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+fn check_enum_type(dt: &DataType, scope: ConstScope, errs: &mut Vec<String>) {
     let DataType::Enum(et) = dt else { return };
     // Sized-literal-width check requires an explicit base type.
     if let Some(base) = &et.base_type {
-        let w = xezim_core::elaborate::resolve_type_width(
-            base,
-            Some(&elab.parameters),
-            Some(&elab.typedefs),
-        );
-        if w != 0 && dim_names_resolve(base, elab) {
+        let w = scope.type_width(base);
+        if w != 0 && dim_names_resolve(base, scope) {
             for m in &et.members {
                 if let Some(init) = &m.init {
                     if let ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) =
@@ -1062,7 +1340,7 @@ fn check_enum_type(dt: &DataType, elab: &ElaboratedModule, errs: &mut Vec<String
             }
         }
     }
-    check_enum_values(et, elab, errs);
+    check_enum_values(et, scope, errs);
 }
 
 /// True if `dt` (an enum base type) is a SIGNED integral type. `bit`/`logic`/
@@ -1133,7 +1411,7 @@ fn expr_contains_syscall(e: &Expression) -> bool {
 /// the base type's range (explicit or auto-incremented / "inferred overflow"),
 /// two members with the same value, an x/z-valued 2-state member, a
 /// non-constant initializer, and an undefined/negative enum name-sequence bound.
-fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+fn check_enum_values(et: &EnumType, scope: ConstScope, errs: &mut Vec<String>) {
     let base = et.base_type.as_deref();
     // Only reason about built-in integral bases; a typedef/struct/enum base has
     // width/signedness we don't resolve here — skip to avoid false positives.
@@ -1147,18 +1425,10 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
     // Same trap as the sized-literal check above: a base whose width names a
     // parameter this map cannot resolve measures 1 bit, and every member then
     // looks out of range (and every one of them looks equal to every other).
-    if base.is_some_and(|b| !dim_names_resolve(b, elab)) {
+    if base.is_some_and(|b| !dim_names_resolve(b, scope)) {
         return;
     }
-    let width = base
-        .map(|b| {
-            xezim_core::elaborate::resolve_type_width(
-                b,
-                Some(&elab.parameters),
-                Some(&elab.typedefs),
-            )
-        })
-        .unwrap_or(32);
+    let width = base.map(|b| scope.type_width(b)).unwrap_or(32);
     if width == 0 || width > 64 {
         return;
     }
@@ -1173,7 +1443,6 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
     } else {
         (1u128 << width) - 1
     };
-    let params = Some(&elab.parameters);
     let mut next: i128 = 0;
     let mut seen: std::collections::HashMap<u128, String> = std::collections::HashMap::new();
 
@@ -1194,10 +1463,7 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
                     ));
                     return;
                 }
-                match (
-                    xezim_core::elaborate::const_eval_i64_with_params(lo_e, params),
-                    xezim_core::elaborate::const_eval_i64_with_params(hi_e, params),
-                ) {
+                match (scope.value(lo_e), scope.value(hi_e)) {
                     (Some(l), Some(h)) => {
                         if l < 0 || h < 0 {
                             errs.push(format!(
@@ -1219,9 +1485,10 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
             // The initializer applies to the first slot only.
             let val: i128 = if slot == 0 {
                 if let Some(init) = &m.init {
-                    match xezim_core::elaborate::const_eval_i64_with_params(init, params) {
-                        Some(v) => v as i128,
-                        None => {
+                    match scope.fold(init) {
+                        Folded::Value(v) => v as i128,
+                        Folded::Hidden => return,
+                        Folded::NotConstant => {
                             if expr_contains_syscall(init) {
                                 errs.push(format!(
                                     "enum member '{}' initializer is not a constant expression (LRM 1800-2017 §6.19)",
@@ -1502,14 +1769,15 @@ fn collect_local_type_names(
 /// interfaces, packages, parameters).
 fn check_typedef(
     t: &TypedefDeclaration,
-    elab: &ElaboratedModule,
+    scope: ConstScope,
     local_types: &std::collections::HashSet<String>,
     errs: &mut Vec<String>,
 ) {
+    let elab = scope.elab;
     if t.forward {
         return;
     }
-    check_enum_type(&t.data_type, elab, errs);
+    check_enum_type(&t.data_type, scope, errs);
     if let DataType::TypeReference { name, .. } = &t.data_type {
         // package-qualified (`pkg::T`) — out of scope for this conservative check
         if name.has_scope() {
@@ -1592,6 +1860,35 @@ fn dim_idents(dt: &DataType, out: &mut Vec<String>) {
 /// expression. Only descends pure operator/paren/conditional trees — never into
 /// calls, indexing, or member access — so a function-call or array-based width
 /// is never mistaken for an undeclared identifier.
+/// `collect_idents` without the names core's binding resolved to a
+/// declaration of their own definition (§23.9), an implicit net of that
+/// definition included (§6.10): those are declared where they are used.
+fn collect_unbound_idents(e: &Expression, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.len() == 1 => {
+            if h.bound.as_decl().is_none() {
+                out.push(h.path[0].name.name.clone());
+            }
+        }
+        ExprKind::Unary { operand, .. } => collect_unbound_idents(operand, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_unbound_idents(left, out);
+            collect_unbound_idents(right, out);
+        }
+        ExprKind::Paren(x) => collect_unbound_idents(x, out),
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_unbound_idents(condition, out);
+            collect_unbound_idents(then_expr, out);
+            collect_unbound_idents(else_expr, out);
+        }
+        _ => {}
+    }
+}
+
 fn collect_idents(e: &Expression, out: &mut Vec<String>) {
     match &e.kind {
         ExprKind::Ident(h) if h.path.len() == 1 => {
@@ -2051,10 +2348,9 @@ fn check_packed_dims(dt: &DataType, _elab: &ElaboratedModule, errs: &mut Vec<Str
 fn check_unpacked_dims(
     name: &str,
     dims: &[UnpackedDimension],
-    elab: &ElaboratedModule,
+    scope: ConstScope,
     errs: &mut Vec<String>,
 ) {
-    let params = Some(&elab.parameters);
     for d in dims {
         match d {
             UnpackedDimension::Expression { expr, .. } => {
@@ -2063,10 +2359,42 @@ fn check_unpacked_dims(
                 // (struct-parameter members, per-instance type params), and
                 // cva6's `logic [W-1:0] mem[$clog2(Cfg.MemWords)]`-style
                 // declarations were rejected as size-0 arrays on legal RTL.
-                if !width_is_confident(expr, elab) {
+                if !width_is_confident(expr, scope) {
                     continue;
                 }
-                if let Some(v) = xezim_core::elaborate::const_eval_i64_with_params(expr, params) {
+                if let Some(v) = scope.value(expr) {
+                    if v <= 0 {
+                        errs.push(format!(
+                            "array '{}' dimension size must be greater than zero (LRM 1800-2017 §7.4)",
+                            name
+                        ));
+                    }
+                }
+            }
+            // §7.4.2: `[N]` with a bare name parses as an associative
+            // dimension keyed by the type `N`; it is a fixed size when `N`
+            // names a constant of this scope and no type (#893).
+            UnpackedDimension::Associative {
+                data_type: Some(dt),
+                ..
+            } => {
+                let DataType::TypeReference {
+                    name: key,
+                    dimensions,
+                    type_args,
+                    ..
+                } = dt.as_ref()
+                else {
+                    continue;
+                };
+                if key.has_scope() || !dimensions.is_empty() || !type_args.is_empty() {
+                    continue;
+                }
+                let n = key.name.name.as_str();
+                if scope.elab.typedefs.contains_key(n) || scope.elab.classes.contains_key(n) {
+                    continue;
+                }
+                if let Some(v) = scope.param(n).and_then(|v| v.to_i64()) {
                     if v <= 0 {
                         errs.push(format!(
                             "array '{}' dimension size must be greater than zero (LRM 1800-2017 §7.4)",
@@ -2085,12 +2413,12 @@ fn check_unpacked_dims(
                         name
                     ));
                 } else {
-                    match xezim_core::elaborate::const_eval_i64_with_params(bound, params) {
-                        Some(v) if v < 0 => errs.push(format!(
+                    match scope.fold(bound) {
+                        Folded::Value(v) if v < 0 => errs.push(format!(
                             "queue '{}' bound must be positive (LRM 1800-2017 §7.10)",
                             name
                         )),
-                        None => errs.push(format!(
+                        Folded::NotConstant => errs.push(format!(
                             "queue '{}' bound must be a constant (LRM 1800-2017 §7.10)",
                             name
                         )),
@@ -2323,9 +2651,17 @@ fn check_implicit_ports(
                     }
                     xezim_core::ast::decl::PortConnection::Wildcard => {
                         if let Some(tports) = port_map.get(&inst.module_name.name) {
+                            // §23.3.2.4: `.*` connects only ports that have a
+                            // name; a non-ANSI null port or unnamed port
+                            // expression (the parser's placeholder) is not
+                            // connected and so cannot be missing.
                             let mut missing: Vec<&String> = tports
                                 .iter()
-                                .filter(|p| !scope.contains(*p) && !explicit.contains(*p))
+                                .filter(|p| {
+                                    !scope.contains(*p)
+                                        && !explicit.contains(*p)
+                                        && !xezim_core::elaborate::is_unnamed_port_placeholder(p)
+                                })
                                 .collect();
                             missing.sort();
                             for p in missing {
@@ -2447,10 +2783,12 @@ fn package_decls(defs: &[&SourceDefinition]) -> HashMap<String, HashSet<String>>
                         out.extend(et.members.iter().map(|m| m.name.name.clone()));
                     }
                 }
-                PackageItem::Function(f) => {
+                // §8.24 / §26.3: an out-of-block class method belongs to
+                // its class, not to the package's imported namespace.
+                PackageItem::Function(f) if f.name.scopes.is_empty() => {
                     out.insert(f.name.name.name.clone());
                 }
-                PackageItem::Task(t) => {
+                PackageItem::Task(t) if t.name.scopes.is_empty() => {
                     out.insert(t.name.name.name.clone());
                 }
                 PackageItem::Class(c) => {
@@ -3324,6 +3662,823 @@ fn check_param_override_idents(
         }
     }
 }
+// ---------------------------------------------------------------------------
+// #888: undeclared identifiers in class and package parameter-override lists
+// ---------------------------------------------------------------------------
+//
+// Three positions are visited by neither the elaborator nor any existing
+// should-fail check:
+//
+//   * a class specialization's parameter-override list (`R #(A #(bad)) x;`,
+//     `typedef R #(A #(bad)) t;`, `extends B #(bad)`, a method's return type
+//     or port). `check_param_override_idents` covers module instantiations
+//     only, and a nested override is worse than merely unvisited: the parser
+//     keeps the inner argument list as source text
+//     (`ExprKind::Specialization::type_args_text`), so no walk of the
+//     expression tree can reach the name at all.
+//   * a class value-parameter default (`class A #(int W = bad)`).
+//     `check_param_value_refs` is fed module parameters only.
+//   * a class property or package-scope variable initializer (`int m = bad;`),
+//     which elaboration folds to 0. The package arm of `lint_should_fail`
+//     already says as much: "a package's own bare names are not resolved here".
+//
+// Resolution here is whole-design rather than scoping-accurate: a name is
+// reported only when it is declared NOWHERE in the design. That is the same
+// "only fire on a definite LRM violation" bar the rest of this file holds, and
+// it is what keeps an override that resolves through a package import, a class
+// parameter, an enclosing class member or a local typedef clean.
+
+/// Keywords and built-in spellings that are legal in a type-argument position
+/// without being declared. `type_args_text` preserves the argument list as
+/// source text, so these have to be recognised by spelling.
+fn reserved_type_arg_name(n: &str) -> bool {
+    matches!(
+        n,
+        "virtual"
+            | "const"
+            | "var"
+            | "type"
+            | "enum"
+            | "struct"
+            | "union"
+            | "packed"
+            | "signed"
+            | "unsigned"
+            | "tagged"
+            | "null"
+            | "this"
+            | "super"
+            | "new"
+            | "default"
+            | "mailbox"
+            | "semaphore"
+            | "process"
+            | "rand"
+            | "randc"
+            | "void"
+    )
+}
+
+/// Identifier runs in a preserved type-argument list (`"16, wrong_"`,
+/// `"A #(W, D)"`). A run preceded by `::` is a member name owned by the scope
+/// to its left and is left to that scope rather than guessed at here.
+fn idents_in_type_arg_text(text: &str) -> Vec<String> {
+    let cs: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cs.len() {
+        // A string actual (`holder #(int, "base_test")`) is a value, not a
+        // name; its contents are never an identifier.
+        if cs[i] == '"' {
+            i += 1;
+            while i < cs.len() {
+                if cs[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if cs[i] == '"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+        // §5.7: a number is never a name. A digit starts a decimal, real or
+        // time literal (`16`, `1.5e3`, `10ns`); `'` plus an optional `s` and
+        // a base starts the digits of a based literal (`8'hFF`, `'b0`).
+        if cs[i].is_ascii_digit() {
+            while i < cs.len() && (word(cs[i]) || cs[i] == '.') {
+                i += 1;
+            }
+            continue;
+        }
+        if cs[i] == '\'' {
+            let mut j = i + 1;
+            if j < cs.len() && matches!(cs[j], 's' | 'S') {
+                j += 1;
+            }
+            if j < cs.len() && matches!(cs[j], 'b' | 'B' | 'o' | 'O' | 'd' | 'D' | 'h' | 'H') {
+                j += 1;
+                // §5.7.1: white space may separate the base from the digits.
+                while j < cs.len() && cs[j].is_whitespace() {
+                    j += 1;
+                }
+                while j < cs.len() && (word(cs[j]) || cs[j] == '?') {
+                    j += 1;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // §20: a system function (`$clog2`, `$bits`) names nothing in the design.
+        if cs[i] == '$' {
+            i += 1;
+            while i < cs.len() && word(cs[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        if !(cs[i].is_alphabetic() || cs[i] == '_') {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < cs.len() && (cs[j].is_alphanumeric() || cs[j] == '_' || cs[j] == '$') {
+            j += 1;
+        }
+        let mut k = i;
+        while k > 0 && cs[k - 1].is_whitespace() {
+            k -= 1;
+        }
+        let is_member = k >= 2 && cs[k - 1] == ':' && cs[k - 2] == ':';
+        if !is_member {
+            out.push(cs[i..j].iter().collect());
+        }
+        i = j;
+    }
+    out
+}
+/// The parser retains some type actuals as source text rather than a parsed
+/// name — virtual interface types above all (`virtual I`, `virtual my_if #(T)`),
+/// whose interface and parameters need interface resolution to judge. Anything
+/// that is not a plain identifier is such a retention and is left alone, the
+/// same guard `type_lint::check_type_actual` applies.
+fn is_plain_ident(n: &str) -> bool {
+    let mut ch = n.chars();
+    match ch.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    n.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Every name the design declares, harvested from the AST. Whole-design on
+/// purpose — see the note above. Names the elaboration already indexes
+/// (`top_declares`) and package members (`pkg_names`) are tested separately.
+fn design_declared_names(defs: &[&SourceDefinition]) -> HashSet<String> {
+    use xezim_core::ast::decl::PackageItem;
+    let mut out = HashSet::new();
+    for d in defs {
+        match d {
+            SourceDefinition::Module(m) => {
+                for p in &m.params {
+                    note_param_names(p, &mut out);
+                }
+                note_port_list_names(&m.ports, &mut out);
+                note_items_names(&m.items, &mut out);
+            }
+            SourceDefinition::Interface(m) => {
+                for p in &m.params {
+                    note_param_names(p, &mut out);
+                }
+                note_port_list_names(&m.ports, &mut out);
+                note_items_names(&m.items, &mut out);
+            }
+            SourceDefinition::Program(m) => {
+                for p in &m.params {
+                    note_param_names(p, &mut out);
+                }
+                note_port_list_names(&m.ports, &mut out);
+                note_items_names(&m.items, &mut out);
+            }
+            SourceDefinition::Package(p) => {
+                out.insert(p.name.name.clone());
+                for it in &p.items {
+                    match it {
+                        PackageItem::Parameter(pd) => note_param_names(pd, &mut out),
+                        PackageItem::Data(dd) => {
+                            note_data_type_names(&dd.data_type, &mut out);
+                            note_declarator_names(&dd.declarators, &mut out);
+                        }
+                        PackageItem::Net(nd) => {
+                            note_data_type_names(&nd.data_type, &mut out);
+                            note_net_declarator_names(&nd.declarators, &mut out);
+                        }
+                        PackageItem::Typedef(td) => {
+                            out.insert(td.name.name.clone());
+                            note_data_type_names(&td.data_type, &mut out);
+                        }
+                        PackageItem::Function(f) => note_function_names(f, &mut out),
+                        PackageItem::Task(t) => note_task_names(t, &mut out),
+                        PackageItem::Class(c) => note_class_names(c, &mut out),
+                        _ => {}
+                    }
+                }
+            }
+            SourceDefinition::Class(c) => note_class_names(c, &mut out),
+            SourceDefinition::Typedef(td) => {
+                out.insert(td.name.name.clone());
+                note_data_type_names(&td.data_type, &mut out);
+            }
+            SourceDefinition::Udp(_) => {}
+        }
+    }
+    out
+}
+
+fn note_param_names(pd: &ParameterDeclaration, out: &mut HashSet<String>) {
+    match &pd.kind {
+        ParameterKind::Data { assignments, .. } => {
+            out.extend(assignments.iter().map(|a| a.name.name.clone()))
+        }
+        ParameterKind::Type { assignments } => {
+            out.extend(assignments.iter().map(|a| a.name.name.clone()))
+        }
+    }
+}
+
+fn note_declarator_names(ds: &[VarDeclarator], out: &mut HashSet<String>) {
+    out.extend(ds.iter().map(|d| d.name.name.clone()));
+}
+
+/// `NetDeclaration` keeps its own declarator type; same shape, distinct type.
+fn note_net_declarator_names(
+    ds: &[xezim_core::ast::decl::NetDeclarator],
+    out: &mut HashSet<String>,
+) {
+    out.extend(ds.iter().map(|d| d.name.name.clone()));
+}
+
+fn note_data_type_names(dt: &DataType, out: &mut HashSet<String>) {
+    match dt {
+        DataType::Struct(su) => {
+            for m in &su.members {
+                out.extend(m.declarators.iter().map(|d| d.name.name.clone()));
+                note_data_type_names(&m.data_type, out);
+            }
+        }
+        DataType::Enum(et) => {
+            out.extend(et.members.iter().map(|m| m.name.name.clone()));
+            if let Some(b) = &et.base_type {
+                note_data_type_names(b, out);
+            }
+        }
+        _ => {}
+    }
+}
+fn note_function_names(f: &xezim_core::ast::decl::FunctionDeclaration, out: &mut HashSet<String>) {
+    out.insert(f.name.name.name.clone());
+    for p in &f.ports {
+        out.insert(p.name.name.clone());
+        note_data_type_names(&p.data_type, out);
+    }
+    note_data_type_names(&f.return_type, out);
+    for st in f.items.iter() {
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            note_declarator_names(declarators, out);
+        }
+    }
+}
+
+fn note_task_names(t: &xezim_core::ast::decl::TaskDeclaration, out: &mut HashSet<String>) {
+    out.insert(t.name.name.name.clone());
+    for p in &t.ports {
+        out.insert(p.name.name.clone());
+        note_data_type_names(&p.data_type, out);
+    }
+    for st in t.items.iter() {
+        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            note_declarator_names(declarators, out);
+        }
+    }
+}
+
+fn note_class_names(c: &ClassDeclaration, out: &mut HashSet<String>) {
+    out.insert(c.name.name.clone());
+    for p in &c.params {
+        note_param_names(p, out);
+    }
+    for it in &c.items {
+        match it {
+            ClassItem::Property(pr) => {
+                note_declarator_names(&pr.declarators, out);
+                note_data_type_names(&pr.data_type, out);
+            }
+            ClassItem::Typedef(td) => {
+                out.insert(td.name.name.clone());
+                note_data_type_names(&td.data_type, out);
+            }
+            ClassItem::Parameter(pd) => note_param_names(pd, out),
+            ClassItem::Method(m) => match &m.kind {
+                ClassMethodKind::Function(f)
+                | ClassMethodKind::PureVirtual(f)
+                | ClassMethodKind::Extern(f) => note_function_names(f, out),
+                ClassMethodKind::Task(t) => note_task_names(t, out),
+            },
+            ClassItem::Class(inner) => note_class_names(inner, out),
+            _ => {}
+        }
+    }
+}
+
+fn note_items_names(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for it in items {
+        match it {
+            ModuleItem::DataDeclaration(d) => {
+                note_declarator_names(&d.declarators, out);
+                note_data_type_names(&d.data_type, out);
+            }
+            ModuleItem::NetDeclaration(d) => {
+                note_net_declarator_names(&d.declarators, out);
+                note_data_type_names(&d.data_type, out);
+            }
+            ModuleItem::PortDeclaration(d) => {
+                note_declarator_names(&d.declarators, out);
+                note_data_type_names(&d.data_type, out);
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                note_param_names(pd, out)
+            }
+            ModuleItem::TypedefDeclaration(td) => {
+                out.insert(td.name.name.clone());
+                note_data_type_names(&td.data_type, out);
+            }
+            ModuleItem::FunctionDeclaration(f) => note_function_names(f, out),
+            ModuleItem::TaskDeclaration(t) => note_task_names(t, out),
+            ModuleItem::ClassDeclaration(c) => note_class_names(c, out),
+            ModuleItem::ModuleInstantiation(mi) => {
+                out.extend(mi.instances.iter().map(|i| i.name.name.clone()))
+            }
+            ModuleItem::GenerateRegion(g) => note_items_names(&g.items, out),
+            ModuleItem::GenerateIf(g) => {
+                for (_, its) in &g.branches {
+                    note_items_names(its, out);
+                }
+            }
+            ModuleItem::GenerateFor(g) => {
+                out.insert(g.var.clone());
+                note_items_names(&g.items, out);
+            }
+            ModuleItem::GenvarDeclaration(g) => {
+                out.extend(g.names.iter().map(|n| n.name.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn note_port_list_names(ports: &PortList, out: &mut HashSet<String>) {
+    match ports {
+        PortList::Ansi(ps) => {
+            for p in ps {
+                out.insert(p.name.name.clone());
+                if let Some(dt) = &p.data_type {
+                    note_data_type_names(dt, out);
+                }
+            }
+        }
+        PortList::NonAnsi(ns) => out.extend(ns.iter().map(|n| n.name.clone())),
+        PortList::Empty => {}
+    }
+}
+/// The #888 finder: walks the positions listed at the head of this section and
+/// reports every identifier declared nowhere in the design.
+struct UndeclaredFinder<'a> {
+    elab: &'a ElaboratedModule,
+    pkg_names: &'a HashSet<String>,
+    declared: &'a HashSet<String>,
+    /// Identical messages reported once, whichever instance surfaced them.
+    seen: HashSet<String>,
+    errs: Vec<String>,
+}
+
+impl<'a> UndeclaredFinder<'a> {
+    /// A name needs no declaration here if it is a keyword, a built-in
+    /// spelling, a package member, something the elaboration indexes, or
+    /// something the design declares anywhere.
+    fn known(&self, n: &str) -> bool {
+        !is_plain_ident(n)
+            || n.starts_with('$')
+            || is_builtin_type(n)
+            || reserved_type_arg_name(n)
+            || self.pkg_names.contains(n)
+            || top_declares(n, self.elab)
+            || self.declared.contains(n)
+    }
+
+    fn name(&mut self, n: &str, what: &str) {
+        if self.known(n) {
+            return;
+        }
+        let msg =
+            format!("{what} refers to undeclared identifier '{n}' (LRM 1800-2017 §6.20.2, §8.25)");
+        if self.seen.insert(msg.clone()) {
+            self.errs.push(msg);
+        }
+    }
+
+    fn init_idents(&mut self, init: &Expression, label: &str) {
+        let mut ids = Vec::new();
+        collect_unbound_idents(init, &mut ids);
+        let what = format!("initializer of '{label}'");
+        for n in ids {
+            self.name(&n, &what);
+        }
+    }
+
+    /// A parameter-override actual: `int`, `my_t`, `A #(bad)`, `.D(bad)`.
+    fn actual(&mut self, e: &Expression, what_owner: &str) {
+        match &e.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let n = h.path[0].name.name.clone();
+                self.name(&n, &format!("parameter override of '{what_owner}'"));
+            }
+            // The nested list is preserved as text, so its names have to be
+            // recovered by spelling — this is the miss at the heart of #888.
+            ExprKind::Specialization {
+                base,
+                type_args_text,
+            } => {
+                self.actual(base, what_owner);
+                let what = format!("parameter override of '{what_owner}'");
+                for t in idents_in_type_arg_text(type_args_text) {
+                    self.name(&t, &what);
+                }
+            }
+            ExprKind::TypeLiteral(dt) => self.data_type(dt, what_owner),
+            ExprKind::NamedArg { expr: Some(x), .. } => self.actual(x, what_owner),
+            ExprKind::Paren(x) => self.actual(x, what_owner),
+            ExprKind::Unary { operand, .. } => self.actual(operand, what_owner),
+            ExprKind::Binary { left, right, .. } => {
+                self.actual(left, what_owner);
+                self.actual(right, what_owner);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.actual(condition, what_owner);
+                self.actual(then_expr, what_owner);
+                self.actual(else_expr, what_owner);
+            }
+            _ => {}
+        }
+    }
+    /// Recurse through a type, checking every parameter-override list it holds.
+    fn data_type(&mut self, dt: &DataType, owner: &str) {
+        match dt {
+            DataType::TypeReference { type_args, .. } => {
+                for a in type_args {
+                    self.actual(a, owner);
+                }
+            }
+            DataType::Interface { type_args, .. } => {
+                for a in type_args {
+                    self.actual(a, owner);
+                }
+            }
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    self.data_type(&m.data_type, owner);
+                }
+            }
+            DataType::Enum(et) => {
+                if let Some(b) = &et.base_type {
+                    self.data_type(b, owner);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn param_default(&mut self, pd: &ParameterDeclaration, owner: &str) {
+        if let ParameterKind::Data { assignments, .. } = &pd.kind {
+            for a in assignments {
+                if let Some(init) = &a.init {
+                    let mut ids = Vec::new();
+                    collect_idents(init, &mut ids);
+                    let what = format!("default value of parameter '{}' of '{owner}'", a.name.name);
+                    for n in ids {
+                        self.name(&n, &what);
+                    }
+                }
+            }
+        }
+    }
+
+    fn ports(&mut self, ports: &[xezim_core::ast::decl::FunctionPort], owner: &str) {
+        for p in ports {
+            self.data_type(&p.data_type, owner);
+            if let Some(d) = &p.default {
+                self.actual(d, owner);
+            }
+        }
+    }
+
+    fn function(&mut self, f: &xezim_core::ast::decl::FunctionDeclaration) {
+        let owner = f.name.name.name.clone();
+        self.data_type(&f.return_type, &owner);
+        self.ports(&f.ports, &owner);
+    }
+
+    fn task(&mut self, t: &xezim_core::ast::decl::TaskDeclaration) {
+        let owner = t.name.name.name.clone();
+        self.ports(&t.ports, &owner);
+    }
+
+    fn class(&mut self, c: &ClassDeclaration) {
+        use xezim_core::ast::decl::ParamValue;
+        let owner = c.name.name.clone();
+        for p in &c.params {
+            self.param_default(p, &owner);
+        }
+        if let Some(x) = &c.extends {
+            for a in &x.args {
+                match a {
+                    ParamValue::Expr(e) => self.actual(e, &owner),
+                    ParamValue::Type(t) => self.data_type(t, &owner),
+                }
+            }
+        }
+        for it in &c.items {
+            match it {
+                ClassItem::Property(pr) => {
+                    self.data_type(&pr.data_type, &owner);
+                    for d in &pr.declarators {
+                        if let Some(init) = &d.init {
+                            self.init_idents(init, &format!("{}.{}", owner, d.name.name));
+                        }
+                    }
+                }
+                ClassItem::Typedef(td) => self.data_type(&td.data_type, &td.name.name),
+                ClassItem::Parameter(pd) => self.param_default(pd, &owner),
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => self.function(f),
+                    ClassMethodKind::Task(t) => self.task(t),
+                },
+                ClassItem::Class(inner) => self.class(inner),
+                _ => {}
+            }
+        }
+    }
+
+    fn items(&mut self, items: &[ModuleItem]) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) => {
+                    let owner = d
+                        .declarators
+                        .first()
+                        .map(|x| x.name.name.clone())
+                        .unwrap_or_default();
+                    self.data_type(&d.data_type, &owner);
+                    for dc in &d.declarators {
+                        if let Some(init) = &dc.init {
+                            self.init_idents(init, &dc.name.name);
+                        }
+                    }
+                }
+                ModuleItem::NetDeclaration(d) => {
+                    let owner = d
+                        .declarators
+                        .first()
+                        .map(|x| x.name.name.clone())
+                        .unwrap_or_default();
+                    self.data_type(&d.data_type, &owner);
+                    for dc in &d.declarators {
+                        if let Some(init) = &dc.init {
+                            self.init_idents(init, &dc.name.name);
+                        }
+                    }
+                }
+                ModuleItem::PortDeclaration(d) => {
+                    let owner = d
+                        .declarators
+                        .first()
+                        .map(|x| x.name.name.clone())
+                        .unwrap_or_default();
+                    self.data_type(&d.data_type, &owner);
+                }
+                ModuleItem::TypedefDeclaration(td) => self.data_type(&td.data_type, &td.name.name),
+                ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                    self.param_default(pd, "")
+                }
+                ModuleItem::FunctionDeclaration(f) => self.function(f),
+                ModuleItem::TaskDeclaration(t) => self.task(t),
+                ModuleItem::ClassDeclaration(c) => self.class(c),
+                ModuleItem::GenerateRegion(g) => self.items(&g.items),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        self.items(its);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => self.items(&g.items),
+                _ => {}
+            }
+        }
+    }
+}
+/// The #888 entry point: report identifiers in class and package
+/// parameter-override lists, class value-parameter defaults, class property
+/// initializers and package-scope variable initializers that are declared
+/// nowhere in the design.
+pub fn check_class_and_package_undeclared(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    pkg_names: &HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    use xezim_core::ast::decl::PackageItem;
+    let declared = design_declared_names(defs);
+    let mut f = UndeclaredFinder {
+        elab,
+        pkg_names,
+        declared: &declared,
+        seen: HashSet::new(),
+        errs: Vec::new(),
+    };
+    for d in defs {
+        match d {
+            SourceDefinition::Module(m) => {
+                for p in &m.params {
+                    f.param_default(p, &m.name.name);
+                }
+                f.items(&m.items);
+            }
+            SourceDefinition::Interface(m) => {
+                for p in &m.params {
+                    f.param_default(p, &m.name.name);
+                }
+                f.items(&m.items);
+            }
+            SourceDefinition::Program(m) => {
+                for p in &m.params {
+                    f.param_default(p, &m.name.name);
+                }
+                f.items(&m.items);
+            }
+            SourceDefinition::Package(p) => {
+                for it in &p.items {
+                    match it {
+                        PackageItem::Parameter(pd) => f.param_default(pd, &p.name.name),
+                        PackageItem::Data(dd) => {
+                            for dc in &dd.declarators {
+                                f.data_type(&dd.data_type, &dc.name.name);
+                                if let Some(init) = &dc.init {
+                                    f.init_idents(
+                                        init,
+                                        &format!("{}.{}", p.name.name, dc.name.name),
+                                    );
+                                }
+                            }
+                        }
+                        PackageItem::Net(nd) => {
+                            for dc in &nd.declarators {
+                                f.data_type(&nd.data_type, &dc.name.name);
+                                if let Some(init) = &dc.init {
+                                    f.init_idents(
+                                        init,
+                                        &format!("{}.{}", p.name.name, dc.name.name),
+                                    );
+                                }
+                            }
+                        }
+                        PackageItem::Typedef(td) => f.data_type(&td.data_type, &td.name.name),
+                        PackageItem::Function(fn_) => f.function(fn_),
+                        PackageItem::Task(t) => f.task(t),
+                        PackageItem::Class(c) => f.class(c),
+                        _ => {}
+                    }
+                }
+            }
+            SourceDefinition::Class(c) => f.class(c),
+            SourceDefinition::Typedef(td) => f.data_type(&td.data_type, &td.name.name),
+            SourceDefinition::Udp(_) => {}
+        }
+    }
+    errs.extend(f.errs);
+}
+
+/// §10.3: a continuous assignment to a net of a user-defined nettype drives
+/// the whole net, so its left-hand side shall not index or select into the
+/// nettype's data type (`assign p.V = v;`, `assign p[0] = b;`). Such an
+/// assignment elaborated, and each member then had a driver of its own.
+fn check_nettype_partial_drivers(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    if elab.nettype_resolvers.is_empty() {
+        return;
+    }
+    let is_nettype = |dt: &DataType| {
+        matches!(dt, DataType::TypeReference { name, .. }
+            if elab.nettype_resolvers.contains_key(&name.name.name))
+    };
+    fn nets_in(
+        items: &[ModuleItem],
+        is_nettype: &dyn Fn(&DataType) -> bool,
+        out: &mut HashSet<String>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::NetDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::PortDeclaration(d) if is_nettype(&d.data_type) => {
+                    out.extend(d.declarators.iter().map(|x| x.name.name.clone()))
+                }
+                ModuleItem::GenerateRegion(g) => nets_in(&g.items, is_nettype, out),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        nets_in(its, is_nettype, out);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => nets_in(&g.items, is_nettype, out),
+                _ => {}
+            }
+        }
+    }
+    /// The nettype net a target selects into, if it does.
+    fn partial_target(e: &Expression, nets: &HashSet<String>) -> Option<String> {
+        let root_net = |x: &Expression| match &x.kind {
+            ExprKind::Ident(h) if h.root.is_none() && nets.contains(&h.path[0].name.name) => {
+                Some(h.path[0].name.name.clone())
+            }
+            _ => None,
+        };
+        match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
+                let n = &h.path[0].name.name;
+                (nets.contains(n) && (h.path.len() > 1 || !h.path[0].selects.is_empty()))
+                    .then(|| n.clone())
+            }
+            ExprKind::MemberAccess { expr, .. }
+            | ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. } => {
+                root_net(expr).or_else(|| partial_target(expr, nets))
+            }
+            ExprKind::Concatenation(xs) => xs.iter().find_map(|x| partial_target(x, nets)),
+            _ => None,
+        }
+    }
+    fn walk(
+        items: &[ModuleItem],
+        nets: &HashSet<String>,
+        elab: &ElaboratedModule,
+        errs: &mut Vec<String>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (l, _) in &ca.assignments {
+                        if let Some(n) = partial_target(l, nets) {
+                            let at = xezim_core::elaborate::span_location(elab, l.span)
+                                .map(|a| format!(" (at {a})"))
+                                .unwrap_or_default();
+                            errs.push(format!(
+                                "continuous assignment to net '{n}' of a user-defined nettype \
+                                 selects part of it; it shall drive the whole net (IEEE \
+                                 1800-2017 §10.3){at}"
+                            ));
+                        }
+                    }
+                }
+                ModuleItem::GenerateRegion(g) => walk(&g.items, nets, elab, errs),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        walk(its, nets, elab, errs);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => walk(&g.items, nets, elab, errs),
+                _ => {}
+            }
+        }
+    }
+    for d in defs {
+        let (ports, items) = match d {
+            SourceDefinition::Module(m) => (&m.ports, &m.items),
+            SourceDefinition::Interface(m) => (&m.ports, &m.items),
+            SourceDefinition::Program(m) => (&m.ports, &m.items),
+            _ => continue,
+        };
+        let mut nets = HashSet::new();
+        if let PortList::Ansi(ps) = ports {
+            for p in ps {
+                if p.data_type.as_ref().is_some_and(|dt| is_nettype(dt)) {
+                    nets.insert(p.name.name.clone());
+                }
+            }
+        }
+        nets_in(items, &is_nettype, &mut nets);
+        if !nets.is_empty() {
+            walk(items, &nets, elab, errs);
+        }
+    }
+}
 
 /// Packages a module imports: (wildcard imports, explicitly imported names).
 fn module_imports(items: &[ModuleItem]) -> (Vec<&str>, HashSet<&str>) {
@@ -3610,12 +4765,8 @@ fn check_imported_hier_refs(
     }
 }
 
-/// Every class visible to a module: its own, the top-level ones and those in
-/// packages.
-fn visible_classes<'a>(
-    defs: &'a [&'a SourceDefinition],
-    items: &'a [ModuleItem],
-) -> HashMap<&'a str, &'a ClassDeclaration> {
+/// The classes every module sees: the top-level ones and those in packages.
+fn global_classes<'a>(defs: &[&'a SourceDefinition]) -> HashMap<&'a str, &'a ClassDeclaration> {
     let mut map = HashMap::new();
     for d in defs {
         match d {
@@ -3632,12 +4783,27 @@ fn visible_classes<'a>(
             _ => {}
         }
     }
-    for it in items {
-        if let ModuleItem::ClassDeclaration(c) = it {
-            map.insert(c.name.name.as_str(), c);
-        }
-    }
     map
+}
+
+/// Every class visible to a module: its own over the global ones. A module
+/// that declares no class shares the global map.
+fn visible_classes<'g, 'a>(
+    global: &'g HashMap<&'a str, &'a ClassDeclaration>,
+    items: &'a [ModuleItem],
+) -> std::borrow::Cow<'g, HashMap<&'a str, &'a ClassDeclaration>> {
+    let own = items.iter().filter_map(|it| match it {
+        ModuleItem::ClassDeclaration(c) => Some(c),
+        _ => None,
+    });
+    if own.clone().next().is_none() {
+        return std::borrow::Cow::Borrowed(global);
+    }
+    let mut map = global.clone();
+    for c in own {
+        map.insert(c.name.name.as_str(), c);
+    }
+    std::borrow::Cow::Owned(map)
 }
 
 /// §8.18: a `local` member is visible only inside its own class, not in a
@@ -4170,4 +5336,365 @@ fn check_cont_assign_rhs_names(
             ));
         }
     }
+}
+
+/// §6.21: an automatic variable may not be referenced by `$monitor` (or
+/// `$monitorb/h/o`), which keeps reading its arguments after the process
+/// that declared them is gone. Loop variables declared in a `for` header
+/// or named by `foreach` are automatic (§12.7.1, §12.7.3), as are variables
+/// declared `automatic`, and the ports and locals of an automatic task or
+/// function and of every class method. The monitor printed x for them.
+fn check_monitor_automatic(items: &[ModuleItem], errs: &mut Vec<String>) {
+    for it in items {
+        match it {
+            ModuleItem::InitialConstruct(i) => monitor_walk(&i.stmt, &mut vec![], false, errs),
+            ModuleItem::AlwaysConstruct(a) => monitor_walk(&a.stmt, &mut vec![], false, errs),
+            ModuleItem::TaskDeclaration(t) => {
+                let auto = matches!(
+                    t.lifetime,
+                    Some(xezim_core::ast::types::Lifetime::Automatic)
+                );
+                monitor_subroutine(&t.ports, &t.items, auto, errs);
+            }
+            ModuleItem::FunctionDeclaration(f) => {
+                let auto = matches!(
+                    f.lifetime,
+                    Some(xezim_core::ast::types::Lifetime::Automatic)
+                );
+                monitor_subroutine(&f.ports, &f.items, auto, errs);
+            }
+            ModuleItem::ClassDeclaration(c) => monitor_class(c, errs),
+            _ => {}
+        }
+    }
+}
+
+fn monitor_class(c: &ClassDeclaration, errs: &mut Vec<String>) {
+    for ci in &c.items {
+        match ci {
+            ClassItem::Method(m) => match &m.kind {
+                ClassMethodKind::Function(f) => monitor_subroutine(&f.ports, &f.items, true, errs),
+                ClassMethodKind::Task(t) => monitor_subroutine(&t.ports, &t.items, true, errs),
+                _ => {}
+            },
+            ClassItem::Class(inner) => monitor_class(inner, errs),
+            _ => {}
+        }
+    }
+}
+
+fn monitor_subroutine(
+    ports: &[xezim_core::ast::decl::FunctionPort],
+    body: &[Statement],
+    auto: bool,
+    errs: &mut Vec<String>,
+) {
+    let mut scopes: Vec<Vec<(String, bool)>> =
+        vec![ports.iter().map(|p| (p.name.name.clone(), auto)).collect()];
+    for s in body {
+        monitor_stmt(s, &mut scopes, auto, errs);
+    }
+}
+
+fn monitor_walk(
+    stmt: &Statement,
+    scopes: &mut Vec<Vec<(String, bool)>>,
+    auto: bool,
+    errs: &mut Vec<String>,
+) {
+    scopes.push(Vec::new());
+    monitor_stmt(stmt, scopes, auto, errs);
+    scopes.pop();
+}
+
+/// Declares the statement's variables in the innermost scope and checks any
+/// `$monitor` it makes. `auto` is the default lifetime of the enclosing
+/// subroutine (block variables of a static context are static).
+fn monitor_stmt(
+    stmt: &Statement,
+    scopes: &mut Vec<Vec<(String, bool)>>,
+    auto: bool,
+    errs: &mut Vec<String>,
+) {
+    use xezim_core::ast::stmt::ForInit;
+    use xezim_core::ast::types::Lifetime;
+    match &stmt.kind {
+        StatementKind::VarDecl {
+            lifetime,
+            declarators,
+            ..
+        } => {
+            let is_auto = match lifetime {
+                Some(Lifetime::Automatic) => true,
+                Some(Lifetime::Static) => false,
+                None => auto,
+            };
+            if let Some(top) = scopes.last_mut() {
+                for d in declarators {
+                    top.push((d.name.name.clone(), is_auto));
+                }
+            }
+        }
+        StatementKind::Expr(e) => {
+            if let ExprKind::SystemCall { name, args } = &e.kind
+                && matches!(
+                    name.as_str(),
+                    "$monitor" | "$monitorb" | "$monitorh" | "$monitoro"
+                )
+            {
+                let mut seen: Vec<String> = Vec::new();
+                for a in args {
+                    let mut ids = Vec::new();
+                    monitor_idents(a, &mut ids);
+                    for id in ids {
+                        let automatic = scopes
+                            .iter()
+                            .rev()
+                            .find_map(|s| s.iter().rev().find(|(n, _)| *n == id).map(|(_, a)| *a))
+                            .unwrap_or(false);
+                        if automatic && !seen.contains(&id) {
+                            errs.push(format!(
+                                "automatic variable '{}' is not allowed as an argument to {} \
+                                 (LRM 1800-2017 §6.21)",
+                                id, name
+                            ));
+                            seen.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            scopes.push(Vec::new());
+            for s in stmts {
+                monitor_stmt(s, scopes, auto, errs);
+            }
+            scopes.pop();
+        }
+        StatementKind::For { init, body, .. } => {
+            let vars: Vec<(String, bool)> = init
+                .iter()
+                .filter_map(|i| match i {
+                    ForInit::VarDecl { name, .. } => Some((name.name.clone(), true)),
+                    ForInit::Assign { .. } => None,
+                })
+                .collect();
+            scopes.push(vars);
+            monitor_walk(body, scopes, auto, errs);
+            scopes.pop();
+        }
+        StatementKind::Foreach { vars, body, .. } => {
+            scopes.push(
+                vars.iter()
+                    .flatten()
+                    .map(|v| (v.name.clone(), true))
+                    .collect(),
+            );
+            monitor_walk(body, scopes, auto, errs);
+            scopes.pop();
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            monitor_walk(then_stmt, scopes, auto, errs);
+            if let Some(e) = else_stmt {
+                monitor_walk(e, scopes, auto, errs);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                monitor_walk(&it.stmt, scopes, auto, errs);
+            }
+        }
+        StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body }
+        | StatementKind::TimingControl { stmt: body, .. }
+        | StatementKind::Wait { stmt: body, .. } => monitor_walk(body, scopes, auto, errs),
+        _ => {}
+    }
+}
+
+/// §10.9.1: an ordered assignment pattern for an unpacked array has exactly
+/// one item per element of the dimension it fills (`'{1,2,3}` for a
+/// `[1:4]` row is illegal). Checked for module-scope arrays whose bounds are
+/// literals (no parameter can change them), assigned whole or by row;
+/// patterns with `default:`, keys, member names or replication are not
+/// counted. A name declared again in a procedural block is skipped.
+fn check_unpacked_pattern_counts(items: &[ModuleItem], errs: &mut Vec<String>) {
+    let mut arrays: std::collections::HashMap<String, Vec<(i64, i64)>> =
+        std::collections::HashMap::new();
+    let mut shadowed: HashSet<String> = HashSet::default();
+    for it in items {
+        if let ModuleItem::DataDeclaration(d) = it {
+            for decl in &d.declarators {
+                if let Some(dims) = literal_unpacked_dims(&decl.dimensions) {
+                    if arrays
+                        .insert(decl.name.name.clone(), dims.clone())
+                        .is_some()
+                    {
+                        shadowed.insert(decl.name.name.clone());
+                    }
+                    // 1-D flat initializers are `check_array_flat_init`'s.
+                    if dims.len() > 1
+                        && let Some(init) = &decl.init
+                        && let ExprKind::AssignmentPattern(pi) = &init.peel_typed_pattern().kind
+                    {
+                        pattern_count(&decl.name.name, pi, &dims, errs);
+                    }
+                }
+            }
+        }
+    }
+    if arrays.is_empty() {
+        return;
+    }
+    let procs: Vec<&Statement> = items
+        .iter()
+        .filter_map(|it| match it {
+            ModuleItem::InitialConstruct(i) => Some(&i.stmt),
+            ModuleItem::AlwaysConstruct(a) => Some(&a.stmt),
+            _ => None,
+        })
+        .collect();
+    for s in &procs {
+        for_each_stmt(s, &mut |st| {
+            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+                for d in declarators {
+                    shadowed.insert(d.name.name.clone());
+                }
+            }
+            if let StatementKind::For { init, .. } = &st.kind {
+                for i in init {
+                    if let xezim_core::ast::stmt::ForInit::VarDecl { name, .. } = i {
+                        shadowed.insert(name.name.clone());
+                    }
+                }
+            }
+        });
+    }
+    for s in &procs {
+        for_each_assign_pair(s, &mut |lhs, rhs| {
+            let ExprKind::AssignmentPattern(pi) = &rhs.peel_typed_pattern().kind else {
+                return;
+            };
+            let mut base = lhs;
+            let mut k = 0usize;
+            while let ExprKind::Index { expr, index } = &base.kind {
+                if matches!(
+                    index.kind,
+                    ExprKind::Range(..) | ExprKind::RangeSelect { .. }
+                ) {
+                    return;
+                }
+                k += 1;
+                base = expr;
+            }
+            let ExprKind::Ident(h) = &base.kind else {
+                return;
+            };
+            if h.root.is_some() || h.path.len() != 1 {
+                return;
+            }
+            k += h.path[0].selects.len();
+            let name = &h.path[0].name.name;
+            if shadowed.contains(name) {
+                return;
+            }
+            if let Some(dims) = arrays.get(name)
+                && k < dims.len()
+            {
+                pattern_count(name, pi, &dims[k..], errs);
+            }
+        });
+    }
+}
+
+fn literal_unpacked_dims(dims: &[UnpackedDimension]) -> Option<Vec<(i64, i64)>> {
+    if dims.is_empty() {
+        return None;
+    }
+    dims.iter()
+        .map(|d| match d {
+            UnpackedDimension::Range { left, right, .. } => {
+                Some((literal_int(left)?, literal_int(right)?))
+            }
+            UnpackedDimension::Expression { expr, .. } => {
+                let n = literal_int(expr)?;
+                (n > 0).then_some((0, n - 1))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn literal_int(e: &Expression) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Number(_) => xezim_core::elaborate::const_eval_i64_with_params(e, None),
+        _ => None,
+    }
+}
+
+fn pattern_count(
+    name: &str,
+    items: &[AssignmentPatternItem],
+    dims: &[(i64, i64)],
+    errs: &mut Vec<String>,
+) {
+    let Some(&(l, r)) = dims.first() else {
+        return;
+    };
+    let mut ordered: Vec<&Expression> = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            AssignmentPatternItem::Ordered(e)
+                if !matches!(e.kind, ExprKind::Replication { .. }) =>
+            {
+                ordered.push(e)
+            }
+            _ => return,
+        }
+    }
+    let n = (l - r).abs() + 1;
+    if ordered.len() as i64 != n {
+        errs.push(format!(
+            "assignment pattern for '{}' has {} element(s), but the dimension [{}:{}] has {} \
+             (LRM 1800-2017 §10.9.1)",
+            name,
+            ordered.len(),
+            l,
+            r,
+            n
+        ));
+        return;
+    }
+    if dims.len() > 1 {
+        for e in ordered {
+            if let ExprKind::AssignmentPattern(inner) = &e.peel_typed_pattern().kind {
+                pattern_count(name, inner, &dims[1..], errs);
+            }
+        }
+    }
+}
+
+/// The leading names an expression reads (`a` of `a[i].f`, and `i`),
+/// including names inside index selects.
+fn monitor_idents(e: &Expression, out: &mut Vec<String>) {
+    for_each_expr(e, &mut |x| {
+        if let ExprKind::Ident(h) = &x.kind {
+            if h.root.is_none()
+                && let Some(first) = h.path.first()
+            {
+                out.push(first.name.name.clone());
+            }
+            for seg in &h.path {
+                for sel in &seg.selects {
+                    monitor_idents(sel, out);
+                }
+            }
+        }
+    });
 }

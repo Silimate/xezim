@@ -136,18 +136,33 @@ impl Simulator {
                 self.module
                     .associative_arrays
                     .insert(n_name.clone(), is_str);
+                let widths = &mut self.module.assoc_index_widths;
+                if let Some(&kw) = widths.get(&s_pre[..s_pre.len() - 1]) {
+                    widths.insert(n_name.clone(), kw);
+                }
+                // §7.4.5: a row that is a queue or dynamic array keeps its
+                // size (`<h>#m[k].size`) and its registration in the copy.
                 let entries: Vec<(String, Value)> = self
                     .signals
                     .keys_with_elem_prefix(&s_pre)
                     .into_iter()
-                    .filter(|k| k.ends_with(']'))
+                    .filter(|k| k.ends_with(']') || k.ends_with("].size"))
                     .filter_map(|k| {
                         let v = self.signals.get(&k)?.clone();
-                        Some((k[s_pre.len()..k.len() - 1].to_string(), v))
+                        Some((k[s_pre.len()..].to_string(), v))
                     })
                     .collect();
-                for (key, v) in entries {
-                    self.signals.insert(format!("{}[{}]", n_name, key), v);
+                for (rest, v) in entries {
+                    if let Some(row) = rest.strip_suffix(".size") {
+                        let (srow, nrow) = (format!("{s_pre}{row}"), format!("{n_name}[{row}"));
+                        if self.module.dynamic_arrays.contains(&srow) {
+                            self.module.dynamic_arrays.insert(nrow.clone());
+                        }
+                        if let Some(&t) = self.module.arrays.get(&srow) {
+                            self.module.arrays.insert(nrow, t);
+                        }
+                    }
+                    self.signals.insert(format!("{}[{}", n_name, rest), v);
                 }
             }
             // §8.12: a shallow copy copies every property's value — a fixed
@@ -804,8 +819,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span: crate::ast::Span::dummy(),
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             crate::ast::Span::dummy(),
         );
@@ -839,7 +855,7 @@ impl Simulator {
                 signed: false,
                 base,
                 value: val_str.trim().to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             });
         }
         // Plain decimal integer (optional leading sign).
@@ -851,7 +867,7 @@ impl Simulator {
                 signed: neg,
                 base: NumberBase::Decimal,
                 value: body.to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             });
         }
         None
@@ -897,6 +913,16 @@ impl Simulator {
                     &cd.param_order
                 };
                 if let Some(idx) = order.iter().position(|p| p == tn) {
+                    // `param_order` interleaves value parameters so a TYPE
+                    // parameter's fragment index is right. The name itself
+                    // still has to be a type parameter. A value parameter's
+                    // fragment is a number (`H` -> `32` on `my_seq #(32, 194)`).
+                    // Returning it made `is_definite_type_arg` treat
+                    // `item #(H, D)` as a type-argument list, the values were
+                    // dropped, and `new` built the default specialization.
+                    if !cd.type_param_names.iter().any(|t| t == tn) {
+                        return None;
+                    }
                     if let Some(v) = Self::spec_arg_at(sig, idx) {
                         let v = v.trim();
                         if !v.is_empty() {
@@ -1094,6 +1120,29 @@ impl Simulator {
     /// through the ENCLOSING spec, so `resource#(T)::get_type()` invoked
     /// from inside `config_db#(int)` keys `resource#(int)` — the same
     /// per-spec cell the concrete resource uses.
+    /// §8.25: the specialization against which a `C#(T)` written in the
+    /// running code resolves its parameter names — the lexical class's. While
+    /// a specialized static call's actuals are evaluated, `current_spec` is
+    /// already the CALLEE's (`eval_call`), so `registry#(B)::add(seq#(T)::cb)`
+    /// in `drv#(byte)` read `T` as `registry`'s parameter; the caller's spec
+    /// is the nearest one on `spec_scope_stack` that applies to the lexical
+    /// class.
+    pub(super) fn lexical_spec(&self) -> Option<(String, String)> {
+        let Some(Some(lex)) = self.class_context_stack.last() else {
+            return self.current_spec.clone();
+        };
+        let applies = |(b, _): &(String, String)| b == lex || self.class_is_a(lex, b);
+        if self.current_spec.as_ref().is_none_or(|c| applies(c)) {
+            return self.current_spec.clone();
+        }
+        self.spec_scope_stack
+            .iter()
+            .rev()
+            .find(|s| applies(s))
+            .cloned()
+            .or_else(|| self.current_spec.clone())
+    }
+
     pub(super) fn resolve_call_spec_params(
         &self,
         spec: Option<(String, String)>,
@@ -1198,9 +1247,9 @@ impl Simulator {
     }
 
     /// Split a virtual-interface type fragment — `virtual [interface]
-    /// I[#(args)][.modport]` in any spacing, including the whitespace-free
-    /// canonical form — into the interface name, its raw `#(...)` arguments
-    /// and the modport. None for anything else.
+    /// I[#(args)][.modport]` in any spacing, including the canonical form —
+    /// into the interface name, its raw `#(...)` arguments and the modport.
+    /// None for anything else, including a class named `virtualI`.
     pub(super) fn parse_vif_frag(
         &self,
         frag: &str,
@@ -1209,6 +1258,9 @@ impl Simulator {
             return None;
         }
         let rest = frag.trim().strip_prefix("virtual")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         let head_end = rest.find(['#', '.']).unwrap_or(rest.len());
         let head: String = rest[..head_end]
             .chars()
@@ -1258,7 +1310,7 @@ impl Simulator {
         Some((name, args, modport))
     }
 
-    /// The canonical (whitespace-free) key of `virtual name#(args).modport`
+    /// The canonical (`normalize_spec_ws`) key of `virtual name#(args).modport`
     /// (§6.22.1): named arguments moved to their slots and omitted trailing
     /// parameters filled with the interface's defaults, so `virtual I`,
     /// `virtual interface I#(int)` and `virtual I#(.T(int), .N(4))` key one
@@ -1294,7 +1346,7 @@ impl Simulator {
                 args.push(d);
             }
         }
-        let mut out = format!("virtual{}", name);
+        let mut out = format!("virtual {}", name);
         if !args.is_empty() {
             out.push_str("#(");
             out.push_str(&args.join(","));
@@ -1704,7 +1756,11 @@ impl Simulator {
                             .next()
                             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
                     });
-                if integral && signing {
+                // §25.9: `virtual bus_if` is an interface type, while
+                // `virtualbus_if` can name an unrelated class.
+                let vif = word == "virtual"
+                    && tail.starts_with(|c: char| c.is_alphabetic() || c == '_');
+                if (integral && signing) || vif {
                     out.push(' ');
                 }
             } else {
@@ -1929,6 +1985,7 @@ impl Simulator {
                             span: crate::ast::Span::dummy(),
                         },
                         span: crate::ast::Span::dummy(),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args,
@@ -1943,6 +2000,54 @@ impl Simulator {
         self.this_stack.pop();
         self.current_spec = saved_spec;
         out
+    }
+
+    /// Value parameters of the running instance, for a specialization
+    /// argument evaluated in that instance's scope (`item #(H, D)` inside
+    /// `my_seq #(32, 194)`). A static/free frame is a boundary: its caller's
+    /// object does not supply the callee's lexical parameters.
+    pub(super) fn enclosing_value_params(&mut self) -> Option<HashMap<String, Value>> {
+        let lexical = self.class_context_stack.last()?.as_ref()?.clone();
+        let mut map: HashMap<String, Value> = HashMap::default();
+        let mut names = Vec::new();
+        let instance = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h))
+            .and_then(|o| o.as_ref());
+        let mut cn: Option<&str> = Some(&lexical);
+        for _ in 0..64 {
+            let Some(cd) = cn.and_then(|c| self.module.classes.get(c)) else {
+                break;
+            };
+            for (n, _) in &cd.param_defaults {
+                if cd.type_param_names.iter().any(|t| t == n) {
+                    continue;
+                }
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+                if let Some(v) = instance.and_then(|inst| {
+                    inst.properties
+                        .get(&format!("{}::{}", cd.name, n))
+                        .or_else(|| inst.properties.get(n))
+                }) {
+                    map.entry(n.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            cn = cd.extends.as_deref();
+        }
+        let saved = self.current_spec.clone();
+        self.current_spec = self.lexical_value_spec();
+        for name in names {
+            if let Some(value) = self.resolve_value_param_in_current(&name) {
+                map.insert(name, value);
+            }
+        }
+        self.current_spec = saved;
+        (!map.is_empty()).then_some(map)
     }
 
     /// IEEE 1800-2017 §6.20.2 / §8.25: the value of the declared default `e`
@@ -2045,8 +2150,9 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         span,
                     )
@@ -2067,7 +2173,7 @@ impl Simulator {
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: v.to_u64()?.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 )
@@ -2132,7 +2238,48 @@ impl Simulator {
                         .collect();
                     (frags.len() == ta.len()).then(|| frags.join(","))
                 }
-                _ => Some(String::new()),
+                // An UNSPECIALIZED `new()` (or a `create()` whose receiver
+                // lost its `#(...)` args) of a parameterized class built
+                // while a specialization of the SAME class is active: carry
+                // the active spec's type-argument signature instead of
+                // falling back to the declared DEFAULTS. The factory
+                // `reg_agent#(dut_rw)::type_id::create("bus",..)` resolves
+                // `current_spec=("reg_agent","test.dut_rw")` for the call,
+                // and the registry's body constructs with a bare `new()` —
+                // dropping the args rebuilt `reg_agent#(int)` (the default),
+                // so its member `reg_driver#(DO)` bound `DO` to `int` and
+                // `DO::rw` silently no-op'd. The bare `new` takes the active
+                // specialization of this same class (reconciling scoped
+                // `test.reg_agent` vs bare `reg_agent` spellings behind
+                // `same_class_declaration`).
+                _ => {
+                    let mut inherited: Option<String> = None;
+                    if let Some((cb, cs)) = &self.current_spec {
+                        let same = if *cb == class_name_owned {
+                            true
+                        } else {
+                            (|| {
+                                let cb2 = cb.split('#').next().unwrap_or(cb);
+                                let cn2 = class_name_owned.split('#').next().unwrap_or(&class_name_owned);
+                                if cb2 == cn2 {
+                                    return true;
+                                }
+                                match (self.module.classes.get(cb2), self.module.classes.get(cn2)) {
+                                    (Some(a), Some(b)) => {
+                                        a.name == b.name
+                                            && a.enclosing == b.enclosing
+                                            && a.declaring_module == b.declaring_module
+                                    }
+                                    _ => false,
+                                }
+                            })()
+                        };
+                        if same && !cs.trim().is_empty() {
+                            inherited = Some(cs.clone());
+                        }
+                    }
+                    inherited.or_else(|| Some(String::new()))
+                }
             };
             if let Some(raw_sig) = raw_sig {
                 let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);
@@ -2275,13 +2422,22 @@ impl Simulator {
         let ancestor_value_args: HashMap<String, HashMap<String, Value>> = if !chain_has_params {
             HashMap::default()
         } else {
+            // An actual `#(...)` argument is an expression in the
+            // specialization site's scope. Inside a method that is the
+            // running instance, so `item #(H, D)` sees this object's
+            // value parameters. Evaluating it with an empty map used the
+            // global default (32) and the new object's properties
+            // disagreed with the specialization `$cast` checks.
+            let enclosing_params = self.enclosing_value_params();
             let mut leaf_params: HashMap<String, Value> = HashMap::default();
             for (pname, pdefault) in class_def.param_defaults.iter() {
                 // An actual argument belongs to the specialization site's
                 // scope; a default to the class's, where the parameters
                 // before it are visible (§6.20.2, `int B = A*2`).
                 let v = match (arg_map.get(pname), pdefault) {
-                    (Some(e), _) => crate::elaborate::const_eval_i64_with_params(e, None),
+                    (Some(e), _) => {
+                        crate::elaborate::const_eval_i64_with_params(e, enclosing_params.as_ref())
+                    }
                     (None, Some(e)) => {
                         crate::elaborate::const_eval_i64_with_params(e, Some(&leaf_params))
                     }
@@ -2422,8 +2578,9 @@ impl Simulator {
                     self.shadowed_prop_names.insert(sp.clone());
                 }
             }
+            // The object is not on the heap yet, so no parked waiter reads
+            // these properties: seeding them notes no name.
             if t.property_seed_keys.is_none() {
-                bump_store_gen();
                 instance.properties = PropMap(t.base_props.clone());
             }
         }
@@ -2617,6 +2774,16 @@ impl Simulator {
                 self.module
                     .associative_arrays
                     .insert(format!("{}#{}", handle, prop), is_str);
+            }
+            // §8.25: a key sized by a class parameter takes this object's
+            // specialization, not the default `assoc_index_props` holds.
+            for (prop, kdt) in &cdef.assoc_key_decl_types {
+                if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
+                    let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
+                    self.module
+                        .assoc_index_widths
+                        .insert(format!("{}#{}", handle, prop), (kw, signed));
+                }
             }
             // Per-instance queue / dynamic-array members. Register the instance-
             // scoped name `<handle>#<member>` in the array tables (mirroring the
@@ -2886,7 +3053,7 @@ impl Simulator {
                 }
             }
         }
-        self.heap.push(Some(instance));
+        self.heap.push(Some(Box::new(instance)));
         // §8.25 / §6.20.2: the ELEMENT width of a fixed-array or queue member
         // follows this specialization too (`bit [W-1:0] a[2]`, `T q[$]`).
         // The per-instance storage registered above used the class table's
@@ -2990,7 +3157,7 @@ impl Simulator {
                 {
                     let Some(su) = self
                         .class_prop_struct(handle, prop)
-                        .filter(Self::spreads_member_wise)
+                        .filter(|su| Self::spreads_member_wise(su))
                     else {
                         continue;
                     };

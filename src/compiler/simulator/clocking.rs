@@ -5,6 +5,46 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// §14.16: commit a clocking drive of a SELECT of an output clockvar
+    /// (`cb.v[2] <= 1`, `cb.u[1] <= 1`) after `skew` ticks, as a nonblocking
+    /// update of just the selected bits or element. `target` is the net with
+    /// the drive's indices frozen when it executed.
+    pub(super) fn drive_clocking_select(&mut self, target: &Expression, val: Value, skew: u64) {
+        let span = target.span;
+        let rvalue = self.make_intra_saved_expr(val, span);
+        let delay = (skew > 0).then(|| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: skew.to_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            )
+        });
+        self.exec_statement(&Statement::new(
+            StatementKind::NonblockingAssign {
+                lvalue: target.clone(),
+                delay,
+                rvalue,
+            },
+            span,
+        ));
+    }
+
+    /// §14.3: the element signals (`net[i]`, with `i`) of clockvar net `net`
+    /// when it is a one-dimensional unpacked array, which has no signal under
+    /// its own name; `None` for any other net.
+    pub(super) fn clocking_array_elems(&self, net: &str) -> Option<Vec<(i64, String)>> {
+        if self.signal_name_to_id.contains_key(net) {
+            return None;
+        }
+        let &(lo, hi, _) = self.module.arrays.get(net)?;
+        Some((lo..=hi).map(|i| (i, format!("{}[{}]", net, i))).collect())
+    }
+
     /// LRM §14.3 clocking-block input snapshot. Each registered cb
     /// has a clock signal; on every posedge transition of that clock
     /// we snapshot the current values of input-direction signals. The
@@ -12,6 +52,45 @@ impl Simulator {
     /// next posedge updates it — this is the `#1step` input-skew
     /// behavior (IEEE 1800-2023 §14.13 / §14.16) that lets clocking block
     /// monitors sample stable pre-edge state.
+    /// §14.4: the per-signal output skew of the clockvar bound to `net`.
+    /// The skew map is keyed by the clockvar's own name; a renamed clockvar
+    /// (`output #2 q = q_drv;`) queues its drive under the bound net, so the
+    /// alias map is consulted the other way round (#824).
+    fn clocking_net_out_skew(&self, cb: &str, net: &str) -> Option<u64> {
+        let per_sig = self.clocking_sig_out_skew.get(cb)?;
+        if let Some(&s) = per_sig.get(net) {
+            return Some(s);
+        }
+        let aliases = self.clocking_sig_alias.get(cb)?;
+        aliases
+            .iter()
+            .find(|(_, bound)| bound.as_str() == net)
+            .and_then(|(vis, _)| per_sig.get(vis).copied())
+    }
+
+    /// §14.5: `sel` (`bus[3:0]`, `mem[2][7:4]`) applied to `base`, the
+    /// sampled value of the net under the selects: the base is swapped for
+    /// the saved value and the select chain evaluated as usual.
+    fn apply_bound_select(&mut self, sel: &Expression, base: Value) -> Value {
+        fn swap_base(e: &mut Expression, saved: Expression) {
+            match &mut e.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }
+                    if Simulator::select_chain_base(expr).is_some() =>
+                {
+                    swap_base(expr, saved)
+                }
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                    **expr = saved;
+                }
+                _ => *e = saved,
+            }
+        }
+        let saved = self.make_intra_saved_expr(base, sel.span);
+        let mut e = sel.clone();
+        swap_base(&mut e, saved);
+        self.eval_expr(&e)
+    }
+
     pub(super) fn tick_clocking_blocks(&mut self) {
         if self.clocking_meta.is_empty() {
             return;
@@ -84,21 +163,18 @@ impl Simulator {
             // whose countdown hits zero (honoring output skew), keep the rest.
             if let Some(mut pend) = self.clocking_cycle_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
-                let mut keep: Vec<(u64, String, Value)> = Vec::new();
-                for (n, net, val) in pend.drain(..) {
+                let mut keep: Vec<(u64, String, Value, Option<Expression>)> = Vec::new();
+                for (n, net, val, target) in pend.drain(..) {
                     if n <= 1 {
-                        let skew = self
-                            .clocking_sig_out_skew
-                            .get(&cb)
-                            .and_then(|m| m.get(&net))
-                            .copied()
-                            .unwrap_or(dskew);
-                        if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
+                        let skew = self.clocking_net_out_skew(&cb, &net).unwrap_or(dskew);
+                        if let Some(t) = target {
+                            self.drive_clocking_select(&t, val, skew);
+                        } else if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
                             let w = self.signal_widths[id];
                             self.schedule_delayed_with_delay(id, val.resize(w), skew);
                         }
                     } else {
-                        keep.push((n - 1, net, val));
+                        keep.push((n - 1, net, val, target));
                     }
                 }
                 if !keep.is_empty() {
@@ -114,14 +190,17 @@ impl Simulator {
             // see the new output values when they run in the Reactive region.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
-                for (sig, val) in pending {
+                for (sig, val, target) in pending {
                     // §14.4 output skew for drives maturing at THIS edge.
-                    let skew = self
-                        .clocking_sig_out_skew
-                        .get(&cb)
-                        .and_then(|m| m.get(&sig))
-                        .copied()
-                        .unwrap_or(dskew);
+                    let skew = self.clocking_net_out_skew(&cb, &sig).unwrap_or(dskew);
+                    if let Some(t) = target {
+                        if skew > 0 {
+                            self.drive_clocking_select(&t, val, skew);
+                        } else {
+                            self.assign_value(&t, &val);
+                        }
+                        continue;
+                    }
                     if skew > 0 {
                         if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
                             let w = self.signal_widths[id];
@@ -140,8 +219,9 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span: crate::ast::Span::dummy(),
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         crate::ast::Span::dummy(),
                     );
@@ -155,11 +235,14 @@ impl Simulator {
             // - `#N`: the value N time units before the edge (`ClockingHist`).
             // A per-signal skew overrides the block default. The `##N` /
             // default-clocking aliases share the named block's skews.
-            let skey: &str = if cb.starts_with("__xz_default_clocking") {
-                self.default_clocking_cb.as_deref().unwrap_or(cb.as_str())
+            let skey: String = if cb.starts_with("__xz_default_clocking") {
+                self.default_clocking_cb
+                    .clone()
+                    .unwrap_or_else(|| cb.clone())
             } else {
-                cb.as_str()
+                cb.clone()
             };
+            let skey = skey.as_str();
             let in_dskew = self
                 .clocking_in_skew
                 .get(skey)
@@ -176,6 +259,28 @@ impl Simulator {
                         .and_then(|m| m.get(vis))
                         .copied()
                         .unwrap_or(in_dskew);
+                    // §14.3: an unpacked-array clockvar samples each element,
+                    // published as `vis[i]` for `cb.sig[i]` reads.
+                    if let Some(elems) = self.clocking_array_elems(sig) {
+                        let leaf = vis.rsplit('.').next().unwrap_or(vis);
+                        if !self.clocking_array_leaves.contains(leaf) {
+                            self.clocking_array_leaves.insert(leaf.to_string());
+                        }
+                        for (idx, e) in elems {
+                            let v = if skew == CB_SKEW_1STEP {
+                                self.clocking_preponed.get(&e).cloned()
+                            } else if skew == 0 {
+                                None
+                            } else {
+                                self.clocking_hist_value(&e, self.time.saturating_sub(skew))
+                            }
+                            .or_else(|| self.get_signal_value_by_name(&e));
+                            if let Some(v) = v {
+                                snap.insert(format!("{}[{}]", vis, idx), v);
+                            }
+                        }
+                        continue;
+                    }
                     let v = if skew == CB_SKEW_1STEP {
                         self.clocking_preponed
                             .get(sig)
@@ -186,6 +291,17 @@ impl Simulator {
                     } else {
                         self.clocking_hist_value(sig, self.time.saturating_sub(skew))
                             .or_else(|| self.get_signal_value_by_name(sig))
+                    };
+                    // §14.5: a clockvar bound to a select samples that select
+                    // of the base net's sample (#823).
+                    let bound_sel = self
+                        .clocking_sig_bound_sel
+                        .get(skey)
+                        .and_then(|m| m.get(vis))
+                        .cloned();
+                    let v = match (v, bound_sel) {
+                        (Some(v), Some(sel)) => Some(self.apply_bound_select(&sel, v)),
+                        (v, _) => v,
                     };
                     if let Some(v) = v {
                         snap.insert(vis.clone(), v);
@@ -326,11 +442,16 @@ impl Simulator {
         if !self.deferred_clocking_guarded.is_empty() {
             self.resolve_deferred_clocking_guards();
         }
+        if self.deferred_clocking_conts.is_empty() {
+            return;
+        }
+        let table_mod_before = self.table_modified;
+        self.table_modified = false;
+        let store_writes_before = STORE_WRITE_MASK.with(|m| m.get());
         let mut guard = 0u32;
         let mut ran_any = false;
         while !self.deferred_clocking_conts.is_empty() {
             let conts = std::mem::take(&mut self.deferred_clocking_conts);
-            self.late_resume_epoch += conts.len() as u64;
             for (pid, stmts) in conts {
                 if self.finished {
                     break;
@@ -354,13 +475,19 @@ impl Simulator {
                 break;
             }
         }
+        let wrote_signals =
+            self.table_modified || self.dirty_any || !self.changed_edge_pos.is_empty();
+        self.table_modified |= table_mod_before;
         // These continuations run after the tick's edge pass. A named event
         // or signal they write (`##2; -> ev;`) had no pass left to wake its
         // `@(ev)` / `@(sig)` waiters, which then resumed one tick late
         // (a clocking-synchronised trigger was seen a clock toggle after
         // it fired). Give their writes the same edge pass the clocking
         // mirror gets above.
-        if ran_any && !self.finished {
+        if ran_any
+            && !self.finished
+            && (wrote_signals || !self.dirty_edge || self.dirty_edge_shadow)
+        {
             self.settle_combinatorial();
             let saved = self.edge_dispatch_phase;
             self.edge_dispatch_phase = "clocking-conts";
@@ -368,6 +495,23 @@ impl Simulator {
             self.edge_dispatch_phase = saved;
             let limit = self.cascade_limit;
             let _ = self.drain_edge_cascade(limit);
+        }
+        if ran_any
+            && (wrote_signals
+                || STORE_WRITE_MASK.with(|m| m.get()) != store_writes_before
+                || !self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                || !self.pending_nba_triggers.is_empty()
+                || !self.packed_nba.is_empty()
+                || !self.pending_nba_instance_triggers.is_empty()
+                || !self.ready_condition_waiters.is_empty()
+                || !self.nba_region_waiters.is_empty()
+                || !self.pending_reactive.is_empty()
+                || !self.reactive_conts.is_empty()
+                || self.event_queue.next_time() == Some(self.time)
+                || !self.inactive_queue.is_empty())
+        {
+            self.late_resume_epoch += 1;
         }
     }
 

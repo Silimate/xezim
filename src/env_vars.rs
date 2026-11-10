@@ -64,6 +64,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace block-local declaration binding",
     ),
     (
+        "XEZIM_BIND_AUDIT",
+        "Elab: print each name's binding (§23.9) beside what the generate rename made of it",
+    ),
+    (
         "XEZIM_BIT_SENS",
         "Scheduling: bit-granular comb sensitivity (a write re-runs only readers of the changed bits); 0 disables",
     ),
@@ -138,6 +142,18 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_CHAIN_CENSUS",
         "Phase 2: size the single-fanout chain clustering opportunity (count, lengths, dynamic coverage)",
+    ),
+    (
+        "XEZIM_CKPT_AUDIT",
+        "Checkpoints: append to this file the simulator fields a run changes after setup",
+    ),
+    (
+        "XEZIM_CKPT_DIGESTS",
+        "Checkpoints: write each field's digest beside a checkpoint when saved and restored",
+    ),
+    (
+        "XEZIM_CLASS_GC",
+        "Class objects: reclaim unreachable objects between time slots (default on; 0 disables, stress collects at every time advance)",
     ),
     (
         "XEZIM_CLKTREE_PROBE",
@@ -486,6 +502,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Build metadata: nearest release tag baked into -V (build-time)",
     ),
     (
+        "XEZIM_GROWTH_TRACE",
+        "Every N ticks of simulated time, print heap, process-context and waiter-table sizes to stderr",
+    ),
+    (
         "XEZIM_HIER_REF_DEBUG",
         "Debug: trace how each hierarchical reference resolves in the §23.8 elaboration check",
     ),
@@ -577,6 +597,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Elab: =1 keeps the nets of substituted input ports that nothing can reach by name (turns unobserved-port elision off)",
     ),
     (
+        "XEZIM_KEYWORDS",
+        "Parse: keyword set outside `begin_keywords` regions, a §22.14 version (same as --keywords)",
+    ),
+    (
         "XEZIM_LARGE_ARRAY_NAME_THRESHOLD",
         "Elab: element-count threshold above which per-element names are lazy",
     ),
@@ -611,6 +635,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "class-perf: sample class-method execution (in-process sampling profiler)",
     ),
     (
+        "XEZIM_METHOD_STMT_FALLBACK",
+        "class-perf: run a statement a compiled method body cannot lower in the interpreter instead of interpreting the whole method (0 disables, default on)",
+    ),
+    (
         "XEZIM_METHOD_TIER",
         "compile a class method after N calls (0 = first call); an explicit setting also attempts compilation on the next call after a wait-free method reaches N measured loop iterations",
     ),
@@ -629,6 +657,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_NO_CLKTREE_DEDUP",
         "Clock tree: disable derived-clock deduplication",
+    ),
+    (
+        "XEZIM_NO_CONFIG_KEYWORDS",
+        "Parse: read the configuration keywords as names (1 enables; same as --no-config-keywords)",
     ),
     (
         "XEZIM_NO_DYN_RENAME",
@@ -789,8 +821,44 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_REG_DBG", "Debug: trace VM register allocation"),
     (
+        "XEZIM_RELAX_CASEX_INSIDE",
+        "Parse: read `casex/casez (e) inside` as `case (e) inside` (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_CROSS_HIER_ITEM",
+        "Parse: accept a hierarchical cross item with an implicit coverpoint (1 enables)",
+    ),
+    (
         "XEZIM_RELAX_DRIVER_CONFLICTS",
         "Elab: report conflicting variable drivers (§6.5, §9.2.2) as warnings, not errors (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_DUPLICATE_DECLS",
+        "Parse: ignore a repeated declaration in a subroutine or block (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_ENUM_NO_BASE",
+        "Parse: read `enum [N:0] {...}` as `enum bit [N:0]` (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_EVENT_THIS",
+        "Parse: read `@this.ev` as `@(this.ev)` (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_MACRO_SPACE",
+        "Preprocess: read white space after a backtick as none (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_NUL_BYTES",
+        "Preprocess: read a NUL byte as white space (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_STATIC_CONST",
+        "Parse: read `static const` as `const static` (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_USE_BEFORE_DECL",
+        "Elab: accept module data references before their declarations with a warning (§6.5; 1 enables)",
     ),
     (
         "XEZIM_REPORT_STATS",
@@ -981,6 +1049,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_VERBOSE",
         "Same as --verbose: version banner, [PHASE] timings, end-of-run engine counters (1)",
+    ),
+    (
+        "XEZIM_VERIFY_CLASS_ELEM_READS",
+        "Debug: check every fast class unpacked-array element read against the full name lookup (1)",
     ),
     (
         "XEZIM_VERIFY_INLINE_BITS",

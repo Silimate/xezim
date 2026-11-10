@@ -159,6 +159,20 @@ pub(crate) fn resolve_sv_libs(cx: &CompatArgs) -> Vec<String> {
         .collect()
 }
 
+/// `-sv_seed`, `-svseed` or `-seed` at `t`: the flag, and the value glued on
+/// with `=` (None when the value is the next token).
+fn seed_flag(t: &str) -> Option<(&'static str, Option<&str>)> {
+    ["-sv_seed", "-svseed", "-seed"]
+        .into_iter()
+        .find_map(|flag| {
+            let rest = t.strip_prefix(flag)?;
+            match rest.strip_prefix('=') {
+                Some(v) => Some((flag, Some(v))),
+                None => rest.is_empty().then_some((flag, None)),
+            }
+        })
+}
+
 /// One of the spellings above at `toks[i]`: apply it and return how many
 /// tokens it used, or 0 when `toks[i]` is not one of them. `base` is where
 /// a relative source file name is also looked up: the args file's directory,
@@ -175,6 +189,19 @@ pub(crate) fn handle_flag(
             .cloned()
             .ok_or_else(|| format!("{} requires an argument", t))
     };
+    // The seed spellings, `<flag> <n>` or `<flag>=<n>`. Here, ahead of the
+    // glued `-s<top>`, in both parsers. The RNG's seed. It is not handed on as
+    // a `+seed=` plusarg: other simulators keep these out of the plusargs a
+    // testbench or a VPI client sees, and cocotb reads `+seed=random` as a seed
+    // and fails.
+    if let Some((flag, glued)) = seed_flag(t) {
+        let (seed, used) = match glued {
+            Some(v) => (v.to_string(), 1),
+            None => (value()?, 2),
+        };
+        cx.seed = Some(check_seed(flag, seed)?);
+        return Ok(used);
+    }
     match t {
         // SystemVerilog is always on, every file already shares one
         // compilation unit (macros and `$unit` declarations carry across
@@ -307,18 +334,6 @@ pub(crate) fn handle_flag(
                 res
             );
             Ok(2)
-        }
-        // The RNG seed. It is not handed on as a `+seed=` plusarg: other
-        // simulators keep these out of the plusargs a testbench or a VPI
-        // client sees, and cocotb reads `+seed=random` as a seed and fails.
-        "-sv_seed" | "-svseed" | "-seed" => {
-            cx.seed = Some(check_seed(t, value()?)?);
-            Ok(2)
-        }
-        _ if t.starts_with("-svseed=") || t.starts_with("-seed=") => {
-            let (flag, seed) = t.split_once('=').unwrap();
-            cx.seed = Some(check_seed(flag, seed.to_string())?);
-            Ok(1)
         }
         "-sv_root" => {
             cx.sv_root = Some(value()?);

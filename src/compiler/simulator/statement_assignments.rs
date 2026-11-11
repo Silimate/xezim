@@ -1466,7 +1466,10 @@ impl Simulator {
         }
         // (A side-effecting lvalue index is folded first, below, and
         // comes back through here.)
+        let row_sized_new = Self::sized_new_parts(rvalue).is_some()
+            && self.dyn_row_of_new_target(lvalue).is_some();
         if self.indexed_colls_live()
+            && !row_sized_new
             && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
             && !Self::lvalue_has_incdec_index(lvalue)
             && self.try_indexed_coll_assign(lvalue, rvalue)

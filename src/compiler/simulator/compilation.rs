@@ -347,21 +347,11 @@ impl Simulator {
                     .copied()
                     .unwrap_or(dskew);
                 if skew != 0 && skew != CB_SKEW_1STEP {
-                    // Elaboration-time only: use module.arrays, not
-                    // `clocking_array_elems`, which skips names that also
-                    // appear in the signal table.
-                    let elem_keys = |a: &str| -> Option<Vec<String>> {
-                        let &(lo, hi, _) = self.module.arrays.get(a)?;
-                        if hi < lo || hi - lo > 4096 {
-                            return None;
-                        }
-                        Some((lo..=hi).map(|i| format!("{a}[{i}]")).collect())
-                    };
-                    if let Some(keys) = [net.as_str(), v.as_str()]
+                    if let Some(elems) = [net.as_str(), v.as_str()]
                         .into_iter()
-                        .find_map(elem_keys)
+                        .find_map(|a| self.clocking_array_elems(a))
                     {
-                        hist.extend(keys.into_iter().map(|e| (e, skew)));
+                        hist.extend(elems.into_iter().map(|(_, e)| (e, skew)));
                     } else {
                         hist.push((net.clone(), skew));
                     }

@@ -1583,19 +1583,16 @@ impl Simulator {
         } else {
             const MAX_VALUES: u64 = 1 << 20;
             let mut n = 0u64;
-            for &(l, h) in &segs {
+            'scan: for &(l, h) in &segs {
                 for v in l..=h {
                     n += 1;
                     if n > MAX_VALUES {
                         eprintln!(
                             "[xezim][warning] bins '{}': a with filter over more than {} \
-                             values is not supported, so the bin is left empty",
+                             values is not supported; keeping the accepted prefix",
                             bin.name.name, MAX_VALUES
                         );
-                        self.cg_with_segs_cache
-                            .borrow_mut()
-                            .insert(key, Vec::new().into());
-                        return Vec::new();
+                        break 'scan;
                     }
                     if self.cg_with_accepts(f, v, ctor) {
                         keep(v, v);
@@ -1753,29 +1750,51 @@ impl Simulator {
             }
             ExprKind::Binary { op, left, right } => {
                 let l = self.cg_item_eval(left, v, ctor)?;
-                let r = self.cg_item_eval(right, v, ctor)?;
                 match op {
-                    B::Add => l.checked_add(r),
-                    B::Sub => l.checked_sub(r),
-                    B::Mul => l.checked_mul(r),
-                    B::Div => l.checked_div(r),
-                    B::Mod => l.checked_rem(r),
-                    B::BitAnd => Some(l & r),
-                    B::BitOr => Some(l | r),
-                    B::BitXor => Some(l ^ r),
-                    B::ShiftLeft => u32::try_from(r).ok().and_then(|r| l.checked_shl(r)),
-                    B::ShiftRight => u32::try_from(r).ok().and_then(|r| l.checked_shr(r)),
-                    B::Eq | B::CaseEq => b(l == r),
-                    B::Neq | B::CaseNeq => b(l != r),
-                    B::Lt => b(l < r),
-                    B::Leq => b(l <= r),
-                    B::Gt => b(l > r),
-                    B::Geq => b(l >= r),
-                    B::LogAnd => b(l != 0 && r != 0),
-                    B::LogOr => b(l != 0 || r != 0),
-                    B::LogImplies => b(l == 0 || r != 0),
-                    B::LogEquiv => b((l != 0) == (r != 0)),
-                    _ => None,
+                    B::LogAnd => {
+                        if l == 0 {
+                            return Some(0);
+                        }
+                        self.cg_item_eval(right, v, ctor).map(|r| (r != 0) as i64)
+                    }
+                    B::LogOr => {
+                        if l != 0 {
+                            return Some(1);
+                        }
+                        self.cg_item_eval(right, v, ctor).map(|r| (r != 0) as i64)
+                    }
+                    B::LogImplies => {
+                        if l == 0 {
+                            return Some(1);
+                        }
+                        self.cg_item_eval(right, v, ctor).map(|r| (r != 0) as i64)
+                    }
+                    B::LogEquiv => {
+                        let r = self.cg_item_eval(right, v, ctor)?;
+                        b((l != 0) == (r != 0))
+                    }
+                    _ => {
+                        let r = self.cg_item_eval(right, v, ctor)?;
+                        match op {
+                            B::Add => l.checked_add(r),
+                            B::Sub => l.checked_sub(r),
+                            B::Mul => l.checked_mul(r),
+                            B::Div => l.checked_div(r),
+                            B::Mod => l.checked_rem(r),
+                            B::BitAnd => Some(l & r),
+                            B::BitOr => Some(l | r),
+                            B::BitXor => Some(l ^ r),
+                            B::ShiftLeft => u32::try_from(r).ok().and_then(|r| l.checked_shl(r)),
+                            B::ShiftRight => u32::try_from(r).ok().and_then(|r| l.checked_shr(r)),
+                            B::Eq | B::CaseEq => b(l == r),
+                            B::Neq | B::CaseNeq => b(l != r),
+                            B::Lt => b(l < r),
+                            B::Leq => b(l <= r),
+                            B::Gt => b(l > r),
+                            B::Geq => b(l >= r),
+                            _ => None,
+                        }
+                    }
                 }
             }
             ExprKind::Index { expr, index } if Self::cg_is_item(expr) => {

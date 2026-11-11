@@ -46,6 +46,18 @@ fn c19_bins_with_filter() {
     );
 }
 
+#[test]
+fn c19_bins_with_filter_guards() {
+    check(
+        "c19_bins_with_filter_guards",
+        include_str!("sv/c19_bins_with_filter_guards.sv"),
+        "c19_bins_with_filter_guards",
+        Order::Exact,
+        &["T|div0|100.00", "T|wide|25.00"],
+        &[],
+    );
+}
+
 // §11.4.12, §19.5: bin range bounds written as constant concatenations or
 // replications; the bins were dropped and the coverpoints read 0.00.
 #[test]

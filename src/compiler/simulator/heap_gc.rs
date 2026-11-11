@@ -518,6 +518,8 @@ impl Simulator {
             slots.retain(|(h, _)| !dead_handle(*h));
         }
         self.event_obj_slots.retain(|_, slots| !slots.is_empty());
+        self.event_null_obj_ids
+            .retain(|id| self.event_obj_slots.contains_key(id));
         let mut released = 0;
         for &handle in dead_list {
             if self.heap.get_mut(handle).and_then(Option::take).is_some() {

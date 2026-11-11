@@ -4197,6 +4197,7 @@ impl Simulator {
             event_aliases: HashMap::default(),
             event_obj_ids: HashMap::default(),
             event_obj_slots: HashMap::default(),
+            event_null_obj_ids: HashSet::default(),
             next_event_obj_id: 0,
             class_event_prop_names: None,
             nba_fast: Vec::new(),

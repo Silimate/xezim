@@ -1204,8 +1204,54 @@ impl Simulator {
         if matches!(e.kind, ExprKind::Null) {
             return Some(Self::EVENT_NULL_KEY.to_string());
         }
+        if let Some(k) = self.class_instance_event_operand_key(e) {
+            return Some(k);
+        }
         let k = self.event_ref_key(e)?;
         Some(self.resolve_event_key(&k))
+    }
+
+    /// Identity operand for `==`/`!=` on a class-property event, including
+    /// `== null` after a rebind skipped the stored handle value.
+    fn class_instance_event_operand_key(&mut self, e: &Expression) -> Option<String> {
+        let stamp = self.class_instance_event_identity_stamp(e)?;
+        let k = self.instance_event_slot(e)?;
+        if let Some(&id) = self.event_obj_ids.get(&k)
+            && self.event_null_obj_ids.contains(&id)
+        {
+            return Some(Self::EVENT_NULL_KEY.to_string());
+        }
+        Some(stamp)
+    }
+
+    fn class_instance_event_identity_stamp(&mut self, e: &Expression) -> Option<String> {
+        if !Self::select_free_event_ref(e) {
+            return None;
+        }
+        let k = self.instance_event_slot(e)?;
+        if !self.class_prop_declared_event(k.0, &k.1) {
+            return None;
+        }
+        if let Some(&id) = self.event_obj_ids.get(&k) {
+            if let Some(leader) = self.event_obj_slots.get(&id).and_then(|s| s.first()) {
+                return Some(Self::instance_event_stamp_key(leader));
+            }
+        }
+        Some(Self::instance_event_stamp_key(&k))
+    }
+
+    /// Identity key for comparing two class-property events (no `null` operand).
+    pub(super) fn class_instance_event_cmp_key(&mut self, e: &Expression) -> Option<String> {
+        self.class_instance_event_identity_stamp(e)
+    }
+
+    fn select_free_event_ref(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.is_empty()),
+            ExprKind::MemberAccess { expr, .. } => Self::select_free_event_ref(expr),
+            ExprKind::This => true,
+            _ => false,
+        }
     }
 
     /// `.triggered` stamp key for a per-instance class event. Instance events
@@ -1705,9 +1751,15 @@ impl Simulator {
 
     /// §15.5.5 `ev = other_ev` / `ev = null` between class-member events:
     /// the slot takes the other slot's event object (a null event, its own
-    /// fresh one that nothing else holds). The ordinary value assignment
-    /// still follows, so `ev == null` keeps comparing the stored handles.
-    pub(super) fn bind_instance_event_assign(&mut self, lvalue: &Expression, rvalue: &Expression) {
+    /// fresh one that nothing else holds). Returns true when the statement was
+    /// an event-to-event handle assignment and must not run the value copy.
+    /// `ev = null` still returns false so `ev == null` can use the stored
+    /// handle.
+    pub(super) fn try_bind_instance_event_assign(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> bool {
         let leaf = |e: &Expression| -> Option<String> {
             match &e.kind {
                 ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
@@ -1741,11 +1793,11 @@ impl Simulator {
             }
         };
         if names.is_empty() || !leaf(lvalue).is_some_and(|n| names.contains(&n)) {
-            return;
+            return false;
         }
         let is_null = matches!(rvalue.kind, ExprKind::Null);
         if !is_null && !leaf(rvalue).is_some_and(|n| names.contains(&n)) {
-            return;
+            return false;
         }
         let declared_event =
             |sim: &Self, k: &(usize, String)| sim.class_prop_declared_event(k.0, &k.1);
@@ -1753,16 +1805,18 @@ impl Simulator {
             .instance_event_slot(lvalue)
             .filter(|k| declared_event(self, k))
         else {
-            return;
+            return false;
         };
         let id = if is_null {
-            self.fresh_event_obj_id()
+            let id = self.fresh_event_obj_id();
+            self.event_null_obj_ids.insert(id);
+            id
         } else {
             let Some(src) = self
                 .instance_event_slot(rvalue)
                 .filter(|k| declared_event(self, k))
             else {
-                return;
+                return false;
             };
             match self.event_obj_ids.get(&src) {
                 Some(&id) => id,
@@ -1783,6 +1837,7 @@ impl Simulator {
             heir = v.first().cloned();
             if v.is_empty() {
                 self.event_obj_slots.remove(&old);
+                self.event_null_obj_ids.remove(&old);
             }
         }
         // §15.5.5: a process already blocked on the slot stays blocked on
@@ -1794,6 +1849,7 @@ impl Simulator {
         }
         self.event_obj_slots.entry(id).or_default().push(slot);
         note_event_trigger();
+        !is_null
     }
 
     /// Is `field` of the object `handle` declared `event` (`class_prop_is_event`

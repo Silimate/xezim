@@ -1464,36 +1464,11 @@ impl Simulator {
         {
             return;
         }
-        // (A side-effecting lvalue index is folded first, below, and
-        // comes back through here.)
-        let row_sized_new = Self::sized_new_parts(rvalue).is_some()
-            && self.dyn_row_of_new_target(lvalue).is_some();
-        if self.indexed_colls_live()
-            && !row_sized_new
-            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
-            && !Self::lvalue_has_incdec_index(lvalue)
-            && self.try_indexed_coll_assign(lvalue, rvalue)
-        {
-            self.settle_after_proc_write();
-            return;
-        }
-        if (matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
-            || self.lvalue_may_name_struct_coll(lvalue))
-            && self.try_struct_aggregate_assign(stmt, lvalue, rvalue)
-        {
-            self.settle_after_proc_write();
-            return;
-        }
-        // §15.5.5: `event_var = other_event / null / q[i]` re-binds
-        // the HANDLE, it does not copy a value.
-        if self.try_event_handle_assign(lvalue, rvalue) {
-            return;
-        }
         // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
-        // is evaluated exactly ONCE. The assign_value machinery
-        // re-evaluates the index in several candidate branches, so
-        // fold side-effecting indices to literals up front. A
-        // compound assign (`x[i++] += 2`) was desugared by the parser
+        // is evaluated exactly ONCE. The assign_value machinery and the
+        // probes below re-evaluate the index in several candidate
+        // branches, so fold side-effecting indices to literals up front.
+        // A compound assign (`x[i++] += 2`) was desugared by the parser
         // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
         // on the RHS — point that clone at the same folded index so
         // the increment still happens once.
@@ -1522,6 +1497,29 @@ impl Simulator {
                 self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
                 return;
             }
+        }
+        let row_sized_new = Self::sized_new_parts(rvalue).is_some()
+            && self.dyn_row_of_new_target(lvalue).is_some();
+        if self.indexed_colls_live()
+            && !row_sized_new
+            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
+            && !Self::lvalue_has_incdec_index(lvalue)
+            && self.try_indexed_coll_assign(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
+        if (matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
+            || self.lvalue_may_name_struct_coll(lvalue))
+            && self.try_struct_aggregate_assign(stmt, lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
+        // §15.5.5: `event_var = other_event / null / q[i]` re-binds
+        // the HANDLE, it does not copy a value.
+        if self.try_event_handle_assign(lvalue, rvalue) {
+            return;
         }
         // LRM §25.8 virtual-interface binding. When the LHS is a
         // class-property write whose property is declared
@@ -1642,6 +1640,10 @@ impl Simulator {
             // unresolved, the constructor path below took the element type
             // for the enclosing class and ran that class's `new`.
             if let Some(row) = self.dyn_row_of_new_target(lvalue) {
+                if !self.ensure_row(&row) {
+                    self.settle_after_proc_write();
+                    return;
+                }
                 self.module.dynamic_arrays.insert(row.clone());
                 self.fill_sized_new(&row, n_expr, src_expr);
                 self.settle_after_proc_write();

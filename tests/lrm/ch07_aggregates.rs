@@ -276,3 +276,29 @@ fn c7_aggregates_more() {
         ],
     );
 }
+
+// §7.5.1 / §11.4.1: row `new[n]` assignment with a post-increment row index
+#[test]
+fn c7_5_1_dyn_row_incdec_index() {
+    check(
+        "7.5.1_dyn_row_incdec_index",
+        include_str!("sv/7.5.1_dyn_row_incdec_index.sv"),
+        "rdx",
+        Order::Exact,
+        &["T|7.5.1row_inc|1 2 0"],
+        &[],
+    );
+}
+
+// §7.10.1 / §7.5.1: sized-new on the first row of an empty queue of dynamic rows
+#[test]
+fn c7_10_1_queue_dyn_row_sized_new() {
+    check(
+        "7.10.1_queue_dyn_row_sized_new",
+        include_str!("sv/7.10.1_queue_dyn_row_sized_new.sv"),
+        "rqdr",
+        Order::Exact,
+        &["T|7.10.1qrow|1 2"],
+        &[],
+    );
+}

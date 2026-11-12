@@ -3791,7 +3791,20 @@ impl Simulator {
         let mut i = 0;
         while i < self.delayed_updates.len() {
             if self.delayed_updates[i].0 <= self.time {
-                let (_, id, mut val) = self.delayed_updates.swap_remove(i);
+                let (when, id, mut val) = self.delayed_updates.swap_remove(i);
+                // §14.16.2: select drives change only their bits of the
+                // net's value as it stands now.
+                if !self.clocking_bit_masks.is_empty()
+                    && let Some(mask) = self.clocking_bit_masks.remove(&(when, id))
+                {
+                    let mut cur = self.signal_table[id].clone();
+                    for b in 0..cur.width as usize {
+                        if mask.get_bit_code(b) == 1 {
+                            cur.set_bit_code(b, val.get_bit_code(b));
+                        }
+                    }
+                    val = cur;
+                }
                 // The committed value carries the TARGET's signedness — a
                 // delayed NBA of a signed 32-bit literal into a plain
                 // `reg [3:0]` must not read back signed (-7 for 4'b1001).

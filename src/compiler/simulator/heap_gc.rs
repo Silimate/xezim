@@ -96,7 +96,7 @@ impl Simulator {
             pending_observed,
             clocking_snapshots,
             clocking_output_pending,
-            clocking_at_event_compose,
+            clocking_bit_masks,
             clocking_cycle_pending,
             clocking_edge_out_pending,
             clocking_preponed,

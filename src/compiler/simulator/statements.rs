@@ -4430,8 +4430,7 @@ impl Simulator {
                                             .push((net, val, edge, d, target));
                                         return;
                                     }
-                                    self.queue_at_event_clocking_drive(
-                                        &cb,
+                                    self.commit_clocking_drive(
                                         &net,
                                         &val,
                                         target.as_ref(),

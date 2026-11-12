@@ -7288,9 +7288,9 @@ pub struct Simulator {
     /// A drive of a SELECT (`cb.v[2] <= 1`) carries its target: the net with
     /// the drive's indices frozen.
     clocking_output_pending: HashMap<String, Vec<ClockingOutputDrive>>,
-    /// §14.16.1/§14.16.2: composed values for skewed drives issued AT a
-    /// clocking event, before they are scheduled once per net.
-    clocking_at_event_compose: HashMap<(String, String), Value>,
+    /// §14.16.2: for a `delayed_updates` entry `(when, id)` made of select
+    /// drives, the mask of bits it drives (1 = driven). A whole-net entry has none.
+    clocking_bit_masks: HashMap<(u64, usize), Value>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
     /// Per-tick clock poll table for `tick_clocking_blocks` (see there).

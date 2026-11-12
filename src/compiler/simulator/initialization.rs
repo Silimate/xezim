@@ -3850,7 +3850,7 @@ impl Simulator {
             clocking_array_leaves: HashSet::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
-            clocking_at_event_compose: HashMap::default(),
+            clocking_bit_masks: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_tick_cache: Vec::new(),
             buf_collapse_write_sets: None,

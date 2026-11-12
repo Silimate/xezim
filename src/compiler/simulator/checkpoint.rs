@@ -1165,7 +1165,7 @@ checkpoint_state!(
     clock_generators,
     clocking_array_leaves,
     clocking_output_pending,
-    clocking_at_event_compose,
+    clocking_bit_masks,
     clocking_cycle_pending,
     clocking_edge_out_pending,
     clocking_edge_drive_dirty,

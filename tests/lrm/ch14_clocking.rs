@@ -100,6 +100,63 @@ fn c14_5_clockvar_slice_binding() {
     );
 }
 
+// §14.16.2: drives that mature in one time step apply in issue order: a whole
+// drive replaces an earlier select of the same output, whatever unrelated
+// drive was issued between them
+#[test]
+fn c14_16_clocking_interleaved_drives() {
+    check(
+        "14.16_clocking_interleaved_drives",
+        include_str!("sv/14.16_clocking_interleaved_drives.sv"),
+        "c14ic",
+        Order::Exact,
+        &["T|a|t=16000 o1=1111 o2=0000", "T|b|t=18000 o1=0000 o2=1010"],
+        &[],
+    );
+}
+
+// §14.16.1, §14.16.2: a select issued at the clocking event applies on top of
+// the whole drive queued for that edge
+#[test]
+fn c14_16_clocking_event_select_after_whole() {
+    check(
+        "14.16_clocking_event_select_after_whole",
+        include_str!("sv/14.16_clocking_event_select_after_whole.sv"),
+        "c14ew",
+        Order::Exact,
+        &["T|a|t=6000 q=0000", "T|b|t=8000 q=1011"],
+        &[],
+    );
+}
+
+// §14.16.2: a select drive changes only its bits, so a bit written during the
+// skew window survives
+#[test]
+fn c14_16_clocking_select_keeps_other_bits() {
+    check(
+        "14.16_clocking_select_keeps_other_bits",
+        include_str!("sv/14.16_clocking_select_keeps_other_bits.sv"),
+        "c14kb",
+        Order::Exact,
+        &["T|a|t=7000 q=1000", "T|b|t=9000 q=1001"],
+        &[],
+    );
+}
+
+// §14.4, §14.16.2: select drives through aliases of one net with different
+// output skews each mature at their own skew
+#[test]
+fn c14_16_clocking_alias_skews() {
+    check(
+        "14.16_clocking_alias_skews",
+        include_str!("sv/14.16_clocking_alias_skews.sv"),
+        "c14as",
+        Order::Exact,
+        &["T|a|t=6000 q=00", "T|b|t=8000 q=10", "T|c|t=10000 q=11"],
+        &[],
+    );
+}
+
 // §14.16, §14.16.2: a bit-select or slice of a clockvar is driven after the output skew,
 // and a later drive in the same cycle overrides only the bits it selects
 #[test]

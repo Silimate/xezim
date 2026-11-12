@@ -51,6 +51,19 @@ fn c15_5_5_class_event_independent_null_compare() {
     );
 }
 
+// §15.5.5: self-assignment of an event handle must not re-register its slot.
+#[test]
+fn c15_5_5_class_event_self_assign_single_sample() {
+    check(
+        "15.5.5_class_event_self_assign_sample",
+        include_str!("sv/15.5.5_class_event_self_assign_sample.sv"),
+        "top",
+        Order::Exact,
+        &["T|15.5.5e|one sample after self assign"],
+        &[],
+    );
+}
+
 // §15.5.5: self-assignment of a nulled class event handle keeps null identity.
 #[test]
 fn c15_5_5_class_event_null_self_assign() {

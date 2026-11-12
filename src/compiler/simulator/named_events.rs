@@ -1843,7 +1843,9 @@ impl Simulator {
             let to = heir.unwrap_or_else(|| (usize::MAX, String::new()));
             self.instance_event_waiters.rekey(&slot, &to);
         }
-        self.event_obj_slots.entry(id).or_default().push(slot);
+        if old != Some(id) {
+            self.event_obj_slots.entry(id).or_default().push(slot);
+        }
         note_event_trigger();
         !is_null
     }

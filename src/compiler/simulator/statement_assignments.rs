@@ -1641,6 +1641,12 @@ impl Simulator {
             // for the enclosing class and ran that class's `new`.
             if let Some(row) = self.dyn_row_of_new_target(lvalue) {
                 if !self.ensure_row(&row) {
+                    // §7.4.6: out-of-range row writes are ignored, but the
+                    // `new[...]` constructor inputs still run.
+                    let _ = self.eval_expr(n_expr);
+                    if let Some(src) = src_expr {
+                        let _ = self.eval_expr(src);
+                    }
                     self.settle_after_proc_write();
                     return;
                 }

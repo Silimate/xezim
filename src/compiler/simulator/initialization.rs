@@ -3745,6 +3745,7 @@ impl Simulator {
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             csp_cache: std::cell::RefCell::new(HashMap::default()),
+            cg_with_segs_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
             pattern_scratch_seq: 0,
             pattern_scratch_free: Vec::new(),

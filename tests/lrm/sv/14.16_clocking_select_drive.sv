@@ -5,7 +5,7 @@ module csel;
   always #5 clk = ~clk;
   logic [3:0] nib = 0, o1 = 0, o2 = 0;
   logic [0:3] asc = 0;
-  clocking cb @(posedge clk);
+  default clocking cb @(posedge clk);
     default output #2;
     output nib, asc, o1, o2;
   endclocking

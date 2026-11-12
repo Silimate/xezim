@@ -37,3 +37,29 @@ fn c15_interprocess_sync() {
         &["T|15.4k|"],
     );
 }
+
+// §15.5.5: nulled class-property event handles compare equal to each other.
+#[test]
+fn c15_5_5_class_event_independent_null_compare() {
+    check(
+        "15.5.5_class_event_null_eq",
+        include_str!("sv/15.5.5_class_event_null_eq.sv"),
+        "top",
+        Order::Exact,
+        &["T|15.5.5c|independent null events equal"],
+        &[],
+    );
+}
+
+// §15.5.5: self-assignment of a nulled class event handle keeps null identity.
+#[test]
+fn c15_5_5_class_event_null_self_assign() {
+    check(
+        "15.5.5_class_event_null_self",
+        include_str!("sv/15.5.5_class_event_null_self.sv"),
+        "top",
+        Order::Exact,
+        &["T|15.5.5d|null after self assign"],
+        &[],
+    );
+}

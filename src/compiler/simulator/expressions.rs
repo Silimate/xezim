@@ -4462,8 +4462,8 @@ impl Simulator {
                     && !matches!(right.kind, ExprKind::Null)
                 {
                     if let (Some(lk), Some(rk)) = (
-                        self.class_instance_event_cmp_key(left),
-                        self.class_instance_event_cmp_key(right),
+                        self.class_instance_event_operand_key(left),
+                        self.class_instance_event_operand_key(right),
                     ) {
                         let eq = lk == rk;
                         let res = if matches!(op, BinaryOp::Eq) { eq } else { !eq };

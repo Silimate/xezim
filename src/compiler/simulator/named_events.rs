@@ -1213,7 +1213,7 @@ impl Simulator {
 
     /// Identity operand for `==`/`!=` on a class-property event, including
     /// `== null` after a rebind skipped the stored handle value.
-    fn class_instance_event_operand_key(&mut self, e: &Expression) -> Option<String> {
+    pub(super) fn class_instance_event_operand_key(&mut self, e: &Expression) -> Option<String> {
         let stamp = self.class_instance_event_identity_stamp(e)?;
         let k = self.instance_event_slot(e)?;
         if let Some(&id) = self.event_obj_ids.get(&k)
@@ -1238,11 +1238,6 @@ impl Simulator {
             }
         }
         Some(Self::instance_event_stamp_key(&k))
-    }
-
-    /// Identity key for comparing two class-property events (no `null` operand).
-    pub(super) fn class_instance_event_cmp_key(&mut self, e: &Expression) -> Option<String> {
-        self.class_instance_event_identity_stamp(e)
     }
 
     fn select_free_event_ref(e: &Expression) -> bool {
@@ -1831,6 +1826,7 @@ impl Simulator {
         let old = self.event_obj_ids.insert(slot.clone(), id);
         let mut heir = None;
         if let Some(old) = old
+            && old != id
             && let Some(v) = self.event_obj_slots.get_mut(&old)
         {
             v.retain(|s| *s != slot);

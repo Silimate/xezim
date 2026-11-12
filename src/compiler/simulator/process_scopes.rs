@@ -3899,6 +3899,7 @@ impl Simulator {
     /// dropped (no visible glitch), not left to fire.
     pub(super) fn cancel_delayed(&mut self, id: usize) {
         self.delayed_updates.retain(|(_, sid, _)| *sid != id);
+        self.clocking_bit_masks.retain(|(_, sid), _| *sid != id);
     }
 
     /// §10.3.3 inertial delay: is an update of `id` to exactly `val` already
@@ -3964,6 +3965,7 @@ impl Simulator {
         let target_time = self.time + delay;
         // Inertial delay: remove any pending update for this signal
         self.delayed_updates.retain(|(_, sid, _)| *sid != id);
+        self.clocking_bit_masks.retain(|(_, sid), _| *sid != id);
         self.delayed_updates.push((target_time, id, val));
     }
 

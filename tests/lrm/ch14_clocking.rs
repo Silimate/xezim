@@ -129,6 +129,19 @@ fn c14_16_clocking_event_select_after_whole() {
     );
 }
 
+// §14.16.2: inertial CA must drop a pending clocking select mask
+#[test]
+fn c14_16_clocking_mask_ca_replace() {
+    check(
+        "14.16_clocking_mask_ca_replace",
+        include_str!("sv/14.16_clocking_mask_ca_replace.sv"),
+        "c14mca",
+        Order::Exact,
+        &["T|a|t=7000 q=1110", "T|b|t=9000 q=1110"],
+        &[],
+    );
+}
+
 // §14.16.2: a select drive changes only its bits, so a bit written during the
 // skew window survives
 #[test]

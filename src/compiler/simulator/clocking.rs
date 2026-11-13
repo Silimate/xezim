@@ -130,7 +130,108 @@ impl Simulator {
         let value = self.fit_clocking_value(id, val);
         self.delayed_updates
             .retain(|(t, sid, _)| *sid != id || *t != when);
+        self.clocking_bit_masks.remove(&(when, id));
         self.delayed_updates.push((when, id, value));
+    }
+
+    /// §14.16.2: a drive of selected bits of `id` (physical positions, LSB of
+    /// `val` first) joins the update of `id` maturing at the same time, in
+    /// issue order. Only those bits are recorded; they are applied to the
+    /// net's value at maturity (`apply_delayed_updates`), so nothing is
+    /// composed on live storage and a bit written meanwhile survives.
+    fn schedule_clocking_bits(&mut self, id: usize, bits: &[i64], val: &Value, delay: u64) {
+        let when = self.time.saturating_add(delay);
+        let width = self.signal_widths[id];
+        let mut sel = val.resize(bits.len() as u32);
+        if sel.has_xz() && self.signal_two_state.get(id).copied().unwrap_or(false) {
+            sel = sel.to_two_state();
+        }
+        let pos = match self
+            .delayed_updates
+            .iter()
+            .position(|(t, sid, _)| *sid == id && *t == when)
+        {
+            Some(p) => p,
+            None => {
+                self.delayed_updates.push((when, id, Value::zero(width)));
+                self.clocking_bit_masks
+                    .insert((when, id), Value::zero(width));
+                self.delayed_updates.len() - 1
+            }
+        };
+        for (k, &p) in bits.iter().enumerate() {
+            self.delayed_updates[pos]
+                .2
+                .set_bit_code(p as usize, sel.get_bit_code(k));
+            if let Some(m) = self.clocking_bit_masks.get_mut(&(when, id)) {
+                m.set_bit_code(p as usize, 1);
+            }
+        }
+    }
+
+    /// The physical bits of signal `id` that the constant select `target`
+    /// (`q[0]`, `q[2:1]`, `q[3:2][0]`) drives, or None for any other lvalue.
+    fn clocking_select_bits(&self, id: usize, target: &Expression) -> Option<Vec<i64>> {
+        let mut root = target;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &root.kind {
+            root = expr;
+        }
+        if self.get_lhs_signal_id(root) != Some(id) {
+            return None;
+        }
+        self.select_chain_bits(target, id, "")
+    }
+
+    /// §14.16/§14.16.2: mature a clocking output after `delay`.
+    pub(super) fn commit_clocking_drive(
+        &mut self,
+        net: &str,
+        val: &Value,
+        target: Option<&Expression>,
+        delay: u64,
+    ) {
+        let id = self.signal_name_to_id.get(net).copied();
+        if let Some(t) = target {
+            let select = id.and_then(|id| Some((id, self.clocking_select_bits(id, t)?)));
+            if let Some((id, bits)) = select {
+                self.schedule_clocking_bits(id, &bits, val, delay);
+            } else if delay == 0 {
+                self.assign_value(t, val);
+            } else {
+                self.drive_clocking_select(t, val.clone(), delay);
+            }
+        } else if let Some(id) = id {
+            self.schedule_clocking_update(id, val, delay);
+        } else {
+            self.drive_clocking_net(net, val);
+            self.clocking_edge_drive_dirty = true;
+        }
+    }
+
+    /// Schedule the skewed drives of `cb` queued between clocking events;
+    /// edge-skewed ones wait for their edge.
+    pub(super) fn flush_clocking_output_pending(
+        &mut self,
+        cb: &str,
+        pending: Vec<ClockingOutputDrive>,
+        dskew: u64,
+    ) {
+        for (raw, sig, val, target) in pending {
+            if let Some((e, d)) = self.clocking_drive_edge(cb, &raw, &sig) {
+                self.clocking_edge_out_pending
+                    .entry(cb.to_string())
+                    .or_default()
+                    .push((sig, val, e, d, target));
+                continue;
+            }
+            let skew = self
+                .clocking_sig_out_skew
+                .get(cb)
+                .and_then(|m| m.get(&raw))
+                .copied()
+                .unwrap_or(dskew);
+            self.commit_clocking_drive(&sig, &val, target.as_ref(), skew);
+        }
     }
 
     /// §14.3: an output with an edge skew is driven on that edge of the
@@ -290,11 +391,7 @@ impl Simulator {
                             .and_then(|m| m.get(&raw))
                             .copied()
                             .unwrap_or(dskew);
-                        if let Some(t) = target {
-                            self.drive_clocking_select(&t, val, skew);
-                        } else if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
-                            self.schedule_clocking_update(id, &val, skew);
-                        }
+                        self.commit_clocking_drive(&net, &val, target.as_ref(), skew);
                     } else {
                         keep.push((n - 1, raw, net, val, target));
                     }
@@ -312,55 +409,7 @@ impl Simulator {
             // see the new output values when they run in the Reactive region.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
-                for (raw, sig, val, target) in pending {
-                    if let Some((edge, d)) = self.clocking_drive_edge(&cb, &raw, &sig) {
-                        self.clocking_edge_out_pending
-                            .entry(cb.clone())
-                            .or_default()
-                            .push((sig, val, edge, d, target));
-                        continue;
-                    }
-                    // §14.4 output skew for drives maturing at THIS edge. A
-                    // `#0` drive on the plain net is scheduled like one made at
-                    // this event so a later drive in the same time step replaces
-                    // it (§14.16.2).
-                    let skew = self
-                        .clocking_sig_out_skew
-                        .get(&cb)
-                        .and_then(|m| m.get(&raw))
-                        .copied()
-                        .unwrap_or(dskew);
-                    if let Some(t) = target {
-                        if skew > 0 {
-                            self.drive_clocking_select(&t, val, skew);
-                        } else {
-                            self.assign_value(&t, &val);
-                        }
-                        continue;
-                    }
-                    if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
-                        self.schedule_clocking_update(id, &val, skew);
-                        continue;
-                    }
-                    let lval = Expression::new(
-                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                            root: None,
-                            path: vec![crate::ast::expr::HierPathSegment {
-                                name: crate::ast::Identifier {
-                                    name: sig.clone(),
-                                    span: crate::ast::Span::dummy(),
-                                },
-                                selects: Vec::new(),
-                            }],
-                            span: crate::ast::Span::dummy(),
-                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
-                            cached_resolved_name: crate::ast::cache::NameCache::new(),
-                            bound: crate::ast::binding::Bound::UNSET,
-                        }),
-                        crate::ast::Span::dummy(),
-                    );
-                    self.assign_value(&lval, &val);
-                }
+                self.flush_clocking_output_pending(&cb, pending, dskew);
             }
             // Refresh the input samples. IEEE 1800-2023 §14.4 input skew:
             // - `#1step` (also the §14.3 default): the Preponed value, before

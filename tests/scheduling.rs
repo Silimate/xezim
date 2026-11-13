@@ -429,6 +429,8 @@ mod comb_sensitivity_591_592;
 mod one_step_delay_615;
 #[path = "scheduling/clocking_select_clockvars.rs"]
 mod clocking_select_clockvars;
+#[path = "scheduling/clocking_select_drive_maturity.rs"]
+mod clocking_select_drive_maturity;
 
 #[path = "scheduling/always_property.rs"]
 mod always_property;

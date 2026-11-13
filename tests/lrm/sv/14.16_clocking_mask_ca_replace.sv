@@ -3,7 +3,7 @@
 module c14mca;
   logic clk = 0;
   always #5 clk = ~clk;
-  logic [3:0] q;
+  wire [3:0] q;
   logic [3:0] d = 4'b0000;
   assign #1 q = d;
   clocking cb @(posedge clk);
@@ -12,7 +12,7 @@ module c14mca;
   endclocking
   initial begin
     @(cb);
-    cb.q[0] <= 1'b1;
+    cb.q[0] <= 1'b0;
     #1 d <= 4'b1110;
     @(cb);
   end

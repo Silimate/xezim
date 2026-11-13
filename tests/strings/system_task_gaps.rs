@@ -221,6 +221,38 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn fread_scalar_in_automatic_function_does_not_alias_submodule_memory() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_auto_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("in.bin");
+    std::fs::write(&bin, [0x11u8, 0x22, 0x33, 0x44]).unwrap();
+    let src = format!(
+        r#"
+module foo;
+  logic [7:0] b [4];
+endmodule
+module tb;
+  foo u_foo();
+  initial automatic_f();
+  function automatic void automatic_f;
+    byte b;
+    integer fd, n;
+    begin
+      fd = $fopen("{bin}", "rb");
+      n = $fread(b, fd);
+      $fclose(fd);
+    end
+  endfunction
+endmodule
+"#,
+        bin = bin.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    assert_eq!(u(&sim, "u_foo.b[0]"), 0, "submodule memory untouched");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------- group 5
 
 #[test]

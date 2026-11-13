@@ -969,6 +969,10 @@ impl Simulator {
         if is_scalar_dest(&resolved) || is_scalar_dest(&raw) {
             return None;
         }
+        let leaf = raw.rsplit('.').next().unwrap_or(raw.as_str());
+        if self.local_stack.last().is_some_and(|f| f.contains_key(leaf)) {
+            return None;
+        }
         if let Some(found) = self.module.arrays.keys().find(|k| {
             *k == &resolved
                 || *k == &raw

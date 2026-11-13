@@ -4457,6 +4457,19 @@ impl Simulator {
                 // event's 1-bit backing signal holds an arbitrary toggle state,
                 // so the integral path returned x — `e1 == e2` after `e1 = e2`
                 // read x instead of 1. Null compares equal only to null.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
+                    && !matches!(left.kind, ExprKind::Null)
+                    && !matches!(right.kind, ExprKind::Null)
+                {
+                    if let (Some(lk), Some(rk)) = (
+                        self.class_instance_event_operand_key(left),
+                        self.class_instance_event_operand_key(right),
+                    ) {
+                        let eq = lk == rk;
+                        let res = if matches!(op, BinaryOp::Eq) { eq } else { !eq };
+                        return Value::from_u64(res as u64, 1);
+                    }
+                }
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
                     let lk = self.event_operand_key(left);
                     let rk = self.event_operand_key(right);

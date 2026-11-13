@@ -1449,8 +1449,10 @@ impl Simulator {
                 }
             }
         }
-        // §15.5.5: a class-member event takes the other event's object.
-        self.bind_instance_event_assign(lvalue, rvalue);
+        // §15.5.5: `ev = other_ev` re-binds the handle, it does not copy a value.
+        if self.try_bind_instance_event_assign(lvalue, rvalue) {
+            return;
+        }
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
         {
             return;

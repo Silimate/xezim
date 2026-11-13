@@ -1266,6 +1266,7 @@ checkpoint_state!(
     event_measure,
     event_obj_ids,
     event_obj_slots,
+    event_null_obj_ids,
     event_phase,
     event_queue,
     event_skip,

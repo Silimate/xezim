@@ -8492,6 +8492,9 @@ pub struct Simulator {
     /// holds its own event. `event_obj_slots` is the reverse index.
     event_obj_ids: HashMap<(usize, String), u64>,
     event_obj_slots: HashMap<u64, Vec<(usize, String)>>,
+    /// Event-object ids created by `ev = null` (§15.5.5.1). `== null` on a
+    /// class handle consults this map, not the skipped value copy.
+    event_null_obj_ids: HashSet<u64>,
     next_event_obj_id: u64,
     /// Every class property name declared `event`, built on first use.
     class_event_prop_names: Option<std::rc::Rc<HashSet<String>>>,

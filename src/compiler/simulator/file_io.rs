@@ -963,6 +963,12 @@ impl Simulator {
         if self.module.arrays.contains_key(&raw) {
             return Some(raw);
         }
+        let is_scalar_dest = |name: &str| {
+            self.signal_name_to_id.contains_key(name) || self.signals.contains_key(name)
+        };
+        if is_scalar_dest(&resolved) || is_scalar_dest(&raw) {
+            return None;
+        }
         if let Some(found) = self.module.arrays.keys().find(|k| {
             *k == &resolved
                 || *k == &raw

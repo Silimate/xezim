@@ -186,6 +186,41 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn fread_scalar_does_not_alias_submodule_memory() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_scalar_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("in.bin");
+    std::fs::write(&bin, [0x11u8, 0x22, 0x33, 0x44]).unwrap();
+    let src = format!(
+        r#"
+module foo;
+  logic [7:0] b [4];
+endmodule
+module tb;
+  foo u_foo();
+  byte b;
+  integer fd, n;
+  initial begin
+    fd = $fopen("{bin}", "rb");
+    n = $fread(b, fd);
+    $fclose(fd);
+  end
+endmodule
+"#,
+        bin = bin.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    assert_eq!(u(&sim, "n"), 1, "$fread into byte must read one byte");
+    assert_eq!(u(&sim, "b"), 0x11);
+    assert_eq!(
+        u(&sim, "u_foo.b[0]"),
+        0,
+        "submodule memory must not alias tb scalar name"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------- group 5
 
 #[test]

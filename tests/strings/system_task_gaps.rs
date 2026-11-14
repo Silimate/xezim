@@ -349,6 +349,39 @@ endmodule
 }
 
 #[test]
+fn fread_class_method_local_array_shadows_property_scalar() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_carr_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let hex = dir.join("m.hex");
+    std::fs::write(&hex, "33\n").unwrap();
+    let src = format!(
+        r#"
+class C;
+  byte b;
+  function void load;
+    logic [7:0] b [2];
+    begin
+      $readmemh("{hex}", b);
+      $display("T|local=%h", b[0]);
+    end
+  endfunction
+endclass
+module tb;
+  initial begin
+    C c = new;
+    c.load();
+  end
+endmodule
+"#,
+        hex = hex.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    let lines: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(lines.iter().any(|l| l.contains("T|local=33")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fread_class_property_scalar_does_not_alias_child_memory() {
     let dir = std::env::temp_dir().join(format!("xezim_fread_cprop_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

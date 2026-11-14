@@ -965,6 +965,7 @@ impl Simulator {
         }
         if hier.path.len() == 1
             && hier.path[0].selects.is_empty()
+            && !self.module.arrays.contains_key(resolved.as_ref())
             && self.scalar_hides_module_coll(hier.path[0].name.name.as_str())
         {
             return None;

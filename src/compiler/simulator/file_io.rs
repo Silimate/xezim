@@ -961,15 +961,16 @@ impl Simulator {
             return None;
         };
         // Names that belong to the running subroutine or object are not module
-        // memories, so these checks come before any array lookup. A registered
-        // array under the resolved name is a local array's own storage and
-        // wins over a scalar of the same spelling.
+        // memories, so these checks come before any array lookup. A resolved
+        // name that differs from the spelling and is a registered array is a
+        // local array's own storage, which wins over a scalar of that spelling.
         if self.frame_bound_bare_name(hier).is_some() {
             return None;
         }
-        // `obj.prop` through a class handle is a property, never a memory
-        // `handle_member_array_name` did not already find.
-        if hier.path.len() > 1
+        // `obj.prop` through a class handle is a property, not a memory (array
+        // properties were taken above). Longer chains, such as `obj.vif.mem`,
+        // resolve through the handle's members as usual.
+        if hier.path.len() == 2
             && self
                 .eval_ident_handle(&hier.path[0].name.name)
                 .is_some_and(|h| self.heap.get(h).is_some_and(|o| o.is_some()))
@@ -978,7 +979,7 @@ impl Simulator {
         }
         let bare = hier.path.len() == 1 && hier.path[0].selects.is_empty();
         if bare
-            && !self.module.arrays.contains_key(resolved.as_ref())
+            && !(resolved.as_ref() != raw && self.module.arrays.contains_key(resolved.as_ref()))
             && self.scalar_hides_module_coll(hier.path[0].name.name.as_str())
         {
             return None;

@@ -198,8 +198,8 @@ fn run_with_file(
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, bytes).unwrap();
-    let sim = simulate(&src.replace("BIN", &path.display().to_string()), 1000)
-        .expect("simulate failed");
+    let sim =
+        simulate(&src.replace("BIN", &path.display().to_string()), 1000).expect("simulate failed");
     let lines = sim
         .output
         .iter()
@@ -281,6 +281,7 @@ class C;
 endclass
 module tb;
   foo u_foo();
+  logic [7:0] b [2];
   integer fd, n;
   initial begin
     C c = new;
@@ -296,6 +297,33 @@ endmodule
     let (sim, lines) = run_with_file("fread_class", "in.bin", &[0x11, 0x22, 0x33], &src);
     assert_eq!(lines, ["T|method n=1 b=11", "T|qualified n=1 b=22"]);
     assert_eq!(u(&sim, "u_foo.b[0]"), 0, "child memory untouched");
+    assert_eq!(u(&sim, "b[0]"), 0, "module memory untouched");
+}
+
+#[test]
+fn fread_class_virtual_interface_memory_is_reachable() {
+    let src = r#"
+interface ifc;
+  logic [7:0] m [2];
+endinterface
+class C;
+  virtual ifc vif;
+endclass
+module tb;
+  ifc i();
+  integer fd, n;
+  initial begin
+    C c = new;
+    c.vif = i;
+    fd = $fopen("BIN", "rb");
+    n = $fread(c.vif.m, fd);
+    $fclose(fd);
+    $display("T|n=%0d m=%h%h", n, i.m[0], i.m[1]);
+  end
+endmodule
+"#;
+    let (_, lines) = run_with_file("fread_vif", "in.bin", &[0x11, 0x22], src);
+    assert_eq!(lines, ["T|n=2 m=1122"]);
 }
 
 #[test]

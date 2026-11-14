@@ -986,23 +986,10 @@ impl Simulator {
         }
         // `resolved` carries the scope or local storage the name refers to
         // here, so it is tried before the spelled path.
-        let names = [resolved.as_ref(), raw.as_str()];
-        let in_arrays = |n: &&str| self.module.arrays.contains_key(*n);
-        if let Some(n) = names.into_iter().find(in_arrays) {
-            return Some(n.to_string());
-        }
-        // A scalar or packed variable of that name is the destination; a
-        // same-named memory in some instance is a different object.
-        if names.iter().any(|n| {
-            self.signal_name_to_id.contains_key(*n) || self.packed_leaf_of_hier(n).is_some()
-        }) {
-            return None;
-        }
-        // Otherwise accept a unique `<scope>.name` memory, never a guess.
-        names
+        [resolved.as_ref(), raw.as_str()]
             .into_iter()
-            .find_map(|n| self.unique_array_suffix(n))
-            .filter(|k| self.module.arrays.contains_key(k))
+            .find(|n| self.module.arrays.contains_key(*n))
+            .map(str::to_string)
     }
 
     /// The memory a `$readmem*` / `$writemem*` call names, with its

@@ -1552,7 +1552,25 @@ impl Simulator {
                 && !self.is_associative_array(&name)
                 && !name.contains('.')
             {
-                if let Some(k) = self.unique_array_suffix(&name) {
+                let suffix = format!(".{}", name);
+                let mut hit: Option<String> = None;
+                let mut many = false;
+                for k in self
+                    .module
+                    .arrays
+                    .keys()
+                    .chain(self.module.arrays_2d.keys())
+                    .chain(self.module.arrays_nd.keys())
+                {
+                    if k.ends_with(&suffix) {
+                        if hit.is_some() {
+                            many = true;
+                            break;
+                        }
+                        hit = Some(k.clone());
+                    }
+                }
+                if let (Some(k), false) = (hit, many) {
                     name = std::borrow::Cow::Owned(k);
                 }
             }

@@ -960,6 +960,10 @@ impl Simulator {
         let ExprKind::Ident(hier) = &expr.kind else {
             return None;
         };
+        // Names that belong to the running subroutine or object are not module
+        // memories, so these checks come before any array lookup. A registered
+        // array under the resolved name is a local array's own storage and
+        // wins over a scalar of the same spelling.
         if self.frame_bound_bare_name(hier).is_some() {
             return None;
         }
@@ -979,7 +983,9 @@ impl Simulator {
         {
             return None;
         }
-        let names = [raw.as_str(), resolved.as_ref()];
+        // `resolved` carries the scope or local storage the name refers to
+        // here, so it is tried before the spelled path.
+        let names = [resolved.as_ref(), raw.as_str()];
         let in_arrays = |n: &&str| self.module.arrays.contains_key(*n);
         if let Some(n) = names.into_iter().find(in_arrays) {
             return Some(n.to_string());

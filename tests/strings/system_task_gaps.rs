@@ -342,6 +342,26 @@ endmodule
 }
 
 #[test]
+fn fread_local_array_shadows_module_array() {
+    let src = r#"
+module tb;
+  logic [7:0] b [2];
+  task load;
+    logic [7:0] b [2];
+    begin
+      $readmemh("BIN", b);
+      $display("T|local=%h", b[0]);
+    end
+  endtask
+  initial load;
+endmodule
+"#;
+    let (sim, lines) = run_with_file("fread_arrarr", "m.hex", b"ee\n", src);
+    assert_eq!(lines, ["T|local=ee"]);
+    assert_eq!(u(&sim, "b[0]"), 0, "module array untouched");
+}
+
+#[test]
 fn fread_class_method_local_array_shadows_property_scalar() {
     let src = r#"
 class C;

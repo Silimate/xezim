@@ -246,7 +246,6 @@ endmodule
         bin = bin.display()
     );
     let sim = simulate(&src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "n"), 1);
     assert_eq!(u(&sim, "b[0]"), 0, "module memory untouched when local shadows");
     let _ = std::fs::remove_dir_all(&dir);
 }

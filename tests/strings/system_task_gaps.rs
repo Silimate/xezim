@@ -253,6 +253,112 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn fread_local_scalar_mem_does_not_block_hierarchical_r_mem() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_lmem_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("in.bin");
+    std::fs::write(&bin, [0x11u8, 0x22]).unwrap();
+    let src = format!(
+        r#"
+module ram;
+  logic [7:0] mem [2];
+endmodule
+module tb;
+  ram r();
+  task load;
+    byte mem;
+    integer fd, n;
+    begin
+      fd = $fopen("{bin}", "rb");
+      n = $fread(r.mem, fd);
+      $fclose(fd);
+    end
+  endtask
+  initial load;
+endmodule
+"#,
+        bin = bin.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    assert_eq!(u(&sim, "r.mem[0]"), 0x11, "$fread into r.mem loads memory");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fread_class_property_scalar_does_not_alias_child_memory() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_cprop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("in.bin");
+    std::fs::write(&bin, [0x11u8]).unwrap();
+    let src = format!(
+        r#"
+module foo;
+  logic [7:0] b [2];
+endmodule
+class C;
+  byte b;
+  function void run;
+    integer fd, n;
+    begin
+      fd = $fopen("{bin}", "rb");
+      n = $fread(b, fd);
+      $fclose(fd);
+    end
+  endfunction
+endclass
+module tb;
+  foo u_foo();
+  initial begin
+    C c = new;
+    c.run();
+  end
+endmodule
+"#,
+        bin = bin.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    assert_eq!(
+        u(&sim, "u_foo.b[0]"),
+        0,
+        "child memory untouched when fread targets class property"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn readmem_sibling_memories_resolve_without_cross_load() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_sib_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let h0 = dir.join("u0.hex");
+    let h1 = dir.join("u1.hex");
+    std::fs::write(&h0, "aa\n").unwrap();
+    std::fs::write(&h1, "bb\n").unwrap();
+    let src = format!(
+        r#"
+module leaf;
+  logic [7:0] m [2];
+endmodule
+module tb;
+  leaf u0(), u1();
+  task load;
+    begin
+      $readmemh("{h0}", u0.m);
+      $readmemh("{h1}", u1.m);
+    end
+  endtask
+  initial load;
+endmodule
+"#,
+        h0 = h0.display(),
+        h1 = h1.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    assert_eq!(u(&sim, "u0.m[0]"), 0xaa);
+    assert_eq!(u(&sim, "u1.m[0]"), 0xbb);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------- group 5
 
 #[test]

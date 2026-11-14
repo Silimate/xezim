@@ -963,29 +963,144 @@ impl Simulator {
         if self.module.arrays.contains_key(&raw) {
             return Some(raw);
         }
-        // Exact array keys are done. The suffix scan below can bind a bare or
-        // module-scoped leaf (e.g. `tb.b`) to an unrelated memory such as
-        // `tb.u_foo.b`. Skip it when the destination is already a scalar:
-        // hierarchical signals, per-object stores, or a subroutine local.
-        let is_scalar_dest = |name: &str| {
-            self.signal_name_to_id.contains_key(name) || self.signals.contains_key(name)
+        let ExprKind::Ident(hier) = &expr.kind else {
+            return None;
         };
-        if is_scalar_dest(&resolved) || is_scalar_dest(&raw) {
+        if self.frame_bound_bare_name(hier).is_some() {
             return None;
         }
-        let leaf = raw.rsplit('.').next().unwrap_or(raw.as_str());
-        if self.local_stack.last().is_some_and(|f| f.contains_key(leaf)) {
+        if hier.path.len() == 1
+            && hier.path[0].selects.is_empty()
+            && self.scalar_hides_module_coll(hier.path[0].name.name.as_str())
+        {
             return None;
         }
-        if let Some(found) = self.module.arrays.keys().find(|k| {
-            *k == &resolved
-                || *k == &raw
-                || k.ends_with(&format!(".{}", resolved))
-                || k.ends_with(&format!(".{}", raw))
-        }) {
-            return Some(found.clone());
+        if self.array_expr_is_scalar_dest(hier, resolved.as_ref(), raw.as_ref()) {
+            return None;
         }
-        None
+        self.resolve_unpacked_array_by_suffix(hier, resolved.as_ref(), raw.as_ref())
+    }
+
+    /// The `$fread` / `$readmem*` destination names a scalar, not an unpacked
+    /// memory: skip the array suffix lookup.
+    fn array_expr_is_scalar_dest(
+        &self,
+        hier: &HierarchicalIdentifier,
+        resolved: &str,
+        raw: &str,
+    ) -> bool {
+        if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+            if let Some(Some(ctx)) = self.class_context_stack.last() {
+                let leaf = hier.path[0].name.name.as_str();
+                if self.prop_owners(ctx).contains_key(leaf)
+                    && !self.module.arrays.contains_key(raw)
+                    && !self.module.arrays.contains_key(resolved)
+                {
+                    return true;
+                }
+            }
+        }
+        for name in [resolved, raw] {
+            if self.module.arrays.contains_key(name) {
+                continue;
+            }
+            if self.packed_leaf_of_hier(name).is_some() {
+                return true;
+            }
+            if self.signal_name_to_id.contains_key(name) || self.signals.contains_key(name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Unpacked array keys that `name` matches exactly or as a hierarchical
+    /// suffix, breaking ties with `name_resolve_hint` like `resolve_hier_name`.
+    fn unpacked_array_suffix_candidates<'a>(&'a self, name: &str) -> Vec<&'a str> {
+        let suffix = format!(".{}", name);
+        self.module
+            .arrays
+            .keys()
+            .filter(|k| k.as_str() == name || k.ends_with(&suffix))
+            .map(|k| k.as_str())
+            .collect()
+    }
+
+    fn pick_best_array_suffix_match(&self, candidates: &[&str]) -> Option<String> {
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1 {
+            return Some(candidates[0].to_string());
+        }
+        let hint_owned = self.name_resolve_hint.borrow().clone().unwrap_or_default();
+        let common_prefix_len = |a: &str, b: &str| -> usize {
+            let mut n = 0usize;
+            for (sa, sb) in a.split('.').zip(b.split('.')) {
+                if sa == sb {
+                    n += 1;
+                } else {
+                    break;
+                }
+            }
+            n
+        };
+        let mut best: Option<&str> = None;
+        let mut best_score: isize = -1;
+        for key in candidates {
+            let key_parent = key.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+            let score = common_prefix_len(&hint_owned, key_parent) as isize;
+            match best {
+                None => {
+                    best = Some(key);
+                    best_score = score;
+                }
+                Some(prev) => {
+                    let prefer = if score != best_score {
+                        score > best_score
+                    } else {
+                        let kd = key.split('.').count();
+                        let pd = prev.split('.').count();
+                        kd < pd || (kd == pd && key.len() < prev.len())
+                    };
+                    if prefer {
+                        best = Some(key);
+                        best_score = score;
+                    }
+                }
+            }
+        }
+        best.map(|k| k.to_string())
+    }
+
+    fn resolve_unpacked_array_by_suffix(
+        &self,
+        hier: &HierarchicalIdentifier,
+        resolved: &str,
+        raw: &str,
+    ) -> Option<String> {
+        for name in [resolved, raw] {
+            if let Some(k) = self.pick_best_array_suffix_match(&self.unpacked_array_suffix_candidates(name)) {
+                return Some(k);
+            }
+        }
+        let leaf = hier
+            .path
+            .last()
+            .map(|s| s.name.name.as_str())
+            .unwrap_or(raw);
+        if hier.path.len() != 1 || leaf.contains('.') {
+            return None;
+        }
+        let suffix = format!(".{}", leaf);
+        let candidates: Vec<&str> = self
+            .module
+            .arrays
+            .keys()
+            .filter(|k| k.ends_with(&suffix))
+            .map(|k| k.as_str())
+            .collect();
+        self.pick_best_array_suffix_match(&candidates)
     }
 
     /// The memory a `$readmem*` / `$writemem*` call names, with its

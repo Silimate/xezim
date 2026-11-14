@@ -989,6 +989,9 @@ impl Simulator {
         resolved: &str,
         raw: &str,
     ) -> bool {
+        if self.module.arrays.contains_key(resolved) {
+            return false;
+        }
         if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
             if let Some(Some(ctx)) = self.class_context_stack.last() {
                 let leaf = hier.path[0].name.name.as_str();
@@ -1026,6 +1029,8 @@ impl Simulator {
             .collect()
     }
 
+    /// Pick one unpacked-memory key when several names share the same
+    /// hierarchical suffix, mirroring `resolve_hier_name` hint scoring.
     fn pick_best_array_suffix_match(&self, candidates: &[&str]) -> Option<String> {
         if candidates.is_empty() {
             return None;
@@ -1073,6 +1078,8 @@ impl Simulator {
         best.map(|k| k.to_string())
     }
 
+    /// Last resort for `$fread` / `$readmem*`: translate an unresolved
+    /// hierarchical spelling into a registered unpacked-memory key.
     fn resolve_unpacked_array_by_suffix(
         &self,
         hier: &HierarchicalIdentifier,

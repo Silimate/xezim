@@ -284,6 +284,39 @@ endmodule
 }
 
 #[test]
+fn fread_local_array_shadows_module_scalar_for_readmem() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_arrb_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let hex = dir.join("m.hex");
+    std::fs::write(&hex, "ee\n").unwrap();
+    let src = format!(
+        r#"
+module tb;
+  byte b;
+  task load;
+    logic [7:0] b [2];
+    begin
+      $readmemh("{hex}", b);
+      $display("T|local=%h", b[0]);
+    end
+  endtask
+  initial load;
+endmodule
+"#,
+        hex = hex.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    let lines: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(
+        lines.iter().any(|l| l.contains("T|local=ee")),
+        "readmem must target subroutine local array: {:?}",
+        lines
+    );
+    assert_ne!(u(&sim, "b"), 0xee);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fread_local_scalar_mem_does_not_block_hierarchical_r_mem() {
     let dir = std::env::temp_dir().join(format!("xezim_fread_lmem_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

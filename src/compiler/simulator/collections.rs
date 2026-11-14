@@ -3645,6 +3645,19 @@ impl Simulator {
         self.set_signal_value_by_name(name, v);
     }
 
+    /// The one registered array whose key ends in `.name`; None when no key
+    /// or several keys match, so sibling instances are never confused.
+    pub(super) fn unique_array_suffix(&self, name: &str) -> Option<String> {
+        let suffix = format!(".{}", name);
+        let m = &self.module;
+        let mut hits = (m.arrays.keys())
+            .chain(m.arrays_2d.keys())
+            .chain(m.arrays_nd.keys())
+            .filter(|k| k.ends_with(&suffix));
+        let hit = hits.next()?;
+        hits.next().is_none().then(|| hit.clone())
+    }
+
     /// A bare identifier bound in the current subroutine frame (a formal or
     /// a local). Such a name must not go through `resolve_hier_name`, which
     /// resolves DESIGN signals and can rewrite `name` into a same-named

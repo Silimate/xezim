@@ -186,143 +186,189 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Run `src` with `BIN` replaced by a scratch file holding `bytes`; return
+/// the simulator and its `T|` display lines.
+fn run_with_file(
+    tag: &str,
+    name: &str,
+    bytes: &[u8],
+    src: &str,
+) -> (xezim::compiler::Simulator, Vec<String>) {
+    let dir = std::env::temp_dir().join(format!("xezim_{}_{}", tag, std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    let sim = simulate(&src.replace("BIN", &path.display().to_string()), 1000)
+        .expect("simulate failed");
+    let lines = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim_end().to_string())
+        .filter(|l| l.starts_with("T|"))
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    (sim, lines)
+}
+
+const FOO_MEM: &str = "module foo;\n  logic [7:0] b [4];\nendmodule\n";
+
 #[test]
 fn fread_scalar_does_not_alias_submodule_memory() {
-    let dir = std::env::temp_dir().join(format!("xezim_fread_scalar_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("in.bin");
-    std::fs::write(&bin, [0x11u8, 0x22, 0x33, 0x44]).unwrap();
     let src = format!(
+        "{FOO_MEM}{}",
         r#"
-module foo;
-  logic [7:0] b [4];
-endmodule
 module tb;
   foo u_foo();
   byte b;
   integer fd, n;
   initial begin
-    fd = $fopen("{bin}", "rb");
+    fd = $fopen("BIN", "rb");
     n = $fread(b, fd);
     $fclose(fd);
   end
 endmodule
-"#,
-        bin = bin.display()
+"#
     );
-    let sim = simulate(&src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "n"), 1, "$fread into byte must read one byte");
+    let (sim, _) = run_with_file("fread_scalar", "in.bin", &[0x11, 0x22, 0x33, 0x44], &src);
+    assert_eq!(u(&sim, "n"), 1, "$fread into byte reads one byte");
     assert_eq!(u(&sim, "b"), 0x11);
-    assert_eq!(
-        u(&sim, "u_foo.b[0]"),
-        0,
-        "submodule memory must not alias tb scalar name"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(u(&sim, "u_foo.b[0]"), 0, "submodule memory untouched");
 }
 
 #[test]
-fn fread_scalar_in_automatic_function_shadows_module_memory_name() {
-    let dir = std::env::temp_dir().join(format!("xezim_fread_modb_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("in.bin");
-    std::fs::write(&bin, [0x11u8, 0x22, 0x33, 0x44]).unwrap();
+fn fread_local_scalar_shadows_module_and_submodule_memory() {
     let src = format!(
+        "{FOO_MEM}{}",
         r#"
-module tb;
-  logic [7:0] b [4];
-  initial automatic_f();
-  function automatic void automatic_f;
-    byte b;
-    integer fd, n;
-    begin
-      fd = $fopen("{bin}", "rb");
-      n = $fread(b, fd);
-      $fclose(fd);
-    end
-  endfunction
-endmodule
-"#,
-        bin = bin.display()
-    );
-    let sim = simulate(&src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "b[0]"), 0, "module memory untouched when local shadows");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn fread_scalar_in_automatic_function_does_not_alias_submodule_memory() {
-    let dir = std::env::temp_dir().join(format!("xezim_fread_auto_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("in.bin");
-    std::fs::write(&bin, [0x11u8, 0x22, 0x33, 0x44]).unwrap();
-    let src = format!(
-        r#"
-module foo;
-  logic [7:0] b [4];
-endmodule
 module tb;
   foo u_foo();
-  initial automatic_f();
-  function automatic void automatic_f;
+  logic [7:0] b [4];
+  initial f();
+  function automatic void f;
     byte b;
     integer fd, n;
     begin
-      fd = $fopen("{bin}", "rb");
+      fd = $fopen("BIN", "rb");
       n = $fread(b, fd);
       $fclose(fd);
+      $display("T|n=%0d b=%h", n, b);
     end
   endfunction
 endmodule
-"#,
-        bin = bin.display()
+"#
     );
-    let sim = simulate(&src, 1000).expect("simulate failed");
+    let (sim, lines) = run_with_file("fread_local", "in.bin", &[0x11, 0x22, 0x33, 0x44], &src);
+    assert_eq!(lines, ["T|n=1 b=11"]);
+    assert_eq!(u(&sim, "b[0]"), 0, "module memory untouched");
     assert_eq!(u(&sim, "u_foo.b[0]"), 0, "submodule memory untouched");
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fread_class_scalar_does_not_alias_child_memory() {
+    // A bare property inside a method and a qualified `c.b` from the module.
+    let src = format!(
+        "{FOO_MEM}{}",
+        r#"
+class C;
+  byte b;
+  function void run(integer fd);
+    integer n;
+    begin
+      n = $fread(b, fd);
+      $display("T|method n=%0d b=%h", n, b);
+    end
+  endfunction
+endclass
+module tb;
+  foo u_foo();
+  integer fd, n;
+  initial begin
+    C c = new;
+    fd = $fopen("BIN", "rb");
+    c.run(fd);
+    n = $fread(c.b, fd);
+    $display("T|qualified n=%0d b=%h", n, c.b);
+    $fclose(fd);
+  end
+endmodule
+"#
+    );
+    let (sim, lines) = run_with_file("fread_class", "in.bin", &[0x11, 0x22, 0x33], &src);
+    assert_eq!(lines, ["T|method n=1 b=11", "T|qualified n=1 b=22"]);
+    assert_eq!(u(&sim, "u_foo.b[0]"), 0, "child memory untouched");
+}
+
+#[test]
+fn fread_struct_scalar_member_does_not_alias_child_memory() {
+    let src = format!(
+        "{FOO_MEM}{}",
+        r#"
+module tb;
+  foo u_foo();
+  initial begin
+    struct { byte b; } s;
+    integer fd, n;
+    fd = $fopen("BIN", "rb");
+    n = $fread(s.b, fd);
+    $fclose(fd);
+    $display("T|n=%0d b=%h", n, s.b);
+  end
+endmodule
+"#
+    );
+    let (sim, lines) = run_with_file("fread_struct", "in.bin", &[0x11, 0x22], &src);
+    assert_eq!(lines, ["T|n=1 b=11"]);
+    assert_eq!(u(&sim, "u_foo.b[0]"), 0, "child memory untouched");
 }
 
 #[test]
 fn fread_local_array_shadows_module_scalar_for_readmem() {
-    let dir = std::env::temp_dir().join(format!("xezim_fread_arrb_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let hex = dir.join("m.hex");
-    std::fs::write(&hex, "ee\n").unwrap();
-    let src = format!(
-        r#"
+    let src = r#"
 module tb;
   byte b;
   task load;
     logic [7:0] b [2];
     begin
-      $readmemh("{hex}", b);
+      $readmemh("BIN", b);
       $display("T|local=%h", b[0]);
     end
   endtask
   initial load;
 endmodule
-"#,
-        hex = hex.display()
-    );
-    let sim = simulate(&src, 1000).expect("simulate failed");
-    let lines: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(
-        lines.iter().any(|l| l.contains("T|local=ee")),
-        "readmem must target subroutine local array: {:?}",
-        lines
-    );
-    assert_ne!(u(&sim, "b"), 0xee);
-    let _ = std::fs::remove_dir_all(&dir);
+"#;
+    let (sim, lines) = run_with_file("fread_arrb", "m.hex", b"ee\n", src);
+    assert_eq!(lines, ["T|local=ee"]);
+    assert_eq!(u(&sim, "b"), 0, "module scalar untouched");
+}
+
+#[test]
+fn fread_class_method_local_array_shadows_property_scalar() {
+    let src = r#"
+class C;
+  byte b;
+  function void load;
+    logic [7:0] b [2];
+    begin
+      $readmemh("BIN", b);
+      $display("T|local=%h", b[0]);
+    end
+  endfunction
+endclass
+module tb;
+  initial begin
+    C c = new;
+    c.load();
+    $display("T|prop=%h", c.b);
+  end
+endmodule
+"#;
+    let (_, lines) = run_with_file("fread_carr", "m.hex", b"33\n", src);
+    assert_eq!(lines, ["T|local=33", "T|prop=00"]);
 }
 
 #[test]
 fn fread_local_scalar_mem_does_not_block_hierarchical_r_mem() {
-    let dir = std::env::temp_dir().join(format!("xezim_fread_lmem_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("in.bin");
-    std::fs::write(&bin, [0x11u8, 0x22]).unwrap();
-    let src = format!(
-        r#"
+    let src = r#"
 module ram;
   logic [7:0] mem [2];
 endmodule
@@ -332,126 +378,56 @@ module tb;
     byte mem;
     integer fd, n;
     begin
-      fd = $fopen("{bin}", "rb");
+      fd = $fopen("BIN", "rb");
       n = $fread(r.mem, fd);
       $fclose(fd);
+      $display("T|n=%0d mem=%h", n, mem);
     end
   endtask
   initial load;
 endmodule
-"#,
-        bin = bin.display()
-    );
-    let sim = simulate(&src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "r.mem[0]"), 0x11, "$fread into r.mem loads memory");
-    let _ = std::fs::remove_dir_all(&dir);
+"#;
+    let (sim, lines) = run_with_file("fread_lmem", "in.bin", &[0x11, 0x22], src);
+    assert_eq!(lines, ["T|n=2 mem=00"]);
+    assert_eq!(u(&sim, "r.mem[0]"), 0x11);
+    assert_eq!(u(&sim, "r.mem[1]"), 0x22);
 }
 
 #[test]
-fn fread_class_method_local_array_shadows_property_scalar() {
-    let dir = std::env::temp_dir().join(format!("xezim_fread_carr_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let hex = dir.join("m.hex");
-    std::fs::write(&hex, "33\n").unwrap();
-    let src = format!(
-        r#"
-class C;
-  byte b;
-  function void load;
-    logic [7:0] b [2];
-    begin
-      $readmemh("{hex}", b);
-      $display("T|local=%h", b[0]);
-    end
-  endfunction
-endclass
-module tb;
-  initial begin
-    C c = new;
-    c.load();
-  end
-endmodule
-"#,
-        hex = hex.display()
-    );
-    let sim = simulate(&src, 1000).expect("simulate failed");
-    let lines: Vec<_> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(lines.iter().any(|l| l.contains("T|local=33")));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn fread_class_property_scalar_does_not_alias_child_memory() {
-    let dir = std::env::temp_dir().join(format!("xezim_fread_cprop_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("in.bin");
-    std::fs::write(&bin, [0x11u8]).unwrap();
-    let src = format!(
-        r#"
-module foo;
-  logic [7:0] b [2];
-endmodule
-class C;
-  byte b;
-  function void run;
-    integer fd, n;
-    begin
-      fd = $fopen("{bin}", "rb");
-      n = $fread(b, fd);
-      $fclose(fd);
-    end
-  endfunction
-endclass
-module tb;
-  foo u_foo();
-  initial begin
-    C c = new;
-    c.run();
-  end
-endmodule
-"#,
-        bin = bin.display()
-    );
-    let sim = simulate(&src, 1000).expect("simulate failed");
-    assert_eq!(
-        u(&sim, "u_foo.b[0]"),
-        0,
-        "child memory untouched when fread targets class property"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn readmem_sibling_memories_resolve_without_cross_load() {
-    let dir = std::env::temp_dir().join(format!("xezim_fread_sib_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let h0 = dir.join("u0.hex");
-    let h1 = dir.join("u1.hex");
-    std::fs::write(&h0, "aa\n").unwrap();
-    std::fs::write(&h1, "bb\n").unwrap();
-    let src = format!(
-        r#"
+fn fread_instance_memory_loads_sibling_instances_independently() {
+    // `u.m` inside the wrapper's task names that wrapper's own memory; the
+    // two wrappers hold same-named memories and must not cross-load.
+    let src = r#"
 module leaf;
   logic [7:0] m [2];
 endmodule
-module tb;
-  leaf u0(), u1();
-  task load;
+module wrap;
+  leaf u();
+  task load(input integer fd);
+    integer n;
     begin
-      $readmemh("{h0}", u0.m);
-      $readmemh("{h1}", u1.m);
+      n = $fread(u.m, fd);
+      $display("T|%m n=%0d", n);
     end
   endtask
-  initial load;
 endmodule
-"#,
-        h0 = h0.display(),
-        h1 = h1.display()
-    );
-    let sim = simulate(&src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "u0.m[0]"), 0xaa);
-    assert_eq!(u(&sim, "u1.m[0]"), 0xbb);
-    let _ = std::fs::remove_dir_all(&dir);
+module tb;
+  wrap w0(), w1();
+  integer fd;
+  initial begin
+    fd = $fopen("BIN", "rb");
+    w0.load(fd);
+    w1.load(fd);
+    $fclose(fd);
+  end
+endmodule
+"#;
+    let (sim, lines) = run_with_file("fread_sib", "in.bin", &[0xaa, 0xbb, 0xcc, 0xdd], src);
+    assert_eq!(lines, ["T|tb.w0.load n=2", "T|tb.w1.load n=2"]);
+    assert_eq!(u(&sim, "w0.u.m[0]"), 0xaa);
+    assert_eq!(u(&sim, "w0.u.m[1]"), 0xbb);
+    assert_eq!(u(&sim, "w1.u.m[0]"), 0xcc);
+    assert_eq!(u(&sim, "w1.u.m[1]"), 0xdd);
 }
 
 // ---------------------------------------------------------------- group 5

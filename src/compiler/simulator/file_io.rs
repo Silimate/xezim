@@ -963,6 +963,10 @@ impl Simulator {
         if self.module.arrays.contains_key(&raw) {
             return Some(raw);
         }
+        // Exact array keys are done. The suffix scan below can bind a bare or
+        // module-scoped leaf (e.g. `tb.b`) to an unrelated memory such as
+        // `tb.u_foo.b`. Skip it when the destination is already a scalar:
+        // hierarchical signals, per-object stores, or a subroutine local.
         let is_scalar_dest = |name: &str| {
             self.signal_name_to_id.contains_key(name) || self.signals.contains_key(name)
         };

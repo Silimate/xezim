@@ -957,12 +957,6 @@ impl Simulator {
                 return Some(name);
             }
         }
-        if self.module.arrays.contains_key(&*resolved) {
-            return Some(resolved.to_string());
-        }
-        if self.module.arrays.contains_key(&raw) {
-            return Some(raw);
-        }
         let ExprKind::Ident(hier) = &expr.kind else {
             return None;
         };
@@ -977,6 +971,12 @@ impl Simulator {
         }
         if self.array_expr_is_scalar_dest(hier, resolved.as_ref(), raw.as_ref()) {
             return None;
+        }
+        if self.module.arrays.contains_key(&*resolved) {
+            return Some(resolved.to_string());
+        }
+        if self.module.arrays.contains_key(&raw) {
+            return Some(raw);
         }
         self.resolve_unpacked_array_by_suffix(hier, resolved.as_ref(), raw.as_ref())
     }

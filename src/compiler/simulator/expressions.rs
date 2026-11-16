@@ -1,5 +1,6 @@
 //! Simulator expressions.
 
+use super::collection_methods::PatternCmpMode;
 use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
@@ -54,7 +55,7 @@ impl Simulator {
             &self.module.typedef_types,
         )
         .1
-        .or_else(|| Self::packed_dim_bounds(&m_dt, params))?;
+        .or_else(|| self.packed_dim_bounds(&m_dt, params))?;
         if dims.len() < idx.len() {
             return None;
         }
@@ -102,6 +103,11 @@ impl Simulator {
         member: &crate::ast::Identifier,
         ctx_width: u32,
     ) -> Value {
+        // #1108: a whole array member of an instance-array element
+        // (`lane[0].payload`).
+        if let Some(folded) = self.inst_array_member_canon_parts(expr, member) {
+            return self.eval_expr_ctx(&folded, ctx_width);
+        }
         // §18.7 — inside `obj.randomize() with { obj.member … }` the
         // receiver `obj` is a caller-scope handle that no longer evals
         // in the randomized frame, so `obj.member` would read 0 and
@@ -1768,7 +1774,17 @@ impl Simulator {
         let r = self.resolve_hier_name(h);
         !(self.module.arrays.contains_key(&*r)
             || self.module.arrays_2d.contains_key(&*r)
-            || self.module.arrays_nd.contains_key(&*r))
+            || self.module.arrays_nd.contains_key(&*r)
+            || self.module.associative_arrays.contains_key(&*r))
+    }
+
+    /// Whether the comparison operand `e` may be an unpacked aggregate: not
+    /// a literal and not a plain scalar name (`cmp_name_scalar`).
+    pub(super) fn may_be_aggregate(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => !self.cmp_name_scalar(h),
+            _ => !Self::cmp_literal_like(e),
+        }
     }
 
     /// A relational or (in)equality comparison of literal-like operands,
@@ -2045,6 +2061,79 @@ impl Simulator {
         value
     }
 
+    /// §7.4.1: whether `expr` (an index chain on a plain packed variable,
+    /// not a local or an unpacked array) selects an element of the named
+    /// signed type the variable is a packed array of.
+    #[inline(never)]
+    pub(super) fn packed_named_select_signed(&mut self, expr: &Expression) -> bool {
+        let mut root = expr;
+        let mut selects = 0usize;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            selects += 1;
+            root = base;
+        }
+        // A class property (`h.m_amb[1]`, or `m_amb[1]` in a method): its
+        // declared type is its class's.
+        if !self.packed_named_signed_props.is_empty() {
+            let prop = match &root.kind {
+                ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                ExprKind::Ident(h) if h.root.is_none() => h
+                    .path
+                    .last()
+                    .filter(|s| s.selects.is_empty())
+                    .map(|s| s.name.name.as_str()),
+                _ => None,
+            };
+            if prop.is_some_and(|p| self.packed_named_signed_props.get(p) == Some(&selects))
+                && self.class_prop_named_signed_depth(root) == Some(selects)
+            {
+                return true;
+            }
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return false;
+        };
+        if h.root.is_some()
+            || h.path.iter().any(|s| !s.selects.is_empty())
+            || self.frame_bound_bare_name(h).is_some()
+        {
+            return false;
+        }
+        let name = self.resolve_hier_name(h);
+        let name = name.as_ref();
+        self.packed_named_signed.get(name) == Some(&selects)
+            && !self.module.arrays.contains_key(name)
+            && !self.module.arrays_2d.contains_key(name)
+            && !self.module.arrays_nd.contains_key(name)
+    }
+
+    /// §7.4.1: the select depth at which the class property `e` names
+    /// reaches a named signed element type, from the property's declaration
+    /// in its class.
+    fn class_prop_named_signed_depth(&self, e: &Expression) -> Option<usize> {
+        let dt = match &e.kind {
+            // A bare property of the running method's object.
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let name = h.path[0].name.name.as_str();
+                if self
+                    .local_stack
+                    .last()
+                    .is_some_and(|f| f.contains_key(name))
+                {
+                    return None;
+                }
+                let th = self.this_stack.last().copied().flatten()?;
+                let class = &self.heap.get(th)?.as_ref()?.class_name;
+                let base = class.split('#').next().unwrap_or(class).trim();
+                let owners = self.prop_owners(base);
+                let (_, cd) = owners.get(name)?;
+                cd.property_types.get(name)?.clone()
+            }
+            _ => self.lvalue_static_type(e)?,
+        };
+        super::bytecode::signed_named_packed_elem_depth(&dt, &self.module.typedef_types)
+    }
+
     /// Declared expression signedness without executing conditional arms or
     /// calls. Context-determined operands need this type before evaluation.
     #[inline(never)]
@@ -2123,6 +2212,10 @@ impl Simulator {
                             || self.is_associative_array(name.as_ref()),
                     )
                 };
+                if unpacked == 0 && self.packed_named_signed.get(name.as_ref()) == Some(&indices) {
+                    // §7.4.1: an element of a named signed type.
+                    return Some(true);
+                }
                 if indices > unpacked {
                     // More indices can enter a nested queue or associative
                     // row. Only a known scalar signal proves a packed select;
@@ -2318,10 +2411,46 @@ impl Simulator {
                 return self.eval_expr_ctx(&stripped, ctx_width);
             }
         }
+        // §7.4.1: an element of a packed array of a named signed type is
+        // signed; the slice that reads it is not. One length test when no
+        // variable is declared that way.
+        if (!self.packed_named_signed.is_empty() || !self.packed_named_signed_props.is_empty())
+            && matches!(expr.kind, ExprKind::Index { .. })
+            && self.packed_named_sign_guard != expr as *const Expression as usize
+            && self.packed_named_select_signed(expr)
+        {
+            let saved = std::mem::replace(
+                &mut self.packed_named_sign_guard,
+                expr as *const Expression as usize,
+            );
+            let mut v = self.eval_expr_ctx_inner(expr, ctx_width, unsigned_context);
+            self.packed_named_sign_guard = saved;
+            if !v.is_real {
+                v.is_signed = true;
+            }
+            return v;
+        }
         match &expr.kind {
             ExprKind::Ident(h) => {
                 if let Some(v) = self.plain_ident_read(h) {
                     return v;
+                }
+                // §23.6: `$root.top.u.s.m` reads exactly like the absolute
+                // `top.u.s.m`. Only the name resolver knew the `$root`
+                // segment; the member and select arms, keyed on the
+                // segments, missed it, and a packed-struct member read x.
+                // A generate or instance-array index (`$root.top.g[1].x`) is
+                // part of the resolver's flat key and stays with it.
+                if h.path.len() >= 3
+                    && h.path[0].name.name == "$root"
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                {
+                    let mut abs = h.clone();
+                    abs.path.remove(0);
+                    abs.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    abs.cached_resolved_name = crate::ast::cache::NameCache::new();
+                    let rewritten = Expression::new(ExprKind::Ident(abs), expr.span);
+                    return self.eval_expr_ctx_inner(&rewritten, ctx_width, unsigned_context);
                 }
                 if h.path.len() >= 2
                     && !self.local_stack.is_empty()
@@ -2534,6 +2663,15 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // §8.9/§7.2.1: a member of a class STATIC property whose type is a
+        // packed struct (`Cls::sp.m`, `h.sp.m`, `sp.m` in the class) slices
+        // the shared static cell by the struct layout. It is not a class
+        // aggregate (no object holds it): the aggregate arm below read the
+        // object's own cell, and the later arms a 32-bit 0.
+        // No object need exist: a static is reachable through its class.
+        if let Some(v) = self.static_packed_member_value(expr) {
+            return v;
         }
         // §7.2/§18.4: a leaf of an unpacked-struct CLASS PROPERTY at any
         // depth — `o.n.inner.a`, `o.s.arr[1]`, `o.arr[0].a`. The member-access
@@ -3160,7 +3298,7 @@ impl Simulator {
                         .and_then(|m| m.get(name.as_str()))
                         .cloned()
                     {
-                        if let Some(v) = self.get_signal_value_by_name(&storage) {
+                        if let Some(v) = self.ref_alias_read(&storage) {
                             return v;
                         }
                     }
@@ -4038,13 +4176,23 @@ impl Simulator {
                 // against another pattern it is a value of its type.
                 if matches!(
                     op,
-                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                    BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
                 ) {
                     let (lt, rt) = (
                         self.unpacked_typed_pattern(left),
                         self.unpacked_typed_pattern(right),
                     );
-                    let (l, r) = (lt.unwrap_or(left), rt.unwrap_or(right));
+                    // `(a) == ('{...})`: parentheses do not change the
+                    // pattern's context, as in an assignment (§10.8).
+                    let (l, r) = (
+                        lt.unwrap_or(Self::peel_parens(left)),
+                        rt.unwrap_or(Self::peel_parens(right)),
+                    );
                     let pat = |e: &Expression| matches!(e.kind, ExprKind::AssignmentPattern(_));
                     let v = if pat(l) && pat(r) {
                         // Two patterns: a typed one is the value of its type.
@@ -4070,19 +4218,19 @@ impl Simulator {
                         return v;
                     }
                 }
-                // §11.4.5: equality on unpacked structs is member-wise.
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    if let Some(v) = self.compare_unpacked_structs(left, right) {
-                        return if matches!(op, BinaryOp::Eq) {
-                            v
-                        } else if v.has_unknown() {
-                            v
-                        } else if v.to_u64() == Some(1) {
-                            Value::zero(1)
-                        } else {
-                            Value::ones(1)
-                        };
-                    }
+                // §11.4.5, §11.4.6: equality on unpacked structs is member-wise,
+                // on unpacked arrays element-wise (below). Both operands must
+                // be aggregates: a literal or a plain scalar name on either
+                // side skips the probes. §11.3.2: parentheses do not change
+                // an operand's value, so the probes look through them (UVM's
+                // comparer writes `(LVALUE) !== (RVALUE)`).
+                let (agg_l, agg_r) = (Self::peel_parens(left), Self::peel_parens(right));
+                let agg_cmp = PatternCmpMode::of(*op)
+                    .filter(|_| self.may_be_aggregate(agg_l) && self.may_be_aggregate(agg_r));
+                if let Some((mode, want_eq)) = agg_cmp
+                    && let Some(c) = self.compare_unpacked_structs(agg_l, agg_r, mode)
+                {
+                    return c.value(want_eq);
                 }
                 // Short-circuit evaluation for logical operators (IEEE §11.3.5)
                 if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
@@ -4169,119 +4317,15 @@ impl Simulator {
                     let r = self.eval_expr_ctx(right, ctx_width);
                     return l.logic_or(&r);
                 }
-                // Unpacked array equality/inequality (§11.4.5) on fixed-size
-                // arrays — module-level OR class-property, accessed as bare
-                // `a`, `this.a`, or `obj.a`. `rhs_.sa == lhs.sa` in a class
-                // method (`compare`/`do_compare`) is the common case.
-                // Multi-dimensional unpacked arrays (or a row of one) compare
-                // element-wise by suffix; the 1-D arm below sees no shape.
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
-                    && !(self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
-                {
-                    if let (Some((lb, ls, l_nd)), Some((rb, rs, r_nd))) =
-                        (self.nd_array_operand(left), self.nd_array_operand(right))
-                    {
-                        if l_nd || r_nd {
-                            let mut equal = ls.len() == rs.len();
-                            let ew = self
-                                .coll_elem_width(&lb)
-                                .or_else(|| self.coll_elem_width(&rb));
-                            if equal {
-                                for (a, b) in ls.iter().zip(rs.iter()) {
-                                    let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
-                                    let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
-                                    if lv.is_none()
-                                        || rv.is_none()
-                                        || self.coll_values_opt_eq(&lv, &rv, ew) == false
-                                    {
-                                        equal = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            let bit = if matches!(op, BinaryOp::Eq) {
-                                equal
-                            } else {
-                                !equal
-                            };
-                            return Value::from_u64(bit as u64, 1);
-                        }
-                    }
-                }
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    if let (Some((ln, llo, lhi)), Some((rn, rlo, rhi))) = (
-                        self.fixed_array_operand(left),
-                        self.fixed_array_operand(right),
-                    ) {
-                        let lsize = (lhi - llo + 1) as usize;
-                        let rsize = (rhi - rlo + 1) as usize;
-                        if lsize != rsize {
-                            return Value::from_u64(
-                                if matches!(op, BinaryOp::Eq) { 0 } else { 1 },
-                                1,
-                            );
-                        }
-                        let l_desc = self.module.descending_arrays.contains(&ln);
-                        let r_desc = self.module.descending_arrays.contains(&rn);
-                        let mut equal = true;
-                        for i in 0..lsize {
-                            let lidx = if l_desc {
-                                lhi - i as i64
-                            } else {
-                                llo + i as i64
-                            };
-                            let ridx = if r_desc {
-                                rhi - i as i64
-                            } else {
-                                rlo + i as i64
-                            };
-                            let lv = self
-                                .get_signal_value_by_name(&format!("{}[{}]", ln, lidx))
-                                .unwrap_or(Value::zero(1));
-                            let rv = self
-                                .get_signal_value_by_name(&format!("{}[{}]", rn, ridx))
-                                .unwrap_or(Value::zero(1));
-                            if lv.has_unknown() || rv.has_unknown() {
-                                // An x/z element makes the comparison neither
-                                // equal nor unequal (both `==` and `!=` come
-                                // out 0), as for dynamic arrays/queues.
-                                return Value::from_u64(0, 1);
-                            }
-                            // Compare at the declared element width (differing
-                            // storage slots must not decide the pair).
-                            let ew = self
-                                .coll_elem_width(&ln)
-                                .or_else(|| self.coll_elem_width(&rn));
-                            if !self.coll_values_eq(&lv, &rv, ew) {
-                                equal = false;
-                                break;
-                            }
-                        }
-                        let r = if matches!(op, BinaryOp::Eq) {
-                            equal
-                        } else {
-                            !equal
-                        };
-                        return Value::from_u64(if r { 1 } else { 0 }, 1);
-                    }
-                }
-                // IEEE 1800-2017 §11.8.1: `==`/`!=` on two dynamic arrays /
-                // queues compares element-by-element (after a length check),
-                // not the container's packed scalar. UVM's
+                // §7.4.3, §11.4.5: unpacked arrays — fixed, multi-dimensional,
+                // dynamic, queue and associative — compare element by
+                // element, not as the container's packed scalar. UVM's
                 // `uvm_resource#(T)::do_write` guards on `val == t` for a
-                // `T`-typed queue, so a wrong scalar compare (X/garbage)
-                // made the update early-return or was otherwise unreliable.
-                // Associative arrays compare as equal key/value sets (§7.12) —
-                // without this a class-property assoc `==` fell through to the
-                // packed-scalar path and always yielded x.
-                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    let want_eq = matches!(op, BinaryOp::Eq);
-                    if let Some(res) = self.compare_assoc_arrays(left, right, want_eq) {
-                        return res;
-                    }
-                    if let Some(res) = self.compare_dyn_arrays(left, right, want_eq) {
-                        return res;
-                    }
+                // `T`-typed queue.
+                if let Some((mode, want_eq)) = agg_cmp
+                    && let Some(c) = self.compare_unpacked_arrays(agg_l, agg_r, mode)
+                {
+                    return c.value(want_eq);
                 }
                 let is_arith_or_bitwise = matches!(
                     op,
@@ -5061,6 +5105,18 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // #1108: an element of an array member of an instance-array
+                // element (`lane[0].nest[1][j]`).
+                if let Some(base) = self.inst_array_member_canon(expr) {
+                    let folded = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: index.clone(),
+                        },
+                        expr.span,
+                    );
+                    return self.eval_expr_ctx(&folded, ctx_width);
+                }
                 if let Some(selected) = self.selected_aggregate_rhs(None, expr) {
                     let selected = Expression::new(
                         ExprKind::Index {
@@ -5174,8 +5230,50 @@ impl Simulator {
                 // struct reached through a member chain (`h.r.t[k]`,
                 // `a[0].r.t[k]`): the field's first dimension picks an
                 // element, not a bit.
+                //
+                // The resolver usually flattens such a chain to a bare Ident
+                // (`h.frame.lanes[0]` → `Ident h.frame.lanes`), so the
+                // MemberAccess-only probe above misses it; reconstruct the
+                // struct-side of the chain (`h.frame`) and reuse the same
+                // element slicing.
+                if let ExprKind::Ident(h) = &expr.kind
+                    && h.path.len() >= 2
+                    && !h.path.iter().any(|s| !s.selects.is_empty())
+                    // Only a chain through a struct-typed class property can
+                    // name such a field; `obj.arr[i]` and `u.mem[i]` skip
+                    // building the receiver.
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .any(|s| self.struct_prop_name_possible(&s.name.name))
+                {
+                    let last = h.path.len() - 1;
+                    // `h.frame.lanes` → sb = `(h).frame` (MemberAccess),
+                    // member = `lanes`.
+                    let sb = Self::ident_prefix_member_access(expr, last);
+                    let member = crate::ast::Identifier {
+                        name: h.path[last].name.name.clone(),
+                        span: expr.span,
+                    };
+                    if let Some(v) = self.struct_field_elem_read(&sb, &member, index) {
+                        return v;
+                    }
+                }
                 if let ExprKind::MemberAccess { expr: sb, member } = &expr.kind
-                    && matches!(sb.kind, ExprKind::MemberAccess { .. })
+                    && (matches!(sb.kind, ExprKind::MemberAccess { .. })
+                        // §7.4.5 implicit-`this` receiver: `frame.lanes[0]`
+                        // inside a method flattens to
+                        // `MemberAccess{ Ident[frame], lanes }`.
+                        || (matches!(&sb.kind, ExprKind::Ident(bh)
+                                if bh.path.len() == 1
+                                    && self.struct_prop_name_possible(&bh.path[0].name.name))
+                            && self.this_stack.last().copied().flatten().is_some())
+                        // `arr[i].lanes[k]`: an element of an unpacked-array
+                        // property of the struct (§7.4.1).
+                        || matches!(&sb.kind, ExprKind::Index { expr: ab, .. }
+                            if matches!(&ab.kind, ExprKind::Ident(ah)
+                                if ah.path.len() <= 2
+                                    && self.struct_prop_name_possible(
+                                        &ah.path[ah.path.len() - 1].name.name))))
                     && let Some(v) = self.struct_field_elem_read(sb, member, index)
                 {
                     return v;

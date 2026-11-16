@@ -47,6 +47,9 @@ pub(crate) struct CompatArgs {
     /// `-sv_seed`/`-svseed`/`-seed`, the last one given. A simulator option,
     /// not a plusarg: it never reaches `$test$plusargs` or VPI's argv.
     pub seed: Option<String>,
+    /// `--wave-suppress-file` files named inside args files: the waveform
+    /// exclusion list, one entry per line.
+    pub wave_suppress_files: Vec<String>,
 }
 
 /// The code coverage `+cover[=<letters>]` and `-coverage [<types>]` ask

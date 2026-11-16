@@ -11,6 +11,7 @@ of options and environment variables is in the
 * [Waveforms](#waveforms)
 * [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
+* [Diagnosing memory growth](#diagnosing-memory-growth)
 * [Native compilation](#native-compilation)
 * [Reducing a multi-file build](#reducing-a-multi-file-build)
 * [Module-timescale extension](#module-timescale-extension)
@@ -86,6 +87,28 @@ per-signal trace table. Pass `--wave` to enable `$dumpfile`/`$dumpvars`
 `--fst` and `--xtrace` imply `--wave`. The three formats are cross-checked
 against each other by decoding them.
 
+The scope options above select what to dump; `--wave-suppress <entry>`
+excludes, and one list applies to all three formats. A bare name is a module
+definition: `--wave-suppress mem_bank` drops every instance of `mem_bank` at
+any depth. A dotted name is one hierarchical path, with or without the
+top-module name: `--wave-suppress tb_top.u_blk.u_bank0` drops that instance
+and everything below it. A path can also name an instance array or a generate
+loop (all of its elements, or one as `g_lane[1]`) or a variable (an unpacked
+array with all of its elements, or one element). A bare name that is not a
+module is read as a path below the top module, so `--wave-suppress u_blk`
+works like `--fst-scope u_blk`; `--wave-suppress-module <name>` forces the
+module reading when an instance has the same name as a module.
+`--wave-suppress-file <file>` reads entries from a file.
+
+Excluded signals are dropped while the dump collects its signals, so they
+cost nothing in the header, the identifier tables or the per-step change
+detection. Each entry reports how many signals it removed, and an entry that
+removed nothing is reported with a warning when the whole design was
+selected. An `--fst-scope`, `--xtrace-scope` or `$dumpvars` argument that
+names an excluded scope, or something inside it, dumps what it names; other
+entries still apply inside it. A compiled artifact takes the options when it
+is run.
+
 Ctrl-C (SIGINT) or SIGTERM stops the run at the current time and closes the
 dumps normally; this includes a long loop inside one time slot. If the run
 cannot stop (a DPI call that does not return), the FST dump is closed at the
@@ -151,6 +174,36 @@ The default directory is `$XEZIM_CACHE_DIR`, then
 `--cache-dir` for a workload-local cache or `--no-cache` for a cold run. With
 `--verbose`, xezim prints `[CACHE] miss`, `[CACHE] stored`, or `[CACHE] hit` on
 stderr.
+
+## Diagnosing memory growth
+
+For a large design that exhausts memory during compilation, capture a cold
+run with the same sources, top and options as the failing command:
+
+```bash
+XEZIM_OOM_TRACE=memory.jsonl xezim --compile --no-cache -f files.f -s top
+```
+
+Use `--simulate` instead when growth occurs during simulator setup or execution.
+The trace appends JSONL records with the active phase, source location,
+instance, latest table counts and process RSS. Periodic samples continue
+during long phases. RSS is available on Linux; other platforms report `null`.
+Complete records remain readable after a kill, although the last line may
+be incomplete. `XEZIM_OOM_TRACE=1` writes to stderr; `0` disables tracing.
+
+Trace files contain design names and source paths. Keep the raw trace private
+and share redacted phase/count summaries with the tested revisions, command
+options, peak RSS and exit or kill evidence. RSS is process-wide: a rise near
+one source location does not establish which allocation owns the memory.
+See the [tracing guide](DEBUGGING.md#tracing-memory-growth) for record fields
+and commands to inspect the largest jumps.
+
+Leave tracing off for performance measurements and compare equivalent cache
+conditions. Recent memory improvements apply automatically, including shared
+net-initializer targets across child instances; no new switch or source rewrite
+is required. Instance-specific destinations, delays and strengths are preserved.
+The synthetic results in the [README](../README.md#performance) do not establish
+that the original large-design OOM in #721 is resolved.
 
 ## Native compilation
 

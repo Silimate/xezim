@@ -1,6 +1,9 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+#[macro_use]
+mod stdio;
+
 // Opt-in end-of-run statistics footer (`--report-stats` / XEZIM_REPORT_STATS).
 // CLI-only plumbing, so it lives in the binary, not the library.
 mod report;
@@ -120,31 +123,36 @@ fn spawn_memory_watchdog() {
         _ => return, // /proc unavailable (non-Linux); skip silently
     };
     let limit_kb = total_kb / 4 * 3;
-    std::thread::spawn(move || {
-        let pid = std::process::id();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
-                if rss_kb > limit_kb {
-                    eprintln!(
-                        "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
-                        rss_kb / 1024,
-                        limit_kb / 1024,
-                        total_kb / 1024,
-                        pid,
-                    );
-                    // SIGKILL self — bypasses panic handlers, no Drop runs,
-                    // but ensures the process actually exits even if a thread
-                    // is stuck inside a long allocation.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
+    let watchdog = std::thread::Builder::new()
+        .name("xezim-memwatch".to_string())
+        .spawn(move || {
+            let pid = std::process::id();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
+                    if rss_kb > limit_kb {
+                        eprintln!(
+                            "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
+                            rss_kb / 1024,
+                            limit_kb / 1024,
+                            total_kb / 1024,
+                            pid,
+                        );
+                        // SIGKILL self — bypasses panic handlers, no Drop runs,
+                        // but ensures the process actually exits even if a thread
+                        // is stuck inside a long allocation.
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                        // Fallback if libc isn't available somehow.
+                        std::process::exit(137);
                     }
-                    // Fallback if libc isn't available somehow.
-                    std::process::exit(137);
                 }
             }
-        }
-    });
+        });
+    if let Err(e) = watchdog {
+        eprintln!("Warning: cannot spawn memory watchdog ({e}); running without it");
+    }
 }
 
 /// `-xezim_env <file>`: set (or with `unsetenv`, remove) the `XEZIM_*`
@@ -205,7 +213,7 @@ fn print_usage() {
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!(
-        "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
+        "  --max-time <n>[fs|ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
     );
     eprintln!("                   0 or none: no cap, run until $finish or no events remain");
     eprintln!("  --save-at <time>[,<file>]  Save a checkpoint at the end of the last time slot at");
@@ -410,6 +418,19 @@ fn print_usage() {
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("  -fst_scope_file <file>  (--fst-scope-file) FST scopes from a file: one or");
     eprintln!("                   more per line, '#' or '//' comments. Adds to --fst-scope.");
+    eprintln!("  --wave-suppress <entry>  EXCLUDE signals from the VCD, FST and XTrace dumps.");
+    eprintln!("                   Repeatable, and the two entry forms may be mixed: a bare name");
+    eprintln!("                   is a MODULE definition, so every instance of it at any depth");
+    eprintln!("                   goes; a dotted name is one hierarchical path, with or without");
+    eprintln!("                   the top-module prefix: an instance, an instance array, a");
+    eprintln!("                   generate block or one variable. A bare name that is no module");
+    eprintln!("                   is a path below the top module.");
+    eprintln!("  --wave-suppress-module <name>  --wave-suppress, reading <name> as a module");
+    eprintln!("                   definition even if an instance carries the same name.");
+    eprintln!("  -wave_suppress_file <file>  (--wave-suppress-file) Exclusions from a file: one");
+    eprintln!(
+        "                   or more per line, '#' or '//' comments. Adds to --wave-suppress."
+    );
     eprintln!("  --fst-repack[=N] gzip-wrap the finished FST on a clean close (GTKWave's");
     eprintln!("                   repack-on-close; deflate level N, 1..9, default 6). About");
     eprintln!("                   1.5x smaller; readers inflate it on open.");
@@ -553,7 +574,7 @@ fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
 /// Build the `--module-timescale` configuration from raw option strings,
 /// validating units and detecting conflicting named assignments.
 /// Parse a `--max-time` value: a bare number is NANOSECONDS (historical
-/// default), an attached suffix selects the unit: `30000000ps`, `30us`,
+/// default), an attached suffix selects the unit: `925000000000fs`, `30us`,
 /// `1ms`, `2s` (case-insensitive; `us` or `µs`). Returns nanoseconds.
 /// A customer run set `--max-time 30000000` intending picoseconds under a
 /// 1ps timescale and got 30 ms — the unit was invisible and unspellable.
@@ -565,7 +586,12 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     if lower == "none" {
         return Ok(RUN_ALL_NS);
     }
-    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower.strip_suffix("ps") {
+    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower
+        .strip_suffix("fs")
+        .filter(|n| n.trim().parse::<f64>().is_ok())
+    {
+        (n, 1e-6)
+    } else if let Some(n) = lower.strip_suffix("ps") {
         (n, 1e-3)
     } else if let Some(n) = lower.strip_suffix("ns") {
         (n, 1.0)
@@ -582,7 +608,7 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     };
     let num: f64 = num_str.trim().parse().map_err(|_| {
         format!(
-            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s], or none)",
+            "invalid --max-time value '{}' (expected <n>[fs|ps|ns|us|ms|s], or none)",
             raw
         )
     })?;
@@ -595,8 +621,25 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
             raw
         ));
     }
-    let ns = num * factor_ns;
-    let rounded = ns.round();
+    // Keep integer femtoseconds exact above f64's 53-bit mantissa. Rounding
+    // to whole ns happens once, after the unit conversion (#1113).
+    if let Some(fs) = lower
+        .strip_suffix("fs")
+        .and_then(|value| value.trim().parse::<u128>().ok())
+    {
+        let ns = fs / 1_000_000 + u128::from(fs % 1_000_000 >= 500_000);
+        if ns >= u64::MAX as u128 {
+            return Ok(u64::MAX);
+        }
+        if ns == 0 {
+            return Err(format!(
+                "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
+                raw
+            ));
+        }
+        return Ok(ns as u64);
+    }
+    let rounded = (num * factor_ns).round();
     if rounded < 1.0 {
         return Err(format!(
             "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
@@ -607,7 +650,7 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
 }
 
 /// Parse a `--save-at` time: like `--max-time`, a bare number is
-/// nanoseconds, but `fs` is accepted and so is zero and anything below 1 ns.
+/// nanoseconds, but zero and anything below 1 ns are also accepted.
 /// Returns seconds.
 fn parse_save_time(raw: &str) -> Result<f64, String> {
     let lower = raw.trim().to_ascii_lowercase();
@@ -1081,6 +1124,20 @@ fn process_command_file(
                     };
                     if let Some(v) = v {
                         compat.fst_scope_files.push(resolve_rel(base, &v));
+                    }
+                }
+                // `-wave_suppress_file <file>` (path relative to this args
+                // file); one `--wave-suppress` entry per line.
+                _ if cli_files::option_value(t, cli_files::WAVE_SUPPRESS_FILE_NAMES).is_some() => {
+                    let v = match cli_files::option_value(t, cli_files::WAVE_SUPPRESS_FILE_NAMES) {
+                        Some(Some(v)) => Some(v.to_string()),
+                        _ => {
+                            i += 1;
+                            toks.get(i).map(|s| s.to_string())
+                        }
+                    };
+                    if let Some(v) = v {
+                        compat.wave_suppress_files.push(resolve_rel(base, &v));
                     }
                 }
                 // `-xezim_env` must be on the command line: the environment
@@ -2037,11 +2094,46 @@ fn append_adopted_libs_to_merged(
     );
 }
 
+fn smaller_worker_stacks(requested_mb: usize) -> impl Iterator<Item = usize> {
+    [1024, 512, 256, 128, 64]
+        .into_iter()
+        .filter(move |&size_mb| size_mb < requested_mb)
+}
+
+#[test]
+fn smaller_worker_stack_ladder() {
+    for (requested, expected) in [
+        (1536, vec![1024, 512, 256, 128, 64]),
+        (1024, vec![512, 256, 128, 64]),
+        (512, vec![256, 128, 64]),
+        (256, vec![128, 64]),
+        (128, vec![64]),
+        (64, vec![]),
+        (32, vec![]),
+    ] {
+        // Exhausting this iterator selects the current-thread fallback.
+        assert_eq!(
+            smaller_worker_stacks(requested).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
 fn main() {
     // `-xezim_env <file>` before anything reads an `XEZIM_*` variable (this
     // very function reads XEZIM_HUGEPAGE and XEZIM_STACK_MB). The process is
     // still single-threaded here, so setting the environment is sound.
     apply_xezim_env_files();
+    // Standalone informational commands need neither compilation nor a worker
+    // stack. Keep their output available even under a tight address-space limit.
+    if env::args().len() == 1
+        || matches!(
+            env::args().nth(1).as_deref(),
+            Some("-V" | "-h" | "--help" | "--show-env-avail")
+        )
+    {
+        std::process::exit(run_main());
+    }
     // FIRST thing, before any large allocation: a parent can disable transparent
     // huge pages for its whole descendant tree with prctl(PR_SET_THP_DISABLE, 1),
     // and the flag is inherited across fork+exec. While set, madvise(MADV_HUGEPAGE)
@@ -2064,7 +2156,6 @@ fn main() {
             libc::prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
         }
     }
-    spawn_memory_watchdog();
     // Install the SIGUSR1 hang-report handler before compile: a user poking a
     // seemingly-hung run during a long elaboration must not kill it (the
     // default SIGUSR1 action is termination).
@@ -2076,26 +2167,62 @@ fn main() {
     // aborts with "thread 'main' has overflowed its stack"). Do what rustc
     // does: run the whole compile+simulate on a worker thread with a large
     // stack. The memory is virtual — pages commit only if actually used —
-    // so the big default costs nothing. XEZIM_STACK_MB overrides.
+    // but the reservation still counts against address-space limits.
+    // XEZIM_STACK_MB overrides; retry smaller workers before the main stack.
     let stack_mb: usize = std::env::var("XEZIM_STACK_MB")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
     if stack_mb > 0 {
-        let code = std::thread::Builder::new()
-            .name("xezim-main".to_string())
-            .stack_size(stack_mb * 1024 * 1024)
-            .spawn(run_main)
-            .expect("spawn simulation thread")
-            .join()
-            .unwrap_or_else(|_| 101);
-        std::process::exit(code);
+        let mut first_error = None;
+        for size_mb in std::iter::once(stack_mb).chain(smaller_worker_stacks(stack_mb)) {
+            let Some(stack_bytes) = size_mb
+                .checked_mul(1024 * 1024)
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+            else {
+                first_error.get_or_insert_with(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "requested stack size is too large",
+                    )
+                });
+                continue;
+            };
+            let warning = first_error.as_ref().map(|e| {
+                format!(
+                    "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({e}); running with a {size_mb} MiB stack (set XEZIM_STACK_MB to a size that fits)"
+                )
+            });
+            match std::thread::Builder::new()
+                .name(xezim::CLI_WORKER_THREAD.to_string())
+                .stack_size(stack_bytes)
+                .spawn(move || {
+                    if let Some(warning) = warning {
+                        eprintln!("{warning}");
+                    }
+                    spawn_memory_watchdog();
+                    run_main()
+                }) {
+                Ok(worker) => std::process::exit(worker.join().unwrap_or(101)),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        eprintln!(
+            "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({}); running on the current thread (set XEZIM_STACK_MB to a size that fits, or raise `ulimit -s`)",
+            first_error.unwrap()
+        );
+        // Keep simulate_multi here too, without changing what children inherit.
+        xezim::CLI_CURRENT_THREAD.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    spawn_memory_watchdog();
     let code = run_main();
     std::process::exit(code);
 }
 
 fn run_main() -> i32 {
+    let _oom_trace = xezim_core::oom_trace::session();
     let compile_wall_start = std::time::Instant::now();
 
     // Default to IEEE 1800-2023 mode. SV-2023 is additive over -2017, so
@@ -2202,6 +2329,9 @@ fn run_main() -> i32 {
     let mut fst_file: Option<String> = None;
     let mut fst_repack: Option<u8> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
+    // `--wave-suppress` / `--wave-suppress-module` / `--wave-suppress-file`:
+    // the waveform EXCLUDE list, shared by VCD, FST and XTrace.
+    let mut wave_suppress: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
@@ -2210,6 +2340,7 @@ fn run_main() -> i32 {
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
+    let mut direct_plusarg_positions: Vec<usize> = Vec::new();
     let mut emit_hypergraph: Option<String> = None;
     let mut load_partition: Option<String> = None;
     let mut write_profile: Option<String> = None;
@@ -2371,6 +2502,32 @@ fn run_main() -> i32 {
                     }
                 }
             }
+            // `--wave-suppress-file <file>`: one `--wave-suppress` entry per
+            // line — module names and hierarchical paths may be mixed freely.
+            // Ahead of the `-f<file>` args-file prefix form, which would
+            // otherwise take `-wave_suppress_file`.
+            _ if cli_files::option_value(arg, cli_files::WAVE_SUPPRESS_FILE_NAMES).is_some() => {
+                let path = match cli_files::option_value(arg, cli_files::WAVE_SUPPRESS_FILE_NAMES) {
+                    Some(Some(v)) => v.to_string(),
+                    _ => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                eprintln!("Error: -wave_suppress_file requires a file");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => wave_suppress.extend(cli_files::parse_scope_file(&text)),
+                    Err(e) => {
+                        eprintln!("Error: cannot read -wave_suppress_file '{}': {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             // `-xezim_env <file>` was applied at start-up (apply_xezim_env_files).
             _ if cli_files::option_value(arg, cli_files::XEZIM_ENV_NAMES).is_some() => {
                 if cli_files::option_value(arg, cli_files::XEZIM_ENV_NAMES) == Some(None) {
@@ -2515,6 +2672,7 @@ fn run_main() -> i32 {
                     xezim::compiler::simulator::set_warn_x(true);
                     xezim::compiler::simulator::set_warn_x_limit(n);
                 }
+                direct_plusarg_positions.push(i);
                 plusargs.push(arg.clone());
             }
             // `-v <file>` — a library FILE (traditional library semantics): its
@@ -2969,6 +3127,33 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
+            }
+            // ── `--wave-suppress`: the waveform EXCLUDE list ──────────────
+            // A bare identifier names a MODULE — every instance of it, at every
+            // depth — and a dotted name names one hierarchical subtree, with or
+            // without the top-module prefix. `--wave-suppress-module` forces the
+            // module reading, so the two rules are never ambiguous. The list is
+            // one matcher shared by the VCD, FST and XTrace dumps.
+            "--wave-suppress" => {
+                i += 1;
+                if i < args.len() {
+                    wave_suppress.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--wave-suppress=") && !arg.starts_with("--wave-suppress-m") => {
+                wave_suppress.push(arg["--wave-suppress=".len()..].to_string());
+            }
+            "--wave-suppress-module" => {
+                i += 1;
+                if i < args.len() {
+                    wave_suppress.push(format!("module:{}", args[i]));
+                }
+            }
+            _ if arg.starts_with("--wave-suppress-module=") => {
+                wave_suppress.push(format!(
+                    "module:{}",
+                    &arg["--wave-suppress-module=".len()..]
+                ));
             }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
@@ -3475,6 +3660,18 @@ fn run_main() -> i32 {
         }
     }
 
+    // `--wave-suppress-file` given inside an args file: the same list, the same
+    // rules, just read relative to the args file that named it.
+    for f in std::mem::take(&mut compat.wave_suppress_files) {
+        match std::fs::read_to_string(&f) {
+            Ok(text) => wave_suppress.extend(cli_files::parse_scope_file(&text)),
+            Err(e) => {
+                eprintln!("Error: cannot read -wave_suppress_file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // `-uvm`: add the UVM library that `XEZIM_UVM_DIR` names (its `src`
     // include directory and `uvm_pkg.sv`; src/uvm_dir.rs). Before
     // `--dump-files-list`, so the list shows what was added.
@@ -3705,6 +3902,9 @@ suppressed but the explicit SDF annotation still applies."
                         xezim::compiler::simulator::set_dump_timescales(dump_timescales);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
                         xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
+                        // The exclusion list applies to a compiled artifact's
+                        // dumps as well.
+                        xezim::compiler::simulator::set_wave_suppress(&wave_suppress);
                         let mut sim = xezim::compiler::Simulator::new(elab, max_time);
                         if let Some(limit) = settle_limit {
                             sim.settle_limit = limit;
@@ -3720,7 +3920,11 @@ suppressed but the explicit SDF annotation still applies."
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
-                        sim.set_args(&args);
+                        sim.set_args(&cli_files::runtime_argv(
+                            &args,
+                            &plusargs,
+                            &direct_plusarg_positions,
+                        ));
                         let compilation_start = xezim::WallTimer::now();
                         sim.compile();
                         if !sim.compile_errors.is_empty() {
@@ -4201,6 +4405,12 @@ suppressed but the explicit SDF annotation still applies."
             && std::env::var("XEZIM_KEEP_PORTS").ok().as_deref() != Some("1"),
     );
 
+    // `--wave-suppress[-file|-module]`: the waveform EXCLUDE list. It reaches
+    // the dump setup the same way the include lists do, and the same list is
+    // consulted by the VCD, FST and XTrace writers, so one design cannot get
+    // three different answers.
+    xezim::compiler::simulator::set_wave_suppress(&wave_suppress);
+
     match xezim::simulate_multi(
         &sources,
         max_time,
@@ -4329,5 +4539,18 @@ fn report_fatal_error(e: &str) {
         eprintln!("{}", e);
     } else {
         eprintln!("Simulation error: {}", e);
+    }
+}
+
+#[test]
+fn integer_femtosecond_limits_round_exactly() {
+    for (input, expected) in [
+        ("9007199255499999fs", 9_007_199_255),
+        ("9007199255500000fs", 9_007_199_256),
+        ("9007199256500001FS", 9_007_199_257),
+        ("18446744073709551614000000fs", u64::MAX - 1),
+        ("18446744073709551615000000fs", u64::MAX),
+    ] {
+        assert_eq!(parse_max_time(input).unwrap(), expected, "{input}");
     }
 }

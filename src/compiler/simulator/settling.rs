@@ -88,9 +88,14 @@ impl Simulator {
 
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
+        let mut constant_drivers: Vec<CombEntry> = Vec::new();
         for entry in self.comb_entries.iter() {
             if entry.cold.write_signal_ids.contains(&id) {
-                sources.extend(entry.cold.read_signal_ids.iter().copied());
+                if entry.cold.read_signal_ids.is_empty() {
+                    constant_drivers.push(entry.clone());
+                } else {
+                    sources.extend(entry.cold.read_signal_ids.iter().copied());
+                }
             }
         }
         for src_id in sources {
@@ -100,6 +105,25 @@ impl Simulator {
                 self.dirty_any = true;
             }
         }
+        // §10.6.2: a driver that reads no signal (`wire w = 4'h5;`,
+        // `assign w = 4'h6;`) is never re-run by a dirty mark, so the
+        // released net kept the forced value. Re-run it here; its value does
+        // not depend on evaluation order.
+        for entry in &constant_drivers {
+            self.eval_released_comb_entry(entry);
+        }
+    }
+
+    /// §10.6.2 / §21.2.1.7: evaluating a net's driver uses its declaration
+    /// scope, then returns to the scope of the procedure doing the release.
+    pub(super) fn eval_released_comb_entry(&mut self, entry: &CombEntry) {
+        let scope = std::mem::take(&mut self.m_block_scope);
+        let scope_id = self.m_block_scope_id;
+        let active = self.m_block_active;
+        self.eval_comb_entry_full(entry);
+        self.m_block_scope = scope;
+        self.m_block_scope_id = scope_id;
+        self.m_block_active = active;
     }
 
     /// Level-BSP combinational settle (XEZIM_BSP_SETTLE=1). Reaches the SAME
@@ -607,10 +631,12 @@ impl Simulator {
                 lhs,
                 rhs,
                 delay: explicit_delay,
+                delay_target,
             } => {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
                 }
+                let delay_target = delay_target.as_deref().copied();
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
@@ -699,6 +725,7 @@ impl Simulator {
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
                 if delay > 0
+                    || delay_target.is_some_and(|t| t.select_delays.is_some())
                     || lhs_id.is_some_and(|id| {
                         self.gate_fall_delay_by_id.contains_key(&id)
                             || self.gate_off_delay_by_id.contains_key(&id)
@@ -707,7 +734,7 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_with_delay(id, val, delay);
+                                self.schedule_delayed_transition(id, val, delay, delay_target);
                             }
                         } else {
                             self.cancel_delayed(id);
@@ -718,6 +745,27 @@ impl Simulator {
                         // this used to DROP the write silently. Composes
                         // against the PENDING delayed value (issue #143).
                         let sel_val = val.resize(sel_w);
+                        // §10.3.3 / §28.16: the select's own transition
+                        // delay, from the selected bits' current value.
+                        let delay = match delay_target {
+                            Some(DelayTarget {
+                                vector,
+                                select_delays: Some((fall, off)),
+                                ..
+                            }) => {
+                                let hi = (lo + sel_w - 1) as usize;
+                                let old = self.signal_table[base_id].range_select(hi, lo as usize);
+                                Self::transition_delay(
+                                    &sel_val,
+                                    &old,
+                                    delay,
+                                    fall,
+                                    off,
+                                    vector || sel_w > 1,
+                                )
+                            }
+                            _ => delay,
+                        };
                         self.schedule_delayed_slice(base_id, lo, sel_w, &sel_val, delay);
                     }
                 } else if let Some(id) = lhs_id {
@@ -1274,6 +1322,54 @@ impl Simulator {
         }
     }
 
+    /// #35 / #1149: list the reads of a cont-assign entry that a deferring
+    /// (post-proc-write) settle skipped, for the next full settle to
+    /// re-dirty. Each id is listed once: the drain re-dirties an id only if
+    /// it is not dirty yet, so a second copy changes nothing, and an entry
+    /// that re-triggers on every settle (one with an unresolved read) is
+    /// skipped again on every blocking write of the process. `marker` lists
+    /// the out-of-range `u32::MAX` entry, which only keeps the list
+    /// non-empty; an id out of range of `dirty_signals` (the drain skips it)
+    /// is listed as that marker too.
+    fn defer_proc_reads(&mut self, ids: &[usize], mut marker: bool) {
+        let n = self.dirty_signals.len();
+        if self.deferred_proc_seen.len() < n.div_ceil(64) {
+            self.deferred_proc_seen.resize(n.div_ceil(64), 0);
+        }
+        for &id in ids {
+            if id >= n {
+                marker = true;
+                continue;
+            }
+            let (w, b) = (id >> 6, 1u64 << (id & 63));
+            if self.deferred_proc_seen[w] & b == 0 {
+                self.deferred_proc_seen[w] |= b;
+                self.deferred_proc_entries.push(id as u32);
+            }
+        }
+        if marker && !self.deferred_proc_unres {
+            self.deferred_proc_unres = true;
+            self.deferred_proc_entries.push(u32::MAX);
+        }
+    }
+
+    /// #1149: the listed-once bits of `deferred_proc_entries`, rebuilt from
+    /// the list (a restored checkpoint holds only the list).
+    pub(super) fn rebuild_deferred_proc_seen(&mut self) {
+        let n = self.dirty_signals.len();
+        self.deferred_proc_seen.clear();
+        self.deferred_proc_seen.resize(n.div_ceil(64), 0);
+        self.deferred_proc_unres = false;
+        for &sid in &self.deferred_proc_entries {
+            let sid = sid as usize;
+            if sid < n {
+                self.deferred_proc_seen[sid >> 6] |= 1u64 << (sid & 63);
+            } else {
+                self.deferred_proc_unres = true;
+            }
+        }
+    }
+
     pub(super) fn settle_combinatorial_inner(&mut self) {
         if !self.ts_sleep.is_empty() {
             self.ts_wake_sleepers();
@@ -1381,14 +1477,23 @@ impl Simulator {
             && (self.time != 0 || self.t0_starts_remaining == 0)
             && !self.deferred_proc_entries.is_empty()
         {
-            let deferred = std::mem::take(&mut self.deferred_proc_entries);
-            for sid in deferred {
+            let mut deferred = std::mem::take(&mut self.deferred_proc_entries);
+            for &sid in &deferred {
                 let sid = sid as usize;
-                if sid < self.dirty_signals.len() && !self.dirty_signals[sid] {
-                    self.dirty_signals[sid] = true;
-                    self.dirty_list.push(sid);
+                if sid < self.dirty_signals.len() {
+                    if let Some(w) = self.deferred_proc_seen.get_mut(sid >> 6) {
+                        *w &= !(1u64 << (sid & 63));
+                    }
+                    if !self.dirty_signals[sid] {
+                        self.dirty_signals[sid] = true;
+                        self.dirty_list.push(sid);
+                    }
                 }
             }
+            self.deferred_proc_unres = false;
+            // The list keeps its allocation for the next deferral.
+            deferred.clear();
+            self.deferred_proc_entries = deferred;
             self.dirty_any = true;
         }
         // First time-0 settle pass: don't fire `always @(list)` blocks that
@@ -1984,22 +2089,15 @@ impl Simulator {
                             | CombItem::FusedAndFanout { .. }
                     ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                 {
-                    self.deferred_proc_entries.extend(
-                        entries[eidx]
-                            .cold
-                            .read_signal_ids
-                            .iter()
-                            .map(|&id| id as u32),
-                    );
                     // An entry with no resolvable read (one reading only
                     // memory cells without element names) has no id to
                     // re-dirty: an out-of-range marker still makes the next
                     // full settle run, which seeds every unresolved entry.
-                    if entries[eidx].has_unresolved_reads
-                        && entries[eidx].cold.read_signal_ids.is_empty()
-                    {
-                        self.deferred_proc_entries.push(u32::MAX);
-                    }
+                    let reads = &entries[eidx].cold.read_signal_ids;
+                    self.defer_proc_reads(
+                        reads,
+                        entries[eidx].has_unresolved_reads && reads.is_empty(),
+                    );
                     continue;
                 }
                 evaluated_any = true;

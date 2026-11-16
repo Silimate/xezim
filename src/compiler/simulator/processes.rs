@@ -100,6 +100,9 @@ impl Simulator {
     }
 
     pub(super) fn take_process_context(&mut self) -> ProcessContext {
+        // §13.5.2: the aliased leaves of a `ref` struct formal reach their
+        // actuals before another process runs.
+        self.ref_frame_flush();
         // The ref stacks leave with the context; nothing can redirect until
         // a context is restored or a new ref frame is pushed.
         self.ref_redirect_hot = false;
@@ -166,6 +169,10 @@ impl Simulator {
         if !self.local_meta_cache.is_empty() && !self.local_meta_claims.is_empty() {
             self.reapply_local_meta();
         }
+        if !self.task_cleanup.is_empty() {
+            self.reinstall_struct_formal_meta();
+        }
+        self.ref_frame_refresh();
     }
 
     /// Capture the current process context, including the current
@@ -1528,6 +1535,22 @@ impl Simulator {
             self.run_fast_delay_always(pid);
         } else if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
             self.run_proc_fsm(pid);
+        } else if stmts.is_empty()
+            && !self.lazy_initial.is_empty()
+            && let Some(p) = self.lazy_initial.remove(&pid)
+        {
+            // An initial block queued by its pending form (see `compile`):
+            // its body is materialized for this instance now, with the
+            // block locals given storage of their own as an instance's
+            // always block gets (`materialize_pending_always`), and is
+            // dropped again when the process ends.
+            let mut ib = p.materialize();
+            Self::rename_instance_locals(&mut ib.stmt, &ib.scope);
+            let stmts = match ib.stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts,
+                other => vec![Statement::new(other, ib.stmt.span)],
+            };
+            self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
         } else {
             self.run_process_stmts(pid, stmts);
         }
@@ -2462,6 +2485,135 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// §9.4.5: capture the right-hand side of an intra-assignment timing
+    /// control when the statement runs, against its target as an
+    /// assignment without the timing control would evaluate it: at the
+    /// target's width (§11.6.1), and a pattern shaped by a packed target
+    /// (§10.9). A pattern for any other target takes its shape from the
+    /// target only when it is stored, so each item's value is captured
+    /// instead, keys and nesting kept, and the delayed store runs the
+    /// pattern of captured values. Returns that right-hand side and the
+    /// statement that frees the captured items after the store, if any.
+    pub(super) fn capture_intra_rhs(
+        &mut self,
+        lvalue: &Expression,
+        rhs: &Expression,
+        span: crate::ast::Span,
+    ) -> (Expression, Option<Statement>) {
+        let mut inner = rhs;
+        while let ExprKind::Paren(e) = &inner.kind {
+            inner = e;
+        }
+        // §11.4.11: a conditional of unpacked aggregates (`c ? '{1, 2} :
+        // '{3, 4}`) selects its operand now, and that operand is captured.
+        // An operand read through a call, or both operands merged under an
+        // unknown condition, are already a snapshot taken now.
+        if matches!(inner.kind, ExprKind::Conditional { .. })
+            && let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), inner)
+        {
+            if matches!(&selected.kind, ExprKind::Ident(h)
+                if h.path.len() == 1 && h.path[0].name.name.starts_with("__xz_cond_aggregate_"))
+            {
+                return (selected, None);
+            }
+            return self.capture_intra_rhs(lvalue, &selected, span);
+        }
+        if matches!(inner.kind, ExprKind::AssignmentPattern(_)) {
+            // A packed target shapes the pattern now; its value is the one
+            // evaluation of the items (a second would repeat their calls).
+            if let Some(v) = self.eval_pattern_for_lvalue(lvalue, inner) {
+                return (self.make_intra_saved_expr(v, span), None);
+            }
+            let mut slots = Vec::new();
+            let captured = self.capture_intra_pattern(inner, &mut slots);
+            let args = slots
+                .iter()
+                .map(|&idx| Self::intra_slot_literal(idx, span))
+                .collect();
+            let release = Statement::new(
+                StatementKind::Expr(Expression::new(
+                    ExprKind::SystemCall {
+                        name: INTRA_RELEASE_MARKER.to_string(),
+                        args,
+                    },
+                    span,
+                )),
+                span,
+            );
+            return (captured, Some(release));
+        }
+        let val = self.eval_target_rhs(lvalue, rhs);
+        (self.make_intra_saved_expr(val, span), None)
+    }
+
+    /// The pattern `e` with each item's value captured (`capture_intra_rhs`).
+    fn capture_intra_pattern(&mut self, e: &Expression, slots: &mut Vec<u64>) -> Expression {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        match &e.kind {
+            ExprKind::Paren(inner) => self.capture_intra_pattern(inner, slots),
+            ExprKind::AssignmentPattern(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(match item {
+                        Item::Ordered(x) => Item::Ordered(self.capture_intra_pattern(x, slots)),
+                        Item::Named(n, x) => {
+                            Item::Named(n.clone(), self.capture_intra_pattern(x, slots))
+                        }
+                        Item::Typed(t, x) => {
+                            Item::Typed(t.clone(), self.capture_intra_pattern(x, slots))
+                        }
+                        Item::Default(x) => Item::Default(self.capture_intra_pattern(x, slots)),
+                        Item::Keyed(k, x) => {
+                            Item::Keyed(k.clone(), self.capture_intra_pattern(x, slots))
+                        }
+                    });
+                }
+                Expression::new(ExprKind::AssignmentPattern(out), e.span)
+            }
+            // `'{n{a, b}}`: the count stays, the items are captured.
+            ExprKind::Replication { count, exprs } => {
+                let mut out = Vec::with_capacity(exprs.len());
+                for x in exprs {
+                    out.push(self.capture_intra_pattern(x, slots));
+                }
+                Expression::new(
+                    ExprKind::Replication {
+                        count: count.clone(),
+                        exprs: out,
+                    },
+                    e.span,
+                )
+            }
+            _ => {
+                let val = self.eval_expr(e);
+                let idx = self.intra_saved_next;
+                self.intra_saved_next += 1;
+                self.intra_saved.insert(idx, val);
+                slots.push(idx);
+                Expression::new(
+                    ExprKind::SystemCall {
+                        name: INTRA_KEPT_MARKER.to_string(),
+                        args: vec![Self::intra_slot_literal(idx, e.span)],
+                    },
+                    e.span,
+                )
+            }
+        }
+    }
+
+    fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
+        Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: NumberBase::Decimal,
+                value: idx.to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        )
     }
 
     /// Stash a §9.4.5 RHS value evaluated at statement-execution time and
@@ -3462,11 +3614,28 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.to_vec();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    // Chain the caller's tail instead of copying it onto the end of
-                                    // the spliced body (ProcCont::pushed).
-                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    let frame = if self.share_task_frames {
+                                        self.task_body_frame(&td, stmt.span)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(frame) = frame {
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
+                                        );
+                                    } else {
+                                        // Preserve first-call lifetimes and checkpoint numbering.
+                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed(cont, pc.start + i + 1),
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -3527,9 +3696,28 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.to_vec();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    let frame = if self.share_task_frames {
+                                        self.task_body_frame(&td, stmt.span)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(frame) = frame {
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
+                                        );
+                                    } else {
+                                        // Preserve first-call lifetimes and checkpoint numbering.
+                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed(cont, pc.start + i + 1),
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -4129,8 +4317,8 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_target_rhs(lvalue, &args[3]);
-                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let (saved, release) =
+                            self.capture_intra_rhs(lvalue, &args[3], rvalue.span);
                         let assign = Statement::new(
                             StatementKind::BlockingAssign {
                                 lvalue: lvalue.clone(),
@@ -4163,6 +4351,7 @@ impl Simulator {
                             ));
                         }
                         cont.push(assign);
+                        cont.extend(release);
                         // Chain the caller's tail instead of copying it onto the end of
                         // the spliced body (ProcCont::pushed).
                         self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
@@ -4177,16 +4366,16 @@ impl Simulator {
             // `#d;` followed by `lhs = <saved value>;`.
             if let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind {
                 if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
-                    let val = self.eval_expr(rhs);
+                    let (saved, release) = self.capture_intra_rhs(lvalue, rhs, rvalue.span);
                     let delay = self.eval_delay_ticks(d_expr);
-                    let saved = self.make_intra_saved_expr(val, rvalue.span);
-                    let cont = vec![Statement::new(
+                    let mut cont = vec![Statement::new(
                         StatementKind::BlockingAssign {
                             lvalue: lvalue.clone(),
                             rvalue: saved,
                         },
                         stmt.span,
                     )];
+                    cont.extend(release);
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
                     self.event_queue.schedule(self.time + delay, pid, cont);
@@ -5281,7 +5470,7 @@ impl Simulator {
                         self.process_scope_hint.insert(pid_child, h);
                     }
                     self.process_origin
-                        .insert(pid_child, (s.span, "fork child"));
+                        .insert(pid_child, (s.span, FORK_CHILD_ORIGIN));
                     // §9.6.2: `disable <label>` where the label names this
                     // child's own top-level `begin : name` block terminates
                     // the child. `disable_labels` was populated ONLY for
@@ -5303,9 +5492,8 @@ impl Simulator {
                     // pre-computed assignment directly at t+d.
                     if let StatementKind::BlockingAssign { lvalue, rvalue } = &s.kind {
                         if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
-                            let val = self.eval_expr(rhs);
+                            let (saved, release) = self.capture_intra_rhs(lvalue, rhs, rvalue.span);
                             let delay = self.eval_delay_ticks(d_expr);
-                            let saved = self.make_intra_saved_expr(val, rvalue.span);
                             let assign = Statement::new(
                                 StatementKind::BlockingAssign {
                                     lvalue: lvalue.clone(),
@@ -5313,11 +5501,10 @@ impl Simulator {
                                 },
                                 s.span,
                             );
-                            self.event_queue.schedule(
-                                self.time + delay,
-                                pid_child,
-                                vec![assign].into(),
-                            );
+                            let mut cont = vec![assign];
+                            cont.extend(release);
+                            self.event_queue
+                                .schedule(self.time + delay, pid_child, cont.into());
                             child_pids.insert(pid_child);
                             continue;
                         }
@@ -5696,13 +5883,9 @@ impl Simulator {
                 // transitive closure made a `join_none` grandchild extend the
                 // wait arbitrarily — or forever, for a persistent monitor
                 // spawned by a child, which is exactly the shape UVM drivers
-                // use.
-                let children: HashSet<usize> = self
-                    .process_parents
-                    .iter()
-                    .filter(|&(_, &parent)| parent == pid)
-                    .map(|(&child, _)| child)
-                    .collect();
+                // use. A finished child's children, handed up to this process
+                // for `disable fork`, are not its own (`wait_fork_children`).
+                let children: HashSet<usize> = self.wait_fork_children(pid);
 
                 if children.is_empty() {
                     i += 1;
@@ -5760,6 +5943,20 @@ impl Simulator {
                         self.continue_flag = false;
                     }
                 }
+            }
+            // §9.6.2: a `disable` of the process's own top-level block ends
+            // with the process; leave no flag for the next activation.
+            if pc.next.is_none()
+                && self.break_flag
+                && !self.killed_pids.contains(&pid)
+                && self
+                    .disable_target
+                    .as_deref()
+                    .is_some_and(|t| self.is_process_top_label(pid, t))
+            {
+                self.disable_target = None;
+                self.break_flag = false;
+                self.continue_flag = false;
             }
             if let Some(frame) = pc.next.clone() {
                 self.run_process_stmts(pid, &frame);

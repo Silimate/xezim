@@ -6,10 +6,20 @@
 //! The cases now live one directory down and are included here as
 //! modules, so this group links ONCE. Tests, names and assertions are
 //! unchanged — only the link unit is.
+
 //!
 //! The explicit module paths below are required: a crate root resolves a
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
+
+#[path = "types/constant_expression_contexts.rs"]
+mod constant_expression_contexts;
+#[path = "types/constant_real_math_1089.rs"]
+mod constant_real_math_1089;
+#[path = "types/deferred_type_contexts_721.rs"]
+mod deferred_type_contexts_721;
+#[path = "types/struct_array_continuous_sensitivity_1090.rs"]
+mod struct_array_continuous_sensitivity_1090;
 
 #[path = "types/ansi_port_name_with_unpacked_dim.rs"]
 mod ansi_port_name_with_unpacked_dim;
@@ -89,6 +99,10 @@ mod copy_ctor_type_mismatch;
 mod declared_signedness_wins;
 #[path = "types/default_assignment_pattern_packed.rs"]
 mod default_assignment_pattern_packed;
+#[path = "types/default_real_array_cells.rs"]
+mod default_real_array_cells;
+#[path = "types/default_real_collection_cells.rs"]
+mod default_real_collection_cells;
 #[path = "types/defparam_override.rs"]
 mod defparam_override;
 #[path = "types/diag_kind_limit_env.rs"]
@@ -337,6 +351,8 @@ mod unpacked_struct_array_members;
 mod unpacked_struct_func_arg;
 #[path = "types/unpacked_struct_multidim_members.rs"]
 mod unpacked_struct_multidim_members;
+#[path = "types/unpacked_struct_pattern_return.rs"]
+mod unpacked_struct_pattern_return;
 #[path = "types/untyped_param_width.rs"]
 mod untyped_param_width;
 #[path = "types/valparam_spec_cycle.rs"]
@@ -699,3 +715,47 @@ mod struct_array_member_elem_select;
 
 #[path = "types/packed_select_geometry_1002.rs"]
 mod packed_select_geometry_1002;
+#[path = "types/struct_pattern_replication.rs"]
+mod struct_pattern_replication;
+#[path = "types/struct_pattern_replication_constant_counts.rs"]
+mod struct_pattern_replication_constant_counts;
+#[path = "types/unpacked_slice_patterns_1045.rs"]
+mod unpacked_slice_patterns_1045;
+
+#[path = "types/package_nettype_import.rs"]
+mod package_nettype_import;
+#[path = "types/struct_pattern_keys_continuous_assign.rs"]
+mod struct_pattern_keys_continuous_assign;
+#[path = "types/ansi_port_inheritance_1078.rs"]
+mod ansi_port_inheritance_1078;
+#[path = "types/packed_struct_array_local_fill_1082.rs"]
+mod packed_struct_array_local_fill_1082;
+#[path = "types/packed_struct_array_member_reads_1088.rs"]
+mod packed_struct_array_member_reads_1088;
+
+#[path = "types/struct_negative_array_pattern.rs"]
+mod struct_negative_array_pattern;
+#[path = "types/negative_index_compiled_blocks.rs"]
+mod negative_index_compiled_blocks;
+#[path = "types/signed_literal_pattern_index.rs"]
+mod signed_literal_pattern_index;
+#[path = "types/literal_pattern_key_sites.rs"]
+mod literal_pattern_key_sites;
+#[path = "types/literal_pattern_key_params_1164.rs"]
+mod literal_pattern_key_params_1164;
+#[path = "types/constant_expression_types_1143.rs"]
+mod constant_expression_types_1143;
+#[path = "types/unsigned_operand_kinds_1158.rs"]
+mod unsigned_operand_kinds_1158;
+#[path = "types/signed_packed_member_reads_1159.rs"]
+mod signed_packed_member_reads_1159;
+#[path = "types/signed_named_packed_elements_1107.rs"]
+mod signed_named_packed_elements_1107;
+#[path = "types/package_typedef_negative_bound_1148.rs"]
+mod package_typedef_negative_bound_1148;
+#[path = "types/review_struct_pattern_return.rs"]
+mod review_struct_pattern_return;
+#[path = "types/enum_receiver_types_1132.rs"]
+mod enum_receiver_types_1132;
+#[path = "types/signed_named_packed_props_ports_1107.rs"]
+mod signed_named_packed_props_ports_1107;

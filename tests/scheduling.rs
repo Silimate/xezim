@@ -109,6 +109,8 @@ mod delay_spike_warning;
 mod determinism_and_stall;
 #[path = "scheduling/disable_loop_label.rs"]
 mod disable_loop_label;
+#[path = "scheduling/disable_own_block_and_loop_jumps.rs"]
+mod disable_own_block_and_loop_jumps;
 #[path = "scheduling/edge_delivery.rs"]
 mod edge_delivery;
 #[path = "scheduling/edge_event_lsb.rs"]
@@ -157,6 +159,8 @@ mod iff_guard_module_scope;
 mod intra_assignment_delay;
 #[path = "scheduling/intra_assignment_event_identifier.rs"]
 mod intra_assignment_event_identifier;
+#[path = "scheduling/intra_delay_assignment_pattern.rs"]
+mod intra_delay_assignment_pattern;
 #[path = "scheduling/issue_237_mixed_clock_configs.rs"]
 mod issue_237_mixed_clock_configs;
 #[path = "scheduling/ivtest_always_cluster.rs"]
@@ -199,6 +203,8 @@ mod null_mailbox_and_stall_location;
 mod oracle_timing_semantics;
 #[path = "scheduling/parallel_dispatch_expr_fallback.rs"]
 mod parallel_dispatch_expr_fallback;
+#[path = "scheduling/unit_assertion_contexts_721.rs"]
+mod unit_assertion_contexts_721;
 #[path = "scheduling/preprocessor_diagnostic_location.rs"]
 mod preprocessor_diagnostic_location;
 #[path = "scheduling/preprocessor_github_issues.rs"]
@@ -223,6 +229,8 @@ mod select_event_terms;
 mod sequential_event_waits;
 #[path = "scheduling/shared_edge_outputs.rs"]
 mod shared_edge_outputs;
+#[path = "scheduling/shared_task_frames.rs"]
+mod shared_task_frames;
 #[path = "scheduling/specify_delays_and_event_list.rs"]
 mod specify_delays_and_event_list;
 #[path = "scheduling/star_sensitivity_and_implicit_port_net.rs"]
@@ -323,6 +331,8 @@ mod package_and_unit_delays_scale_by_timescale;
 mod package_cli_timescale_delay;
 #[path = "scheduling/phase_jump_static_latch.rs"]
 mod phase_jump_static_latch;
+#[path = "scheduling/release_constant_driver_from_always.rs"]
+mod release_constant_driver_from_always;
 #[path = "scheduling/release_from_level_sensitive_block.rs"]
 mod release_from_level_sensitive_block;
 #[path = "scheduling/static_recursion_shared_cell.rs"]
@@ -398,6 +408,8 @@ mod sampled_action_468;
 #[path = "scheduling/sampled_action_array_509.rs"]
 mod sampled_action_array_509;
 
+#[path = "scheduling/sva_abort_properties.rs"]
+mod sva_abort_properties;
 #[path = "scheduling/sva_until_properties.rs"]
 mod sva_until_properties;
 
@@ -441,6 +453,8 @@ mod class_collection_named_wait;
 
 #[path = "scheduling/class_or_value_change.rs"]
 mod class_or_value_change;
+#[path = "scheduling/event_control_class_prop_expr.rs"]
+mod event_control_class_prop_expr;
 
 #[path = "scheduling/preprocessor_linear_join.rs"]
 mod preprocessor_linear_join;
@@ -476,3 +490,33 @@ mod unpacked_struct_array_sens;
 
 #[path = "scheduling/clocking_edge_regressions.rs"]
 mod clocking_edge_regressions;
+
+#[path = "scheduling/static_local_in_clocked_call.rs"]
+mod static_local_in_clocked_call;
+
+#[path = "scheduling/hierarchical_subroutine_static.rs"]
+mod hierarchical_subroutine_static;
+#[path = "scheduling/review_loop_jumps_and_block_disables.rs"]
+mod review_loop_jumps_and_block_disables;
+#[path = "scheduling/nba_partial_commit_order.rs"]
+mod nba_partial_commit_order;
+#[path = "scheduling/finished_process_metadata.rs"]
+mod finished_process_metadata;
+#[path = "scheduling/review_intra_delay_capture_1162.rs"]
+mod review_intra_delay_capture_1162;
+#[path = "scheduling/review_sva_abort_order_1155.rs"]
+mod review_sva_abort_order_1155;
+#[path = "scheduling/review_sva_property_operators_220.rs"]
+mod review_sva_property_operators_220;
+#[path = "scheduling/review_sva_abort_first_tick_1155.rs"]
+mod review_sva_abort_first_tick_1155;
+#[path = "scheduling/deferred_assign_reads_1149.rs"]
+mod deferred_assign_reads_1149;
+#[path = "scheduling/function_call_assign_reads_1126.rs"]
+mod function_call_assign_reads_1126;
+#[path = "scheduling/instance_array_member_reads_1108.rs"]
+mod instance_array_member_reads_1108;
+#[path = "scheduling/instance_array_member_arrays_1108.rs"]
+mod instance_array_member_arrays_1108;
+#[path = "scheduling/struct_array_actual_paths_1110.rs"]
+mod struct_array_actual_paths_1110;

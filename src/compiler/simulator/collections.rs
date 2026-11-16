@@ -134,6 +134,32 @@ impl Simulator {
         )
     }
 
+    /// The class of the elements of the collection of handles `name`.
+    pub(super) fn coll_elem_class(&self, name: &str) -> Option<String> {
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        let root = name.split('[').next().unwrap_or(name);
+        if let Some(c) = [name, leaf, root]
+            .iter()
+            .find_map(|n| self.module.array_elem_class.get(*n))
+        {
+            return Some(c.clone());
+        }
+        let dt = self
+            .module
+            .var_decl_types
+            .get(name)
+            .or_else(|| self.module.var_decl_types.get(leaf))
+            .or_else(|| self.module.var_decl_types.get(root))?;
+        match self.resolve_dt_ref(dt) {
+            DataType::TypeReference { name: tn, .. }
+                if self.module.classes.contains_key(&tn.name.name) =>
+            {
+                Some(tn.name.name.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// The live size of row `name` when the dimension its next select
     /// indexes is a queue or dynamic one, from the declared shape. None for a
     /// fixed row (`raw[0]` of `T raw[][2]`), which is registered as dynamic
@@ -161,11 +187,16 @@ impl Simulator {
 
     /// §7.8.6: the value a read of a NONEXISTENT associative-array element
     /// yields — the element type's default, x for a 4-state integral type and
-    /// 0 for a 2-state one, at the element's width and signedness. `None`
-    /// when the element type is unknown or not integral; the caller keeps its
-    /// own fallback.
+    /// 0 for a 2-state one, at the element's width and signedness, and real
+    /// 0.0 for a real one. `None` when the element type is unknown or neither
+    /// integral nor real; the caller keeps its own fallback.
     pub(super) fn assoc_missing_elem_value(&self, name: &str) -> Option<Value> {
         use crate::ast::types::{IntegerAtomType as IAT, IntegerVectorType as IVT};
+        // §6.8, Table 6-7: a real/shortreal element's default is real 0.0
+        // (`assoc_elem_decl_type` gives integral element types only).
+        if self.coll_elem_is_real(name) {
+            return Some(Value::from_f64(0.0));
+        }
         let dt = self.assoc_elem_decl_type(name)?;
         let four_state = match self.resolve_dt_ref(dt) {
             DataType::IntegerVector { kind, .. } => !matches!(kind, IVT::Bit),
@@ -232,14 +263,20 @@ impl Simulator {
         let Some(dt) = self.module.var_decl_types.get(name) else {
             return val;
         };
-        // Integral element types only: a class handle or struct element
-        // keeps its own representation.
-        if !matches!(
-            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+        // Integral element types only: a class handle or an unpacked struct
+        // element keeps its own representation. §6.11.1: a packed struct or
+        // union is integral, so its element is fitted too (§10.7);
+        // `a[0] = '0` kept the fill's one bit (§5.7.1) and a later member
+        // write read x.
+        let integral = match super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types)
+        {
             crate::ast::types::DataType::IntegerVector { .. }
-                | crate::ast::types::DataType::IntegerAtom { .. }
-                | crate::ast::types::DataType::Enum(_)
-        ) {
+            | crate::ast::types::DataType::IntegerAtom { .. }
+            | crate::ast::types::DataType::Enum(_) => true,
+            crate::ast::types::DataType::Struct(su) => su.packed,
+            _ => false,
+        };
+        if !integral {
             return val;
         }
         let mut fitted = if val.width != w {
@@ -599,6 +636,74 @@ impl Simulator {
             None
         };
         fields.filter(|f| !f.is_empty())
+    }
+
+    /// §7.2.2, §11.8.1: whether each packed member `fields` names
+    /// ([`Self::coll_packed_elem_fields`] of `arr`) is signed, so the slice
+    /// bound for `item.<member>` keeps its member's signedness: `sort() with
+    /// (item.lo)` of a `bit signed [3:0] lo` orders -8 first.
+    pub(super) fn coll_packed_elem_field_signs(
+        &self,
+        arr: &str,
+        fields: &[(String, u32, u32)],
+    ) -> Vec<bool> {
+        let elem = self.coll_elem_decl_type(arr);
+        fields
+            .iter()
+            .map(|(path, _, _)| {
+                let Some(mut cur) = elem.clone() else {
+                    return false;
+                };
+                for seg in path.split('.') {
+                    let DataType::Struct(su) = self.resolve_dt(&cur) else {
+                        return false;
+                    };
+                    let Some(m) = su
+                        .members
+                        .iter()
+                        .find(|m| m.declarators.iter().any(|d| d.name.name == seg))
+                    else {
+                        return false;
+                    };
+                    cur = m.data_type.clone();
+                }
+                super::elaborate::is_type_signed_resolved(&cur, &self.module.typedef_types)
+            })
+            .collect()
+    }
+
+    /// The declared element type of collection `arr`: a module, package or
+    /// local one (`var_decl_types` holds the element type), a class
+    /// member's (`<handle>#m`) from its declaring class, or a struct's
+    /// dynamic member's.
+    pub(super) fn coll_elem_decl_type(&self, arr: &str) -> Option<DataType> {
+        if let Some(dt) = self.p_elem_type_ref(arr) {
+            Some(dt.into_owned())
+        } else if let Some((h, prop)) = arr.split_once('#')
+            && let Ok(handle) = h.parse::<usize>()
+        {
+            let mut cls = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            let mut found = None;
+            for _ in 0..64 {
+                let Some(cd) = cls.as_deref().and_then(|c| self.module.classes.get(c)) else {
+                    break;
+                };
+                if let Some(dt) = self.class_prop_decl_type(cd, prop) {
+                    found = Some(dt.clone());
+                    break;
+                }
+                cls = cd.extends.clone();
+            }
+            found
+        } else if arr.contains('.') && self.struct_colls_possible() {
+            self.struct_member_coll_of(arr).map(|(_, dt, _)| dt)
+        } else {
+            None
+        }
     }
 
     pub(super) fn is_associative_array(&self, name: &str) -> bool {
@@ -3034,7 +3139,9 @@ impl Simulator {
             // module-scope object existed, silently returned THAT object's
             // field. The whole-struct read was correct throughout, which is
             // what disguised this as an argument-passing bug.
-            if let Some(cur) = self.get_local_or_signal(&base) {
+            // §13.5.2: an aliased `ref` formal's member is the actual's.
+            let aliased = self.ref_alias_base_value(&base);
+            if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut v = cur.range_select((off + w - 1) as usize, off as usize);
                 // §7.2.1: the slice is a raw bit pattern — re-stamp the
                 // member's DECLARED signedness (`int s` in a packed struct
@@ -3119,8 +3226,21 @@ impl Simulator {
                     Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val,
                 };
+                let through = if self.ref_redirect_possible() {
+                    self.ref_alias_stack
+                        .last()
+                        .and_then(|m| m.get(name))
+                        .cloned()
+                        .map(|storage| (storage, fitted.clone()))
+                } else {
+                    None
+                };
                 if let Some(frame) = self.local_stack.last_mut() {
                     frame.insert(name.to_string(), fitted);
+                }
+                // §13.5.2: an aliased leaf of a `ref` struct formal.
+                if let Some((storage, v)) = through {
+                    self.ref_alias_write(&storage, &v);
                 }
                 return;
             }
@@ -3202,7 +3322,9 @@ impl Simulator {
         // independent leaf that would silently stop aliasing its siblings.
         if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
             // Frame first, mirroring the read path above.
-            if let Some(cur) = self.get_local_or_signal(&base) {
+            let aliased = self.ref_alias_base_value(&base);
+            let through_alias = aliased.is_some();
+            if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut next = cur.clone();
                 let mut piece = val.resize(w);
                 if !self.mixed_packed_vars.is_empty() {
@@ -3211,7 +3333,10 @@ impl Simulator {
                 for i in 0..w {
                     next.set_bit((off + i) as usize, piece.get_bit(i as usize));
                 }
-                if next != cur {
+                if through_alias {
+                    // §13.5.2: write the actual now, and keep the frame copy.
+                    self.ref_alias_store_base(&base, &next);
+                } else if next != cur {
                     self.set_local_or_signal(&base, next);
                 }
                 return;
@@ -4833,6 +4958,45 @@ impl Simulator {
         )
     }
 
+    /// Whether `m` names a built-in method of a collection, a string or an
+    /// enumeration, which the call dispatch recognizes by name.
+    pub(super) fn builtin_method_name(m: &str) -> bool {
+        Self::is_array_builtin_method(m)
+            || Self::is_parenless_zero_arg_builtin(m)
+            || matches!(
+                m,
+                "delete"
+                    | "insert"
+                    | "push_back"
+                    | "push_front"
+                    | "find"
+                    | "find_index"
+                    | "find_first"
+                    | "find_first_index"
+                    | "find_last"
+                    | "find_last_index"
+                    | "unique"
+                    | "unique_index"
+                    | "getc"
+                    | "putc"
+                    | "substr"
+                    | "compare"
+                    | "icompare"
+                    | "toupper"
+                    | "tolower"
+                    | "atoi"
+                    | "atohex"
+                    | "atooct"
+                    | "atobin"
+                    | "atoreal"
+                    | "itoa"
+                    | "hextoa"
+                    | "octtoa"
+                    | "bintoa"
+                    | "realtoa"
+            )
+    }
+
     pub(super) fn is_parenless_zero_arg_builtin(m: &str) -> bool {
         matches!(
             m,
@@ -4915,6 +5079,37 @@ impl Simulator {
             return self.eval_randomize_with(&call, constraints);
         }
         if let ExprKind::Call { func, args } = &call.kind {
+            // §18.12: outside a class the `std::` prefix of the scope
+            // randomize function may be omitted. Read a bare
+            // `randomize(…) with {…}` as `std::randomize(…) with {…}`; it fell
+            // through to the plain call and returned 0 without solving.
+            if let ExprKind::Ident(h) = &func.kind
+                && h.root.is_none()
+                && h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && h.path[0].name.name == "randomize"
+                && self.bare_randomize_is_scope_randomize()
+            {
+                let member = h.path[0].name.clone();
+                let mut std_expr = (**func).clone();
+                if let ExprKind::Ident(sh) = &mut std_expr.kind {
+                    sh.path[0].name.name = "std".to_string();
+                }
+                let std_call = Expression::new(
+                    ExprKind::Call {
+                        func: Box::new(Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(std_expr),
+                                member,
+                            },
+                            func.span,
+                        )),
+                        args: args.clone(),
+                    },
+                    call.span,
+                );
+                return self.eval_randomize_with(&std_call, constraints);
+            }
             if let ExprKind::MemberAccess { expr, member } = &func.kind {
                 if member.name == "randomize" {
                     // std::randomize(vars) with {...}

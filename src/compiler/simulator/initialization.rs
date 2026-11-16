@@ -4,6 +4,15 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+fn trace_array_storage(name: &str, cells: usize, width: u32) -> xezim_core::oom_trace::Scope {
+    let scope = xezim_core::oom_trace::scope("array storage", "", "", name);
+    xezim_core::oom_trace::checkpoint(
+        "allocate array",
+        &[("cells", cells), ("element_bits", width as usize)],
+    );
+    scope
+}
+
 impl Simulator {
     /// `XEZIM_MEM_CENSUS` end-of-run class-heap line: live object slots,
     /// property entries, and the heap bytes of their names.
@@ -799,7 +808,7 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                Value::from_str_radix(value, r, w).to_u64()
+                Value::from_literal_text(value, r, w).to_u64()
             }
             ExprKind::Paren(inner) => Self::const_expr_u64(inner, params),
             ExprKind::Ident(h) => params
@@ -1340,6 +1349,8 @@ impl Simulator {
                     let alias = format!("__xz_edgesel{}", new_signals.len());
                     new_signals.push(alias.clone());
                     new_assigns.push(super::elaborate::ContinuousAssignment {
+                        gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: mk_ident(&alias, span),
                         rhs,
@@ -1521,7 +1532,8 @@ impl Simulator {
         }
         for &i in index.pend.get(vleaf).unwrap_or(&none) {
             let p = &module.pending_cont_assign[i];
-            let src = &*p.lhs_source;
+            let lhs_source = p.source_lhs();
+            let src = &*lhs_source;
             let may_name_v = |e: &Expression| -> bool {
                 base_ident(e).is_some_and(|b| {
                     leaf(&b) == vleaf
@@ -1547,7 +1559,7 @@ impl Simulator {
                     &p.ctx.interface_map,
                 )
             };
-            let lhs = rw(src);
+            let lhs = p.materialize_lhs();
             let rhs = matches!(p.rhs_source.kind, ExprKind::Replication { .. })
                 .then(|| rw(&p.rhs_source));
             classify(&lhs, rhs.as_ref());
@@ -1649,7 +1661,11 @@ impl Simulator {
     }
 
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
+        let _oom_scope = xezim_core::oom_trace::scope("construct simulator", "", &module.name, "");
         let phase_total = std::time::Instant::now();
+        let checkpoint_requested =
+            checkpoint::command_line_requested() || checkpoint_calls::in_design(&module);
+        let share_task_frames = !checkpoint_requested;
         // The simulator counts ticks of `module.tick_s` (the finest timescale
         // precision; 1 ns by default). Delays were pre-scaled to ticks at
         // elaboration. `max_time` is supplied in nanoseconds, so convert it to
@@ -2287,6 +2303,8 @@ impl Simulator {
                 module
                     .continuous_assigns
                     .push(super::elaborate::ContinuousAssignment {
+                        gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: mk_ident(&nm, rhs.span),
                         rhs,
@@ -2874,6 +2892,14 @@ impl Simulator {
         // Return those pages to the OS before the array storage below claims
         // fresh memory (see `release_free_memory`).
         xezim_core::release_free_memory();
+        xezim_core::oom_trace::checkpoint(
+            "reserve array tables",
+            &[
+                ("array_cells", array_elem_count),
+                ("named_cells", named_elem_count),
+                ("static_signals", signal_table.len()),
+            ],
+        );
         signal_table.reserve(array_elem_count);
         signal_widths_vec.reserve(array_elem_count);
         signal_signed_vec.reserve(array_elem_count);
@@ -2936,6 +2962,10 @@ impl Simulator {
                         + PACKED_PAD
                 })
                 .fold(0usize, usize::saturating_add);
+            xezim_core::oom_trace::checkpoint(
+                "reserve packed arrays",
+                &[("packed_capacity_bytes", bound)],
+            );
             packed_mem_arena.reserve(bound);
         }
         let mut packed_arrays: std::collections::HashSet<String> =
@@ -2943,6 +2973,7 @@ impl Simulator {
         let mut packed_cells: usize = 0;
         for (base, &(lo, hi, w)) in arrays_sorted {
             let count = (hi - lo + 1).max(0) as usize;
+            let _oom_array = trace_array_storage(base, count, w);
             if mem_census && count > 0 {
                 census.push((base.clone(), count, w));
             }
@@ -3091,6 +3122,9 @@ impl Simulator {
                 // needs this — same shape as the §6.11.1 signedness loop.
                 if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     for id in first_id..signal_table.len() {
+                        // §6.8, Table 6-7: real/shortreal cells start at real
+                        // 0.0; the value tag must agree with the metadata.
+                        signal_table[id] = Value::from_f64(0.0);
                         signal_real_vec[id] = true;
                     }
                 }
@@ -3114,7 +3148,11 @@ impl Simulator {
                 }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
-                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    // Reals also occur in two_state_signals; keep their
+                    // typed 0.0 from the real-inheritance loop (§6.8).
+                    if !signal_real_vec[id] {
+                        signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    }
                 }
             }
         }
@@ -3241,6 +3279,11 @@ impl Simulator {
             module.arrays_2d.iter().collect();
         arrays_2d_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, &((lo1, hi1), (lo2, hi2), w)) in arrays_2d_sorted {
+            let _oom_array = trace_array_storage(
+                base,
+                ((hi1 - lo1 + 1).max(0) as usize).saturating_mul((hi2 - lo2 + 1).max(0) as usize),
+                w,
+            );
             let first_id = signal_table.len();
             for i in lo1..=hi1 {
                 for j in lo2..=hi2 {
@@ -3278,6 +3321,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3286,6 +3330,17 @@ impl Simulator {
             module.arrays_nd.iter().collect();
         arrays_nd_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, (shape, w)) in arrays_nd_sorted {
+            let _oom_array = if xezim_core::oom_trace::enabled() {
+                Some(trace_array_storage(
+                    base,
+                    shape.iter().fold(1usize, |count, &(lo, hi)| {
+                        count.saturating_mul((hi - lo + 1).max(0) as usize)
+                    }),
+                    *w,
+                ))
+            } else {
+                None
+            };
             fn enumerate(dims: &[(i64, i64)], prefix: String, out: &mut Vec<String>) {
                 if dims.is_empty() {
                     out.push(prefix);
@@ -3330,6 +3385,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3350,7 +3406,7 @@ impl Simulator {
             }
             let prefix = format!("{}[", base);
             for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) {
+                if name.starts_with(prefix.as_str()) && !signal_real_vec[id] {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
                 }
             }
@@ -3707,8 +3763,43 @@ impl Simulator {
             }
             m
         };
+        let packed_named_signed_props: HashMap<String, usize> = module
+            .classes
+            .values()
+            .flat_map(|cd| cd.property_types.iter())
+            .filter_map(|(p, dt)| {
+                super::bytecode::signed_named_packed_elem_depth(dt, &module.typedef_types)
+                    .map(|depth| (p.clone(), depth))
+            })
+            .collect();
+        let packed_named_signed: HashMap<String, usize> = {
+            let types = &module.typedef_types;
+            let mut m: HashMap<String, usize> = HashMap::default();
+            for (name, dt) in &module.var_decl_types {
+                if let Some(depth) = super::bytecode::signed_named_packed_elem_depth(dt, types) {
+                    m.insert(name.clone(), depth);
+                }
+                // §7.2: a member of a structure variable (`st.m` with
+                // `lane_t [0:8] m`) keeps its declared type.
+                if let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, types) {
+                    for member in &su.members {
+                        let Some(depth) = super::bytecode::signed_named_packed_elem_depth(
+                            &member.data_type,
+                            types,
+                        ) else {
+                            continue;
+                        };
+                        for d in &member.declarators {
+                            m.insert(format!("{}.{}", name, d.name.name), depth);
+                        }
+                    }
+                }
+            }
+            m
+        };
+        let addressed_statics = Self::addressed_subroutine_statics(&module, &deferred_always);
         let (hoisted_sub_static_names, hoisted_static_subroutines) =
-            Self::hoist_subroutine_statics(&mut module);
+            Self::hoist_subroutine_statics(&mut module, &addressed_statics);
         let port_formal_two_state: HashMap<String, bool> = {
             let top = format!("{}.", module.name);
             module
@@ -3717,6 +3808,13 @@ impl Simulator {
                 .map(|(f, _, ts)| (f.strip_prefix(top.as_str()).unwrap_or(f).to_string(), *ts))
                 .collect()
         };
+        let class_real_props = Self::collect_class_real_props(&module);
+        let static_struct_props = Self::collect_static_struct_props(&module);
+        let modport_names: HashSet<String> = module
+            .modport_member_dirs
+            .keys()
+            .map(|(_, mp)| mp.clone())
+            .collect();
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -3746,6 +3844,8 @@ impl Simulator {
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             csp_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
+            ref_park_flags: 0,
+            indexed_scopes: std::cell::OnceCell::new(),
             pattern_scratch_seq: 0,
             pattern_scratch_free: Vec::new(),
             force_epoch_gen: 0,
@@ -3845,6 +3945,7 @@ impl Simulator {
             sva_preponed: HashMap::default(),
             sva_preponed_slot: None,
             sva_owed: false,
+            sva_abort_step: false,
             sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),
@@ -3909,6 +4010,8 @@ impl Simulator {
             settle_limit_last_time: 0,
             proc_settle_defer: false,
             deferred_proc_entries: Vec::new(),
+            deferred_proc_seen: Vec::new(),
+            deferred_proc_unres: false,
             t0_starts_remaining: 0,
             rand_scope_nd: HashMap::default(),
             rand_scope_nd_dyn: HashMap::default(),
@@ -3930,6 +4033,7 @@ impl Simulator {
             sdf_select: None,
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
+            delayed_slice_chains: false,
             delayed_nba: Vec::new(),
             delayed_nba_queue: Vec::new(),
             packed_nba: Vec::new(),
@@ -3959,6 +4063,7 @@ impl Simulator {
             local_meta_cache: HashMap::default(),
             local_meta_claims: Vec::new(),
             class_gc_live: 0,
+            class_gc_live_signals: 0,
             class_gc_released: 0,
             class_gc_runs: 0,
             virtual_iface_bindings: HashMap::default(),
@@ -4101,11 +4206,16 @@ impl Simulator {
             cg_this: None,
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
+            adopted_pids: HashSet::default(),
             process_contexts: HashMap::default(),
             process_scope_hint: HashMap::default(),
             process_m_scope: HashMap::default(),
             process_m_label: HashMap::default(),
             process_origin: HashMap::default(),
+            retired_fork_pids: Vec::new(),
+            retired_fork_sweep_needed: false,
+            #[cfg(test)]
+            retired_fork_reset_visits: 0,
             trace_sched: std::env::var("XEZIM_TRACE_SCHED").ok().and_then(|v| {
                 let v = v.trim();
                 if v.is_empty() || v == "0" {
@@ -4172,6 +4282,8 @@ impl Simulator {
             constraint_scopes: HashMap::default(),
             inline_constraint_scope: None,
             signed_class_colls: HashSet::default(),
+            coll_store_fit_cache: Default::default(),
+            coll_store_fit_next: 0,
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
             dep_names: Vec::new(),
@@ -4195,6 +4307,8 @@ impl Simulator {
             edge_parallel_work: Vec::new(),
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
+            nba_queued_partial_ids: HashSet::default(),
+            nba_queue_noted: 0,
             pending_nba_triggers: Vec::new(),
             pending_nba_instance_triggers: Vec::new(),
             active_task_pids: HashMap::default(),
@@ -4203,6 +4317,9 @@ impl Simulator {
             event_obj_slots: HashMap::default(),
             next_event_obj_id: 0,
             class_event_prop_names: None,
+            class_real_props,
+            static_struct_props,
+            modport_names,
             nba_fast: Vec::new(),
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
@@ -4249,6 +4366,7 @@ impl Simulator {
             t0_timing_free: HashSet::default(),
             t0_pid_ord: HashMap::default(),
             fast_delay_always: HashMap::default(),
+            lazy_initial: HashMap::default(),
             proc_fsm: HashMap::default(),
             fsm_start_pc: 0,
             fsm_suspend: None,
@@ -4294,6 +4412,8 @@ impl Simulator {
             warned_delay_spikes: HashSet::default(),
             warned_uncovered_patterns: HashSet::default(),
             typed_pattern_seq: 0,
+            enum_recv_cache: HashMap::default(),
+            enum_recv_cache_gen: 0,
             slice_arg_targets: HashMap::default(),
             slice_arg_seq: 0,
             t0_delay_deferred: HashSet::default(),
@@ -4312,6 +4432,7 @@ impl Simulator {
             ref_identity_stack: Vec::new(),
             pending_formal_dyn: Vec::new(),
             ref_redirect_hot: false,
+            ref_pin_users: HashMap::default(),
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
             hint_key_scratch: std::cell::RefCell::new(String::new()),
@@ -4449,7 +4570,10 @@ impl Simulator {
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
             vcd_filter_scopes: Vec::new(),
+            vcd_dump_none: false,
             vcd_dump_depth: 0,
+            vcd_earlier_selections: Vec::new(),
+            vcd_start_time: u64::MAX,
             vcd_var_kinds: Vec::new(),
             vcd_event_last: Vec::new(),
             vcd_limit: None,
@@ -4476,8 +4600,13 @@ impl Simulator {
             xtrace_to_t: u64::MAX,
             fst_file: None,
             fst_scopes: Vec::new(),
+            fst_dump_none: false,
+            wave_suppress: configured_wave_suppress(),
             fst_writer: None,
             cast_widths,
+            packed_named_signed,
+            packed_named_signed_props,
+            packed_named_sign_guard: 0,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
             class_handle_member_types_cache: None,
@@ -4717,6 +4846,9 @@ impl Simulator {
             vif_return_pending: false,
             lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
+            share_task_frames,
+            task_frame_eligibility: HashMap::default(),
+            task_frame_cache: HashMap::default(),
             class_task_frame_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
             exec_cache_pids: HashSet::default(),
@@ -4795,6 +4927,7 @@ impl Simulator {
             vpi_self_ptr: std::ptr::null_mut(),
             file_handles: HashMap::default(),
             checkpoint_ops: Vec::new(),
+            checkpoint_requested,
             checkpoint_save_at: Vec::new(),
             checkpoint_restored: false,
             checkpoint_muted: false,

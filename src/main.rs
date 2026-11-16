@@ -586,22 +586,30 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     if lower == "none" {
         return Ok(RUN_ALL_NS);
     }
+    let mut bare_unit = true;
     let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower
         .strip_suffix("fs")
         .filter(|n| n.trim().parse::<f64>().is_ok())
     {
+        bare_unit = false;
         (n, 1e-6)
     } else if let Some(n) = lower.strip_suffix("ps") {
+        bare_unit = false;
         (n, 1e-3)
     } else if let Some(n) = lower.strip_suffix("ns") {
+        bare_unit = false;
         (n, 1.0)
     } else if let Some(n) = lower.strip_suffix("µs") {
+        bare_unit = false;
         (n, 1e3)
     } else if let Some(n) = lower.strip_suffix("us") {
+        bare_unit = false;
         (n, 1e3)
     } else if let Some(n) = lower.strip_suffix("ms") {
+        bare_unit = false;
         (n, 1e6)
     } else if let Some(n) = lower.strip_suffix('s') {
+        bare_unit = false;
         (n, 1e9)
     } else {
         (lower.as_str(), 1.0)
@@ -612,14 +620,19 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
             raw
         )
     })?;
-    if num == 0.0 {
+    if num == 0.0 && bare_unit {
         return Ok(RUN_ALL_NS);
     }
     if !(num > 0.0) {
-        return Err(format!(
-            "--max-time must be positive (or 0/none for no cap), got '{}'",
-            raw
-        ));
+        let msg = if bare_unit {
+            format!(
+                "--max-time must be positive (or 0/none for no cap), got '{}'",
+                raw
+            )
+        } else {
+            format!("--max-time must be positive, got '{}'", raw)
+        };
+        return Err(msg);
     }
     // Keep integer femtoseconds exact above f64's 53-bit mantissa. Rounding
     // to whole ns happens once, after the unit conversion (#1113).

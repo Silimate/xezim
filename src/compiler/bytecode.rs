@@ -47,6 +47,12 @@ pub(crate) struct MethodAdmission {
     /// The `instance_fields` that are strings (§6.16), so a dotted read
     /// through a handle of that class is a string operand.
     pub instance_string_fields: HashMap<String, HashSet<String>>,
+    /// The `instance_fields` that are STRING QUEUE / dynamic / associative
+    /// arrays (§6.16 + §7.10/§7.11), keyed by declared class: a dotted
+    /// element read `obj.m_q[i]` through a handle of that class is a
+    /// string operand (`string_cmp`/`StrOp` typing, not the integral
+    /// fallback).
+    pub instance_string_colls: HashMap<String, HashSet<String>>,
     /// §8.20: declared class -> method -> the class whose body a call
     /// through a handle of that declared type binds to, for every
     /// NON-virtual method that some subclass redeclares (the only case where
@@ -2166,6 +2172,14 @@ pub struct BytecodeCompiler<'a> {
     /// Named-cast targets known at compile time: name -> (width, signed).
     /// See the simulator's `cast_widths`.
     cast_widths: Option<&'a HashMap<String, (u32, bool)>>,
+    /// `expr_signedness` of a dotted identifier (a hierarchical, interface,
+    /// package or member name), by name: an operator re-types its operand
+    /// subtrees, so a long expression asks for the same leaf many times.
+    /// Cleared with the scope hint, which name resolution depends on.
+    dotted_ident_sign: HashMap<String, Option<bool>>,
+    /// `packed_named_select_signed`'s declaration lookup, by variable name:
+    /// the select depth that reaches a named signed element, if any.
+    named_elem_depth: HashMap<String, Option<usize>>,
     /// Top-module name (e.g. "tb"). When a hierarchical identifier reads a
     /// signal whose absolute path is `<top>.<rest>` (e.g. xezim's
     /// port-rewriting baked the top name into a cross-hierarchical
@@ -2399,6 +2413,8 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_struct: HashMap::default(),
             local_packed_types: HashMap::default(),
             cast_widths: None,
+            dotted_ident_sign: HashMap::default(),
+            named_elem_depth: HashMap::default(),
             pattern_ctx: None,
             inline_ret_ty: None,
             local_const_vars: HashMap::default(),
@@ -2907,7 +2923,7 @@ impl<'a> BytecodeCompiler<'a> {
             let &(_, m1_off, _) = fields.iter().find(|(n, _, _)| n == &m1.name)?;
             let (stride1, dim1) = self.packed_member_array_shape(&key, &hier, &m1.name)?;
             let elem = self.emit_packed_member_slice(v, idx1, dim1, stride1, m1_off, stride1)?;
-            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name)?;
+            let (_, mem_off, _) = Self::elem_zero_field(&fields, &m1.name, &member.name, stride1)?;
             let rel = mem_off.checked_sub(m1_off)?;
             let nested = format!("{}.{}", m1.name, member.name);
             let (elem_w, dim2) = self.packed_member_array_shape(&key, &hier, &nested)?;
@@ -2944,27 +2960,38 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         };
         let (root_value, root_key, hier, fields) = self.compile_packed_struct_value(root)?;
-        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, &member.name, leaf)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &hier, &member.name)?;
+        let (_, field_offset, field_width) =
+            Self::elem_zero_field(&fields, &member.name, leaf, elem_w)?;
         self.emit_packed_member_slice(root_value, index, dim, elem_w, field_offset, field_width)
     }
 
-    /// Element-0 layout of `<member>[i].<leaf>`. Elaboration registers an
-    /// array-of-struct member under two conventions: element-relative
-    /// (`descriptors.region`, plain struct nets) or expanded per element
-    /// (`descriptors[0].region`, packed arrays of structs). Both put element
-    /// 0 at the member's base, so either key gives the stride origin.
+    /// Layout of `<member>[i].<leaf>` in the element at the member's base
+    /// (slot 0, the stride origin). Elaboration registers an array-of-struct
+    /// member under two conventions: element-relative (`descriptors.region`,
+    /// plain struct nets) or expanded per element (`descriptors[0].region`,
+    /// packed arrays of structs). §7.4.1: element 0 sits at the base only
+    /// for a descending range; in an ascending one (`hdr_t [0:2] slots`) it
+    /// is the most significant element, so the leaf's offset is reduced to
+    /// its place within one `stride`-bit element above the member's base.
     fn elem_zero_field(
         fields: &[(String, u32, u32)],
         member: &str,
         leaf: &str,
+        stride: u32,
     ) -> Option<(String, u32, u32)> {
         let rel = format!("{}.{}", member, leaf);
         let per_elem = format!("{}[0].{}", member, leaf);
-        fields
+        let (name, off, w) = fields
             .iter()
             .find(|(name, _, _)| name == &rel || name == &per_elem)
-            .cloned()
+            .cloned()?;
+        match fields.iter().find(|(n, _, _)| n == member) {
+            Some(&(_, base, _)) if stride > 0 && off >= base => {
+                Some((name, base + (off - base) % stride, w))
+            }
+            _ => Some((name, off, w)),
+        }
     }
 
     /// `<path>.<member>[i].<leaf>` where the container and member arrive as
@@ -2988,8 +3015,8 @@ impl<'a> BytecodeCompiler<'a> {
             seg.selects.clear();
         }
         let (root_key, fields) = self.packed_struct_layout_for_hier(&bare)?;
-        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf)?;
         let (elem_w, dim) = self.packed_member_array_shape(&root_key, &bare, member)?;
+        let (_, field_offset, field_width) = Self::elem_zero_field(&fields, member, leaf, elem_w)?;
         let root = if root_hier.path.iter().any(|s| !s.selects.is_empty()) {
             let e = Expression::new(ExprKind::Ident(root_hier.clone()), root_hier.span);
             self.compile_expr(&e, 0)?
@@ -3111,6 +3138,32 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         Some(Box::new(ArrayOperand::Named(name)))
+    }
+
+    /// `array_operand` with the index register the element instruction
+    /// reads. §7.4.2: an index into an array whose range has a negative
+    /// bound addresses elements by its signed value, but the element
+    /// instructions read the register's bits as an unsigned number, so
+    /// `arr[-1]` of `int arr[-1:1]`, or `arr[k]` with `int k = -1`, missed its
+    /// element in every compiled block (a read gave x, a write was lost).
+    /// Widen the index to 64 bits first: `MoveResize` sign-extends a signed
+    /// index and zero-extends an unsigned one, which stays out of range.
+    fn array_operand_index(
+        &mut self,
+        name: String,
+        idx_reg: RegId,
+    ) -> Option<(Box<ArrayOperand>, RegId)> {
+        let array = self.array_operand(name)?;
+        let lowest = match array.as_ref() {
+            ArrayOperand::Dense { lo, hi, .. } => (*lo).min(*hi),
+            ArrayOperand::Named(name) => self.arrays.get(name).map_or(0, |&(lo, hi, _)| lo.min(hi)),
+        };
+        if lowest >= 0 {
+            return Some((array, idx_reg));
+        }
+        let wide = self.alloc_reg();
+        self.emit(Insn::MoveResize(wide, idx_reg, 64));
+        Some((array, wide))
     }
 
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
@@ -3415,6 +3468,8 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
+        self.dotted_ident_sign.clear();
+        self.named_elem_depth.clear();
         self.scope_hint = scope;
     }
 
@@ -3669,7 +3724,26 @@ impl<'a> BytecodeCompiler<'a> {
             }
             (!out.is_empty()).then_some(out)
         };
-        let (sfd, sargs) = super::struct_sra::scalarize_member_call(fd, args, member, &members)?;
+        // §7.4.2/§10.9.2: typedef array members keep the existing scalarizer
+        // handling; only the new replication expansion is disabled for them.
+        let replication_allowed = |ms: &super::struct_sra::Members| {
+            !ms.iter().any(|(_, dt)| {
+                let DataType::TypeReference { name, .. } = dt else {
+                    return false;
+                };
+                self.typedef_unpacked_dims.is_some_and(|dims| {
+                    self.typedef_entry(dims, name, scope)
+                        .is_some_and(|(_, d)| !d.is_empty())
+                })
+            })
+        };
+        let (sfd, sargs) = super::struct_sra::scalarize_member_call(
+            fd,
+            args,
+            member,
+            &members,
+            &replication_allowed,
+        )?;
         let start = self.insns.len();
         let next = self.next_reg;
         let saved_reason = self.bail_reason;
@@ -4164,6 +4238,16 @@ impl<'a> BytecodeCompiler<'a> {
         let saved_local_arrays = std::mem::take(&mut self.local_var_array);
         let saved_local_elems = std::mem::take(&mut self.local_var_elem);
         let saved_local_structs = std::mem::take(&mut self.local_var_struct);
+        // §13.4: the body never sees the caller's unrolled loop constants or
+        // register banks, as for an inlined task. An unrolled loop variable
+        // shadows every same-named name, so a callee's own `for (int s ...)`
+        // tested the caller's `s` and never ended, and a module variable `s`
+        // read the caller's loop value.
+        let saved_banks = std::mem::take(&mut self.local_array_regs);
+        let saved_consts = std::mem::take(&mut self.local_const_vars);
+        let saved_const_kinds = std::mem::take(&mut self.local_const_kinds);
+        let saved_const_binds = std::mem::take(&mut self.const_var_binds);
+        let saved_decl_locals = std::mem::take(&mut self.decl_local_regs);
         for (n, sb) in struct_binds {
             if let Some(pfx) = &qpfx {
                 self.local_var_struct
@@ -4268,14 +4352,6 @@ impl<'a> BytecodeCompiler<'a> {
         self.loop_break_patches = saved_break_patches;
         self.loop_continue_patches = saved_continue_patches;
         self.named_block_patches = saved_named_block_patches;
-        if ok {
-            for (target, value, width) in &ref_writes {
-                if !self.compile_blocking_target(target, *value, *width) {
-                    ok = false;
-                    break;
-                }
-            }
-        }
         self.allow_ast_fallback = saved_fallback;
         self.inlining_stack.pop();
         self.local_var_regs = saved_locals;
@@ -4284,6 +4360,21 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_array = saved_local_arrays;
         self.local_var_elem = saved_local_elems;
         self.local_var_struct = saved_local_structs;
+        self.local_array_regs = saved_banks;
+        self.local_const_vars = saved_consts;
+        self.local_const_kinds = saved_const_kinds;
+        self.const_var_binds = saved_const_binds;
+        self.decl_local_regs = saved_decl_locals;
+        // §13.5.3: copy-out assigns the caller's lvalues after return. Restore
+        // its locals and loop constants first, including for indexed targets.
+        if ok {
+            for (target, value, width) in &ref_writes {
+                if !self.compile_blocking_target(target, *value, *width) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!(
@@ -4477,6 +4568,16 @@ impl<'a> BytecodeCompiler<'a> {
                     && Self::static_local_carries(&p.name.name, &body)
             }) || (body.iter().any(Self::stmt_declares) && Self::stmts_carry_static(&body)))
         {
+            return false;
+        }
+        // §6.21: so does a static variable of any subroutine — a local of a
+        // subroutine with the default (static) lifetime, or one declared
+        // `static` in an automatic subroutine — when its value can be read
+        // before the call writes it.
+        if Self::body_has_carried_static(
+            &body,
+            matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic)),
+        ) {
             return false;
         }
         if ports.len() != args.len()
@@ -6758,15 +6859,13 @@ impl<'a> BytecodeCompiler<'a> {
             crate::ast::expr::ExprKind::MemberAccess { expr: base, member } => {
                 let m = member.name.as_str();
                 // A receiver of another declared class (`p.contents` with
-                // `pattern p`) is admitted by THAT class's collections.
-                let admitted = match self.foreign_colls(base) {
-                    Some(colls) => colls.members.contains(m),
-                    None => {
-                        self.method_handle_chain_class(base).is_some()
-                            && self.coll_member_names.contains(m)
-                    }
-                };
-                admitted.then(|| (member.name.clone(), false, Some((**base).clone())))
+                // `pattern p`) is admitted by THAT class's collections. A
+                // STRING collection (`obj.m_q[i]`) is admitted by the
+                // class's string-collection set (kept separate — see
+                // `instance_string_colls`); its element loads as a real
+                // string Value, so `StrOp` typing works.
+                self.foreign_coll_admitted(base, m)
+                    .then(|| (member.name.clone(), false, Some((**base).clone())))
             }
             // The parser's spelling of a dotted foreach array: `p.contents`.
             crate::ast::expr::ExprKind::Ident(h)
@@ -6776,12 +6875,33 @@ impl<'a> BytecodeCompiler<'a> {
             {
                 let base = Self::dotted_head_expr(h);
                 let m = h.path[1].name.name.as_str();
-                self.foreign_colls(&base)?
-                    .members
-                    .contains(m)
+                self.foreign_coll_admitted(&base, m)
                     .then(|| (m.to_string(), false, Some(base)))
             }
             _ => None,
+        }
+    }
+
+    /// `obj.m_q` — is `m_q` a collection member (integral OR string) of
+    /// `obj`'s DECLARED class, resolvable through a handle chain?
+    /// Returns true for the plan's integral `instance_colls` members and
+    /// for string collections (`instance_string_colls`).
+    fn foreign_coll_admitted(&self, base: &Expression, m: &str) -> bool {
+        match self.foreign_colls(base) {
+            Some(colls) => {
+                colls.members.contains(m)
+                    || self
+                        .method_admission
+                        .as_ref()
+                        .and_then(|a| {
+                            self.method_handle_chain_class(base)
+                                .and_then(|c| a.instance_string_colls.get(&c))
+                        })
+                        .is_some_and(|sc| sc.contains(m))
+            }
+            None => {
+                self.method_handle_chain_class(base).is_some() && self.coll_member_names.contains(m)
+            }
         }
     }
 
@@ -8313,7 +8433,13 @@ impl<'a> BytecodeCompiler<'a> {
             // (`q[0]` on `string q[$]`), local or instance member, is a
             // string.
             ExprKind::Index { expr: base, .. } => {
-                self.local_string_coll(base) || self.member_string_coll(base)
+                if self.local_string_coll(base) || self.member_string_coll(base) {
+                    return true;
+                }
+                // `obj.m_q[i]`: a referenced object's string-collection
+                // element is a string too (§6.16/§7.10) — the member
+                // collection may be on a class other than the method's own.
+                self.foreign_string_coll_member(base).is_some()
             }
             ExprKind::Paren(inner) => self.expr_is_string_static(inner),
             ExprKind::SystemCall { name, args } => match name.as_str() {
@@ -8434,6 +8560,55 @@ impl<'a> BytecodeCompiler<'a> {
                     .is_some_and(|fields| fields.contains(member))
             })
         })
+    }
+
+    /// Method mode: is `base.member` a STRING-COLLECTION member (queue /
+    /// dynamic / associative array of `string`) of `base`'s DECLARED class,
+    /// read through an admitted handle chain? Mirrors `dotted_string_member`
+    /// for collection members, so `obj.m_q[i]` (a referenced object's string
+    /// collection element) is typed as a string by `string_cmp` instead of
+    /// falling to the integral X-padded compare (§6.16/§7.10).
+    fn dotted_string_coll(&self, base: &Expression, member: &str) -> bool {
+        if !self.method_handle_chain_ok(base) || !self.method_instance_field_ok(base, member) {
+            return false;
+        }
+        let class = self.method_handle_chain_class(base);
+        if class.as_deref() == Some(self.method_class.as_deref().unwrap_or("")) {
+            return false;
+        }
+        class.is_some_and(|class| {
+            self.method_admission.as_ref().is_some_and(|admission| {
+                admission
+                    .instance_string_colls
+                    .get(&class)
+                    .is_some_and(|colls| colls.contains(member))
+            })
+        })
+    }
+
+    /// If `expr` is an admitted, select-free reference to a foreign
+    /// object's string-collection member (`a1.q`, `this.holder.q`), return
+    /// the member name; else None. Consumes the two AST spellings a dotted
+    /// collection element (`a1.q[i]`) reaches: `MemberAccess { expr: a1,
+    /// member: q }` and the dotted two-segment Ident `a1.q`.
+    fn foreign_string_coll_member(&self, expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::MemberAccess { expr: base, member } => self
+                .dotted_string_coll(base, member.name.as_str())
+                .then(|| member.name.clone()),
+            ExprKind::Ident(h)
+                if self.method_mode
+                    && h.root.is_none()
+                    && h.path.len() == 2
+                    && h.path.iter().all(|seg| seg.selects.is_empty()) =>
+            {
+                let base = Self::dotted_head_expr(h);
+                let member = h.path[1].name.name.as_str();
+                self.dotted_string_coll(&base, member)
+                    .then(|| h.path[1].name.name.to_string())
+            }
+            _ => None,
+        }
     }
 
     /// `recv.method(args)` where the receiver is a statically-known STRING
@@ -9169,7 +9344,192 @@ impl<'a> BytecodeCompiler<'a> {
         self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
         let dest = self.alloc_reg();
         self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
+        // §7.2.1: the member keeps its declared type's sign.
+        if self.packed_member_signed(&key, member) == Some(true) {
+            self.emit(Insn::SetSigned(dest));
+        }
         Some(dest)
+    }
+
+    /// §7.4.3: the width of one element of the outer packed dimension of the
+    /// plain packed variable `base`, from its declared type and its signal
+    /// width — 1 for a vector, 11 for `lane_t [-9:9] x`. None for any other
+    /// shape (an unpacked array, a member, a local), which keeps its
+    /// interpreted path.
+    fn packed_part_select_elem_width(&self, base: &Expression) -> Option<u32> {
+        use crate::ast::types::{DataType as D, PackedDimension as P};
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.root.is_some()
+            || h.path.len() != 1
+            || !h.path[0].selects.is_empty()
+            || self.local_var_reg_of(h).is_some()
+            || self.lookup_array_name(h).is_some()
+            || self.is_multi_dim_array(h)
+        {
+            return None;
+        }
+        let total = *self.signal_widths.get(self.lookup_signal_id(h)?)?;
+        let raw = Self::hier_raw_name(h);
+        let scoped = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, raw));
+        fn lookup<'m, V>(
+            m: &'m HashMap<String, V>,
+            scoped: Option<&str>,
+            raw: &str,
+        ) -> Option<&'m V> {
+            scoped.and_then(|q| m.get(q)).or_else(|| m.get(raw))
+        }
+        let (scoped, raw) = (scoped.as_deref(), raw.as_str());
+        let declared = self.var_decl_types.and_then(|m| lookup(m, scoped, raw));
+        let (Some(mut dt), Some(types)) = (declared, self.typedef_types) else {
+            // No declaration on record (a net, say): the packed shape tables
+            // decide, and a name in neither is a plain vector.
+            if let Some(&ew) = self.packed_elem_widths.and_then(|m| lookup(m, scoped, raw)) {
+                return (ew > 0).then_some(ew);
+            }
+            if self
+                .packed_full_dims
+                .and_then(|m| lookup(m, scoped, raw))
+                .is_some_and(|dims| dims.len() > 1)
+            {
+                return None;
+            }
+            return Some(1);
+        };
+        // The outer dimension: the declaration's first packed range, through
+        // plain typedef aliases; a declaration with none selects bits.
+        let mut outer: Option<&P> = None;
+        for _ in 0..64 {
+            match dt {
+                D::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    if let Some(first) = dimensions.first() {
+                        outer = Some(first);
+                        break;
+                    }
+                    dt = crate::compiler::elaborate::lookup_scoped_type(name, types)?;
+                }
+                D::IntegerVector { dimensions, .. } | D::Implicit { dimensions, .. } => {
+                    outer = dimensions.first();
+                    break;
+                }
+                D::IntegerAtom { .. } | D::Struct(_) | D::Enum(_) => break,
+                _ => return None,
+            }
+        }
+        let count = match outer {
+            None => total,
+            Some(P::Range { left, right, .. }) => {
+                let (l, r) = (self.eval_const_bound(left)?, self.eval_const_bound(right)?);
+                (l - r).unsigned_abs() as u32 + 1
+            }
+            Some(_) => return None,
+        };
+        (count > 0 && total % count == 0).then(|| total / count)
+    }
+
+    /// §7.4.1: whether `expr` (an index chain on a plain packed variable)
+    /// selects an element whose type is a named signed type — see
+    /// `signed_named_packed_elem_depth`.
+    fn packed_named_select_signed(&mut self, expr: &Expression) -> bool {
+        let (Some(decls), Some(types)) = (self.var_decl_types, self.typedef_types) else {
+            return false;
+        };
+        let mut root = expr;
+        let mut selects = 0usize;
+        while let ExprKind::Index { expr: base, .. } = &root.kind {
+            selects += 1;
+            root = base;
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return false;
+        };
+        if h.root.is_some()
+            || h.path.iter().any(|s| !s.selects.is_empty())
+            || self.local_var_reg_of(h).is_some()
+            || self.lookup_array_name(h).is_some()
+            || self.is_multi_dim_array(h)
+        {
+            return false;
+        }
+        let raw = Self::hier_raw_name(h);
+        if let Some(&depth) = self.named_elem_depth.get(&raw) {
+            return depth == Some(selects);
+        }
+        let scoped = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, raw));
+        let depth = scoped
+            .as_deref()
+            .and_then(|q| declared_type_of(q, decls, types))
+            .or_else(|| declared_type_of(&raw, decls, types))
+            .and_then(|dt| signed_named_packed_elem_depth(dt, types));
+        self.named_elem_depth.insert(raw, depth);
+        depth == Some(selects)
+    }
+
+    /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
+    /// packed structure or union variable `var` holds, from its declared
+    /// type. None when the declaration or the member cannot be resolved.
+    fn packed_member_signed(&self, var: &str, member: &str) -> Option<bool> {
+        use crate::ast::types::DataType as D;
+        let decls = self.var_decl_types?;
+        let types = self.typedef_types?;
+        let leaf_var = var.rsplit_once('.').map_or(var, |(_, leaf)| leaf);
+        let mut dt = decls.get(var).or_else(|| decls.get(leaf_var))?;
+        for segment in member.split('.') {
+            let D::Struct(su) = crate::compiler::elaborate::resolve_typedef_chain(dt, types) else {
+                return None;
+            };
+            if !su.packed {
+                return None;
+            }
+            dt = &su
+                .members
+                .iter()
+                .find(|m| m.declarators.iter().any(|d| d.name.name == segment))?
+                .data_type;
+        }
+        let resolved = crate::compiler::elaborate::resolve_typedef_chain(dt, types);
+        match resolved {
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) | D::Struct(_) => Some(
+                crate::compiler::elaborate::is_type_signed_resolved(resolved, types),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The packed-structure variable and member path a dotted identifier
+    /// names (`s.f`, `s.inner.f`), as `compile_packed_member_read` reads it.
+    fn packed_member_of_hier(&self, hier: &HierarchicalIdentifier) -> Option<(String, String)> {
+        let fields_tbl = self.packed_struct_fields?;
+        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = Self::hier_raw_name(hier);
+        let (base, member) = raw.rsplit_once('.')?;
+        let key = self
+            .scope_hint
+            .as_ref()
+            .map(|scope| format!("{}.{}", scope, base))
+            .filter(|q| self.signal_name_to_id.get(q.as_str()).is_some())
+            .or_else(|| {
+                self.signal_name_to_id
+                    .get(base)
+                    .is_some()
+                    .then(|| base.to_string())
+            })?;
+        let layout = fields_tbl.get(&key).or_else(|| fields_tbl.get(base))?;
+        layout
+            .iter()
+            .any(|(m, _, w)| m == member && *w > 0)
+            .then(|| (key, member.to_string()))
     }
 
     /// Does this statement read or write a register-bank local array? Such a
@@ -12730,6 +13090,57 @@ impl<'a> BytecodeCompiler<'a> {
         })
     }
 
+    /// §6.21: does a subroutine body declare, at any depth, a static
+    /// variable whose value can carry from one call to the next? `auto` is
+    /// the subroutine's lifetime: in an automatic one only a variable
+    /// declared `static` is static.
+    fn body_has_carried_static(stmts: &[Statement], auto: bool) -> bool {
+        use crate::ast::types::Lifetime;
+        fn nested(s: &Statement, auto: bool) -> bool {
+            match &s.kind {
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    BytecodeCompiler::body_has_carried_static(stmts, auto)
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => nested(then_stmt, auto) || else_stmt.as_ref().is_some_and(|e| nested(e, auto)),
+                StatementKind::Case { items, .. } => items.iter().any(|it| nested(&it.stmt, auto)),
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body }
+                | StatementKind::TimingControl { stmt: body, .. }
+                | StatementKind::Wait { stmt: body, .. } => nested(body, auto),
+                _ => false,
+            }
+        }
+        stmts.iter().enumerate().any(|(i, s)| match &s.kind {
+            StatementKind::VarDecl {
+                lifetime,
+                declarators,
+                ..
+            } => {
+                let explicit = matches!(lifetime, Some(Lifetime::Static));
+                let is_static = explicit || (!auto && lifetime.is_none());
+                is_static
+                    && declarators.iter().any(|d| {
+                        // Hoisted static cells are hierarchically observable
+                        // even when this call writes them before reading.
+                        (explicit && d.name.name.contains('.'))
+                            || match &d.init {
+                                Some(_) => explicit,
+                                None => Self::static_local_carries(&d.name.name, &stmts[i + 1..]),
+                            }
+                    })
+            }
+            _ => nested(s, auto),
+        })
+    }
+
     /// §6.21: can a STATIC variable `name`, declared just before `rest`,
     /// carry a value from one execution of its declaration to the next?
     /// Not when every path writes it whole (`t = e`, `for (t = e; ...)`,
@@ -13272,7 +13683,9 @@ impl<'a> BytecodeCompiler<'a> {
             // jumps to the method's common exit (the prologue reads that
             // register's value and returns it to the caller). Trailing/jump
             // targets are back-patched like `inline_ret_jumps` below.
-            StatementKind::Return(e) if self.method_mode => {
+            // §13.4.1: a nested inline returns to its caller inside this
+            // method, using inline_ret below, rather than ending the method.
+            StatementKind::Return(e) if self.method_mode && self.inline_ret.is_none() => {
                 // class-perf collection-return: only `return '{…}` literals
                 // are admitted — each element lands in a contiguous arg slot
                 // and one `RetCollection` hands the range to the interpreter's
@@ -15301,6 +15714,21 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
+        // §8.8: a bare typed constructor `C::new` constructs, as `C::new()`
+        // does, rather than reading a class-scope name.
+        if !matches!(expr.kind, ExprKind::Call { .. })
+            && let Some((prefix, _)) = crate::compiler::simulator::Simulator::typed_ctor_call(expr)
+            && self.scope_static_receivers.contains(prefix)
+        {
+            let call = Expression::new(
+                ExprKind::Call {
+                    func: Box::new(expr.clone()),
+                    args: Vec::new(),
+                },
+                expr.span,
+            );
+            return self.compile_expr_typed(&call, ctx_width, false);
+        }
         self.compile_expr_typed(expr, ctx_width, false)
     }
 
@@ -15322,6 +15750,11 @@ impl<'a> BytecodeCompiler<'a> {
             return self.compile_pattern(expr, ctx_width, pattern_ctx);
         }
         let result = self.compile_expr_inner(expr, ctx_width, unsigned_context)?;
+        // §7.4.1: an element of a packed array of a named signed type
+        // (`lane_t [0:8] x; x[1]`) is signed; the slice that read it is not.
+        if matches!(expr.kind, ExprKind::Index { .. }) && self.packed_named_select_signed(expr) {
+            self.emit(Insn::SetSigned(result));
+        }
         let propagates = matches!(
             expr.kind,
             ExprKind::Binary { .. }
@@ -15347,6 +15780,16 @@ impl<'a> BytecodeCompiler<'a> {
         // §7.10: `$` is the last index of the queue its select indexes. The
         // interpreter evaluates a select chain holding one whole, binding each
         // `$` to its own base.
+        if matches!(
+            expr.kind,
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+        ) && self.inst_array_multidim_elem(expr)
+        {
+            // #1108: an element of a multidimensional array member of an
+            // instance-array element (`lane[0].nest[1][2]`) is resolved by
+            // the interpreter, from the array's stored name.
+            return self.emit_expr_fallback(expr, ctx_width, "inst_array_member");
+        }
         if matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
@@ -15788,6 +16231,40 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(r) = self.compile_real_operator(*op, left, right) {
                     return r;
                 }
+                // §11.6.1: in a self-determined position (a concatenation
+                // operand, no context width) an arithmetic or bitwise
+                // operator is its own context: the wider operand's width,
+                // propagated down to both operands, so the narrower one is
+                // extended by its own sign before the operator. Without it
+                // the operands met at unequal widths and the two execution
+                // tiers extended them differently.
+                let ctx_width = if ctx_width == 0
+                    && matches!(
+                        op,
+                        BinaryOp::Add
+                            | BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::BitXnor
+                    ) {
+                    // Only with both operands' widths (the two width oracles
+                    // agreeing) and signs known: anything else keeps the
+                    // run-time operator's own extension.
+                    // Equal widths need no extension.
+                    let (lw, rw) = (self.lrm_self_width(left), self.lrm_self_width(right));
+                    let known = lw > 0
+                        && rw > 0
+                        && lw != rw
+                        && lw == self.expr_max_width(left)
+                        && rw == self.expr_max_width(right)
+                        && self.expr_signedness(left).is_some()
+                        && self.expr_signedness(right).is_some();
+                    if known { lw.max(rw) } else { 0 }
+                } else {
+                    ctx_width
+                };
                 // Verilog operand-width rules: comparison and logical ops
                 // (==, !=, <, <=, >, >=, &&, ||, ===, !==, case-eq) are
                 // self-determined — their operands' widths are max(L,R) of
@@ -16582,7 +17059,7 @@ impl<'a> BytecodeCompiler<'a> {
                             ));
                             return Some(dest);
                         }
-                        let array = self.array_operand(name)?;
+                        let (array, idx_reg) = self.array_operand_index(name, idx_reg)?;
                         self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
                     }
@@ -17090,15 +17567,23 @@ impl<'a> BytecodeCompiler<'a> {
                             .lookup_signal_id(h)
                             .and_then(|id| self.signal_widths.get(id).copied())
                             .unwrap_or(0),
-                        // `x[hi:lo]` with constant bounds: hi - lo + 1.
+                        // `x[hi:lo]` with constant bounds: hi - lo + 1
+                        // ELEMENTS of `x`'s outer packed dimension, each as
+                        // wide as one element (§7.4.3, §11.4.14): a slice of
+                        // `lane_t [-9:9] x` is eleven bits per element.
                         ExprKind::RangeSelect {
+                            expr: base,
                             left,
                             right,
                             kind: RangeKind::Constant,
-                            ..
-                        } => match (self.eval_const_bound(left), self.eval_const_bound(right)) {
-                            (Some(hi), Some(lo)) if hi >= lo => (hi - lo + 1) as u32,
-                            (Some(hi), Some(lo)) => (lo - hi + 1) as u32,
+                        } => match (
+                            self.eval_const_bound(left),
+                            self.eval_const_bound(right),
+                            self.packed_part_select_elem_width(base),
+                        ) {
+                            (Some(hi), Some(lo), Some(ew)) => {
+                                ((hi - lo).unsigned_abs() as u32 + 1).saturating_mul(ew)
+                            }
                             _ => 0,
                         },
                         _ => 0,
@@ -17707,12 +18192,21 @@ impl<'a> BytecodeCompiler<'a> {
                 // are already flattened in the layout table.
                 let direct_start = self.insns.len();
                 let direct_reg = self.next_reg;
-                if let Some((root, _, _, fields)) = self.compile_packed_struct_value(base)
+                if let Some((root, key, hier, fields)) = self.compile_packed_struct_value(base)
                     && let Some((_, off, width)) =
                         fields.iter().find(|(name, _, _)| name == &member.name)
                 {
                     let dest = self.alloc_reg();
                     self.emit(Insn::RangeSelectConst(dest, root, *off + *width - 1, *off));
+                    // §7.2.1: the member keeps its declared type's sign.
+                    let var = Self::hier_raw_name(&hier);
+                    if self
+                        .packed_member_signed(&key, &member.name)
+                        .or_else(|| self.packed_member_signed(&var, &member.name))
+                        == Some(true)
+                    {
+                        self.emit(Insn::SetSigned(dest));
+                    }
                     return Some(dest);
                 }
                 self.truncate_insns(direct_start);
@@ -18591,7 +19085,8 @@ impl<'a> BytecodeCompiler<'a> {
             lo_reg,
             Box::new(Value::from_u64(off as u64, 32)),
         ));
-        Some((self.array_operand(name)?, idx_reg, hi_reg, lo_reg, resized))
+        let (array, idx_reg) = self.array_operand_index(name, idx_reg)?;
+        Some((array, idx_reg, hi_reg, lo_reg, resized))
     }
 
     /// A packed lvalue PATH that mixes several dynamic steps:
@@ -18969,7 +19464,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let Some(array) = self.array_operand(name) else {
+                            let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg)
+                            else {
                                 return false;
                             };
                             self.emit(Insn::NbaAssignArray(array, idx_reg, val_reg, width));
@@ -19275,7 +19771,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let Some(array) = self.array_operand(name) else {
+                                    let Some((array, idx_reg)) =
+                                        self.array_operand_index(name, idx_reg)
+                                    else {
                                         return false;
                                     };
                                     self.emit(Insn::NbaAssignArrayRange(
@@ -19552,7 +20050,7 @@ impl<'a> BytecodeCompiler<'a> {
                     b_reg,
                     Box::new(Value::from_u64(b as u64, 32)),
                 ));
-                let Some(array) = self.array_operand(name) else {
+                let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg) else {
                     return Some(false);
                 };
                 self.emit(Insn::BlockingAssignArrayRange(
@@ -19799,7 +20297,34 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Whether `e` selects, through two or more indices, an array member
+    /// reached through a select (`lane[0].nest[1][2]`).
+    fn inst_array_multidim_elem(&self, e: &Expression) -> bool {
+        let ExprKind::Index { expr: inner, .. } = &e.kind else {
+            return false;
+        };
+        if !matches!(inner.kind, ExprKind::Index { .. })
+            || !crate::compiler::simulator::Simulator::select_entered_member_shape(inner)
+        {
+            return false;
+        }
+        // An element of a variable (`sa[1].f0[3][7]` of an array of
+        // structures) is not a scope; it compiles as before.
+        let Some(root) = crate::compiler::simulator::Simulator::expr_root_first_seg(inner) else {
+            return false;
+        };
+        !self.arrays.contains_key(root)
+            && !self.scope_hint.as_ref().is_some_and(|scope| {
+                self.arrays
+                    .contains_key(format!("{}.{}", scope, root).as_str())
+            })
+    }
+
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
+        if self.inst_array_multidim_elem(lhs) {
+            self.bail("inst_array_member");
+            return false;
+        }
         // class-perf method-mode: `this.<member> = e` / `<classlocal>.<member> = e`
         // is an OBJECT-field store off the heap.
         if self.method_mode
@@ -20173,7 +20698,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            let Some(array) = self.array_operand(name) else {
+                            let Some((array, idx_reg)) = self.array_operand_index(name, idx_reg)
+                            else {
                                 return false;
                             };
                             self.emit(Insn::BlockingAssignArray(array, idx_reg, val_reg, width));
@@ -20599,7 +21125,9 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                 };
                                 if let Some((hi_reg, lo_reg)) = regs {
-                                    let Some(array) = self.array_operand(name) else {
+                                    let Some((array, idx_reg)) =
+                                        self.array_operand_index(name, idx_reg)
+                                    else {
                                         return false;
                                     };
                                     self.emit(Insn::BlockingAssignArrayRange(
@@ -21145,7 +21673,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // §5.7 (issue #31): compiled-path literals warn here — once
                 // per literal string, deduped with the elaboration/AST sites.
                 crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
-                let mut v = Value::from_str_radix(value, r, w);
+                let mut v = Value::from_literal_text(value, r, w);
                 // Same inline cache the AST evaluator keeps on this node: a
                 // literal in a declared range is re-evaluated for every
                 // reference to the signal.
@@ -21389,16 +21917,67 @@ impl<'a> BytecodeCompiler<'a> {
                     let class = self.method_class.as_deref()?;
                     return Some(self.class_field_signed(class, &h.path[0].name.name));
                 }
-                let id = self.lookup_signal_id(h)?;
-                Some(self.signal_signed[id])
+                self.named_operand_signedness(h)
+            }
+            // §11.8.1: a package parameter (`pkg::P`), an interface variable
+            // (`i0.u`), a hierarchical reference (`lf.u`) or a flattened
+            // unpacked-structure member (`unp.u`) has its declared type's
+            // signedness, so an unsigned one makes the expression unsigned.
+            ExprKind::Ident(h)
+                if h.path.len() > 1 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let name = Self::hier_raw_name(h);
+                if let Some(&known) = self.dotted_ident_sign.get(&name) {
+                    return known;
+                }
+                let sign = if self.lookup_signal_id(h).is_none()
+                    && let Some((key, member)) = self.packed_member_of_hier(h)
+                {
+                    // §7.2.1: a packed-structure member has its declared type.
+                    self.packed_member_signed(&key, &member)
+                } else {
+                    self.named_operand_signedness(h)
+                };
+                self.dotted_ident_sign.insert(name, sign);
+                sign
+            }
+            // §11.5, §13.4.1: a function call has its return type's sign.
+            ExprKind::Call { func, .. } => {
+                let ExprKind::Ident(h) = &func.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let name = self.scoped_callee_name(h.path[0].name.name.clone())?;
+                let fd = self.functions.and_then(|f| f.get(&name))?;
+                self.decl_signedness(&fd.return_type, Some(name.as_str()))
             }
             ExprKind::MemberAccess { expr: base, member } if self.method_mode => {
                 self.handle_member_width(base, &member.name)?;
                 let class = self.method_handle_chain_class(base)?;
                 Some(self.class_field_signed(&class, &member.name))
             }
+            // §7.2.1: a member of a packed-structure element (`a[0].f`) has
+            // its declared type's sign, as the direct member read gives it.
+            ExprKind::MemberAccess { expr: base, member } => {
+                let mut root = base.as_ref();
+                while let ExprKind::Index { expr, .. } | ExprKind::Paren(expr) = &root.kind {
+                    root = &**expr;
+                }
+                let ExprKind::Ident(hier) = &root.kind else {
+                    return None;
+                };
+                let (key, fields) = self.packed_struct_layout_for_hier(hier)?;
+                if !fields.iter().any(|(name, _, _)| name == &member.name) {
+                    return None;
+                }
+                self.packed_member_signed(&key, &member.name)
+                    .or_else(|| self.packed_member_signed(&Self::hier_raw_name(hier), &member.name))
+            }
             // Part-selects, concatenations and replications are UNSIGNED
             // regardless of their operands (§11.8.1).
+            ExprKind::Index { .. } if self.packed_named_select_signed(e) => Some(true),
             ExprKind::Index { expr, .. } => {
                 // §7.4: an unpacked element retains its declared type; only
                 // a packed bit-select is necessarily unsigned (§11.8.1).
@@ -21444,6 +22023,18 @@ impl<'a> BytecodeCompiler<'a> {
                 "$unsigned" => Some(false),
                 // §6.24.1: a SIZE cast preserves the operand's signedness.
                 "$__xz_size_cast" => args.get(1).and_then(|a| self.expr_signedness(a)),
+                // §6.24.1: a type cast (`u8_t'(x)`) has the type's sign; a
+                // size cast through a parameter (`N'(x)`) keeps the operand's.
+                "$__xz_named_cast" => {
+                    let key = self.named_cast_key(args.first()?)?;
+                    if let Some(&(_, signed)) = self.cast_widths.and_then(|m| m.get(&key)) {
+                        Some(signed)
+                    } else if self.params.is_some_and(|p| p.contains_key(&key)) {
+                        args.get(1).and_then(|a| self.expr_signedness(a))
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             },
             ExprKind::Unary { op, operand } => match op {
@@ -21495,6 +22086,39 @@ impl<'a> BytecodeCompiler<'a> {
                     (Some(false), _) | (_, Some(false)) => Some(false),
                     _ => None,
                 }
+            }
+            _ => None,
+        }
+    }
+
+    /// §11.8.1: the signedness of a named operand with no select: a signal
+    /// (module variable, interface variable, hierarchical reference or a
+    /// flattened unpacked member) has its declared sign, a parameter its
+    /// value's (§6.20.2). Unknown when the name resolves to neither.
+    fn named_operand_signedness(&self, h: &HierarchicalIdentifier) -> Option<bool> {
+        if let Some(id) = self.lookup_signal_id(h) {
+            return self.signal_signed.get(id).copied();
+        }
+        self.lookup_param_value(h)
+            .filter(|v| !v.is_real)
+            .map(|v| v.is_signed)
+    }
+
+    /// §6.11.3: the signedness a declared integral type gives its values;
+    /// None for a real, string or unresolved type.
+    fn decl_signedness(
+        &self,
+        dt: &crate::ast::types::DataType,
+        scope: Option<&str>,
+    ) -> Option<bool> {
+        use crate::ast::types::DataType as D;
+        let resolved = self.resolved_decl_type(dt, scope);
+        match resolved {
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) | D::Implicit { .. } => {
+                Some(crate::compiler::elaborate::is_type_signed(resolved))
+            }
+            D::Struct(su) if su.packed => {
+                Some(crate::compiler::elaborate::is_type_signed(resolved))
             }
             _ => None,
         }
@@ -31027,6 +31651,85 @@ fn chain_has_call_base(e: &Expression) -> bool {
 /// string-valued functions, and the ones that carry their argument's type
 /// (`system_function_carries_arg`), are None. Shared by the compiler's width
 /// and signedness inference and by the interpreter, so every path agrees.
+/// The declared type of variable `name`, or of member `m` of a structure
+/// variable `v` for `name` = `v.m` (§7.2: a member keeps its declared type).
+pub(crate) fn declared_type_of<'a>(
+    name: &str,
+    decls: &'a HashMap<String, crate::ast::types::DataType>,
+    types: &'a HashMap<String, crate::ast::types::DataType>,
+) -> Option<&'a crate::ast::types::DataType> {
+    if let Some(dt) = decls.get(name) {
+        return Some(dt);
+    }
+    let (var, member) = name.rsplit_once('.')?;
+    let crate::ast::types::DataType::Struct(su) =
+        crate::compiler::elaborate::resolve_typedef_chain(decls.get(var)?, types)
+    else {
+        return None;
+    };
+    su.members
+        .iter()
+        .find(|m| m.declarators.iter().any(|d| d.name.name == member))
+        .map(|m| &m.data_type)
+}
+
+/// §7.4.1: the number of selects at which a packed array declared as
+/// `T [d1]...[dn] x` (directly, or through typedefs) reaches its NAMED
+/// element type `T`, when `T` is a signed integral type. Such an element
+/// select is signed; every other select of a packed array is unsigned
+/// ("the individual elements of the array are unsigned unless they are of a
+/// named type declared as signed"). None for any other declaration.
+pub(crate) fn signed_named_packed_elem_depth(
+    dt: &crate::ast::types::DataType,
+    types: &HashMap<String, crate::ast::types::DataType>,
+) -> Option<usize> {
+    use crate::ast::types::DataType as D;
+    /// Through plain aliases (`typedef T U;`) to the defining type.
+    fn follow<'a>(mut cur: &'a D, types: &'a HashMap<String, D>) -> Option<&'a D> {
+        for _ in 0..64 {
+            match cur {
+                D::TypeReference {
+                    name, dimensions, ..
+                } if dimensions.is_empty() => {
+                    cur = crate::compiler::elaborate::lookup_scoped_type(name, types)?;
+                }
+                _ => return Some(cur),
+            }
+        }
+        None
+    }
+    let mut cur = follow(dt, types)?;
+    let mut depth = 0usize;
+    for _ in 0..64 {
+        let D::TypeReference {
+            name, dimensions, ..
+        } = cur
+        else {
+            return None;
+        };
+        depth += dimensions.len();
+        let elem = follow(
+            crate::compiler::elaborate::lookup_scoped_type(name, types)?,
+            types,
+        )?;
+        match elem {
+            // The element is itself a packed array of a named type: an
+            // element of THAT array is one select deeper.
+            D::TypeReference { .. } => cur = elem,
+            D::IntegerAtom { .. } | D::IntegerVector { .. } | D::Enum(_) => {
+                return crate::compiler::elaborate::is_type_signed_resolved(elem, types)
+                    .then_some(depth);
+            }
+            D::Struct(su) if su.packed => {
+                return crate::compiler::elaborate::is_type_signed_resolved(elem, types)
+                    .then_some(depth);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
     Some(match name {
         "$countones"
@@ -31168,6 +31871,11 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
 
     fn const_i64(&mut self, e: &Expression) -> Option<i64> {
         self.0.fold_const_i64(e)
+    }
+
+    fn pattern_index(&mut self, e: &Expression, bounds: (i64, i64)) -> Option<i64> {
+        xezim_core::elaborate::const_eval_typed_pattern_index(e, self.0.params, bounds)
+            .or_else(|| self.0.fold_const_i64(e))
     }
 
     fn is_type_name(&mut self, name: &str) -> bool {

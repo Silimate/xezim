@@ -170,10 +170,11 @@ impl Simulator {
                 || val.less_equal(&self.eval_expr(hi)).is_true();
             return lo_ok && hi_ok;
         }
-        if let Some(nm) = self.array_operand_name(pat) {
-            let sz = self.get_queue_size(&nm);
-            for i in 0..sz {
-                if let Some(ev) = self.get_signal_value_by_name(&format!("{}[{}]", nm, i)) {
+        // An array item, also an associative one or a call returning an
+        // array (§11.4.13, §13.4.1), matches any of its elements.
+        if let Some(keys) = self.inside_operand_keys(pat) {
+            for key in keys {
+                if let Some(ev) = self.get_signal_value_by_name(&key) {
                     if val.wildcard_eq(&ev).is_true() {
                         return true;
                     }
@@ -736,8 +737,10 @@ impl Simulator {
     /// A formal no collection, struct, array or associative binder claims:
     /// no unpacked dimensions and a built-in integral, real or string type.
     pub(super) fn port_is_plain_scalar(port: &crate::ast::decl::FunctionPort) -> bool {
+        // §13.5.1: `[W-1:0] v` is an integral formal even when the
+        // declaration omits `logic`; its actual takes the declared width.
         port.dimensions.is_empty()
-            && matches!(
+            && (matches!(
                 port.data_type,
                 DataType::IntegerAtom { .. }
                     | DataType::IntegerVector { .. }
@@ -746,7 +749,7 @@ impl Simulator {
                         kind: crate::ast::types::SimpleType::String,
                         ..
                     }
-            )
+            ) || matches!(&port.data_type, DataType::Implicit { dimensions, .. } if !dimensions.is_empty()))
     }
 
     /// The SHAPE a call actual may be context-sized for: a plain scalar
@@ -818,15 +821,20 @@ impl Simulator {
             }
         }
         match dt {
-            DataType::IntegerVector { dimensions, .. } => dimensions.iter().all(|d| match d {
-                PackedDimension::Range { left, right, .. } => {
-                    name_free(left)
-                        && name_free(right)
-                        && crate::elaborate::const_eval_i64_with_params(left, None).is_some()
-                        && crate::elaborate::const_eval_i64_with_params(right, None).is_some()
-                }
-                PackedDimension::Unsized(_) => false,
-            }),
+            // An omitted formal type can inherit the preceding formal's
+            // type (§13.5.2); an empty placeholder is not a one-bit vector.
+            DataType::Implicit { dimensions, .. } if dimensions.is_empty() => false,
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions.iter().all(|d| match d {
+                    PackedDimension::Range { left, right, .. } => {
+                        name_free(left)
+                            && name_free(right)
+                            && crate::elaborate::const_eval_i64_with_params(left, None).is_some()
+                            && crate::elaborate::const_eval_i64_with_params(right, None).is_some()
+                    }
+                    PackedDimension::Unsized(_) => false,
+                })
+            }
             _ => false,
         }
     }
@@ -843,7 +851,9 @@ impl Simulator {
         }
         let mut width = self.actual_context_width(port);
         if width.is_none() && Self::actual_ctx_shape(port) {
-            if let DataType::IntegerVector { dimensions, .. } = &port.data_type {
+            if let DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. } = &port.data_type
+            {
                 if let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
                     dimensions.as_slice()
                 {
@@ -1080,7 +1090,9 @@ impl Simulator {
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
                 &self.module.typedef_types,
-            ) {
+            ) || Self::dt_is_class_handle(&m.data_type, &self.module)
+            {
+                // §8.4: a class handle member starts null.
                 Value::zero(mw)
             } else {
                 Value::new(mw)
@@ -1438,7 +1450,7 @@ impl Simulator {
             .count();
         let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
         let pattern_vals = self
-            .eval_flat_struct_pattern(arg, leaf_count, &widths)
+            .eval_flat_struct_pattern(&su, arg, leaf_count, &widths)
             .or_else(|| {
                 let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                 self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
@@ -1636,6 +1648,7 @@ impl Simulator {
     /// a simple ordered pattern (caller falls back to member-access eval).
     pub(super) fn eval_flat_struct_pattern(
         &mut self,
+        su: &crate::ast::types::StructUnionType,
         arg: &Expression,
         n: usize,
         widths: &[u32],
@@ -1643,7 +1656,9 @@ impl Simulator {
         let ExprKind::AssignmentPattern(parts) = &self.unpacked_pattern(arg).kind else {
             return None;
         };
-        if parts.len() != n {
+        // §10.9.2: even a one-member replication needs member type
+        // context. Let the shared structure binder remove its inner braces.
+        if parts.len() != n || self.struct_replication_items(su, parts, n).is_some() {
             return None;
         }
         let mut out = Vec::with_capacity(n);
@@ -1796,7 +1811,7 @@ impl Simulator {
             locals.insert(format!("{}.", port_name), Value::zero(1));
             let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
             let pattern_vals = self
-                .eval_flat_struct_pattern(arg, leaves.len(), &widths)
+                .eval_flat_struct_pattern(&su, arg, leaves.len(), &widths)
                 .or_else(|| {
                     let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                     self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
@@ -1840,7 +1855,7 @@ impl Simulator {
             })
             .collect();
         let pattern_vals = self
-            .eval_flat_struct_pattern(arg, flat_names.len(), &widths)
+            .eval_flat_struct_pattern(&su, arg, flat_names.len(), &widths)
             .or_else(|| {
                 let mut keys = Vec::new();
                 for m in &su.members {
@@ -2326,6 +2341,9 @@ impl Simulator {
             return self.bind_array_arg(port, &selected);
         }
         let arg = self.unpacked_pattern(arg);
+        // #1108: an array member of an instance-array element.
+        let folded = self.inst_array_member_canon(arg);
+        let arg = folded.as_ref().unwrap_or(arg);
         let params = Some(&self.module.parameters);
         let (lo, hi) = match dims.first()? {
             UD::Range { left, right, .. } => {

@@ -17,10 +17,16 @@ mod array_equality_class;
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
 mod bit_class_property_signedness;
+#[path = "classes/byte_array_elem_signed_bytecode_store.rs"]
+mod byte_array_elem_signed_bytecode_store;
 #[path = "classes/block_local_shadows_enclosing.rs"]
 mod block_local_shadows_enclosing;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
+#[path = "classes/global_class_assert_else_block_local.rs"]
+mod global_class_assert_else_block_local;
+#[path = "classes/assert_action_block_local_visibility.rs"]
+mod assert_action_block_local_visibility;
 #[path = "classes/blocklocal_struct_named_like_member.rs"]
 mod blocklocal_struct_named_like_member;
 #[path = "classes/call_actual_formal_width_557.rs"]
@@ -35,6 +41,8 @@ mod class_descending_array_members;
 mod class_formal_named_like_struct;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
+#[path = "classes/implicit_formal_width_1044.rs"]
+mod implicit_formal_width_1044;
 #[path = "classes/class_interface_same_name.rs"]
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
@@ -51,6 +59,8 @@ mod compiled_method_member_array_compare;
 mod compiled_method_static_locals;
 #[path = "classes/class_param_default_scope.rs"]
 mod class_param_default_scope;
+#[path = "classes/class_param_string_ref_formal_key_walk.rs"]
+mod class_param_string_ref_formal_key_walk;
 #[path = "classes/class_queue_struct_prop_copy.rs"]
 mod class_queue_struct_prop_copy;
 #[path = "classes/class_property_x_default.rs"]
@@ -440,6 +450,8 @@ mod randomize_wide_sets;
 mod randomize_wide_open;
 #[path = "classes/randomize_shift_mask_wide_peer.rs"]
 mod randomize_shift_mask_wide_peer;
+#[path = "classes/rand_masked_eq_variable_mask.rs"]
+mod rand_masked_eq_variable_mask;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
 #[path = "classes/rand_inline_bitand_bool.rs"]
@@ -894,6 +906,14 @@ mod typedef_packed_return_prototype;
 mod inherited_type_param_create;
 #[path = "classes/dynamic_array_property_new_init.rs"]
 mod dynamic_array_property_new_init;
+#[path = "classes/dynamic_array_new_in_method.rs"]
+mod dynamic_array_new_in_method;
+#[path = "classes/spec_args_module_params.rs"]
+mod spec_args_module_params;
+#[path = "classes/null_receiver_nonvirtual_call.rs"]
+mod null_receiver_nonvirtual_call;
+#[path = "classes/builtin_class_typedef_handles.rs"]
+mod builtin_class_typedef_handles;
 #[path = "classes/type_param_handle_not_struct.rs"]
 mod type_param_handle_not_struct;
 #[path = "classes/compiled_method_packed_elem_select.rs"]
@@ -1215,3 +1235,34 @@ mod rand_sub_object_back_handle;
 
 #[path = "classes/rand_solver_sparse_1003.rs"]
 mod rand_solver_sparse_1003;
+
+#[path = "classes/rand_concat_field_equality.rs"]
+mod rand_concat_field_equality;
+
+#[path = "classes/rand_solver_bound_order.rs"]
+mod rand_solver_bound_order;
+
+#[path = "classes/typed_constructor_call.rs"]
+mod typed_constructor_call;
+
+#[path = "classes/typed_constructor_scope.rs"]
+mod typed_constructor_scope;
+
+#[path = "classes/gc_large_payload_reclamation_1054.rs"]
+mod gc_large_payload_reclamation_1054;
+#[path = "classes/class_property_nba_real_targets.rs"]
+mod class_property_nba_real_targets;
+#[path = "classes/static_packed_member_reads.rs"]
+mod static_packed_member_reads;
+#[path = "classes/type_param_struct_members_1082.rs"]
+mod type_param_struct_members_1082;
+#[path = "classes/redeclared_property_base_scope_1064.rs"]
+mod redeclared_property_base_scope_1064;
+#[path = "classes/static_packed_member_writes_1046.rs"]
+mod static_packed_member_writes_1046;
+#[path = "classes/builtin_class_struct_members_1161.rs"]
+mod builtin_class_struct_members_1161;
+#[path = "classes/null_receiver_builtin_names_1139.rs"]
+mod null_receiver_builtin_names_1139;
+#[path = "classes/static_call_in_param_initializer_1130.rs"]
+mod static_call_in_param_initializer_1130;

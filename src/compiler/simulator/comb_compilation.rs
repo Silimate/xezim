@@ -77,6 +77,24 @@ impl Simulator {
         if !matches!(e.kind, ExprKind::MemberAccess { .. }) {
             return None;
         }
+        self.select_entered_stored_name(e)
+    }
+
+    /// #1108, §9.4.2: an element of an unpacked array in a scope entered
+    /// through a select (`lane[0].payload[2]`, an array of instances) as
+    /// the element's own stored signal. `fold_indexed_hier_path` folds only
+    /// up to a stored signal, and the array itself (`lane[0].payload`) is
+    /// none, so an event control on the element waited on nothing.
+    pub(super) fn fold_indexed_elem_path(&self, e: &Expression) -> Option<Expression> {
+        if !matches!(e.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let flat = self.select_entered_stored_name(e)?;
+        Some(Self::flat_name_ident(flat, e.span))
+    }
+
+    /// The stored name of path `e` when it enters a scope through a select.
+    fn select_entered_stored_name(&self, e: &Expression) -> Option<String> {
         let mut path: Vec<crate::ast::expr::HierPathSegment> = Vec::new();
         if !Self::fold_hier_path_segments(e, &mut path) || path.len() < 2 {
             return None;
@@ -106,6 +124,190 @@ impl Simulator {
         let flat = Self::resolve_hier_name_static(&hier, &self.module);
         self.signal_name_to_id.get(flat.as_str())?;
         Some(flat)
+    }
+
+    /// Whether any instance of the design sits in an indexed scope: an
+    /// element of an array of instances, or a generate-loop block.
+    #[inline]
+    pub(super) fn has_indexed_scopes(&self) -> bool {
+        *self
+            .indexed_scopes
+            .get_or_init(|| self.module.instances.iter().any(|i| i.path.contains('[')))
+    }
+
+    /// Whether `e` is a select chain over a member reached through a select
+    /// (`lane[0].payload`, `lane[0].payload[2]`, `lane[0].nest[1][j]`).
+    #[inline]
+    pub(crate) fn select_entered_member_shape(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => cur = expr,
+                ExprKind::MemberAccess { expr, .. } => {
+                    return matches!(expr.kind, ExprKind::Index { .. });
+                }
+                // The same path as one identifier whose scope segment
+                // carries the select (`foreach (lane[0].payload[i])`).
+                ExprKind::Ident(h) => {
+                    return h.root.is_none()
+                        && h.path.len() >= 2
+                        && h.path[..h.path.len() - 1]
+                            .iter()
+                            .any(|s| !s.selects.is_empty());
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// §23.3.2, §7.4: an unpacked array that is a member of an element of
+    /// an array of instances (`lane[0].payload`) is named, where the
+    /// instance is not an array, by one identifier (`one.payload`), and
+    /// every array operation resolves it from that: a whole-array read or
+    /// assignment, a `foreach`, an array query, a subroutine actual, a
+    /// nonblocking element write, an element of a multidimensional member.
+    /// Through an array of instances the path stays a member access on a
+    /// select, which none of them take for an array. Rewrite such a path
+    /// (and a select chain over it) onto the array's stored name. `None`
+    /// for any other path.
+    pub(super) fn inst_array_member_canon(&self, e: &Expression) -> Option<Expression> {
+        if !self.has_indexed_scopes() || !Self::select_entered_member_shape(e) {
+            return None;
+        }
+        self.inst_array_member_canon_inner(e)
+    }
+
+    fn inst_array_member_canon_inner(&self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                let base = self.inst_array_member_canon_inner(expr)?;
+                let mut out = e.clone();
+                if let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } =
+                    &mut out.kind
+                {
+                    **expr = base;
+                }
+                Some(out)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let flat = self.select_entered_array_name(expr, member)?;
+                Some(Self::flat_name_ident(flat, e.span))
+            }
+            ExprKind::Ident(h) => {
+                let (last, scope) = h.path.split_last()?;
+                let flat = self.select_entered_array_name_of(scope.to_vec(), &last.name)?;
+                let ident = Self::flat_name_ident(flat, e.span);
+                // The array's own selects stay selects of the folded name.
+                Some(last.selects.iter().fold(ident, |base, sel| {
+                    Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: Box::new(sel.clone()),
+                        },
+                        e.span,
+                    )
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    /// `inst_array_member_canon` for the member access `base.member`.
+    pub(super) fn inst_array_member_canon_parts(
+        &self,
+        base: &Expression,
+        member: &crate::ast::Identifier,
+    ) -> Option<Expression> {
+        if !matches!(base.kind, ExprKind::Index { .. }) || !self.has_indexed_scopes() {
+            return None;
+        }
+        let flat = self.select_entered_array_name(base, member)?;
+        Some(Self::flat_name_ident(flat, base.span))
+    }
+
+    /// The stored name of the unpacked array the member path `e` names when
+    /// it enters a scope through a select and the root of the path is not
+    /// itself a variable.
+    fn select_entered_array_name(
+        &self,
+        base: &Expression,
+        member: &crate::ast::Identifier,
+    ) -> Option<String> {
+        // An element of a variable (`arr[0].m` of an array of structures, a
+        // queue of handles) is not a scope. Checked first, on the borrowed
+        // root name: this runs for every such member read.
+        let root = Self::expr_root_first_seg(base)?;
+        if self.module.arrays.contains_key(root)
+            || self.module.dynamic_arrays.contains(root)
+            || self.module.queue_vars.contains(root)
+            || self.module.associative_arrays.contains_key(root)
+            || self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(root))
+        {
+            return None;
+        }
+        let mut path: Vec<crate::ast::expr::HierPathSegment> = Vec::new();
+        if !Self::fold_hier_path_segments(base, &mut path) {
+            return None;
+        }
+        self.select_entered_array_name_of(path, member)
+    }
+
+    /// `select_entered_array_name` for the scope segments `path` and the
+    /// member `member` below them.
+    fn select_entered_array_name_of(
+        &self,
+        mut path: Vec<crate::ast::expr::HierPathSegment>,
+        member: &crate::ast::Identifier,
+    ) -> Option<String> {
+        let root = path.first()?.name.name.as_str();
+        if self.module.arrays.contains_key(root)
+            || self.module.dynamic_arrays.contains(root)
+            || self.module.queue_vars.contains(root)
+            || self.module.associative_arrays.contains_key(root)
+            || self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(root))
+            || path.iter().any(|s| {
+                s.selects
+                    .iter()
+                    .any(|x| !matches!(x.kind, ExprKind::Number(_)))
+            })
+        {
+            return None;
+        }
+        path.push(crate::ast::expr::HierPathSegment {
+            name: member.clone(),
+            selects: Vec::new(),
+        });
+        if path.len() > 1
+            && !self.module.name.is_empty()
+            && path[0].selects.is_empty()
+            && path[0].name.name == self.module.name
+        {
+            path.remove(0);
+        }
+        let hier = crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path,
+            span: member.span,
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
+        };
+        let flat = Self::resolve_hier_name_static(&hier, &self.module);
+        let is_array = |n: &str| {
+            self.module.arrays.contains_key(n)
+                || self.module.arrays_2d.contains_key(n)
+                || self.module.arrays_nd.contains_key(n)
+        };
+        if is_array(&flat) {
+            return Some(flat);
+        }
+        self.hint_scoped(&flat).filter(|s| is_array(s))
     }
 
     /// Flatten `a`, `a.b`, `a[0].b`, `a[0].b[1]` into segments, pushing an
@@ -290,6 +492,7 @@ impl Simulator {
         self.comb_time0_idx = cache.time0_idx;
         self.comb_time0_deferred = cache.time0_deferred;
         self.cont_driven = cache.cont_driven;
+        self.initialize_continuously_driven_nets();
         self.gate_fall_delay_by_id
             .extend(cache.gate_fall_delay_by_id);
         self.gate_off_delay_by_id.extend(cache.gate_off_delay_by_id);
@@ -353,6 +556,68 @@ impl Simulator {
             Err(err) => {
                 let _ = std::fs::remove_file(&tmp);
                 eprintln!("[CACHE] prepared-comb store skipped: {}", err);
+            }
+        }
+    }
+
+    // Prepared tables store the program, not the initial signal values, so a
+    // cache hit replays this initialization of the cold path before the
+    // time-0 continuous assignments run.
+    fn initialize_continuously_driven_nets(&mut self) {
+        // §6.6.1 vs a DRIVEN net: an undriven net reads z, but a net that has a
+        // continuous driver is not undriven — its value is whatever that driver
+        // produces, and until the driver first resolves that is UNKNOWN, not
+        // high-impedance. The distinction is invisible for a zero-delay driver
+        // (the time-0 settle overwrites it immediately) but shows through the
+        // whole delay window of a DELAYED one, which is exactly a gate-level
+        // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
+        // before it first resolves, and it should read x there.
+        //
+        // A combinational CYCLE (`assign p = q; assign q = p;`) keeps this
+        // x forever — measured: the reference does the SAME (cycles read x,
+        // driven or not). `alias` is NOT a cycle — it unifies names onto one
+        // net (see `alias_pairs`).
+        //
+        // Only all-z signals are touched, so a net given a real initial value
+        // (supply0/1) keeps it. A tri0/tri1 net is no different from a wire
+        // here: its pull is only the weak fallback where no driver drives, so
+        // with a driver it is x as well until that driver resolves (measured
+        // on the reference: `tri0 t; assign #2 t = a;` reads x until t=2).
+        let cont_driven: Vec<usize> = self.cont_driven.iter().copied().collect();
+        let has_pulled = self.module.resolved_net_kinds.values().any(|k| {
+            matches!(
+                k,
+                xezim_core::elaborate::ResolvedNetKind::Tri0
+                    | xezim_core::elaborate::ResolvedNetKind::Tri1
+            )
+        });
+        for id in cont_driven {
+            if self.signal_real[id] {
+                continue;
+            }
+            let w = self.signal_widths[id];
+            if w == 0 {
+                continue;
+            }
+            let cur = &self.signal_table[id];
+            let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
+            let pulled = has_pulled
+                && !all_z
+                && self
+                    .name_opt(id)
+                    .and_then(|n| self.module.resolved_net_kinds.get(n))
+                    .is_some_and(|k| {
+                        matches!(
+                            k,
+                            xezim_core::elaborate::ResolvedNetKind::Tri0
+                                | xezim_core::elaborate::ResolvedNetKind::Tri1
+                        )
+                    });
+            if all_z || pulled {
+                let mut v = Value::new(w); // all-x
+                v.is_signed = self.signal_signed[id];
+                self.signal_table[id] = v;
+                self.sync_mirror(id);
             }
         }
     }
@@ -653,7 +918,9 @@ impl Simulator {
             }
             reads.clear();
             writes.clear();
-            Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
+            let frame_local_reads = Self::with_frame_local_reads(|| {
+                Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads)
+            });
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
             // Substituted port actuals whose bare name collides with a child
             // declaration arrive ROOT-marked (core rewrite_expr_impl, issue
@@ -837,12 +1104,92 @@ impl Simulator {
             } else {
                 wids
             };
+            // §28.16: primitive fall delays have already had the structural
+            // delay-mode override applied. Keep that value when recording the
+            // assignment's per-driver transition delays below.
+            if ca.gate_delay_fall.is_some()
+                && ca.delay_fall.is_some()
+                && wids.len() == 1
+                && lhs_is_bare_ident
+                && self
+                    .module
+                    .gate_fall_delays
+                    .contains_key(self.name_for_id(wids[0]))
+            {
+                ca.delay_fall = self.gate_fall_delay_by_id.get(&wids[0]).copied();
+            }
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
+            // §28.16: a primitive that is the only driver of its net keeps
+            // its fall delay in the name map alone, so one with a zero rise
+            // delay (`buf #(0, 5)`) shows no delay of its own here; it took
+            // the undelayed gate path and fell at once.
+            let primitive_fall = ca.gate_delay_fall.is_some()
+                && wids.len() == 1
+                && lhs_is_bare_ident
+                && self
+                    .gate_fall_delay_by_id
+                    .get(&wids[0])
+                    .is_some_and(|&d| d > 0);
+            // §28.16: a primitive keeps its fall delay apart from the
+            // assignment's own; like the per-driver map of a whole-net output
+            // it follows the structural delay mode.
+            let select_target = matches!(
+                ca.lhs.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            );
+            let select_fall = ca.delay_fall.or_else(|| {
+                ca.gate_delay_fall
+                    .filter(|_| select_target && delay_mode() != 1)
+                    .map(apply_delay_mode)
+            });
             let has_transition_delay = explicit_delay > 0
+                || primitive_fall
                 || ca.delay_fall.is_some_and(|d| d > 0)
-                || ca.delay_off.is_some_and(|d| d > 0);
+                || ca.delay_off.is_some_and(|d| d > 0)
+                || (select_target && select_fall.is_some_and(|d| d > 0));
+            // §10.3.3 versus §28.16: use the assignment's origin, not the
+            // target's gate marker. Multi-driver lowering can give a gate
+            // and an assignment separate, unmarked driver nets.
+            let delay_target = if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
+                ca.delay_select
+                    .or_else(|| {
+                        ca.origin.as_ref().and_then(|_| {
+                            xezim_core::elaborate::continuous_assign_delay_select(
+                                &ca.lhs,
+                                &self.module,
+                                Some(self.signal_widths[wids[0]]),
+                            )
+                        })
+                    })
+                    .map(|(lo, width, vector)| DelayTarget {
+                        lo,
+                        width,
+                        vector: ca.origin.is_some() && vector,
+                        select_delays: None,
+                    })
+            } else if has_transition_delay
+                && select_target
+                && (select_fall.is_some_and(|f| f != explicit_delay)
+                    || ca.delay_off.is_some_and(|t| t != explicit_delay))
+            {
+                // §10.3.3 / §28.16: a constant select keeps a select target
+                // (no other driver overlaps it), so the per-driver maps of
+                // its net cannot hold its fall and turn-off delays. A
+                // part-select is a vector target; a bit-select (or a gate
+                // output on one) takes the gate rules unless it selects a
+                // vector element.
+                Some(DelayTarget {
+                    lo: 0,
+                    width: 0,
+                    vector: ca.origin.is_some()
+                        && matches!(ca.lhs.kind, ExprKind::RangeSelect { .. }),
+                    select_delays: Some((select_fall, ca.delay_off)),
+                })
+            } else {
+                None
+            };
             let fused = if !has_transition_delay && cov_counter.is_none() {
                 self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref())
             } else {
@@ -850,9 +1197,10 @@ impl Simulator {
             };
             // `assign #(rise, fall[, turnoff]) net = …` (§10.3.3): the lowered
             // item carries the rise delay; the fall / turn-off values go to
-            // the per-net maps consulted by `schedule_delayed_with_delay`,
+            // the per-driver maps consulted by `schedule_delayed_with_delay`,
             // the one point where both the target and the new value are
-            // known. Whole-net targets only, like the gate form (§28.11).
+            // known. Whole-net targets only, including widened overlapping
+            // selects, like the gate form (§28.16).
             if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
                 if let Some(f) = ca.delay_fall {
                     if f != explicit_delay {
@@ -877,6 +1225,7 @@ impl Simulator {
                     lhs: Box::new(ca.lhs.clone()),
                     rhs: Box::new(ca.rhs.clone()),
                     delay: explicit_delay,
+                    delay_target: delay_target.map(Box::new),
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
@@ -975,6 +1324,7 @@ impl Simulator {
                             lhs: Box::new(ca.lhs),
                             rhs: Box::new(ca.rhs),
                             delay: 0,
+                            delay_target: None,
                         }
                     }
                 }
@@ -1066,6 +1416,7 @@ impl Simulator {
                             lhs: Box::new(ca.lhs),
                             rhs: Box::new(ca.rhs),
                             delay: 0,
+                            delay_target: None,
                         }
                     }
                 }
@@ -1074,6 +1425,7 @@ impl Simulator {
                     lhs: Box::new(ca.lhs),
                     rhs: Box::new(ca.rhs),
                     delay: 0,
+                    delay_target: None,
                 }
             };
 
@@ -1122,6 +1474,12 @@ impl Simulator {
             // port-connection source like `u.a = a` (where `a` is genuinely
             // the top signal, not `<scope>.a`).
             let entry_is_bytecode = matches!(&item, CombItem::CompiledContAssign { .. });
+            // The scope of the assignment's target (see the whole-array
+            // fallback below).
+            let ca_lhs_scope: Option<&str> = writes
+                .iter()
+                .next()
+                .and_then(|w| w.rsplit_once('.').map(|(head, _)| head));
             for r in &reads {
                 let mut found = false;
                 // Root-marked read: the name is absolute by construction —
@@ -1175,6 +1533,29 @@ impl Simulator {
                             rids.push(id);
                             found = true;
                         }
+                    }
+                }
+                // #1108, #1110: a dotted whole unpacked-array read
+                // (`u.lane[0].payload`, `top.a`, a generate block's `h.a`)
+                // stands for the array's element signals. The member-strip
+                // fallbacks below resolved it to an enclosing scope's proxy
+                // signal, which no write dirties, so the assignment kept its
+                // first value. An array of the packed arena has no per-cell
+                // ids: the read stays unresolved.
+                let mut packed_array_read = false;
+                if !found && r.contains('.') {
+                    let scopes = if read_is_rooted {
+                        [None, None]
+                    } else {
+                        [ca_lhs_scope, scope_hint.as_deref()]
+                    };
+                    match self.whole_array_read_ids(r, &scopes, &top_prefix) {
+                        Some(Some(ids)) => {
+                            Self::extend_new_ids(&mut rids, ids);
+                            found = true;
+                        }
+                        Some(None) => packed_array_read = true,
+                        None => {}
                     }
                 }
                 // Top-prefix strip fallback: `<top>.<rest>` → `<rest>`. Fixes
@@ -1323,6 +1704,10 @@ impl Simulator {
                         cands.push(format!("{}.{}", scope, r));
                     }
                     cands.push(r.clone());
+                    // #1110: `top.a` names the top module's `a`, keyed bare.
+                    if let Some(bare) = r.strip_prefix(top_prefix.as_str()) {
+                        cands.push(bare.to_string());
+                    }
                     for cand in &cands {
                         let Some(&(first_id, lo, hi)) = self.array_first_id.get(cand.as_str())
                         else {
@@ -1378,8 +1763,24 @@ impl Simulator {
                         );
                     }
                 }
-                if !found {
+                // #1126: a called function's loop variable or block local
+                // (`i` of `foreach (s[i])`) is frame state, not an operand
+                // (§10.3.2, §13.4).
+                if (!found && !frame_local_reads.contains(r)) || packed_array_read {
                     unresolved_count += 1;
+                }
+            }
+            // §10.3.2, §7.2: a whole unpacked struct or struct-array
+            // operand changes when any member does. Array resolution above
+            // yields element containers; those never change on a member
+            // write, so depend on their registered leaves as well.
+            for i in 0..rids.len() {
+                if let Some(leaves) = self.unpacked_struct_sens.get(self.name_for_id(rids[i])) {
+                    for &id in leaves {
+                        if !rids.contains(&id) {
+                            rids.push(id);
+                        }
+                    }
                 }
             }
             if dump_ca_reads {
@@ -1434,62 +1835,7 @@ impl Simulator {
             });
         }
 
-        // §6.6.1 vs a DRIVEN net: an undriven net reads z, but a net that has a
-        // continuous driver is not undriven — its value is whatever that driver
-        // produces, and until the driver first resolves that is UNKNOWN, not
-        // high-impedance. The distinction is invisible for a zero-delay driver
-        // (the time-0 settle overwrites it immediately) but shows through the
-        // whole delay window of a DELAYED one, which is exactly a gate-level
-        // netlist: `and #(2,5) g(o, a, b);` leaves `o` readable for 5 ticks
-        // before it first resolves, and it should read x there.
-        //
-        // A combinational CYCLE (`assign p = q; assign q = p;`) keeps this
-        // x forever — measured: the reference does the SAME (cycles read x,
-        // driven or not). `alias` is NOT a cycle — it unifies names onto one
-        // net (see `alias_pairs`).
-        //
-        // Only all-z signals are touched, so a net given a real initial value
-        // (supply0/1) keeps it. A tri0/tri1 net is no different from a wire
-        // here: its pull is only the weak fallback where no driver drives, so
-        // with a driver it is x as well until that driver resolves (measured
-        // on the reference: `tri0 t; assign #2 t = a;` reads x until t=2).
-        let cont_driven: Vec<usize> = self.cont_driven.iter().copied().collect();
-        let has_pulled = self.module.resolved_net_kinds.values().any(|k| {
-            matches!(
-                k,
-                xezim_core::elaborate::ResolvedNetKind::Tri0
-                    | xezim_core::elaborate::ResolvedNetKind::Tri1
-            )
-        });
-        for id in cont_driven {
-            if self.signal_real[id] {
-                continue;
-            }
-            let w = self.signal_widths[id];
-            if w == 0 {
-                continue;
-            }
-            let cur = &self.signal_table[id];
-            let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
-            let pulled = has_pulled
-                && !all_z
-                && self
-                    .name_opt(id)
-                    .and_then(|n| self.module.resolved_net_kinds.get(n))
-                    .is_some_and(|k| {
-                        matches!(
-                            k,
-                            xezim_core::elaborate::ResolvedNetKind::Tri0
-                                | xezim_core::elaborate::ResolvedNetKind::Tri1
-                        )
-                    });
-            if all_z || pulled {
-                let mut v = Value::new(w); // all-x
-                v.is_signed = self.signal_signed[id];
-                self.signal_table[id] = v;
-                self.sync_mirror(id);
-            }
-        }
+        self.initialize_continuously_driven_nets();
 
         // Always @* and always_comb blocks. Reuse `reads`/`writes` from the
         // continuous_assigns loop above (clear-not-realloc). always_latch is
@@ -1599,6 +1945,8 @@ impl Simulator {
                 // input (fed by the port's continuous assign) settles later.
                 // Register BOTH: a superset sensitivity is always safe.
                 let mut rids: Vec<usize> = Vec::new();
+                // A whole read of an array of the packed arena (see below).
+                let mut packed_array_read = false;
                 for r in sens_reads.iter() {
                     if let Some(scope) = &scope_hint {
                         let q = format!("{}.{}", scope, r);
@@ -1626,6 +1974,26 @@ impl Simulator {
                         }
                     }
                     let before = rids.len();
+                    // #1108, §9.2.2.2: a dotted whole unpacked-array read
+                    // (`lane[0].payload` of an instance-array element,
+                    // `u.mem`, `top.a`) stands for the array's element
+                    // signals, as in a continuous assignment. The fallbacks
+                    // below resolved it only to an enclosing scope's proxy
+                    // signal, which no write dirties, so the block never ran
+                    // again. A packed-arena array has no per-cell ids: the
+                    // block then re-evaluates at every settle.
+                    if r.contains('.') && !self.signal_name_to_id.contains_key(r.as_str()) {
+                        let own = (!ab.scope.is_empty()).then_some(ab.scope.as_str());
+                        match self.whole_array_read_ids(
+                            r,
+                            &[scope_hint.as_deref(), own],
+                            &top_prefix,
+                        ) {
+                            Some(Some(ids)) => Self::extend_new_ids(&mut rids, ids),
+                            Some(None) => packed_array_read = true,
+                            None => {}
+                        }
+                    }
                     if let Some(id) = resolve_one(r.as_str()) {
                         if !rids.contains(&id) {
                             rids.push(id);
@@ -1721,6 +2089,8 @@ impl Simulator {
                         scope_hint.as_ref().map(|s| format!("{s}.{r}")),
                         (!ab.scope.is_empty()).then(|| format!("{}.{}", ab.scope, r)),
                         Some(r.clone()),
+                        // #1110: `top.a` names the top module's `a`.
+                        r.strip_prefix(top_prefix.as_str()).map(str::to_string),
                     ];
                     for name in scoped.iter().flatten() {
                         for &lid in self.unpacked_struct_sens.get(name).into_iter().flatten() {
@@ -1749,9 +2119,10 @@ impl Simulator {
                 // re-evaluates on every settle — the way a continuous assign
                 // reading one is tracked (§10.3; `packed_store` keeps such
                 // settles running).
-                let has_unresolved_reads = sens_reads
-                    .iter()
-                    .any(|r| self.read_names_unnamed_cell(r, scope_hint.as_deref(), &ab.scope));
+                let has_unresolved_reads = packed_array_read
+                    || sens_reads
+                        .iter()
+                        .any(|r| self.read_names_unnamed_cell(r, scope_hint.as_deref(), &ab.scope));
                 // Try bytecode-compiling the comb always block. On success
                 // the settle path skips exec_statement entirely and runs
                 // the flat Insn stream via exec_insns.

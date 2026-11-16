@@ -59,7 +59,7 @@ impl Simulator {
                 // above returns first), and the shared dedupe means a literal
                 // already reported at elaboration stays quiet.
                 super::elaborate::warn_unsized_decimal_wrap(*size, base, value);
-                let mut v = Value::from_str_radix(value, r, w);
+                let mut v = Value::from_literal_text(value, r, w);
                 // Cache inline values (width <= 64)
                 if w <= 64 {
                     if let Some((vb, xz)) = v.inline_bits() {
@@ -536,6 +536,33 @@ impl Simulator {
         }
     }
 
+    /// §7.2, §13.4.1: hand over the returned array `name` of unpacked
+    /// structs, its elements `idx` in order, through a store of its own that
+    /// records the element type, so the caller copies each element member by
+    /// member. Frame teardown wipes a subroutine-local array before the
+    /// caller reads it, which left the copy empty.
+    pub(super) fn snapshot_ret_structs(
+        &mut self,
+        name: &str,
+        idx: &[i64],
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        let snap = Self::RET_STRUCT_SNAP;
+        if name != snap {
+            let w = self.module.arrays.get(name).map_or(32, |t| t.2);
+            self.module.arrays.insert(snap.to_string(), (0, -1, w));
+            self.module.dynamic_arrays.insert(snap.to_string());
+            self.module
+                .var_decl_types
+                .insert(snap.to_string(), DataType::Struct(su.clone()));
+            for (pos, i) in idx.iter().enumerate() {
+                self.copy_unpacked_struct(&format!("{snap}[{pos}]"), &format!("{name}[{i}]"), su);
+            }
+            self.set_queue_size(snap, idx.len() as u64);
+        }
+        self.pending_ret_collection = Some(snap.to_string());
+    }
+
     /// §7.6/§13.4.1: snapshot a fixed unpacked return in declaration
     /// order before its local storage is restored or destroyed. The reserved
     /// return store has zero-based indices, independently of the source range.
@@ -547,6 +574,18 @@ impl Simulator {
             return false;
         };
         let descending = self.module.descending_arrays.contains(name);
+        // §7.2, §13.4.1: an unpacked-struct element has member leaves and no
+        // value of its own. Its copy goes to a store of its own that records
+        // the element type, so the caller copies it member by member too.
+        if let Some(su) = self.queue_elem_struct(name) {
+            let idx: Vec<i64> = if descending {
+                (lo..=hi).rev().collect()
+            } else {
+                (lo..=hi).collect()
+            };
+            self.snapshot_ret_structs(name, &idx, &su);
+            return true;
+        }
         const RET_SNAP: &str = "__xz_ret_coll__";
         for pos in 0..=(hi - lo) {
             let idx = if descending { hi - pos } else { lo + pos };
@@ -623,6 +662,14 @@ impl Simulator {
     /// §13.5.1: a collection returned by an actual expression is evaluated
     /// once in the caller and copied before the callee's frame is entered.
     pub(super) fn collection_call_actual(&mut self, arg: &Expression) -> Option<String> {
+        self.ret_collection_operand(arg).flatten()
+    }
+
+    /// §13.4.1: when `arg` is a call returning an unpacked array, evaluate
+    /// it once and name the store holding the returned elements:
+    /// `Some(None)` when the call ran but handed back no collection, `None`
+    /// (nothing evaluated) when `arg` is no such call.
+    pub(super) fn ret_collection_operand(&mut self, arg: &Expression) -> Option<Option<String>> {
         let arg = Self::unparen(arg);
         let ExprKind::Call { func, .. } = &arg.kind else {
             return None;
@@ -630,7 +677,29 @@ impl Simulator {
         if !self.call_returns_collection(func) {
             return None;
         }
-        let data_type = self.call_return_type(func)?;
+        let data_type = self
+            .call_return_type(func)
+            .or_else(|| self.static_call_return_type(func))?;
+        Some(self.eval_ret_collection(arg, data_type))
+    }
+
+    /// §8.10: the declared return type of a static method called through
+    /// its class, `C::f()`, which `call_return_type` (resolving a receiver
+    /// object) does not answer.
+    fn static_call_return_type(&self, func: &Expression) -> Option<DataType> {
+        let ExprKind::Ident(h) = &func.kind else {
+            return None;
+        };
+        let [cls, m] = h.path.as_slice() else {
+            return None;
+        };
+        if !self.module.classes.contains_key(&cls.name.name) {
+            return None;
+        }
+        self.class_method_return_type(&cls.name.name, &m.name.name)
+    }
+
+    fn eval_ret_collection(&mut self, arg: &Expression, data_type: DataType) -> Option<String> {
         let width = resolve_type_width(
             &data_type,
             Some(&self.module.parameters),
@@ -647,6 +716,10 @@ impl Simulator {
             // consumers also need its type and storage classification.
             self.module.arrays.insert(name.clone(), (0, -1, width));
             self.module.dynamic_arrays.insert(name.clone());
+            self.module.var_decl_types.insert(name.clone(), data_type);
+        } else if name == Self::RET_ASSOC_SNAP {
+            // §21.2.1.7: the element type of a returned associative array
+            // (an enum prints its labels, a string is quoted).
             self.module.var_decl_types.insert(name.clone(), data_type);
         }
         Some(name)
@@ -881,7 +954,7 @@ impl Simulator {
         // general path.
         if self.ref_redirect_possible() {
             if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(root)) {
-                h = self.get_signal_value_by_name(storage)?.to_u64()? as usize;
+                h = self.ref_alias_peek(storage)?.to_u64()? as usize;
             } else if self
                 .ref_identity_stack
                 .last()
@@ -1400,6 +1473,25 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        // #1108: a whole array member of an instance-array element on either
+        // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
+        // An element select is folded where it is read or written.
+        let whole =
+            |e: &Expression| matches!(e.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_));
+        if self.has_indexed_scopes() && (whole(lvalue) || whole(rvalue)) {
+            let l = whole(lvalue)
+                .then(|| self.inst_array_member_canon(lvalue))
+                .flatten();
+            let r = whole(rvalue)
+                .then(|| self.inst_array_member_canon(rvalue))
+                .flatten();
+            if l.is_some() || r.is_some() {
+                let lvalue = l.as_ref().unwrap_or(lvalue);
+                let rvalue = r.as_ref().unwrap_or(rvalue);
+                self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+                return;
+            }
+        }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
             return;
@@ -2785,6 +2877,25 @@ impl Simulator {
                 // elements + size, not re-key assoc entries. Distinguish
                 // by whether the collection is a true assoc array.
                 let dst_is_assoc = self.is_associative_array(&dst);
+                // §7.6, §7.2: a FIXED class-property array of unpacked
+                // structs from a queue or dynamic array (`fx = da`): each
+                // element member by member, from the destination's left
+                // bound, into the instance cells its reads use.
+                if !dst_is_assoc
+                    && !self.is_associative_array(&src)
+                    && let Some((_, lo, hi)) = self.fixed_array_operand(lvalue)
+                    && let Some(su) = self
+                        .queue_elem_struct(&src)
+                        .or_else(|| self.queue_elem_struct(&dst))
+                {
+                    let n = self.get_queue_size(&src).min((hi - lo + 1) as u64);
+                    for i in 0..n {
+                        let (d, s) = (format!("{dst}[{}]", lo + i as i64), format!("{src}[{i}]"));
+                        self.copy_unpacked_struct(&d, &s, &su);
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
                 if !dst_is_assoc
                     && (self.module.dynamic_arrays.contains(&dst)
                         || self.signals.contains_key(&format!("{}.size", dst)))
@@ -3663,7 +3774,14 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
-        let val = if let ExprKind::Call { func, args } = &rvalue.kind {
+        // §8.8: `lhs = C::new(...)` builds a `C`, not the class `lhs` is
+        // declared with (the `new` branch below), and the bare `C::new`
+        // constructs too rather than reading a name.
+        let typed_ctor = Self::typed_ctor_call(rvalue)
+            .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
+        let val = if let Some(v) = typed_ctor {
+            v
+        } else if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
                 let method_name = hier.path.last().unwrap().name.name.as_str();
                 if method_name == "new" {
@@ -3734,6 +3852,13 @@ impl Simulator {
                     // `other.h = new()` with `other` a `W #(B)` builds a `B`
                     // (#596).
                     let type_name = self.member_target_class(lvalue).or(type_name);
+                    // §15.3, §15.4, §6.18: a built-in class named with its
+                    // specialization (`mailbox #(int)`) or through a typedef.
+                    let type_name = type_name.map(|tn| {
+                        self.builtin_container_kind(&tn)
+                            .map(str::to_string)
+                            .unwrap_or(tn)
+                    });
                     if let Some(tname) = type_name {
                         if tname == "semaphore" {
                             let handle = self.heap.len();
@@ -3999,8 +4124,18 @@ impl Simulator {
         if let (Some(dst), Some((src, lo, hi))) = (l_dyn.clone(), r_fix) {
             let desc = self.module.descending_arrays.contains(&src);
             let n = (hi - lo + 1) as u64;
+            // §7.6, §7.2: an unpacked-struct element has no value of its own,
+            // only member leaves: copy each element member by member.
+            let su = self
+                .queue_elem_struct(&src)
+                .or_else(|| self.queue_elem_struct(&dst));
             for i in 0..n {
                 let ridx = if desc { hi - i as i64 } else { lo + i as i64 };
+                if let Some(su) = &su {
+                    let (d, s) = (format!("{dst}[{i}]"), format!("{src}[{ridx}]"));
+                    self.copy_unpacked_struct(&d, &s, su);
+                    continue;
+                }
                 let v = self
                     .get_signal_value_by_name(&format!("{}[{}]", src, ridx))
                     .unwrap_or_else(|| Value::zero(32));
@@ -4024,8 +4159,16 @@ impl Simulator {
             let desc = self.module.descending_arrays.contains(&dst);
             let cap = (hi - lo + 1) as u64;
             let n = self.get_queue_size(&src).min(cap);
+            let su = self
+                .queue_elem_struct(&src)
+                .or_else(|| self.queue_elem_struct(&dst));
             for i in 0..n {
                 let lidx = if desc { hi - i as i64 } else { lo + i as i64 };
+                if let Some(su) = &su {
+                    let (d, s) = (format!("{dst}[{lidx}]"), format!("{src}[{i}]"));
+                    self.copy_unpacked_struct(&d, &s, su);
+                    continue;
+                }
                 let v = self
                     .get_signal_value_by_name(&format!("{}[{}]", src, i))
                     .unwrap_or_else(|| Value::zero(32));

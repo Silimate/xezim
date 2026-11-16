@@ -14,6 +14,20 @@ impl Simulator {
     pub(super) fn unpacked_concat_operand_values(&mut self, items: Vec<&Expression>) -> Vec<Value> {
         let mut all_vals: Vec<Value> = Vec::new();
         for expr in items {
+            // §10.10, §13.4.1: a call returning an unpacked array contributes
+            // the elements it returns, in order (the call runs once).
+            if matches!(expr.kind, ExprKind::Call { .. })
+                && let Some(src) = self.ret_collection_operand(expr)
+            {
+                if let Some(src) = src.filter(|s| !self.is_associative_array(s)) {
+                    for j in 0..self.get_queue_size(&src) {
+                        if let Some(v) = self.get_signal_value_by_name(&format!("{src}[{j}]")) {
+                            all_vals.push(v);
+                        }
+                    }
+                }
+                continue;
+            }
             // A queue/array operand — bare (`q`), an instance-
             // scoped member (`obj.q`, `arr[i].q`), or a nested
             // assoc-of-queue element (`assoc[key]`) —
@@ -402,11 +416,15 @@ impl Simulator {
                 }
                 suffixes = next;
             }
-            // §7.5.1: the element type's default (x when 4-state).
+            // §7.5.1: the element type's default (x when 4-state, real 0.0
+            // for real, §6.8).
             let four_state = self.coll_elem_starts_x(name);
+            let real = self.coll_elem_is_real(name);
             for i in keep..n {
                 for s in &suffixes {
-                    let v = if four_state {
+                    let v = if real {
+                        Value::from_f64(0.0)
+                    } else if four_state {
                         Value::new(w)
                     } else {
                         Value::zero(w)
@@ -426,8 +444,11 @@ impl Simulator {
                 .map(|&(_, _, w)| w)
                 .unwrap_or(32);
             // A class member (`<handle>#da`) has its type on the class.
+            // §6.8, Table 6-7: a real/shortreal element starts at real 0.0.
             let four_state = self.coll_elem_starts_x(name);
-            let fill = if four_state {
+            let fill = if self.coll_elem_is_real(name) {
+                Value::from_f64(0.0)
+            } else if four_state {
                 Value::new(w)
             } else {
                 Value::zero(w)
@@ -515,6 +536,9 @@ impl Simulator {
         // (§12.7.3, §12.8), across every collection shape. Publish heat once
         // after the inner runner has restored loop and method scopes.
         let mut iterations = 0;
+        // #1108: `foreach (lane[0].payload[i])`.
+        let folded = self.inst_array_member_canon(array);
+        let array = folded.as_ref().unwrap_or(array);
         self.exec_stmt_foreach_inner(stmt, array, vars, body, &mut iterations);
         self.record_ast_loop_heat(iterations);
     }
@@ -1489,6 +1513,19 @@ impl Simulator {
                     }
                 }
             }
+            // §12.7.3, §7.2.1: `foreach (frame.lanes[k])` over a packed-array
+            // member of a packed-struct class property iterates the member's
+            // packed dimensions.
+            if prop_packed_dims.is_none()
+                && hier.path.len() >= 2
+                && hier.path[..hier.path.len() - 1]
+                    .iter()
+                    .any(|s| self.struct_prop_name_possible(&s.name.name))
+                && let Some(pd) = self.struct_member_packed_dims(array)
+                && pd.len() >= vars.len()
+            {
+                prop_packed_dims = Some(pd);
+            }
             // A bare array name inside a SUBMODULE process resolves
             // under the process's instance scope ("u_s.mem"), like
             // reads/writes already do — otherwise the collection
@@ -2033,8 +2070,16 @@ impl Simulator {
                         idx += step;
                     }
                 } else {
-                    // Bit-by-bit foreach over a packed vector.
-                    let size = self.lookup_signal_width(&name).unwrap_or(1) as u64;
+                    // §12.7.3: a formal's live value has the callee's width,
+                    // including class-specialized bounds. It shadows any
+                    // module signal or stale width entry with the same name.
+                    let size = self
+                        .local_stack
+                        .iter()
+                        .rev()
+                        .find_map(|frame| frame.get(&*name).map(|v| v.width))
+                        .or_else(|| self.lookup_signal_width(&name))
+                        .unwrap_or(1) as u64;
                     for i in 0..size {
                         if self.finished {
                             break;
@@ -2140,6 +2185,19 @@ impl Simulator {
             None
         };
         let tp_concrete = tp_param.or_else(|| tp_scoped.clone());
+        // §6.20.3/§8.25: a binding that names a design typedef (a packed
+        // struct, say) is the local's declared type for the metadata below:
+        // the member layout, member names and packed dimensions. Under the
+        // bare `T` none was registered, so `loc.data` read 0 while `loc`
+        // held the right bits.
+        // So is a struct whose members name a type parameter (`typedef
+        // struct packed { T inner; logic [3:0] tag; } wrap_t;`) with the
+        // members bound: `w.inner` had no width in its layout.
+        let bound_typedef = match tp_concrete.as_deref() {
+            Some(c) => self.bound_typedef_dt(c),
+            None => self.struct_with_bound_members(data_type),
+        };
+        let data_type: &DataType = bound_typedef.as_ref().unwrap_or(data_type);
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
@@ -2501,6 +2559,16 @@ impl Simulator {
                         data_type,
                         &self.module.parameters,
                     ) {
+                        // §6.19: its member names are constants of the block.
+                        let base_w = super::elaborate::resolve_type_width(
+                            data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        for (n, v) in &m {
+                            self.declare_enum_constant(n, Value::from_u64(*v, base_w));
+                        }
                         self.type_tables_gen += 1;
                         self.module.enum_members.insert(d.name.name.clone(), m);
                         if let Some(set) = self.plain_class_types.borrow_mut().as_mut() {
@@ -2600,50 +2668,56 @@ impl Simulator {
             // §6.18/§6.20.3: a typedef'd (or type-param-bound) local
             // carries its unpacked dims on the TYPE — `my_array_t a;`
             // declared inside a task elaborated as a scalar.
-            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> =
-                if d.dimensions.is_empty() && !plain_class {
-                    if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
-                        let tn = &name.name.name;
-                        let concrete = self
-                            .resolve_type_param_binding(tn)
-                            .unwrap_or_else(|| tn.clone());
-                        self.module
-                            .typedef_unpacked_dims
-                            .get(&concrete)
-                            .cloned()
-                            .or_else(|| {
-                                // CLASS-LOCAL typedef: an explicit
-                                // `C::t_t v;` scope, else the class
-                                // whose method is executing — a
-                                // `Ph::d_t dd;` local bound as a
-                                // scalar, so a later `ref` call saw
-                                // no collection to write back to.
-                                let start = name
-                                    .scopes
-                                    .first()
-                                    .map(|s| s.name.name.clone())
-                                    .or_else(|| self.class_context_stack.last().cloned().flatten())
-                                    .or_else(|| {
-                                        self.this_stack.last().copied().flatten().and_then(|h| {
-                                            self.heap
-                                                .get(h)
-                                                .and_then(|x| x.as_ref())
-                                                .map(|i| i.class_name.clone())
-                                        })
-                                    })?;
-                                Self::typedef_dims_via_tables(&self.module, &start, &concrete)
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
+            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> = if !plain_class {
+                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                    let tn = &name.name.name;
+                    let concrete = self
+                        .resolve_type_param_binding(tn)
+                        .unwrap_or_else(|| tn.clone());
+                    self.module
+                        .typedef_unpacked_dims
+                        .get(&concrete)
+                        .cloned()
+                        .or_else(|| {
+                            // CLASS-LOCAL typedef: an explicit
+                            // `C::t_t v;` scope, else the class
+                            // whose method is executing — a
+                            // `Ph::d_t dd;` local bound as a
+                            // scalar, so a later `ref` call saw
+                            // no collection to write back to.
+                            let start = name
+                                .scopes
+                                .first()
+                                .map(|s| s.name.name.clone())
+                                .or_else(|| self.class_context_stack.last().cloned().flatten())
+                                .or_else(|| {
+                                    self.this_stack.last().copied().flatten().and_then(|h| {
+                                        self.heap
+                                            .get(h)
+                                            .and_then(|x| x.as_ref())
+                                            .map(|i| i.class_name.clone())
+                                    })
+                                })?;
+                            Self::typedef_dims_via_tables(&self.module, &start, &concrete)
+                        })
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
-                };
+                }
+            } else {
+                Vec::new()
+            };
+            // §7.4.5: a local with dimensions of its own (`q_t l[$];`) puts
+            // them first, then the typedef's, as at module scope; the
+            // typedef's were dropped, so each row of `l` held one scalar.
+            let joined_dims: Vec<crate::ast::types::UnpackedDimension>;
             let dims: &Vec<crate::ast::types::UnpackedDimension> = if typedef_dims.is_empty() {
                 &d.dimensions
-            } else {
+            } else if d.dimensions.is_empty() {
                 &typedef_dims
+            } else {
+                joined_dims = d.dimensions.iter().chain(&typedef_dims).cloned().collect();
+                &joined_dims
             };
             // §7.4.2 / §8.23: a dimension sized by a constant of the
             // enclosing scope (`l[N]`, `l[N * 2]`, `l[cls::N]`) — the
@@ -3368,8 +3442,11 @@ impl Simulator {
                         crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(&su)
                     );
                 let v = if let Some(init_expr) = d.init.as_ref().filter(|_| !struct_init_later) {
-                    let mut produced: Option<Value> = None;
-                    if let Some(cn) = &class_name {
+                    // §8.8: `B h = C::new(...)` builds a `C`, not the
+                    // declared class (the `new` forms below).
+                    let mut produced: Option<Value> = Self::typed_ctor_call(init_expr)
+                        .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
+                    if let Some(cn) = class_name.as_ref().filter(|_| produced.is_none()) {
                         // `T x = new(...);` / `T x = new;` — detect the
                         // constructor form once; consumed by both the
                         // class and covergroup branches below.
@@ -3880,7 +3957,10 @@ impl Simulator {
                 // container. Clear any stale same-named entry from another
                 // frame (var_container_types is a flat map like
                 // var_class_types) when this decl isn't a container.
-                match class_name.as_deref().and_then(Self::container_base) {
+                match class_name
+                    .as_deref()
+                    .and_then(|t| self.builtin_container_kind(t))
+                {
                     Some(k) => {
                         self.var_container_types
                             .insert(d.name.name.clone(), k.to_string());
@@ -4103,7 +4183,10 @@ impl Simulator {
                 // and `this` are live: the commit runs later in a context
                 // where neither is.
                 let lvalue_vif;
-                let lvalue: &Expression = match self.vif_rebase_expr(lvalue) {
+                let lvalue: &Expression = match self
+                    .vif_rebase_expr(lvalue)
+                    .or_else(|| self.inst_array_member_canon(lvalue))
+                {
                     Some(r) => {
                         lvalue_vif = r;
                         &lvalue_vif
@@ -4180,8 +4263,8 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(1) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_target_rhs(packed_lvalue, &args[3]);
-                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let (saved, release) =
+                            self.capture_intra_rhs(packed_lvalue, &args[3], rvalue.span);
                         let edge = match edge_code {
                             1 => Some(Edge::Posedge),
                             2 => Some(Edge::Negedge),
@@ -4212,6 +4295,7 @@ impl Simulator {
                             },
                             stmt.span,
                         ));
+                        cont.extend(release);
                         let child = self.next_pid;
                         self.next_pid += 1;
                         self.process_origin
@@ -4508,7 +4592,21 @@ impl Simulator {
                 }
                 if d == 0 {
                     let id_opt = self.resolve_nba_target(lvalue);
-                    if let Some(id) = id_opt {
+                    if let Some(id) = id_opt
+                        && self.nba_behind_queued_partial(id)
+                    {
+                        // §4.6 b): a partial update to this signal is already
+                        // queued; `nba_fast` would commit this one first.
+                        self.nba_queue.push(NbaEntry {
+                            lhs: None,
+                            value: val.resize_for_assign(w),
+                            resolved_id: Some(id),
+                            static_key: None,
+                            static_slice: None,
+                            this_handle: None,
+                            root_frame: None,
+                        });
+                    } else if let Some(id) = id_opt {
                         // Track via index map so subsequent partial-NBAs
                         // (NbaAssignRange / NbaAssignBitDyn from the
                         // bytecode VM) targeting the same signal merge into
@@ -5184,7 +5282,7 @@ impl Simulator {
                     if let Some(h) = self.process_scope_hint.get(&self.current_pid).cloned() {
                         self.process_scope_hint.insert(pid, h);
                     }
-                    self.process_origin.insert(pid, (s.span, "fork child"));
+                    self.process_origin.insert(pid, (s.span, FORK_CHILD_ORIGIN));
                     self.inherit_fork_child_context(pid);
                     self.inherit_fork_m_scope(pid, self.current_pid, block_name.as_ref());
                     let frame = self.fork_child_frame(s);
@@ -5465,6 +5563,13 @@ impl Simulator {
                     ));
                     return;
                 }
+                // §10.9, §13.4.1: a pattern returned as an array or queue of
+                // unpacked structs is built in storage of the return type.
+                if let Some(rhs) = expr
+                    && self.return_pattern_in_storage(rhs, stmt.span)
+                {
+                    return;
+                }
 
                 if let Some(e) = expr {
                     // Parentheses do not change an unpacked return's shape.
@@ -5557,16 +5662,17 @@ impl Simulator {
                             // collection before the caller's assignment
                             // consumes it (the recorded name read back size
                             // 0) — snapshot elements+size under a reserved
-                            // name that survives the pop, unless the element
-                            // type is an unpacked struct (that copy path is
-                            // keyed by the ORIGINAL name; module-scope
-                            // collections aren't wiped, so keep them live).
-                            if self.queue_elem_struct(&n).is_none() {
+                            // name that survives the pop; unpacked-struct
+                            // elements member by member under a store that
+                            // records their type (`snapshot_ret_structs`).
+                            if let Some(su) = self.queue_elem_struct(&n) {
+                                let len = self.get_queue_size(&n) as i64;
+                                let idx: Vec<i64> = (0..len).collect();
+                                self.snapshot_ret_structs(&n, &idx, &su);
+                            } else {
                                 const RET_SNAP: &str = "__xz_ret_coll__";
                                 self.copy_whole_queue(RET_SNAP, &n);
                                 self.pending_ret_collection = Some(RET_SNAP.to_string());
-                            } else {
-                                self.pending_ret_collection = Some(n.to_string());
                             }
                         } else if self
                             .fn_ret_collection_stack
@@ -5917,7 +6023,7 @@ impl Simulator {
                     self.dpi_wait_fork();
                 } else if self.dpi_export_depth > 0 {
                     let me = self.current_pid;
-                    self.run_nested_until(|sim| !sim.process_parents.values().any(|&p| p == me));
+                    self.run_nested_until(|sim| !sim.has_wait_fork_children(me));
                 }
             }
             StatementKind::RsReturn => {
@@ -6368,9 +6474,7 @@ impl Simulator {
                             None => next,
                         };
                         next = v.wrapping_add(1);
-                        self.module
-                            .parameters
-                            .insert(m.name.name.clone(), Value::from_u64(v, base_w));
+                        self.declare_enum_constant(&m.name.name, Value::from_u64(v, base_w));
                         members.push((m.name.name.clone(), v));
                     }
                     self.module

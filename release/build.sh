@@ -65,6 +65,13 @@ cargo metadata --locked --format-version 1 > /dev/null || {
   echo 'release/Cargo.lock is out of date: run release/run.sh lock' >&2
   exit 1
 }
+# Dev builds use Clang and LLD (.cargo/config.toml). The pinned manylinux
+# builder only ships gcc, so override the linker and toolchain for this build.
+if ! command -v clang >/dev/null 2>&1; then
+  export CC=gcc CXX=g++ AR=ar RANLIB=ranlib
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
+  sed -i '/^CC = /d; /^CXX = /d; /^AR = /d; /^RANLIB = /d; /^linker = /d' .cargo/config.toml
+fi
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 
 # The gates: licenses, sources and advisories of what ships; known

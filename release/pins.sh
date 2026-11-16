@@ -11,7 +11,7 @@ RUNNER=docker.io/library/almalinux:8-minimal@sha256:5edccbe0aa69031af6604d963a0d
 
 # The Rust toolchain: Cargo.toml's rust-version, installed by a pinned
 # rustup-init (which checks each component against the release manifest).
-RUST=1.92.0
+RUST=1.100.0
 RUSTUP_URL=https://static.rust-lang.org/rustup/archive/1.29.2/x86_64-unknown-linux-gnu/rustup-init
 RUSTUP_SHA256=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4
 

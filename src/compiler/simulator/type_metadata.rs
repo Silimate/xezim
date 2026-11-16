@@ -140,7 +140,7 @@ impl Simulator {
         // container. Clear any stale same-named entry from another
         // frame (var_container_types is a flat map like
         // var_class_types) when this decl isn't a container.
-        match class_name.and_then(Self::container_base) {
+        match class_name.and_then(|t| self.builtin_container_kind(t)) {
             Some(k) => {
                 self.var_container_types
                     .insert(name.to_string(), k.to_string());
@@ -833,6 +833,24 @@ impl Simulator {
         name: &str,
         e: &Expression,
     ) -> Value {
+        // §6.19.5: the variable has its type before its initializer runs
+        // (`for (e_t s = s.first(); ...)`), in this frame only.
+        if let DataType::TypeReference { name: tref, .. } = data_type {
+            let tn = if tref.has_scope() {
+                tref.qualified()
+            } else {
+                tref.name.name.clone()
+            };
+            if self.module.enum_members.contains_key(&tn)
+                || self.module.typedef_types.contains_key(&tn)
+            {
+                self.record_local_typedef_type(name, &tn);
+            } else if self.module.enum_members.contains_key(&tref.name.name)
+                || self.module.typedef_types.contains_key(&tref.name.name)
+            {
+                self.record_local_typedef_type(name, &tref.name.name);
+            }
+        }
         let v = self.eval_expr(e);
         let w = super::elaborate::resolve_type_width(
             data_type,
@@ -2298,7 +2316,7 @@ impl Simulator {
 
     /// The first path segment of the identifier at the root of a
     /// member/index chain (`s` in `s.mm[1][0]`, `arr` in `arr[2].x`).
-    pub(super) fn expr_root_first_seg(e: &Expression) -> Option<&str> {
+    pub(crate) fn expr_root_first_seg(e: &Expression) -> Option<&str> {
         match &e.kind {
             ExprKind::Ident(h) => h.path.first().map(|s| s.name.name.as_str()),
             ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
@@ -2403,13 +2421,16 @@ impl Simulator {
     pub(super) fn packed_dims_are_literal(dt: &DataType) -> bool {
         use crate::ast::types::PackedDimension;
         match dt {
-            DataType::IntegerVector { dimensions, .. } => dimensions.iter().all(|d| match d {
-                PackedDimension::Range { left, right, .. } => {
-                    matches!(left.kind, ExprKind::Number(_))
-                        && matches!(right.kind, ExprKind::Number(_))
-                }
-                PackedDimension::Unsized(_) => false,
-            }),
+            DataType::Implicit { dimensions, .. } if dimensions.is_empty() => false,
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions.iter().all(|d| match d {
+                    PackedDimension::Range { left, right, .. } => {
+                        matches!(left.kind, ExprKind::Number(_))
+                            && matches!(right.kind, ExprKind::Number(_))
+                    }
+                    PackedDimension::Unsized(_) => false,
+                })
+            }
             _ => false,
         }
     }

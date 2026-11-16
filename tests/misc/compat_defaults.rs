@@ -152,8 +152,8 @@ fn compat_keeps_an_explicit_run_length() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// `--max-time none` and `--max-time 0` (in any unit) lift the default
-/// 100 ms cap; a negative value is still refused.
+/// Bare `--max-time 0` and `--max-time none` lift the default 100 ms cap; zero
+/// with a unit is refused; a negative value is still refused.
 #[test]
 fn max_time_none_runs_to_finish() {
     let d = scratch("none");
@@ -168,11 +168,19 @@ fn max_time_none_runs_to_finish() {
     let (code, all, err) = run(&d, &["tb.sv", "-do", "run -all"], &[]);
     assert_eq!(code, 0, "{}", err);
     assert!(all.contains("L t=150000000\n"), "{}", all);
-    for v in ["none", "NONE", "0", "0ns", "0s"] {
+    for v in ["none", "NONE", "0"] {
         let (code, out, err) = run(&d, &["tb.sv", "--max-time", v], &[]);
         assert_eq!((code, out.as_str()), (0, all.as_str()), "{}: {}", v, err);
         let (code, out, _) = run(&d, &[&format!("--max-time={}", v), "tb.sv"], &[]);
         assert_eq!((code, out.as_str()), (0, all.as_str()), "={}", v);
+    }
+    for v in ["0ns", "0fs", "0s"] {
+        let (code, _, err) = run(&d, &["tb.sv", "--max-time", v], &[]);
+        assert_eq!(code, 1, "{}: {}", v, err);
+        assert!(err.contains("must be positive"), "{}: {}", v, err);
+        let (code, _, err) = run(&d, &[&format!("--max-time={}", v), "tb.sv"], &[]);
+        assert_eq!(code, 1, "={}: {}", v, err);
+        assert!(err.contains("must be positive"), "={}: {}", v, err);
     }
     let (code, _, err) = run(&d, &["tb.sv", "--max-time", "-5"], &[]);
     assert_eq!(code, 1);

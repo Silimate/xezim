@@ -10,6 +10,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An `always` block that starts with an event control waits there before
+  any `initial` block writes, as on the reference simulator and Icarus
+  Verilog (§9.2), when the control has no `iff` and nothing after it waits
+  on an event again (a `wait`, another event control, or one in a called
+  task or joined `fork`). `initial clk = 0; always @(clk) #10 clk = ~clk;`
+  starts its clock wherever the two blocks sit in the source; the time-0
+  change was missed when the `initial` block ran first.
+* In a `.v` file, a variable declaration assignment (`reg clk = 1'b0;`) is
+  an `initial` assignment at time 0 (IEEE 1364-2005 §6.2.1), so the
+  variable changes from x then and the processes waiting on it wake, as on
+  the reference simulator. In a `.sv` file, or with `-sv`, it still sets
+  the value before time 0 with no event (§6.8). The clock of the Analog
+  Devices HDL testbenches (`reg clk = 1'b0; always @(*) #10 clk <= ~clk;`)
+  never started.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

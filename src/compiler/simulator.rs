@@ -64,6 +64,9 @@ static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 const COND_AUDIT_EVALS: u8 = 4;
 /// `--dump-timescales`: print every module's timescale before the run starts.
 static DUMP_TIMESCALES: AtomicBool = AtomicBool::new(false);
+/// `-sv`: compile every source file as SystemVerilog, `.v` files included
+/// (see `Simulator::take_verilog_decl_inits`).
+static SV_ALL_FILES: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 /// Opaque handle base for `process::self()` (IEEE 1800-2023 §9.7). The token is
@@ -624,6 +627,18 @@ pub fn set_dump_timescales(enabled: bool) {
 #[inline]
 fn dump_timescales_enabled() -> bool {
     DUMP_TIMESCALES.load(Ordering::Relaxed)
+}
+
+/// `-sv`: read `.v` files as SystemVerilog too. Without it a `.v` file is
+/// Verilog (IEEE 1364-2005), where a variable declaration assignment is an
+/// `initial` assignment (§6.2.1), as in the reference simulator.
+pub fn set_sv_all_files(enabled: bool) {
+    SV_ALL_FILES.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+fn sv_all_files() -> bool {
+    SV_ALL_FILES.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -8919,6 +8934,17 @@ pub struct Simulator {
     /// Pids of `initial` blocks that cannot suspend (no timing control,
     /// no blocking call); see `order_time0_processes`.
     t0_timing_free: HashSet<usize>,
+    /// Pids of `always` processes whose statement starts with an event
+    /// control: they wait there before any `initial` block runs (see
+    /// `order_time0_processes`).
+    t0_event_led: HashSet<usize>,
+    /// The time-0 process of the Verilog variable declaration assignments
+    /// (`take_verilog_decl_inits`), if there is one.
+    t0_decl_init_pid: Option<usize>,
+    /// IEEE 1364-2005 §6.2.1: the variables of Verilog (`.v`) modules whose
+    /// declaration assigns them a value, with that value. They hold x until
+    /// time 0, where one process assigns them all.
+    verilog_decl_inits: Vec<(String, Value)>,
     /// Time-0 activation index of each process queued at time 0, consulted
     /// by `clock_rank_on_pop` until the first drain settles the generators.
     t0_pid_ord: HashMap<usize, usize>,

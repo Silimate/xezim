@@ -1660,6 +1660,90 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1364-2005 §6.2.1: in Verilog, a variable declaration assignment
+    /// (`reg clk = 1'b0;`) is an `initial` assignment, so the variable
+    /// changes from x at time 0 and the processes waiting on it wake.
+    /// SystemVerilog (IEEE 1800-2023 §6.8, §10.5) sets the value before time
+    /// 0 instead, with no event, which is how elaboration stores it. Like the
+    /// reference simulator, a module is Verilog when its file is a `.v` file
+    /// and `-sv` was not given. Only the module-level `reg`, `integer` and
+    /// `time` variables qualify: §6.2.1 allows the assignment only at module
+    /// level, and the other variable types are SystemVerilog's. Each one is
+    /// set back to x here and keeps its value in the returned list, which
+    /// `compile` assigns from one process at time 0.
+    pub(super) fn take_verilog_decl_inits(module: &mut ElaboratedModule) -> Vec<(String, Value)> {
+        use crate::ast::types::IntegerVectorType;
+        if sv_all_files() || module.source_files.is_empty() {
+            return Vec::new();
+        }
+        let is_verilog = |def: &str| {
+            let def = xezim_core::bind_spec_base(def);
+            module
+                .src_file_of_module
+                .get(def)
+                .and_then(|&i| module.source_files.get(i as usize))
+                .and_then(|f| std::path::Path::new(f).extension())
+                .is_some_and(|e| e.eq_ignore_ascii_case("v"))
+        };
+        let top = is_verilog(&module.name);
+        let instances: HashMap<&str, bool> = module
+            .instances
+            .iter()
+            .map(|i| (i.path.as_str(), is_verilog(&i.def_name)))
+            .collect();
+        if !top && !instances.values().any(|&v| v) {
+            return Vec::new();
+        }
+        let mut found: Vec<String> = Vec::new();
+        for (name, sig) in module.signals.iter() {
+            let n = name.as_str();
+            // Declared directly in a Verilog module: the top, or an instance.
+            let verilog = match n.rsplit_once('.') {
+                None => top,
+                Some((scope, _)) => instances.get(scope).copied().unwrap_or(false),
+            };
+            if !verilog
+                || sig.is_const
+                || sig.is_real
+                || sig.width == 0
+                || matches!(
+                    sig.direction,
+                    Some(PortDirection::Input) | Some(PortDirection::Inout)
+                )
+                || module.nets.contains(n)
+                || module.two_state_signals.contains(n)
+                || module.events.contains(n)
+                || module.parameters.contains_key(n)
+            {
+                continue;
+            }
+            let kind_ok = matches!(
+                module.var_decl_types.get(n),
+                Some(DataType::IntegerVector {
+                    kind: IntegerVectorType::Reg,
+                    ..
+                }) | Some(DataType::IntegerAtom {
+                    kind: IntegerAtomType::Integer | IntegerAtomType::Time,
+                    ..
+                })
+            );
+            if kind_ok && (0..sig.width as usize).any(|i| sig.value.get_bit(i) != LogicBit::X) {
+                found.push(n.to_string());
+            }
+        }
+        found.sort_unstable();
+        found
+            .into_iter()
+            .filter_map(|n| {
+                let sig = module.signals.get_mut(n.as_str())?;
+                let mut x = Value::all_x(sig.width);
+                x.is_signed = sig.value.is_signed;
+                let init = std::mem::replace(&mut sig.value, x);
+                Some((n, init))
+            })
+            .collect()
+    }
+
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
         let _oom_scope = xezim_core::oom_trace::scope("construct simulator", "", &module.name, "");
         let phase_total = std::time::Instant::now();
@@ -1675,6 +1759,9 @@ impl Simulator {
             let scale = (1e-9_f64 / tick_s).round();
             (max_time as f64 * scale.max(1.0)) as u64
         };
+        // Before anything reads a starting value: a Verilog variable
+        // declaration assignment takes effect at time 0, not before it.
+        let verilog_decl_inits = Self::take_verilog_decl_inits(&mut module);
         // X-init coercion: when XEZIM_INIT_ZERO=1, signals matching one of
         // XEZIM_INIT_ZERO_PATHS (comma-separated substring filters) start
         // at 0 instead of X. Use this for designs where intentional `1'bx`
@@ -4364,6 +4451,9 @@ impl Simulator {
             clock_generators: Vec::new(),
             clock_gen_src: Vec::new(),
             t0_timing_free: HashSet::default(),
+            t0_event_led: HashSet::default(),
+            t0_decl_init_pid: None,
+            verilog_decl_inits,
             t0_pid_ord: HashMap::default(),
             fast_delay_always: HashMap::default(),
             lazy_initial: HashMap::default(),

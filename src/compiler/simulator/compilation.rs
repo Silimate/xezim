@@ -1638,6 +1638,39 @@ impl Simulator {
                 .insert(pid, (span, "static initializer"));
             self.event_queue.schedule(0, pid, stmts.into());
         }
+        // IEEE 1364-2005 §6.2.1: the declaration assignments of Verilog
+        // variables, as one `initial` process (see `take_verilog_decl_inits`).
+        if !self.verilog_decl_inits.is_empty() {
+            let span = crate::ast::Span::dummy();
+            let stmts: Vec<Statement> = std::mem::take(&mut self.verilog_decl_inits)
+                .into_iter()
+                .map(|(name, v)| {
+                    let rvalue = Expression::new(
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                            size: Some(v.width),
+                            signed: v.is_signed,
+                            base: crate::ast::expr::NumberBase::Binary,
+                            value: v.to_bin_string(),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                        }),
+                        span,
+                    );
+                    Statement::new(
+                        StatementKind::BlockingAssign {
+                            lvalue: super::vpi_model::ident_expr(&name),
+                            rvalue,
+                        },
+                        span,
+                    )
+                })
+                .collect();
+            let pid = self.next_pid;
+            self.next_pid += 1;
+            self.process_origin
+                .insert(pid, (span, "declaration assignment"));
+            self.t0_decl_init_pid = Some(pid);
+            self.event_queue.schedule(0, pid, stmts.into());
+        }
         // §16.5/§16.14: declarative concurrent assertions exist before
         // Active processes run, including an initial clock's time-zero edge.
         // Extract only synthetic assertion blocks, retaining the existing

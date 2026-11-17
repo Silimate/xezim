@@ -142,6 +142,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
 
+**Performance**
+
+* A member select through constant element selects of a packed struct
+  (`st.e[1].dw[0].value <= d`, `x = st.e[1].dw[0].value`) compiles to one
+  static bit range of the container instead of running in the interpreter
+  (§7.2, §7.4.2). (#356)
+
 **Maintenance**
 
 * Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned

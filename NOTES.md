@@ -81,6 +81,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* In a module below the top, a write to a member of an element of a packed
+  array of structs (`b_o.dw[0].value <= d` on an output port,
+  `s2.e[0].dw[1].value <= d` on a variable) lands in the variable, which stayed
+  x, and a member of a packed-struct net (`wire t_t n; ... n.a`) reads the net
+  and wakes its readers, which kept a stale value (§7.2, §7.4.2, §6.7.1).
+  (#347, #348)
 
 **Usability**
 

@@ -10,6 +10,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* `$dumpvars(0, tb_top.u)` called from another top-level module dumps
+  `tb_top.u` and everything below it; the argument was ignored and the dump
+  selected nothing. The same holds for a generate-block instance, a variable
+  and `$fsdbDumpvars` (§21.7.1.2, §23.6). (Silimate/xezim#306)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

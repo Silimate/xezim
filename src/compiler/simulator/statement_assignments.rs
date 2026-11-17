@@ -4420,33 +4420,26 @@ impl Simulator {
                     return;
                 }
                 if let ExprKind::Concatenation(exprs) = &rvalue.kind {
-                    // IEEE 1800 §10.10.1: in an unpacked-array
-                    // concatenation each item is read in the context of
-                    // the ELEMENT type, so a nested plain-brace concat
-                    // is itself an array value whose elements SPLICE
-                    // into the outer one — `a = {1, {2, 3}}` assigns
-                    // `{1, 2, 3}` — i.e. nested braces flatten. Only
-                    // flatten when the element type is not itself an
-                    // array (for a multi-dimensional target an inner
-                    // brace denotes one whole sub-array element).
-                    // Assignment patterns `'{...}` never flatten; they
+                    // §10.10.3: every item of an unpacked array
+                    // concatenation has a self-determined type and the
+                    // concatenation as a whole has none, so they do not
+                    // nest. A braced item is a vector or string
+                    // concatenation (§11.4.12), one element of its own
+                    // type: `q = {q, {pc, insn}}` on a queue of 64-bit
+                    // elements appends ONE element, and
+                    // `SQ = {S1, SQ, {"element 3 is ", S2}}` appends the
+                    // string "element 3 is S2" (the §10.10.3 example). A
+                    // braced item that holds a queue or unpacked array is
+                    // no vector concatenation (illegal either way); it
+                    // still splices its operands, as it always has, when
+                    // the element type is not itself an array (for a
+                    // multi-dimensional target an inner brace is one
+                    // sub-array element). Assignment patterns `'{...}`
                     // take the AssignmentPattern branch above.
-                    fn flatten_unpacked_concat<'a>(
-                        exprs: &'a [Expression],
-                        out: &mut Vec<&'a Expression>,
-                    ) {
-                        for e in exprs {
-                            if let ExprKind::Concatenation(inner) = &e.kind {
-                                flatten_unpacked_concat(inner, out);
-                            } else {
-                                out.push(e);
-                            }
-                        }
-                    }
                     let elem_is_scalar = self.foreach_dims(&lname).is_none_or(|d| d.len() == 1);
                     let items: Vec<&Expression> = if elem_is_scalar {
                         let mut v = Vec::new();
-                        flatten_unpacked_concat(exprs, &mut v);
+                        self.splice_array_braces(exprs, &mut v);
                         v
                     } else {
                         exprs.iter().collect()
@@ -4551,5 +4544,44 @@ impl Simulator {
         }
         self.assign_value(lvalue, &val);
         self.settle_after_proc_write();
+    }
+
+    /// §10.10.3: the items of an unpacked array concatenation, with each
+    /// braced item that holds a queue or unpacked array operand replaced by
+    /// its operands. Every other braced item is a vector or string
+    /// concatenation, one element.
+    fn splice_array_braces<'a>(&mut self, exprs: &'a [Expression], out: &mut Vec<&'a Expression>) {
+        for e in exprs {
+            match &e.kind {
+                ExprKind::Concatenation(inner) if self.braces_hold_array(inner) => {
+                    self.splice_array_braces(inner, out)
+                }
+                _ => out.push(e),
+            }
+        }
+    }
+
+    /// Whether a braced list holds, at any depth, an operand that is a
+    /// queue or unpacked array, a slice of one, or a call returning one:
+    /// an operand no vector concatenation can take (§11.4.12).
+    fn braces_hold_array(&mut self, exprs: &[Expression]) -> bool {
+        exprs.iter().any(|e| match &e.kind {
+            ExprKind::Concatenation(inner) => self.braces_hold_array(inner),
+            ExprKind::Call { func, .. } => self.call_returns_collection(func),
+            ExprKind::RangeSelect { expr: base, .. } => match &base.kind {
+                ExprKind::Ident(h) => {
+                    let n = self.resolve_hier_name(h).into_owned();
+                    let n = self.instance_assoc_member(&n).unwrap_or(n);
+                    self.module.arrays.contains_key(&n)
+                }
+                _ => false,
+            },
+            _ => {
+                self.array_operand_name(e).is_some()
+                    || self
+                        .nested_index_name(e)
+                        .is_some_and(|n| self.module.dynamic_arrays.contains(&n))
+            }
+        })
     }
 }

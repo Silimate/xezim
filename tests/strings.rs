@@ -23,6 +23,8 @@ mod class_member_string_queue_element_bytecode_compare;
 mod compiled_sformatf_native;
 #[path = "strings/display_only_always.rs"]
 mod display_only_always;
+#[path = "strings/dpi_c_sources.rs"]
+mod dpi_c_sources;
 #[path = "strings/dpi_child_module_import.rs"]
 mod dpi_child_module_import;
 #[path = "strings/dpi_export_task_waits.rs"]

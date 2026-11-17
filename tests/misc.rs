@@ -285,6 +285,8 @@ mod shadow_name_matrix;
 mod simulation_version_banner;
 #[path = "misc/spec_static_and_pkg_queue.rs"]
 mod spec_static_and_pkg_queue;
+#[path = "misc/struct_member_unselected_generate.rs"]
+mod struct_member_unselected_generate;
 #[path = "misc/struct_members_and_constant_targets.rs"]
 mod struct_members_and_constant_targets;
 #[path = "misc/subroutine_port_redeclaration.rs"]

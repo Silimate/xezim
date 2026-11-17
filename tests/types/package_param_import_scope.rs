@@ -147,6 +147,22 @@ endmodule
     expect(src, &["R|2 4 32 32 7 1"]);
 }
 
+/// §26.3, §6.19: an enum member the package imports is a constant of its
+/// scope too, so a module's own import of another package's `N` does not
+/// change `z::B`.
+#[test]
+fn imported_enum_member_is_read_in_the_declaring_package() {
+    let src = r#"
+package e; typedef enum int { N = 8, M = 9 } t; endpackage
+package o; typedef enum int { N = 2 } u; endpackage
+package z; import e::*; localparam int B = N * 2; localparam int C = M; endpackage
+module top; import o::*; import z::B;
+  initial $display("R|%0d %0d %0d", B, z::B, z::C);
+endmodule
+"#;
+    expect(src, &["R|16 16 9"]);
+}
+
 /// §26.3 makes a name that two wildcard imports provide invisible. CORE-ET's
 /// `icache_pkg` still reads `PaSize`, which `etlink_pkg` and `minion_pkg`
 /// both declare as 40; xezim does not diagnose that in a package, and since

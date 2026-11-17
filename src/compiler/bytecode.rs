@@ -2517,6 +2517,95 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
+    /// §7.2, §7.4.2: a member select through constant element selects of a
+    /// packed struct (`s.e[1].dw[0].value`). Elaboration flattens a member that
+    /// is a packed array of structs into one entry per element (`e[1]`,
+    /// `e[1].dw[0].value`, ...), so with constant indices the whole select is
+    /// one static bit range of the container signal. Returns
+    /// `(container_signal_id, layout key, member path, lsb_offset, width)`, or
+    /// `None` for anything else (a dynamic or x/z index, an index outside the
+    /// declared range, an unpacked root), which keeps its existing path.
+    fn packed_const_member_path_target(
+        &self,
+        lhs: &Expression,
+    ) -> Option<(usize, String, String, u32, u32)> {
+        let fields_map = self.packed_struct_fields?;
+        // The selects below the root, innermost (leaf) first.
+        let mut tail: Vec<String> = Vec::new();
+        let mut has_index = false;
+        let mut cur = lhs;
+        let hier = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    tail.push(format!(".{}", member.name));
+                    cur = expr;
+                }
+                ExprKind::Index { expr, index } => {
+                    if self.is_xz_literal(index) {
+                        return None;
+                    }
+                    tail.push(format!("[{}]", self.eval_const_bound(index)?));
+                    has_index = true;
+                    cur = expr;
+                }
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        if !has_index {
+            return None;
+        }
+        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        if self.lookup_array_name(hier).is_some() || self.is_multi_dim_array(hier) {
+            return None;
+        }
+        tail.reverse();
+        let suffix: String = tail.concat();
+        let seg = |i: usize| hier.path[i].name.name.as_str();
+        // As `packed_struct_member_target`: the longest base that is a
+        // container signal with a layout wins. Elaboration may already have
+        // folded the leading members into the identifier (`s.e` then `[1]`).
+        // The container must be entered through a member (`s.e[1]`), not an
+        // element (`a[1].f`, an array of structs, which has its own stores).
+        for k in (1..=hier.path.len()).rev() {
+            let base: String = (0..k).map(seg).collect::<Vec<_>>().join(".");
+            let mut member: String = (k..hier.path.len()).map(seg).collect::<Vec<_>>().join(".");
+            if !member.is_empty() {
+                member.push_str(&suffix);
+            } else if let Some(rest) = suffix.strip_prefix('.') {
+                member = rest.to_string();
+            } else {
+                continue;
+            }
+            // The instance's own variable first, as `compile_packed_member_read`
+            // resolves a base: a bare key may belong to the top module or to
+            // another instance.
+            let scoped = self
+                .scope_hint
+                .as_ref()
+                .filter(|sc| !sc.is_empty() && !base.contains('.'))
+                .map(|sc| format!("{}.{}", sc, base));
+            let Some((base_id, key)) = scoped
+                .and_then(|s| Some((self.lookup_signal_id_by_name(&s)?, s)))
+                .or_else(|| Some((self.lookup_signal_id_by_name(&base)?, base.clone())))
+            else {
+                continue;
+            };
+            let Some(fields) = fields_map.get(key.as_str()) else {
+                continue;
+            };
+            if let Some(&(_, off, w)) = fields.iter().find(|(m, _, _)| *m == member)
+                && w > 0
+            {
+                return Some((base_id, key, member, off, w));
+            }
+        }
+        None
+    }
+
     /// Resolve a packed-struct container and clone its flattened field layout.
     /// The clone keeps later instruction emission free to mutably borrow the
     /// compiler without retaining a borrow into elaboration metadata.
@@ -18233,6 +18322,32 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                 }
+                // §7.2, §7.4.2: `s.e[1].dw[0].value` with constant indices
+                // is one static range of `s`, as `compile_packed_member_read`
+                // reads a plain member path.
+                // §7.2.1: the member keeps its declared type's sign (the
+                // element selects on the way only pick the element), so the
+                // read compiles only when that type is known.
+                if let Some((base_id, key, path, off, w)) =
+                    self.packed_const_member_path_target(expr)
+                    && let Some(signed) = self.packed_member_signed(
+                        &key,
+                        &path
+                            .split('.')
+                            .map(|seg| seg.split('[').next().unwrap_or(seg))
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    )
+                {
+                    let root = self.alloc_reg();
+                    self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
+                    if signed {
+                        self.emit(Insn::SetSigned(dest));
+                    }
+                    return Some(dest);
+                }
                 if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_MemberAccess") {
                     return Some(r);
                 }
@@ -19851,6 +19966,19 @@ impl<'a> BytecodeCompiler<'a> {
                 if self.try_packed_path_nba(lhs, val_reg) {
                     return true;
                 }
+                // `s.e[1].dw[0].value <= v`: one static range of `s`.
+                if let Some((base_id, _, _, off, mw)) = self.packed_const_member_path_target(lhs) {
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::NbaAssignRange(
+                        as_sig_id(base_id),
+                        off + mw - 1,
+                        off,
+                        resized,
+                    ));
+                    return true;
+                }
                 self.bail("nba_member_access");
                 false
             }
@@ -20589,6 +20717,19 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     self.emit(Insn::BlockingAssignArrayRange(
                         array, idx_reg, hi_reg, lo_reg, resized,
+                    ));
+                    return true;
+                }
+                // `s.e[1].dw[0].value = v`: one static range of `s`.
+                if let Some((base_id, _, _, off, mw)) = self.packed_const_member_path_target(lhs) {
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::BlockingAssignRange(
+                        as_sig_id(base_id),
+                        off + mw - 1,
+                        off,
+                        resized,
                     ));
                     return true;
                 }

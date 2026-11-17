@@ -805,70 +805,96 @@ impl<'a> GenerateSelection<'a> {
     }
 
     /// For each branch of a generate `if` of `def` (`None` is the final
-    /// `else`), whether some instance may elaborate it. Every branch may when
-    /// one instance's choice is not certain, or nothing elaborates `def`.
-    pub(crate) fn if_branches(&self, def: &str, conds: &[Option<&Expression>]) -> Vec<bool> {
-        let scopes = self.scopes(def);
-        let mut live = vec![scopes.is_empty(); conds.len()];
-        for scope in scopes {
-            let mut chosen = None;
+    /// `else`), the instances that elaborate it, out of `reach`, the ones
+    /// that elaborate the enclosing branch (None: every instance, or not
+    /// known). A branch no instance in `reach` selects gets an empty set.
+    /// Every branch keeps `reach` when one instance's choice is not certain,
+    /// and gets None when nothing elaborates `def`.
+    pub(crate) fn if_branches(
+        &self,
+        def: &str,
+        conds: &[Option<&Expression>],
+        reach: &GenReach,
+    ) -> Vec<GenReach> {
+        self.select(def, conds.len(), reach, |scope| {
             for (i, c) in conds.iter().enumerate() {
                 match c.map(|c| Self::known(scope, c)) {
-                    None => {
-                        chosen = Some(i);
-                        break;
-                    }
+                    None => return Some(Some(i)),
                     Some(Some(0)) => {}
-                    Some(Some(_)) => {
-                        chosen = Some(i);
-                        break;
-                    }
-                    Some(None) => return vec![true; conds.len()],
+                    Some(Some(_)) => return Some(Some(i)),
+                    Some(None) => return None,
                 }
             }
-            if let Some(i) = chosen {
-                live[i] = true;
-            }
-        }
-        live
+            Some(None)
+        })
     }
 
     /// For each arm of a generate `case` of `def` (an empty list of values
-    /// is the `default`), whether some instance may elaborate it, as for
+    /// is the `default`), the instances that elaborate it, as for
     /// [`Self::if_branches`].
     pub(crate) fn case_arms(
         &self,
         def: &str,
         selector: &Expression,
         arms: &[&[Expression]],
-    ) -> Vec<bool> {
-        let scopes = self.scopes(def);
-        let mut live = vec![scopes.is_empty(); arms.len()];
-        for scope in scopes {
-            let Some(sel) = Self::known(scope, selector) else {
-                return vec![true; arms.len()];
-            };
-            let mut chosen = arms.iter().position(|vals| vals.is_empty());
+        reach: &GenReach,
+    ) -> Vec<GenReach> {
+        self.select(def, arms.len(), reach, |scope| {
+            let sel = Self::known(scope, selector)?;
             for (i, vals) in arms.iter().enumerate() {
                 let mut hit = false;
                 for v in vals.iter() {
-                    match Self::known(scope, v) {
-                        Some(v) => hit |= v == sel,
-                        None => return vec![true; arms.len()],
-                    }
+                    hit |= Self::known(scope, v)? == sel;
                 }
                 if hit {
-                    chosen = Some(i);
-                    break;
+                    return Some(Some(i));
                 }
             }
-            if let Some(i) = chosen {
-                live[i] = true;
+            Some(arms.iter().position(|vals| vals.is_empty()))
+        })
+    }
+
+    /// Splits `reach` among `n` branches by `choose`, which gives the branch
+    /// one instance elaborates (`Some(None)`: none of them), or None when it
+    /// is not certain.
+    fn select(
+        &self,
+        def: &str,
+        n: usize,
+        reach: &GenReach,
+        choose: impl Fn(ConstScope) -> Option<Option<usize>>,
+    ) -> Vec<GenReach> {
+        let scopes = self.scopes(def);
+        if scopes.is_empty() {
+            return vec![None; n];
+        }
+        let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let all: Vec<usize>;
+        let members = match reach {
+            Some(r) => r.as_slice(),
+            None => {
+                all = (0..scopes.len()).collect();
+                &all
+            }
+        };
+        for &k in members {
+            let Some(&scope) = scopes.get(k) else {
+                return vec![reach.clone(); n];
+            };
+            match choose(scope) {
+                Some(Some(i)) => out[i].push(k),
+                Some(None) => {}
+                None => return vec![reach.clone(); n],
             }
         }
-        live
+        out.into_iter().map(Some).collect()
     }
 }
+
+/// The instances of a definition (indices of its scopes in
+/// `GenerateSelection`) that elaborate a generate branch; None for every
+/// instance, or when that is not known.
+pub(crate) type GenReach = Option<Vec<usize>>;
 
 /// A fold in a `ConstScope`.
 enum Folded {

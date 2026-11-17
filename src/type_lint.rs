@@ -62,7 +62,7 @@ use xezim_core::ast::types::{
 };
 use xezim_core::elaborate::ElaboratedModule;
 
-use crate::should_fail_lint::GenerateSelection;
+use crate::should_fail_lint::{GenReach, GenerateSelection};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Ty {
@@ -369,6 +369,9 @@ struct Ck<'a> {
     /// The conditional generate branches the elaborated design selects
     /// (§27.5); a branch no instance selects is not checked.
     gen_sel: Option<&'a GenerateSelection<'a>>,
+    /// The instances that elaborate the generate branch being walked (see
+    /// `GenReach`); a nested construct is decided for those only.
+    gen_reach: GenReach,
     /// Stack depth of the definition's own scope: a name declared above it
     /// is local to a generate block (or a genvar), which the elaborated
     /// parameter tables do not key by its bare name.
@@ -395,6 +398,7 @@ impl<'a> Ck<'a> {
             params_fixed: false,
             gen_depth: 0,
             gen_sel: None,
+            gen_reach: None,
             body_depth: usize::MAX,
             errs: Vec::new(),
         }
@@ -2877,23 +2881,21 @@ impl<'a> Ck<'a> {
                 ModuleItem::GenerateIf(g) => {
                     let conds: Vec<Option<&Expression>> =
                         g.branches.iter().map(|(c, _)| c.as_ref()).collect();
-                    let live = match self.gen_sel {
+                    let reach = match self.gen_sel {
                         Some(sel) if !conds.iter().flatten().any(|c| self.names_gen_local(c)) => {
-                            sel.if_branches(&self.owner, &conds)
+                            sel.if_branches(&self.owner, &conds, &self.gen_reach)
                         }
-                        _ => vec![true; conds.len()],
+                        _ => vec![self.gen_reach.clone(); conds.len()],
                     };
-                    for ((_, items), live) in g.branches.iter().zip(live) {
-                        if live {
-                            self.walk_block(items, None);
-                        }
+                    for ((_, items), reach) in g.branches.iter().zip(reach) {
+                        self.walk_branch(items, reach);
                     }
                 }
                 ModuleItem::GenerateFor(g) => self.walk_block(&g.items, Some(&g.var)),
                 ModuleItem::GenerateCase(g) => {
                     let arms: Vec<&[Expression]> =
                         g.arms.iter().map(|a| a.values.as_slice()).collect();
-                    let live = match self.gen_sel {
+                    let reach = match self.gen_sel {
                         Some(sel)
                             if !self.names_gen_local(&g.selector)
                                 && !arms
@@ -2901,19 +2903,28 @@ impl<'a> Ck<'a> {
                                     .flat_map(|a| a.iter())
                                     .any(|v| self.names_gen_local(v)) =>
                         {
-                            sel.case_arms(&self.owner, &g.selector, &arms)
+                            sel.case_arms(&self.owner, &g.selector, &arms, &self.gen_reach)
                         }
-                        _ => vec![true; arms.len()],
+                        _ => vec![self.gen_reach.clone(); arms.len()],
                     };
-                    for (arm, live) in g.arms.iter().zip(live) {
-                        if live {
-                            self.walk_block(&arm.items, None);
-                        }
+                    for (arm, reach) in g.arms.iter().zip(reach) {
+                        self.walk_branch(&arm.items, reach);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// A conditional generate branch, walked only when some instance in
+    /// `reach` elaborates it (§27.5), with its constructs decided for those.
+    fn walk_branch(&mut self, items: &[ModuleItem], reach: GenReach) {
+        if reach.as_ref().is_some_and(|r| r.is_empty()) {
+            return;
+        }
+        let outer = std::mem::replace(&mut self.gen_reach, reach);
+        self.walk_block(items, None);
+        self.gen_reach = outer;
     }
 
     /// Whether `e` reads a name declared inside a generate block or a genvar,

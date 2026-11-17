@@ -27,6 +27,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
+* A module named `gated_clk_cell` is elaborated from its body like any
+  other. Every instance of that name ran as `assign clk_out = clk_in`, an
+  optimization for OpenC910's pass-through cell, so Wujian100's latch-based
+  clock gate never gated (its rtc test ran 15.4 ms instead of 2.26 ms) and
+  the cell's signals could not be reached by hierarchical name. A cell that
+  is exactly that pass-through keeps the direct assignment. (Silimate/xezim#344)
 * `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
   adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
   `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so

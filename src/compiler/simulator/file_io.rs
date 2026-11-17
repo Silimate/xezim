@@ -4,6 +4,21 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// The memory a `$readmem*` / `$writemem*` call names (§21.4, §21.5).
+pub(super) struct MemoryTaskTarget {
+    name: String,
+    /// An unpacked memory's declared `(left, right)` address bounds; for an
+    /// associative array, the least and greatest address its index type
+    /// holds.
+    lo: i64,
+    hi: i64,
+    /// Element width.
+    width: u32,
+    /// An associative array with an integral index type, its elements keyed
+    /// by address.
+    assoc: bool,
+}
+
 impl Simulator {
     /// Whether `$display`/`$write` output is handed to a background writer.
     ///
@@ -974,18 +989,29 @@ impl Simulator {
         None
     }
 
-    /// The memory a `$readmem*` / `$writemem*` call names, with its
-    /// `(lo, hi, width)`. A target that names no unpacked memory is an error
-    /// (the reference simulator rejects the design); report it rather than
-    /// skip the call silently.
+    /// The memory a `$readmem*` / `$writemem*` call names. A target that
+    /// names no memory is an error (the reference simulator rejects the
+    /// design); report it rather than skip the call silently.
     pub(super) fn memory_task_target(
         &mut self,
         task: &str,
         arg: &Expression,
-    ) -> Option<(String, (i64, i64, u32))> {
+    ) -> Option<MemoryTaskTarget> {
+        // An associative array is looked up by its exact name first: the
+        // unpacked-memory lookup ends in a suffix match that could claim a
+        // same-named memory in another scope.
+        if let Some(t) = self.assoc_memory_target(arg) {
+            return Some(t);
+        }
         if let Some(name) = self.resolve_array_name_from_expr(arg) {
-            if let Some(&dims) = self.module.arrays.get(&name) {
-                return Some((name, dims));
+            if let Some(&(lo, hi, width)) = self.module.arrays.get(&name) {
+                return Some(MemoryTaskTarget {
+                    name,
+                    lo,
+                    hi,
+                    width,
+                    assoc: false,
+                });
             }
         }
         let flat = Self::member_chain_as_hier_ident(arg);
@@ -1015,6 +1041,67 @@ impl Simulator {
         self.record_output(m.clone());
         self.stdout_writeln(&m);
         None
+    }
+
+    /// §21.4 / §21.5: the memory may also be an associative array whose
+    /// index type is integral; each address is a key. `None` for anything
+    /// else, including a string-, class- or wildcard-indexed array.
+    fn assoc_memory_target(&mut self, arg: &Expression) -> Option<MemoryTaskTarget> {
+        // `r.mem` inside a subroutine body arrives as a member-access chain;
+        // resolve it as the hierarchical name it spells, as for an unpacked
+        // memory.
+        let name = match self.assoc_operand_name(arg) {
+            Some(n) => n,
+            None if matches!(arg.kind, ExprKind::MemberAccess { .. }) => {
+                let flat = self.member_chain_ident(arg)?;
+                self.assoc_operand_name(&flat)?
+            }
+            None => return None,
+        };
+        if self.is_string_keyed_array(&name) || self.assoc_key_class_of_arr(&name).is_some() {
+            return None;
+        }
+        let (kw, signed) = self.assoc_index_width_for(&name)?;
+        let width = self.assoc_elem_width(&name)?;
+        // The addresses the index type can hold.
+        let (lo, hi) = match (signed, kw) {
+            (true, 64..) => (i64::MIN, i64::MAX),
+            (true, _) => (-(1i64 << (kw - 1)), (1i64 << (kw - 1)) - 1),
+            (false, 63..) => (0, i64::MAX),
+            (false, _) => (0, (1i64 << kw) - 1),
+        };
+        Some(MemoryTaskTarget {
+            name,
+            lo,
+            hi,
+            width,
+            assoc: true,
+        })
+    }
+
+    /// §21.4: load `val` into address `addr` of associative memory `name`,
+    /// as `name[addr] = val` would: the address converted to the index type
+    /// is the key (§7.8), and the value takes the element type. Returns
+    /// whether the element changed.
+    fn assoc_memory_store(&mut self, name: &str, addr: i64, mut val: Value) -> bool {
+        let mut key = Value::from_u64(addr as u64, 64);
+        key.is_signed = true;
+        let elem = Self::name_with_key(name, &self.assoc_key_str(name, &key));
+        if let Some(signed) = self.assoc_elem_signed(name) {
+            val.is_signed = signed;
+        }
+        // A 2-state element (its missing-element default is 0, not x) holds
+        // x/z digits as 0.
+        if val.has_xz()
+            && self
+                .assoc_missing_elem_value(name)
+                .is_some_and(|d| !d.has_xz())
+        {
+            val = val.to_two_state();
+        }
+        let changed = self.signals.get(&elem) != Some(&val);
+        self.signals.insert(elem, val);
+        changed
     }
 
     /// [`member_chain_as_hier_ident`] with each select folded into its
@@ -1145,13 +1232,23 @@ impl Simulator {
             10 => "$readmemd",
             _ => "$readmemh",
         };
-        let Some((mem_name, (lo, hi, width))) = self.memory_task_target(task, &args[1]) else {
+        let Some(MemoryTaskTarget {
+            name: mem_name,
+            lo,
+            hi,
+            width,
+            assoc,
+        }) = self.memory_task_target(task, &args[1])
+        else {
             return Value::zero(32);
         };
+        // §21.4: with no start address, loading begins at the memory's left
+        // bound; an associative array has none and begins at address 0.
+        let first = if assoc { 0 } else { lo };
         let mut addr = if args.len() >= 3 {
-            self.eval_expr(&args[2]).to_i64().unwrap_or(lo)
+            self.eval_expr(&args[2]).to_i64().unwrap_or(first)
         } else {
-            lo
+            first
         };
         let end_addr = if args.len() >= 4 {
             self.eval_expr(&args[3]).to_i64().unwrap_or(hi)
@@ -1177,7 +1274,12 @@ impl Simulator {
             }
         };
         let mut loaded = 0usize;
-        let dense_array = self.array_first_id.get(mem_name.as_str()).copied();
+        let dense_array = if assoc {
+            None
+        } else {
+            self.array_first_id.get(mem_name.as_str()).copied()
+        };
+        let mut assoc_changed = false;
         'lines: for raw_line in content.lines() {
             let line = raw_line.split("//").next().unwrap_or("").trim();
             if line.is_empty() {
@@ -1203,7 +1305,9 @@ impl Simulator {
                 };
                 if addr >= min_idx && addr <= max_idx {
                     let val = Value::from_str_radix(&digits, radix, width);
-                    if let Some((first_id, arr_lo, arr_hi)) = dense_array {
+                    if assoc {
+                        assoc_changed |= self.assoc_memory_store(&mem_name, addr, val);
+                    } else if let Some((first_id, arr_lo, arr_hi)) = dense_array {
                         if addr >= arr_lo && addr <= arr_hi {
                             let id = first_id + (addr - arr_lo) as usize;
                             if is_packed_id(id) {
@@ -1240,6 +1344,10 @@ impl Simulator {
                 addr += step;
             }
         }
+        if assoc_changed {
+            // Comb readers of the array re-evaluate, as after `mem[k] = v`.
+            self.touch_queue(&mem_name);
+        }
         sim_dbg_eprintln!(
             "[DEBUG] $readmem*: loaded {} words into '{}' from '{}'",
             loaded,
@@ -1261,7 +1369,14 @@ impl Simulator {
         if path.is_empty() {
             return Value::zero(32);
         }
-        let Some((mem_name, (lo, hi, width))) = self.memory_task_target(tn, &args[1]) else {
+        let Some(MemoryTaskTarget {
+            name: mem_name,
+            lo,
+            hi,
+            width,
+            assoc,
+        }) = self.memory_task_target(tn, &args[1])
+        else {
             return Value::zero(32);
         };
         let start = if args.len() >= 3 {
@@ -1281,6 +1396,32 @@ impl Simulator {
         } else {
             10
         };
+        if assoc {
+            // §21.5: an associative array writes the elements that exist,
+            // in index order, between the start and finish addresses.
+            let (from, to) = (start.min(end), start.max(end));
+            let mut words: Vec<(i64, Value)> = Vec::new();
+            for key in self.assoc_top_level_keys_shared(&mem_name).iter() {
+                let Some(addr) = self.assoc_foreach_key_value(&mem_name, key).to_i64() else {
+                    continue;
+                };
+                if addr < from || addr > to {
+                    continue;
+                }
+                if let Some(val) = self.lookup_signal_value(&Self::name_with_key(&mem_name, key)) {
+                    words.push((addr, val));
+                }
+            }
+            if start > end {
+                words.reverse();
+            }
+            let mut out = String::new();
+            for (addr, val) in &words {
+                Self::push_memory_word(&mut out, *addr, val, radix);
+            }
+            let _ = std::fs::write(&path, out);
+            return Value::zero(32);
+        }
         let step: i64 = if start <= end { 1 } else { -1 };
         let min_idx = lo.min(hi);
         let max_idx = lo.max(hi);
@@ -1302,19 +1443,24 @@ impl Simulator {
                 } else {
                     Value::zero(width)
                 };
-                out.push_str(&format!("@{:x} ", addr));
-                let s = match radix {
-                    2 => val.to_bin_string(),
-                    16 => val.to_hex_string(),
-                    _ => val.to_dec_string(),
-                };
-                out.push_str(&s);
-                out.push('\n');
+                Self::push_memory_word(&mut out, addr, &val, radix);
             }
             addr += step;
         }
         let _ = std::fs::write(&path, out);
         Value::zero(32)
+    }
+
+    /// One `$writemem*` line, `@<addr_hex> <value_in_radix>`.
+    fn push_memory_word(out: &mut String, addr: i64, val: &Value, radix: u32) {
+        out.push_str(&format!("@{:x} ", addr));
+        let s = match radix {
+            2 => val.to_bin_string(),
+            16 => val.to_hex_string(),
+            _ => val.to_dec_string(),
+        };
+        out.push_str(&s);
+        out.push('\n');
     }
 
     pub(super) fn base_ident_name(expr: &Expression) -> Option<String> {

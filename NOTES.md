@@ -45,6 +45,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   totals; a design unit counts an item that any of its instances counts.
   `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`)
   counts them as before (§11.2.1, §12.4, §12.5). (Silimate/xezim#25)
+* `vpi_handle(vpiLeftRange)` and `vpi_handle(vpiRightRange)` of an element
+  or sub-array of an unpacked array give its own range (§38.11), and
+  `vpi_chk_error` fills `file` with an empty string instead of NULL (§38.3).
+  cocotb writing a list to an unpacked-array port (the I3C core's
+  `axi_adapter_id_filter` tests) read a value through the NULL range handle
+  and then crashed logging the error. (Silimate/xezim#349)
 * Toggle coverage counts each instance's input and inout ports in that
   instance, as commercial simulators do, with the value the connection gives
   the port: a port connected to a whole net shows that net's counts, one

@@ -249,6 +249,8 @@ mod sva_time0_default_samples;
 mod task_body_delay_scaling;
 #[path = "scheduling/time0_process_order.rs"]
 mod time0_process_order;
+#[path = "scheduling/time0_startup.rs"]
+mod time0_startup;
 #[path = "scheduling/timing_check_delayed_nets_singlelimit.rs"]
 mod timing_check_delayed_nets_singlelimit;
 #[path = "scheduling/typeparam_pool_wait.rs"]

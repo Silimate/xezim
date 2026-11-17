@@ -291,6 +291,8 @@ mod streaming_and_typedef_array_width;
 mod struct_copy_and_queue_ops;
 #[path = "types/struct_member_array_of_structs_copy.rs"]
 mod struct_member_array_of_structs_copy;
+#[path = "types/submodule_struct_array_member_writes.rs"]
+mod submodule_struct_array_member_writes;
 #[path = "types/struct_member_typedef_element_dims.rs"]
 mod struct_member_typedef_element_dims;
 #[path = "types/struct_named_patterns.rs"]

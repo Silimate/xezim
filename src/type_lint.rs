@@ -3075,7 +3075,11 @@ fn dpi_name(d: &xezim_core::ast::decl::DPIImport) -> Option<String> {
 }
 
 /// Run the checks over every definition; returns the error messages.
-pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
+pub fn check(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    gen_sel: &GenerateSelection<'_>,
+) -> Vec<String> {
     // Phase 0: class names (a name declared twice is ambiguous and ignored).
     let mut class_names: HashMap<String, usize> = HashMap::default();
     fn count_items(items: &[ModuleItem], out: &mut HashMap<String, usize>) {
@@ -3308,7 +3312,6 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         |n: &String| !instantiated.contains(n) && (!reach_known || reached.contains(n));
 
     // Phase 3: walk every body.
-    let gen_sel = GenerateSelection::new(elab);
     let mut errs = Vec::new();
     let env = || Env {
         class_names: &class_names,
@@ -3334,7 +3337,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
-                ck.gen_sel = Some(&gen_sel);
+                ck.gen_sel = Some(gen_sel);
                 ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
@@ -3352,7 +3355,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
-                ck.gen_sel = Some(&gen_sel);
+                ck.gen_sel = Some(gen_sel);
                 ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
@@ -3370,7 +3373,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
-                ck.gen_sel = Some(&gen_sel);
+                ck.gen_sel = Some(gen_sel);
                 ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }

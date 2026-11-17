@@ -42,7 +42,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     // segments of the parameter keys and the classes every unit sees.
     let _leaves = ParamLeaves::install(elab);
     let global = global_classes(defs);
-    let views = InstanceViews::build(elab);
+    // One set of per-instance views, shared with the type lint's generate
+    // selection (a large design has many instances and parameters).
+    let gen_sel = GenerateSelection::new(elab);
+    let views = &gen_sel.views;
     let elaborated = elaborated_definitions(defs, elab);
     for def in defs {
         match def {
@@ -80,7 +83,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &m.name.name,
                     &m.items,
                     scope,
-                    &views,
+                    views,
                     &local_types,
                     &mut errs,
                 );
@@ -113,7 +116,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &m.name.name,
                     &m.items,
                     scope,
-                    &views,
+                    views,
                     &local_types,
                     &mut errs,
                 );
@@ -145,7 +148,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &m.name.name,
                     &m.items,
                     scope,
-                    &views,
+                    views,
                     &local_types,
                     &mut errs,
                 );
@@ -186,7 +189,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
-        errs.extend(crate::type_lint::check(defs, elab));
+        errs.extend(crate::type_lint::check(defs, elab, &gen_sel));
         // §23.8: a hierarchical name that does not resolve is an error.
         errs.extend(crate::hier_ref_lint::check(defs, elab));
     }

@@ -10,6 +10,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A module-scope task evaluates an input actual at the formal's width, as
+  if assigned to it (§13.5, §11.6.1), as functions and class methods
+  already did: `t({2{1'b1}} << 4)` into `input [31:0] v` binds `32'h30`,
+  not 0, and `t(-b)` sign-fills the formal. A task or function formal whose
+  bounds name a parameter (`input [W-1:0] v`) now gives its actual that
+  width too. (Silimate/xezim#331)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

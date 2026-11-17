@@ -426,7 +426,7 @@ impl Simulator {
                 // already dropped.
                 let value = match self.formal_pattern_value(port, &args[i]) {
                     Some(v) => v,
-                    None => match self.actual_context_width(port) {
+                    None => match self.free_actual_context_width(port) {
                         Some(w) => self.eval_expr_ctx(&args[i], w),
                         None => self.eval_expr(&args[i]),
                     },
@@ -2741,9 +2741,23 @@ impl Simulator {
                 }
                 _ => {
                     let mut val = if arg_supplied(i) {
+                        // §13.5, §11.6.1: an input actual is evaluated as if
+                        // assigned to the formal, so the formal's declared
+                        // width is its context, as for a function: `t32(
+                        // {2{1'b1}} << 4)` into `input [31:0] v` shifts at 32
+                        // bits (32'h30). Self-determined, the 2-bit
+                        // replication shifted its bits out and bound 0.
+                        let width = if method_ctx.is_none() {
+                            self.free_actual_context_width(port)
+                        } else {
+                            self.actual_context_width(port)
+                        };
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
-                            None => self.eval_expr(&args[i]),
+                            None => match width {
+                                Some(w) => self.eval_expr_ctx(&args[i], w),
+                                None => self.eval_expr(&args[i]),
+                            },
                         };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {

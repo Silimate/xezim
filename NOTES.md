@@ -20,6 +20,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   simulator's name for an unlabeled statement), kind, file and line, and the
   attempts, nonvacuous passes, vacuous passes, failures, disabled attempts and
   cover matches (§16.14.3). The summed `assertions` list is unchanged.
+* A part-select through an index into an output port of an instantiated
+  module (`f[0][31:1]` on `output logic [0:0][31:1] f`) counts the port's
+  declared labels, as on a variable (§7.4.1, §11.5.1, §23.2.2.3). The port
+  had no declared type on file, so it took a store that mapped the labels
+  twice: a whole-element write was dropped, `f[0][30:2]` landed one bit low,
+  an ascending element mirrored the wrong way and a slice of a 3-D port's
+  middle dimension wrote bits. VeeR EH2's flush path stayed x after reset.
+  (Silimate/xezim#316)
 * Vacuity follows §16.14.8 through nested properties: `a |-> (c |-> b)`
   succeeds vacuously while `c` is false, so it runs no pass action and a
   `cover` of it does not match, and `p or q` with a sequence operand is never

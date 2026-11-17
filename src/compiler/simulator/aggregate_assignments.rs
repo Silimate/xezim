@@ -1586,7 +1586,7 @@ impl Simulator {
     /// Declared bounds of a fixed multi-dimensional unpacked array, outermost
     /// first, or None for anything else (queues, associative arrays, 1-D
     /// arrays, arrays of unpacked structs).
-    fn fixed_unpacked_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+    pub(super) fn fixed_unpacked_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
         if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) {
             return None;
         }

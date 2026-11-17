@@ -84,6 +84,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Usability**
 
+* A DPI import that no `--dpi-lib` library defines binds to the C function
+  of that name in the libraries the process already has loaded, as the
+  reference simulator does, so `import "DPI-C" function string
+  getenv(input string name);` and other C library functions need no library
+  of their own (§35.5.1). An import found nowhere is still a `Fatal` when
+  called. (Silimate/xezim#338)
 * FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
   `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
   machines (one- and two-process, enum, parameter and `` `define `` encodings,

@@ -1,0 +1,151 @@
+//! §7.4.3, §11.5.1: a part-select written after an index into a
+//! multi-dimensional packed array picks whole ELEMENTS of the next declared
+//! dimension. On `logic [3:0][5:0][7:0] a`, `a[0][5:0]` is six 8-bit
+//! elements, 48 bits; its RHS is evaluated in that 48-bit context (§11.6.1)
+//! and the write covers all of them (§10.3 for the continuous form).
+//!
+//! The bytecode compiler sized such a target by its label count and placed
+//! its labels as bit offsets, so `assign a[0][5:0] = b` wrote bits 5..0 of
+//! `a[0]` and left the other 42 bits x. Reads, the always_comb and NBA forms,
+//! indexed part-selects and variable indices shared the same arithmetic. The
+//! VeeR EH2 interrupt controller seeds its priority tree with
+//! `assign level_intpend_id[0][pt.PIC_TOTAL_INT_PLUS1+2:0] = {...}` on
+//! `logic [N:0][PIC_TOTAL_INT_PLUS1+2:0][7:0]`; the tree went x at reset
+//! release and instruction fetch stalled (Silimate/xezim#309). Expected
+//! values follow the LRM; Verilator agrees on every line.
+
+fn lines(src: &str) -> Vec<String> {
+    let sim = xezim::simulate(src, 100).expect("simulate");
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .filter(|m| m.starts_with("PASS") || m.starts_with("FAIL"))
+        .collect()
+}
+
+const SRC: &str = r#"
+package cfg_pkg;
+  typedef struct packed { int unsigned N; int unsigned M; } cfg_t;
+endpackage
+
+module tb;
+  import cfg_pkg::*;
+  localparam cfg_t pt = '{N: 3, M: 2};
+  logic clk = 0;
+  logic [2:0] j = 3'd2;
+  logic [1:0] sel = 2'd2;
+  logic [7:0] x8 = 8'hff, y8 = 8'h01;
+
+  logic [5:0][7:0] b;
+  for (genvar i = 0; i < 6; i++) begin : G
+    assign b[i] = 8'(i + 1);
+  end
+
+  // Continuous assignment to a slice of the middle dimension.
+  logic [3:0][5:0][7:0] a1;
+  assign a1[0][5:0] = b;
+  // The VeeR EH2 shape: bounds from a struct parameter, inside a generate.
+  logic [3:0][pt.N+3:0][7:0] lvl;
+  if (1) begin : GEN
+    assign lvl[0][pt.N+2:0] = {8'h0, 8'h0, 8'h0, b[2:0]};
+  end
+  // Indexed part-selects, constant base.
+  logic [3:0][5:0][7:0] a2;
+  assign a2[0][1 +: 3] = 24'h333231;
+  assign a2[1][5 -: 2] = 16'h4241;
+  // always_comb, variable outer index and variable base.
+  logic [3:0][5:0][7:0] a3, a4;
+  always_comb for (int i = 0; i < 4; i++) a3[i][2:0] = {8'(i), 8'(i + 16), 8'(i + 32)};
+  always_comb begin
+    a4 = '0;
+    a4[sel][j +: 2] = 16'h8988;
+  end
+  // NBA, variable outer index and base.
+  logic [3:0][5:0][7:0] a5;
+  always_ff @(posedge clk) begin
+    a5[sel][3:0] <= 32'h19181716;
+    a5[1][j -: 2] <= 16'h8a8b;
+  end
+  // Four dimensions: slices of the second and the third.
+  logic [1:0][2:0][3:0][7:0] h;
+  assign h[1][2][3:1] = 24'h939291;
+  assign h[0][2:1] = 64'ha8a7a6a5a4a3a2a1;
+  // A middle dimension that is not zero-based.
+  logic [3:0][6:1][7:0] m;
+  assign m[0][4:2] = 24'hd3d2d1;
+  // An element of an unpacked array of 2-D packed vectors.
+  logic [5:0][7:0] u [4];
+  assign u[1][3:2] = 16'h1211;
+  // §11.6.1: the slice is the RHS context, so the carry is kept.
+  logic [3:0][5:0][7:0] c1;
+  assign c1[1][4:2] = x8 + y8;
+  // Outer-dimension slice through an NBA.
+  logic [5:0][7:0] p;
+  always_ff @(posedge clk) p[4:3] <= 16'h4443;
+  // Reads.
+  logic [47:0] r1;
+  logic [15:0] r2;
+  logic [63:0] r3;
+  assign r1 = a1[0][5:0];
+  always_comb r2 = a1[0][j +: 2];
+  always_comb r3 = {a1[0][1:0], a1[0][5:4], a1[0][3:2], 16'h0};
+
+  task automatic chk(string name, logic [255:0] got, logic [255:0] exp);
+    if (got === exp) $display("PASS %s", name);
+    else $display("FAIL %s got=%h exp=%h", name, got, exp);
+  endtask
+
+  initial begin
+    #1 clk = 1;
+    #1 clk = 0;
+    #1;
+    chk("assign", a1[0], 48'h060504030201);
+    chk("struct param", lvl[0], 56'hxx000000030201);
+    chk("indexed up", a2[0], 48'hxxxx333231xx);
+    chk("indexed down", a2[1], 48'h4241xxxxxxxx);
+    chk("comb loop", {a3[3][2:0], a3[2][2:0], a3[1][2:0], a3[0][2:0]},
+        96'h031323_021222_011121_001020);
+    chk("comb var", a4, {48'h0, 48'h000089880000, 48'h0, 48'h0});
+    chk("nba var outer", a5[2], 48'hxxxx19181716);
+    chk("nba var base", a5[1], 48'hxxxxxx8a8bxx);
+    chk("4-D inner", h[1][2], 32'h939291xx);
+    chk("4-D middle", h[0], 96'ha8a7a6a5a4a3a2a1xxxxxxxx);
+    chk("offset dim", m[0], 48'hxxxxd3d2d1xx);
+    chk("unpacked elem", u[1], 48'hxxxx1211xxxx);
+    chk("context", c1[1][4:2], 24'h000100);
+    chk("nba outer", p, 48'hxx4443xxxxxx);
+    chk("read", r1, 48'h060504030201);
+    chk("read var", r2, 16'h0403);
+    chk("read concat", r3, 64'h0201_0605_0403_0000);
+    $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn part_select_of_middle_packed_dimension_selects_whole_elements() {
+    let got = lines(SRC);
+    let expected: Vec<String> = [
+        "assign",
+        "struct param",
+        "indexed up",
+        "indexed down",
+        "comb loop",
+        "comb var",
+        "nba var outer",
+        "nba var base",
+        "4-D inner",
+        "4-D middle",
+        "offset dim",
+        "unpacked elem",
+        "context",
+        "nba outer",
+        "read",
+        "read var",
+        "read concat",
+    ]
+    .iter()
+    .map(|n| format!("PASS {n}"))
+    .collect();
+    assert_eq!(got, expected);
+}

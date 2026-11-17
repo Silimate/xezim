@@ -91,6 +91,16 @@ pub(crate) fn install_interrupt_handler() {
     });
 }
 
+/// The exit status of a run that SIGINT or SIGTERM stopped: 128 plus the
+/// signal number (130, 143), the status a shell reports for a process that
+/// signal ended. The run still leaves through its normal exit and finalizes
+/// its dumps first, but a harness must not take a killed run for a passing
+/// one. `None` when no signal stopped the run.
+pub fn interrupted_exit_status() -> Option<i32> {
+    let sig = INTERRUPT_SIGNAL.load(Ordering::Relaxed);
+    (sig != 0).then_some(128 + sig)
+}
+
 /// Whether Ctrl-C / SIGTERM asked the run to stop. Stays true after the
 /// interrupt is acknowledged, so every loop the request reaches unwinds.
 #[inline(always)]

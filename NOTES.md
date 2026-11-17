@@ -98,6 +98,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   simulators with one flag: no time cap, `--relax-implicit-static`,
   `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
   or `-do` run time still sets the run length.
+* A run that SIGTERM or Ctrl-C (SIGINT) stops still closes its dumps through
+  the normal exit, and now exits 143 or 130 (128 + the signal number) instead
+  of 0, so a harness that judges a run by its exit status does not take a
+  killed run for a passing one. (Silimate/xezim#350)
 * `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
   `$finish` or no events remain, as with `-do "run -all"`. The default is
   unchanged: a design that never finishes still stops.

@@ -43,6 +43,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     let _leaves = ParamLeaves::install(elab);
     let global = global_classes(defs);
     let views = InstanceViews::build(elab);
+    let elaborated = elaborated_definitions(defs, elab);
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
@@ -66,6 +67,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     params: &m.params,
                     ports: &m.ports,
                     items: &m.items,
+                    elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
                     &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
@@ -87,8 +89,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, scope, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
-                check_instantiations(&m.items, &port_map, &mut errs);
-                check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                if unit.elaborated {
+                    check_instantiations(&m.items, &port_map, &mut errs);
+                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                }
             }
             SourceDefinition::Interface(m) => {
                 let unit = Unit {
@@ -96,6 +100,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     params: &m.params,
                     ports: &m.ports,
                     items: &m.items,
+                    elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
                     &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
@@ -116,8 +121,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
-                check_instantiations(&m.items, &port_map, &mut errs);
-                check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                if unit.elaborated {
+                    check_instantiations(&m.items, &port_map, &mut errs);
+                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                }
             }
             SourceDefinition::Program(m) => {
                 let unit = Unit {
@@ -125,6 +132,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     params: &m.params,
                     ports: &m.ports,
                     items: &m.items,
+                    elaborated: elaborated.as_ref().is_none_or(|e| e.contains(&m.name.name)),
                 };
                 check_unit(
                     &unit, defs, elab, &global, &pkg_decls, &pkg_names, &mut errs,
@@ -146,8 +154,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_program_items(&m.items, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
-                check_instantiations(&m.items, &port_map, &mut errs);
-                check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                if unit.elaborated {
+                    check_instantiations(&m.items, &port_map, &mut errs);
+                    check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
+                }
             }
             SourceDefinition::Package(p) => {
                 use xezim_core::ast::decl::PackageItem;
@@ -189,6 +199,9 @@ struct Unit<'a> {
     params: &'a [xezim_core::ast::decl::ParameterDeclaration],
     ports: &'a PortList,
     items: &'a [ModuleItem],
+    /// Some instance of the definition may be elaborated (see
+    /// `elaborated_definitions`); its instantiations are judged only then.
+    elaborated: bool,
 }
 
 /// The declaration and reference checks shared by modules, interfaces and
@@ -208,7 +221,9 @@ fn check_unit<'a>(
     check_pattern_counts(defs, u.items, elab, is_top, errs);
     check_foreach_dims(u.items, errs);
     check_select_depth(u.items, errs);
-    check_port_actuals(defs, u.items, errs);
+    if u.elaborated {
+        check_port_actuals(defs, u.items, errs);
+    }
     check_generate_block_names(u.items, errs);
     check_system_task_values(u.items, errs);
     check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
@@ -2618,6 +2633,74 @@ fn build_port_map(defs: &[&SourceDefinition]) -> HashMap<String, HashSet<String>
         }
     }
     m
+}
+
+/// The definitions some elaborated instance may come from: the root, the
+/// definition of every elaborated instance, and whatever an instantiation in
+/// one of those reaches in the source (in any generate branch, or bound in
+/// with `bind`), so the set errs on the side of checking. Port connections
+/// are checked at elaboration (§23.3.2, §23.3.3), so a definition outside the
+/// set — another top-level module that `-s` did not select — has none of its
+/// instantiations judged. None when the elaboration recorded no instances.
+fn elaborated_definitions(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+) -> Option<HashSet<String>> {
+    if elab.instances.is_empty() {
+        return None;
+    }
+    fn instantiated(items: &[ModuleItem], out: &mut Vec<String>) {
+        for it in items {
+            match it {
+                ModuleItem::ModuleInstantiation(mi) => out.push(mi.module_name.name.clone()),
+                ModuleItem::Bind(b) => out.push(b.instantiation.module_name.name.clone()),
+                ModuleItem::GenerateRegion(g) => instantiated(&g.items, out),
+                ModuleItem::GenerateIf(g) => {
+                    g.branches.iter().for_each(|(_, i)| instantiated(i, out))
+                }
+                ModuleItem::GenerateFor(g) => instantiated(&g.items, out),
+                ModuleItem::GenerateCase(g) => {
+                    g.arms.iter().for_each(|a| instantiated(&a.items, out))
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut kids: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut bound: Vec<String> = Vec::new();
+    for def in defs {
+        let (name, items) = match def {
+            SourceDefinition::Module(m) => (&m.name.name, &m.items),
+            SourceDefinition::Interface(m) => (&m.name.name, &m.items),
+            SourceDefinition::Program(m) => (&m.name.name, &m.items),
+            _ => continue,
+        };
+        let mut out = Vec::new();
+        instantiated(items, &mut out);
+        bound.extend(items.iter().filter_map(|it| match it {
+            ModuleItem::Bind(b) => Some(b.instantiation.module_name.name.clone()),
+            _ => None,
+        }));
+        kids.insert(name.as_str(), out);
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = std::iter::once(elab.name.clone())
+        .chain(elab.instances.iter().map(|i| i.def_name.clone()))
+        .chain(bound)
+        .chain(
+            elab.resolved_binds
+                .values()
+                .flatten()
+                .map(|b| b.instantiation.module_name.name.clone()),
+        )
+        .collect();
+    while let Some(n) = stack.pop() {
+        if let Some(k) = kids.get(n.as_str()) {
+            stack.extend(k.iter().filter(|k| !seen.contains(*k)).cloned());
+        }
+        seen.insert(n);
+    }
+    Some(seen)
 }
 
 /// §23.3.2: a `.name(...)` (or `.name` implicit) connection in an instantiation

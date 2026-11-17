@@ -1,15 +1,15 @@
 //! IEEE 1800-2023 §11.4.11 conditional operator with ambiguous (x/z) select,
-//! and §10.10.1 unpacked-array concatenation brace flattening.
+//! and §10.10.3 braces nested in an unpacked array concatenation.
 //!
 //! §11.4.11: when the `?:` condition is x/z, BOTH operands are evaluated and
 //! merged bit by bit (Table 11-21): a result bit keeps the operands' value
 //! only where both agree on 0 or 1; every other pairing (incl. z/z) gives x.
 //!
-//! §10.10.1: in an unpacked-array concatenation each item is read in the
-//! context of the ELEMENT type, so a nested plain-brace concat is itself an
-//! array value whose elements splice into the outer one — nested braces
-//! flatten: `a = {1, {2, 3}}` is `a = {1, 2, 3}`. A queue/array operand
-//! inside the concat likewise splices its elements (`q2 = {0, q, 9}`).
+//! §10.10.3: each item of an unpacked array concatenation has a
+//! self-determined type and the concatenation as a whole has none, so they
+//! do not nest: a braced item is a vector or string concatenation, ONE
+//! element (`q = {q, {pc, insn}}` appends one 64-bit element). A queue/array
+//! operand of the concatenation splices its elements (`q2 = {0, q, 9}`).
 
 use xezim::simulate;
 
@@ -71,26 +71,51 @@ endmodule
     );
 }
 
-/// §10.10.1: nested plain braces in an unpacked-array concatenation flatten.
-/// `{1, {2, 3}}` assigns `{1, 2, 3}` (and nesting flattens recursively).
-/// Assignment patterns `'{...}` keep their non-flattening semantics for
-/// arrays of arrays.
+/// §10.10.3: braces nested in an unpacked array concatenation are a vector
+/// or string concatenation, one element of its self-determined type, at any
+/// depth. The `q` case is the issue's reproducer (CHERIoT Ibex's `dii_if`),
+/// where the reference simulator appends one element per statement, and
+/// `SQ` is the §10.10.3 example. Array-of-arrays assignment patterns
+/// `'{...}` keep one sub-array per inner pattern.
+///
+/// This test used to assert the opposite, `a = {1, {2, 3}}` assigning
+/// `{1, 2, 3}`, citing §10.10.1. That clause's own example rules it out:
+/// `A9 = {A3, {4,5,6,7,8,9} }; // illegal, {...} is not self-determined
+/// here`. Braces around unsized literals are no legal vector concatenation
+/// (§11.4.12) and an unpacked array concatenation cannot be an item
+/// (§10.10.3), so that form has no meaning; with sized operands the braces
+/// form one element.
 #[test]
-fn nested_unpacked_concat_flattens() {
+fn nested_braces_are_one_element() {
     const SRC: &str = r#"
 module tb;
-  int a[3];
-  int d[3];
+  logic [15:0] h[3];
+  logic [15:0] d[3];
+  logic [63:0] q[$];
+  logic [31:0] pc, insn;
+  string S1, S2;
+  string SQ[$];
   int b[2][2];
-  bit pass_a, pass_d, pass_b;
+  bit pass_h, pass_d, pass_q, pass_s, pass_b;
   initial begin
-    a = {1, {2, 3}};
-    pass_a = (a[0] == 1) && (a[1] == 2) && (a[2] == 3);
-    // Nesting flattens recursively.
-    d = {4, {5, {6}}};
-    pass_d = (d[0] == 4) && (d[1] == 5) && (d[2] == 6);
+    h = {16'h1, {8'h23, 8'h45}, 16'h6};
+    pass_h = (h[0] == 16'h0001) && (h[1] == 16'h2345) && (h[2] == 16'h0006);
+    d = {16'h7, {8'h08, {4'h9, 4'ha}}, 16'hb};
+    pass_d = (d[0] == 16'h0007) && (d[1] == 16'h089a) && (d[2] == 16'h000b);
+    pc = 32'h8000_0080; insn = 32'h03d0_01db;
+    q = {q, {pc, insn}};
+    pc = 32'h8000_0084; insn = 32'h2002_05b7;
+    q = {q, {pc, insn}};
+    pass_q = (q.size() == 2) && (q[0] == 64'h80000080_03d001db)
+             && (q[1] == 64'h80000084_200205b7);
+    S1 = "S1";
+    S2 = "S2";
+    SQ = '{"element 0", "element 1"};
+    SQ = {S1, SQ, {"element 3 is ", S2}};
+    pass_s = (SQ.size() == 4) && (SQ[0] == "S1") && (SQ[1] == "element 0")
+             && (SQ[2] == "element 1") && (SQ[3] == "element 3 is S2");
     // Array-of-arrays uses assignment patterns '{...}: each inner pattern is
-    // one whole sub-array element — must NOT be flattened.
+    // one whole sub-array element.
     b = '{'{1, 2}, '{3, 4}};
     pass_b = (b[0][0] == 1) && (b[0][1] == 2) && (b[1][0] == 3) && (b[1][1] == 4);
   end
@@ -98,14 +123,24 @@ endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(
-        flag(&sim, "pass_a"),
+        flag(&sim, "pass_h"),
         1,
-        "a = {{1, {{2, 3}}}} must flatten to {{1, 2, 3}}"
+        "{{16'h1, {{8'h23, 8'h45}}, 16'h6}} is three elements"
     );
     assert_eq!(
         flag(&sim, "pass_d"),
         1,
-        "nested braces must flatten recursively"
+        "deeper braces are still one vector concatenation"
+    );
+    assert_eq!(
+        flag(&sim, "pass_q"),
+        1,
+        "q = {{q, {{pc, insn}}}} appends one 64-bit element"
+    );
+    assert_eq!(
+        flag(&sim, "pass_s"),
+        1,
+        "the inner braces of the §10.10.3 example are one string"
     );
     assert_eq!(
         flag(&sim, "pass_b"),
@@ -114,9 +149,11 @@ endmodule
     );
 }
 
-/// §10.10.1: a queue/array operand inside an unpacked concatenation splices
-/// its elements — `q2 = {0, q, 9}` — and still does so through flattening
-/// (`{0, {q, 9}}`).
+/// §10.10: a queue/array operand of an unpacked array concatenation splices
+/// its elements — `q2 = {0, q, 9}`. Braces around a queue operand
+/// (`{0, {q, 9}}`) are neither a vector concatenation (§11.4.12) nor a
+/// nested unpacked array concatenation (§10.10.3); xezim keeps splicing
+/// their operands, as before.
 #[test]
 fn queue_splice_in_concat_preserved() {
     const SRC: &str = r#"
@@ -130,7 +167,7 @@ module tb;
     q2 = {0, q, 9};
     pass_q2 = (q2.size() == 4) && (q2[0] == 0) && (q2[1] == 5)
               && (q2[2] == 6) && (q2[3] == 9);
-    // Splice still works for a queue operand inside a nested brace.
+    // Braces around a queue operand still splice it.
     q3 = {0, {q, 9}};
     pass_q3 = (q3.size() == 4) && (q3[0] == 0) && (q3[1] == 5)
               && (q3[2] == 6) && (q3[3] == 9);
@@ -146,6 +183,6 @@ endmodule
     assert_eq!(
         flag(&sim, "pass_q3"),
         1,
-        "queue splice must survive nested-brace flattening"
+        "braces around a queue operand still splice"
     );
 }

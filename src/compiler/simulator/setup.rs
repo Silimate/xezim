@@ -1733,7 +1733,9 @@ impl Simulator {
         if !ab.scope.is_empty() {
             *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
         }
+        Self::take_star_kept_own_write();
         let extracted = self.extract_sensitivity(&ab.stmt);
+        let star_reads_own_nba = Self::take_star_kept_own_write();
         // §14.13: a clocking event is delivered after sampling/NBA, rather
         // than as the raw clock edge returned by extract_sensitivity.
         fn leading_event(stmt: &Statement) -> Option<&EventControl> {
@@ -1812,10 +1814,18 @@ impl Simulator {
                 // (`always @(big[i])` on a large memory) has no dependency
                 // edge the comb path could wake on; such a block runs as a
                 // process below.
+                // §9.4.2.2: an `@*` block that reads a variable it writes
+                // with `<=` (`dot <= b; prod <= a * dot;`) has that variable
+                // in its sensitivity, and the NBA update wakes it again in
+                // the same time step. The comb path leaves every variable a
+                // block writes out of its dependencies, so it ran the block
+                // once and `prod` kept the old `dot`, a cycle late. The
+                // process below waits on the full inferred list.
                 if all_level
                     && !clocking_head
                     && !has_named_event
                     && !self_ref
+                    && !star_reads_own_nba
                     && !self.stmt_is_blocking(&body)
                     && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
                     && !sens.iter().any(|s| self.sens_unnamed_cell(s))

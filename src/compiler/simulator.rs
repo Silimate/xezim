@@ -1750,7 +1750,9 @@ struct CombEntryCold {
 // §10.9.1, §11.8.1, §7.2.1, §7.4.1, §11.4.14: typed pattern keys, operand signs, packed elements, stream widths.
 // §23.3.2, §7.4: elements of a multidimensional array member of an instance-array
 // element are read and written by the interpreter and depend on their own signals.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB038";
+// §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
+// process, not as a combinational entry.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB039";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

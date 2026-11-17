@@ -21,6 +21,14 @@ thread_local! {
     /// formal or local), in every spelling registered. Such a read that
     /// resolves to no signal is not an unresolved operand (§10.3.2, §13.4).
     static FRAME_LOCAL_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
+    /// While set, `collect_stmt_rw` leaves the targets of nonblocking
+    /// assignments out of the write set (`star_excluded_writes`).
+    static SKIP_NBA_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set when `collect_stmt_rw` meets a nonblocking assignment.
+    static NBA_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by `star_sens_from_body` when the `@*` sensitivity it inferred
+    /// keeps a variable the body itself writes (`take_star_kept_own_write`).
+    static STAR_KEPT_OWN_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The names a function body declares below its top-level statement list:
@@ -1724,7 +1732,13 @@ impl Simulator {
                 if let Some(r) = reads.as_deref_mut() {
                     Self::collect_expr_reads(rvalue, module, r)
                 };
-                Self::collect_lhs_writes_ex(lvalue, module, writes, arrays.as_deref_mut());
+                let nba = matches!(stmt.kind, StatementKind::NonblockingAssign { .. });
+                if nba {
+                    NBA_SEEN.with(|c| c.set(true));
+                }
+                if !(nba && SKIP_NBA_WRITES.with(|c| c.get())) {
+                    Self::collect_lhs_writes_ex(lvalue, module, writes, arrays.as_deref_mut());
+                }
                 // Also read the index expression of the LHS if it's an array/range select
                 if let Some(r) = reads.as_deref_mut() {
                     Self::collect_lhs_index_reads(lvalue, module, r)
@@ -2452,7 +2466,11 @@ impl Simulator {
         let mut writes: HashSet<String> = HashSet::default();
         // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
         SKIP_FN_BODY_READS.with(|c| c.set(true));
+        NBA_SEEN.with(|c| c.set(false));
         let whole = Self::collect_stmt_reads_whole(body, &self.module, &mut reads, &mut writes);
+        // Only the variables the body writes other than through nonblocking
+        // assignments leave the list below (`star_excluded_writes`).
+        let (writes, whole) = Self::star_excluded_writes(body, &self.module, &reads, writes, whole);
         SKIP_FN_BODY_READS.with(|c| c.set(false));
         // Registration usually runs with the hint unset (the process body
         // just executed); the executing instance's own scope is the correct
@@ -2543,6 +2561,59 @@ impl Simulator {
             }
         }
         out
+    }
+
+    /// §9.4.2.2: the writes that take a read of an `@*` body out of its
+    /// inferred sensitivity (`self_written_read`), given the body's reads,
+    /// writes and origins collected with function bodies skipped. `@*` adds
+    /// every variable the statement reads, including one it also writes: the
+    /// LRM's own example, `tmp1 = a & b; tmp2 = c & d; y = tmp1 | tmp2;`, is
+    /// `@(a or b or c or d or tmp1 or tmp2)`. A blocking write changes the
+    /// variable while the block runs, not while it waits at `@*`, so it never
+    /// wakes the block, and those variables are left out (which also keeps a
+    /// settle from re-running the block on its own writes). A NONBLOCKING
+    /// write is different: its update lands in the NBA region, after the
+    /// block is back at `@*`, and wakes it (§4.4). `dot <= b; prod <= a *
+    /// dot;` must run again on the new `dot`, so only the other writes count
+    /// here, and `take_star_kept_own_write` then reports that the list keeps
+    /// one of the block's own writes. (`always_comb` leaves out every
+    /// variable it writes, §9.2.2.2.1(b), and does not come here.)
+    fn star_excluded_writes(
+        body: &Statement,
+        module: &ElaboratedModule,
+        reads: &HashSet<String>,
+        writes: HashSet<String>,
+        whole: ImplicitReadOrigins,
+    ) -> (HashSet<String>, ImplicitReadOrigins) {
+        STAR_KEPT_OWN_WRITE.with(|c| c.set(false));
+        // Collect again only when the body has a nonblocking write and reads
+        // one of its own writes; otherwise the two sets are the same.
+        if !NBA_SEEN.with(|c| c.get())
+            || !reads
+                .iter()
+                .any(|r| Self::self_written_read(r, reads, &writes, &whole))
+        {
+            return (writes, whole);
+        }
+        let mut r2: HashSet<String> = HashSet::default();
+        let mut w2: HashSet<String> = HashSet::default();
+        SKIP_NBA_WRITES.with(|c| c.set(true));
+        let o2 = Self::collect_stmt_reads_whole(body, module, &mut r2, &mut w2);
+        SKIP_NBA_WRITES.with(|c| c.set(false));
+        let kept = reads.iter().any(|r| {
+            Self::self_written_read(r, reads, &writes, &whole)
+                && !Self::self_written_read(r, reads, &w2, &o2)
+        });
+        STAR_KEPT_OWN_WRITE.with(|c| c.set(kept));
+        (w2, o2)
+    }
+
+    /// Did the last `star_sens_from_body` keep a variable the body writes
+    /// (through nonblocking assignments only)? Clears the flag. The
+    /// comb-settle path cannot run such a block: it takes a block's
+    /// dependencies to be what it reads minus everything it writes.
+    pub(super) fn take_star_kept_own_write() -> bool {
+        STAR_KEPT_OWN_WRITE.with(|c| c.replace(false))
     }
 
     /// §15.5.3: does `head` name an EVENT for the purposes of

@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An instance that leaves an interface port unconnected (absent from a
+  named list, `.p()`, or an empty ordered slot) is an elaboration error
+  naming the port and the instance, as on Verilator and the reference
+  simulator (§25.3, §23.3.3). It used to elaborate, the port's members
+  reading x of their own, which hid a stale testbench.
+  `--relax-unconnected-interface-port` (or
+  `XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT=1`) keeps that behavior, with a
+  warning. (Silimate/xezim#340)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

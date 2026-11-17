@@ -759,3 +759,5 @@ mod review_struct_pattern_return;
 mod enum_receiver_types_1132;
 #[path = "types/signed_named_packed_props_ports_1107.rs"]
 mod signed_named_packed_props_ports_1107;
+#[path = "types/package_param_import_scope.rs"]
+mod package_param_import_scope;

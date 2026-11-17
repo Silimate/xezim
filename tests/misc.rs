@@ -659,3 +659,5 @@ mod urandom_seed_input_1058;
 mod oom_trace;
 #[path = "misc/scope_randomize_without_std.rs"]
 mod scope_randomize_without_std;
+#[path = "misc/relax_wildcard_import_conflict.rs"]
+mod relax_wildcard_import_conflict;

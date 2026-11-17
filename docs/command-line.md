@@ -22,6 +22,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--sv2017` | Parse with the IEEE 1800-2017 grammar instead of the default 1800-2023 |
 | `--no-strict` (`--lenient`) | Accept some LRM-illegal constructs that are errors by default, among them a hierarchical name that does not resolve (§23.8), which is then left unchecked |
 | `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
+| `--writemem-every-address` | `$writememh`/`$writememb` write `@<address> <word>` on every line, the layout xezim used to write. By default they write one word per line, with an `@<address>` line only before a word that `$readmem*` would not otherwise load at that address: the first word of a range that does not start at the memory's first address, and the word after a gap (an associative array's missing keys) |
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines`. Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. Repeatable. See the [user guide](user-guide.md#module-timescale-extension) |
 | `--dump-timescales` | Print every module's resolved timescale before the run (no source `$printtimescale` needed); modules with no `` `timescale `` are flagged |

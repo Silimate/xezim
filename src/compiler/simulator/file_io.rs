@@ -1395,8 +1395,8 @@ impl Simulator {
     }
 
     /// §21.5 `$writememb/h/d`: dump a memory array to a file in the specified
-    /// radix. Each line is `@<addr_hex> <value_in_radix>`, matching the
-    /// `$readmem*` format so the file is round-trippable.
+    /// radix, in the `$readmem*` format (see [`MemDump`]) so the file is
+    /// round-trippable.
     pub(super) fn write_memory_file(&mut self, args: &[Expression], tn: &str) -> Value {
         self.flush_file_writes();
         if args.len() < 2 {
@@ -1457,18 +1457,19 @@ impl Simulator {
             if start > end {
                 words.reverse();
             }
-            let mut out = String::new();
+            // A load with no start address begins at address 0.
+            let mut out = MemDump::new(0, if start > end { -1 } else { 1 }, radix);
             for (addr, val) in &words {
-                Self::push_memory_word(&mut out, *addr, val, radix);
+                out.word(*addr, val);
             }
-            let _ = std::fs::write(&path, out);
+            let _ = std::fs::write(&path, out.text);
             return Value::zero(32);
         }
         let step: i64 = if start <= end { 1 } else { -1 };
         let min_idx = lo.min(hi);
         let max_idx = lo.max(hi);
         let dense_array = self.array_first_id.get(mem_name.as_str()).copied();
-        let mut out = String::new();
+        let mut out = MemDump::new(lo, step, radix);
         let mut addr = start;
         while (step > 0 && addr <= end) || (step < 0 && addr >= end) {
             if addr >= min_idx && addr <= max_idx {
@@ -1485,24 +1486,12 @@ impl Simulator {
                 } else {
                     Value::zero(width)
                 };
-                Self::push_memory_word(&mut out, addr, &val, radix);
+                out.word(addr, &val);
             }
             addr += step;
         }
-        let _ = std::fs::write(&path, out);
+        let _ = std::fs::write(&path, out.text);
         Value::zero(32)
-    }
-
-    /// One `$writemem*` line, `@<addr_hex> <value_in_radix>`.
-    fn push_memory_word(out: &mut String, addr: i64, val: &Value, radix: u32) {
-        out.push_str(&format!("@{:x} ", addr));
-        let s = match radix {
-            2 => val.to_bin_string(),
-            16 => val.to_hex_string(),
-            _ => val.to_dec_string(),
-        };
-        out.push_str(&s);
-        out.push('\n');
     }
 
     pub(super) fn base_ident_name(expr: &Expression) -> Option<String> {
@@ -1705,22 +1694,15 @@ impl Simulator {
         } else {
             Box::new((end.max(lo)..=start.min(hi)).rev())
         };
-        let mut out = String::new();
+        let mut out = MemDump::new(lo, if start <= end { 1 } else { -1 }, radix);
         for addr in addrs {
             let val = match self.elem_cell(&mem.base, &mem.indices(addr)) {
                 Some(id) => self.cell_read(id),
                 None => Value::zero(mem.width),
             };
-            out.push_str(&format!("@{:x} ", addr));
-            let s = match radix {
-                2 => val.to_bin_string(),
-                16 => val.to_hex_string(),
-                _ => val.to_dec_string(),
-            };
-            out.push_str(&s);
-            out.push('\n');
+            out.word(addr, &val);
         }
-        let _ = std::fs::write(&path, out);
+        let _ = std::fs::write(&path, out.text);
         Value::zero(32)
     }
 }
@@ -1773,5 +1755,56 @@ impl NdMemory {
         let mut idx = self.prefix.clone();
         idx.extend(tail);
         idx
+    }
+}
+
+/// The text of a `$writemem*` file (§21.5): one word per line, in the
+/// radix of the task. An `@<address>` line comes before a word only where
+/// `$readmem*` would not load it there otherwise: before the first word
+/// unless it is at the address a load with no start address begins at, and
+/// after a gap in the addresses (an associative array's missing keys). So
+/// a dump of a whole array is data only, as Verilator writes it, and a dump
+/// of a range starts with one address line, which tools that compare dumps
+/// skip. §21.5.3 has address specifiers written for an associative array
+/// and left out for an unpacked one; the leading line of a range is kept so
+/// that `$readmem*` with no addresses loads the range back where it came
+/// from. With `--writemem-every-address` every word is written as
+/// `@<address> <word>`, the form xezim used to write.
+struct MemDump {
+    text: String,
+    /// The address the next word lands at without an `@` line.
+    next: i64,
+    /// +1 or -1: the direction from the start address to the finish one.
+    step: i64,
+    radix: u32,
+    every: bool,
+}
+
+impl MemDump {
+    /// A dump whose words run in direction `step`, read back by a load that
+    /// begins at address `first`.
+    fn new(first: i64, step: i64, radix: u32) -> Self {
+        MemDump {
+            text: String::new(),
+            next: first,
+            step,
+            radix,
+            every: writemem_every_address(),
+        }
+    }
+
+    fn word(&mut self, addr: i64, val: &Value) {
+        if self.every {
+            self.text.push_str(&format!("@{:x} ", addr));
+        } else if addr != self.next {
+            self.text.push_str(&format!("@{:x}\n", addr));
+        }
+        self.text.push_str(&match self.radix {
+            2 => val.to_bin_string(),
+            16 => val.to_hex_string(),
+            _ => val.to_dec_string(),
+        });
+        self.text.push('\n');
+        self.next = addr.wrapping_add(self.step);
     }
 }

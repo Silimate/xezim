@@ -45,6 +45,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§21.6, §38.17). The seed line the run prints (`[xezim] seed: <n>`, or
   `[xezim] random seed: <n> (replay with -sv_seed <n>)` for `random`) names
   the option the seed came from. (Silimate/xezim#2)
+* `$writememh` and `$writememb` write one word per line, with an
+  `@<address>` line only before a word that `$readmem*` would not otherwise
+  load at its address: the first word of a range that does not start at the
+  memory's first address, and the word after a gap, such as an associative
+  array's missing keys (§21.5). A whole memory is then data only, as
+  Verilator writes it. Every line was `@<address> <word>`, so tools that
+  compare a dump with a golden file failed: NVDLA's sanity3 checktest
+  failed with identical data. `--writemem-every-address` keeps the old
+  layout. (Silimate/xezim#335)
 * Code coverage leaves out what a constant condition rules out in an
   instance, as the reference simulator does: a `case` whose selector and
   items are constants, an `if` chain or `?:` on parameters, genvars or ports

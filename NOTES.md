@@ -84,6 +84,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Usability**
 
+* A name that two wildcard-imported packages both declare, which §26.3
+  makes invisible, is now reported with both packages and the scope that
+  imports them, including in a cast (`size_e'(x)`), where it used to be an
+  undeclared identifier. `--relax-wildcard-import-conflict` (or
+  `XEZIM_RELAX_WILDCARD_IMPORT_CONFLICT=1`) resolves it to the first of
+  those imports in source order, as simulators that accept the name do, with
+  a warning naming both packages. It is not part of `--compat`: the
+  reference simulator rejects the name.
 * FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
   `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
   machines (one- and two-process, enum, parameter and `` `define `` encodings,

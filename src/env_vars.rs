@@ -865,6 +865,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Elab: accept module data references before their declarations with a warning (§6.5; 1 enables)",
     ),
     (
+        "XEZIM_RELAX_WILDCARD_IMPORT_CONFLICT",
+        "Elab: resolve a name two wildcard-imported packages declare to the first import, with a warning (§26.3; 1 enables)",
+    ),
+    (
         "XEZIM_REPORT_STATS",
         "Print summary statistics at end of run",
     ),

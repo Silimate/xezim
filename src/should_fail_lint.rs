@@ -211,7 +211,7 @@ fn check_unit<'a>(
     check_port_actuals(defs, u.items, errs);
     check_generate_block_names(u.items, errs);
     check_system_task_values(u.items, errs);
-    check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
+    check_wildcard_import_conflicts(u, pkg_decls, errs);
     check_imported_hier_refs(defs, u.items, pkg_decls, errs);
     let classes = visible_classes(global, u.items);
     check_inherited_local_access(&classes, u.items, errs);
@@ -4627,28 +4627,29 @@ fn collect_stmt_exprs<'a>(st: &'a Statement, f: &mut dyn FnMut(&'a Expression)) 
 /// visible through either import; referencing it without a local declaration
 /// or an explicit import is an error.
 fn check_wildcard_import_conflicts(
-    ports: &PortList,
-    params: &[xezim_core::ast::decl::ParameterDeclaration],
-    items: &[ModuleItem],
+    u: &Unit,
     pkgs: &HashMap<String, HashSet<String>>,
     errs: &mut Vec<String>,
 ) {
+    let items = u.items;
     let (wild, explicit) = module_imports(items);
     if wild.len() < 2 {
         return;
     }
-    let own = module_own_names(ports, params, items);
-    let mut count: HashMap<&str, usize> = HashMap::new();
-    let mut uniq: Vec<&str> = wild.clone();
-    uniq.sort();
-    uniq.dedup();
-    for p in uniq {
-        for n in pkgs.get(p).into_iter().flatten() {
-            *count.entry(n.as_str()).or_default() += 1;
+    let own = module_own_names(u.ports, u.params, items);
+    // Each name's packages, in the order of the imports.
+    let mut providers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (i, p) in wild.iter().enumerate() {
+        if wild[..i].contains(p) {
+            continue;
+        }
+        for n in pkgs.get(*p).into_iter().flatten() {
+            providers.entry(n.as_str()).or_default().push(*p);
         }
     }
-    let ambiguous =
-        |n: &str| count.get(n).is_some_and(|&c| c > 1) && !own.contains(n) && !explicit.contains(n);
+    let ambiguous = |n: &str| {
+        providers.get(n).is_some_and(|ps| ps.len() > 1) && !own.contains(n) && !explicit.contains(n)
+    };
     let mut hits: Vec<String> = Vec::new();
     for it in items {
         if let ModuleItem::DataDeclaration(d) = it
@@ -4686,9 +4687,17 @@ fn check_wildcard_import_conflicts(
     hits.sort();
     hits.dedup();
     for n in hits {
+        let ps = &providers[n.as_str()];
+        let list: Vec<String> = ps.iter().map(|p| format!("'{p}'")).collect();
+        let (last, rest) = list.split_last().expect("two or more packages");
         errs.push(format!(
-            "'{n}' is declared by more than one wildcard-imported package, so it is not \
-             visible here (LRM 1800-2017 §26.3)"
+            "'{n}' is declared by more than one wildcard-imported package ({} and {last}, all \
+             imported into '{}'), so it is not visible here (IEEE 1800-2023 §26.3); import it \
+             explicitly or qualify it (`{}::{n}`), or pass --relax-wildcard-import-conflict to \
+             use the first import",
+            rest.join(", "),
+            u.name,
+            ps[0],
         ));
     }
 }

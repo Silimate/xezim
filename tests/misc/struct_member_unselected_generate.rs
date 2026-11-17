@@ -111,6 +111,40 @@ endmodule
     assert!(o.iter().any(|l| l == "O|5a"), "{o:?}");
 }
 
+/// A nested construct is decided for the instances that reach its
+/// enclosing branch only: `Mode = 0` reaches the outer branch but not the
+/// inner one, and `Mode = 1` selects the inner condition but never reaches
+/// it.
+#[test]
+fn member_in_a_nested_branch_no_reaching_instance_selects_is_not_checked() {
+    let child = r#"
+module m #(parameter int Mode = 0) (output logic [7:0] o);
+  import p::*;
+  s_t r;
+  assign r.a = 8'h5a;
+  if (Mode == 0) begin : gen_outer
+    if (Mode == 1) begin : gen_inner
+      assign o = r.missing;
+    end else begin : gen_inner_ok
+      assign o = r.a;
+    end
+  end else begin : gen_other
+    case (Mode)
+      0: begin : gen_never
+        assign o = r.also_missing;
+      end
+      default: begin : gen_case_ok
+        assign o = r.a;
+      end
+    endcase
+  end
+endmodule
+"#;
+    let o = lines(&design(child, &top(&[".Mode(0)", ".Mode(1)"])));
+    assert!(o.iter().any(|l| l == "O0|5a"), "{o:?}");
+    assert!(o.iter().any(|l| l == "O1|5a"), "{o:?}");
+}
+
 #[test]
 fn member_in_a_selected_branch_is_still_rejected() {
     let err = simulate(&design(IF_CHILD, &top(&[".Full(1'b1)"])), 10)

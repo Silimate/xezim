@@ -62,6 +62,8 @@ use xezim_core::ast::types::{
 };
 use xezim_core::elaborate::ElaboratedModule;
 
+use crate::should_fail_lint::GenerateSelection;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Ty {
     Unknown,
@@ -364,6 +366,13 @@ struct Ck<'a> {
     /// Inside a generate block, which may not be elaborated: counts that
     /// depend on a parameter are not judged there.
     gen_depth: u32,
+    /// The conditional generate branches the elaborated design selects
+    /// (§27.5); a branch no instance selects is not checked.
+    gen_sel: Option<&'a GenerateSelection<'a>>,
+    /// Stack depth of the definition's own scope: a name declared above it
+    /// is local to a generate block (or a genvar), which the elaborated
+    /// parameter tables do not key by its bare name.
+    body_depth: usize,
     errs: Vec<String>,
 }
 
@@ -385,6 +394,8 @@ impl<'a> Ck<'a> {
             seen: HashSet::default(),
             params_fixed: false,
             gen_depth: 0,
+            gen_sel: None,
+            body_depth: usize::MAX,
             errs: Vec::new(),
         }
     }
@@ -2864,19 +2875,63 @@ impl<'a> Ck<'a> {
                 ModuleItem::ClassDeclaration(c) => self.walk_class(c),
                 ModuleItem::GenerateRegion(g) => self.walk_block(&g.items, None),
                 ModuleItem::GenerateIf(g) => {
-                    for (_, items) in &g.branches {
-                        self.walk_block(items, None);
+                    let conds: Vec<Option<&Expression>> =
+                        g.branches.iter().map(|(c, _)| c.as_ref()).collect();
+                    let live = match self.gen_sel {
+                        Some(sel) if !conds.iter().flatten().any(|c| self.names_gen_local(c)) => {
+                            sel.if_branches(&self.owner, &conds)
+                        }
+                        _ => vec![true; conds.len()],
+                    };
+                    for ((_, items), live) in g.branches.iter().zip(live) {
+                        if live {
+                            self.walk_block(items, None);
+                        }
                     }
                 }
                 ModuleItem::GenerateFor(g) => self.walk_block(&g.items, Some(&g.var)),
                 ModuleItem::GenerateCase(g) => {
-                    for arm in &g.arms {
-                        self.walk_block(&arm.items, None);
+                    let arms: Vec<&[Expression]> =
+                        g.arms.iter().map(|a| a.values.as_slice()).collect();
+                    let live = match self.gen_sel {
+                        Some(sel)
+                            if !self.names_gen_local(&g.selector)
+                                && !arms
+                                    .iter()
+                                    .flat_map(|a| a.iter())
+                                    .any(|v| self.names_gen_local(v)) =>
+                        {
+                            sel.case_arms(&self.owner, &g.selector, &arms)
+                        }
+                        _ => vec![true; arms.len()],
+                    };
+                    for (arm, live) in g.arms.iter().zip(live) {
+                        if live {
+                            self.walk_block(&arm.items, None);
+                        }
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Whether `e` reads a name declared inside a generate block or a genvar,
+    /// whose value the elaborated tables do not hold under its bare name.
+    fn names_gen_local(&self, e: &Expression) -> bool {
+        let mut local = false;
+        visit_expr(e, &mut |x| {
+            if let ExprKind::Ident(h) = &x.kind
+                && let Some(seg) = h.path.first()
+            {
+                let n = seg.name.name.as_str();
+                local |= self.stack.iter().skip(self.body_depth).any(|l| {
+                    let s = l.get();
+                    s.vars.contains_key(n) || s.types.contains_key(n) || s.unsure.contains(n)
+                });
+            }
+        });
+        local
     }
 
     fn walk_block(&mut self, items: &[ModuleItem], genvar: Option<&str>) {
@@ -3253,6 +3308,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         |n: &String| !instantiated.contains(n) && (!reach_known || reached.contains(n));
 
     // Phase 3: walk every body.
+    let gen_sel = GenerateSelection::new(elab);
     let mut errs = Vec::new();
     let env = || Env {
         class_names: &class_names,
@@ -3278,6 +3334,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(&gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Interface(m) => {
@@ -3294,6 +3352,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(&gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Program(m) => {
@@ -3310,6 +3370,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(&gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Package(p) => {

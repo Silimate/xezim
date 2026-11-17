@@ -745,6 +745,113 @@ impl InstanceViews {
     }
 }
 
+/// §27.5: which branches of a definition's conditional generate constructs
+/// the elaborated design holds. Only the branch a construct's constant
+/// selects is elaborated, so a check of the definition's source must not
+/// judge a branch no instance selects: `if (Full) assign o = r.missing;`
+/// is legal while every instance has `Full = 0`.
+pub(crate) struct GenerateSelection<'a> {
+    elab: &'a ElaboratedModule,
+    views: InstanceViews,
+}
+
+impl<'a> GenerateSelection<'a> {
+    pub(crate) fn new(elab: &'a ElaboratedModule) -> Self {
+        GenerateSelection {
+            elab,
+            views: InstanceViews::build(elab),
+        }
+    }
+
+    /// The scope of the top, or of each elaborated instance of `def`; empty
+    /// when nothing elaborates `def`.
+    fn scopes(&self, def: &str) -> Vec<ConstScope<'_>> {
+        let top = ConstScope::of(self.elab, def);
+        if top.top {
+            return vec![top];
+        }
+        self.views
+            .of(def)
+            .iter()
+            .map(|v| ConstScope::instance(self.elab, v))
+            .collect()
+    }
+
+    /// The value of a condition in `scope`, when it is certain there.
+    fn known(scope: ConstScope, e: &Expression) -> Option<i64> {
+        if width_is_confident(e, scope) {
+            scope.value(e)
+        } else {
+            None
+        }
+    }
+
+    /// For each branch of a generate `if` of `def` (`None` is the final
+    /// `else`), whether some instance may elaborate it. Every branch may when
+    /// one instance's choice is not certain, or nothing elaborates `def`.
+    pub(crate) fn if_branches(&self, def: &str, conds: &[Option<&Expression>]) -> Vec<bool> {
+        let scopes = self.scopes(def);
+        let mut live = vec![scopes.is_empty(); conds.len()];
+        for scope in scopes {
+            let mut chosen = None;
+            for (i, c) in conds.iter().enumerate() {
+                match c.map(|c| Self::known(scope, c)) {
+                    None => {
+                        chosen = Some(i);
+                        break;
+                    }
+                    Some(Some(0)) => {}
+                    Some(Some(_)) => {
+                        chosen = Some(i);
+                        break;
+                    }
+                    Some(None) => return vec![true; conds.len()],
+                }
+            }
+            if let Some(i) = chosen {
+                live[i] = true;
+            }
+        }
+        live
+    }
+
+    /// For each arm of a generate `case` of `def` (an empty list of values
+    /// is the `default`), whether some instance may elaborate it, as for
+    /// [`Self::if_branches`].
+    pub(crate) fn case_arms(
+        &self,
+        def: &str,
+        selector: &Expression,
+        arms: &[&[Expression]],
+    ) -> Vec<bool> {
+        let scopes = self.scopes(def);
+        let mut live = vec![scopes.is_empty(); arms.len()];
+        for scope in scopes {
+            let Some(sel) = Self::known(scope, selector) else {
+                return vec![true; arms.len()];
+            };
+            let mut chosen = arms.iter().position(|vals| vals.is_empty());
+            for (i, vals) in arms.iter().enumerate() {
+                let mut hit = false;
+                for v in vals.iter() {
+                    match Self::known(scope, v) {
+                        Some(v) => hit |= v == sel,
+                        None => return vec![true; arms.len()],
+                    }
+                }
+                if hit {
+                    chosen = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = chosen {
+                live[i] = true;
+            }
+        }
+        live
+    }
+}
+
 /// A fold in a `ConstScope`.
 enum Folded {
     Value(i64),

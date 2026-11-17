@@ -111,6 +111,25 @@ fn the_switch_takes_the_first_wildcard_import() {
     }
 }
 
+/// An enum member is the same import's member in a constant (a localparam)
+/// as at run time.
+#[test]
+fn the_switch_resolves_constant_enum_members_alike() {
+    for (imports, want) in [
+        ("import a::*; import b::*;", "R|1 1"),
+        ("import b::*; import a::*;", "R|4 4"),
+    ] {
+        let src = format!(
+            "package a; typedef enum int {{ N = 1 }} ea; endpackage\n\
+             package b; typedef enum int {{ N = 4 }} eb; endpackage\n\
+             module top; {imports}\n  localparam int K = N;\n\
+             \x20 initial $display(\"R|%0d %0d\", K, N);\nendmodule\n"
+        );
+        let (ok, text) = run(&src, &["--relax-wildcard-import-conflict"], &[]);
+        assert!(ok && text.contains(want), "{imports} {want}:\n{text}");
+    }
+}
+
 /// An explicit import or a local declaration still decides the name, with
 /// no warning; the switch only picks among wildcard imports (§26.3).
 /// (A simulator that accepts the ambiguous sources takes the first wildcard

@@ -10,6 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* `$readmemh` and `$readmemb` load a multidimensional unpacked array, or a
+  partially indexed one (`ram[1]`), and `$writememh` and `$writememb` write
+  one (§21.4.3, §21.5). The words are in row-major order, the rightmost
+  dimension fastest and each dimension from its low index to its high one.
+  The start and finish addresses and the file's `@` entries count elements
+  in that order, as in Verilator, Icarus and the reference simulator. Both
+  reported that the array names no unpacked memory and did nothing, so
+  Caliptra's testbench loaded no firmware into its byte-wide
+  `caliptra_sram`. (Silimate/xezim#328)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

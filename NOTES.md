@@ -10,6 +10,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An enum label used in a port connection of an instance inside a module
+  (`.din(state == STREAM)`) is a declared constant, not a §6.10 implicit
+  net. A label from a package (`import pk::*`) or `$unit` read x in that
+  module, in the connection and elsewhere, once the module sat two or more
+  levels below the top: every use took the instance path. A label of the
+  module's own enum got an "implicit 1-bit net created" warning, under
+  `` `default_nettype none `` too (§6.19, §26.3). (Silimate/xezim#305)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

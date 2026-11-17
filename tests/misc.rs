@@ -301,6 +301,8 @@ mod svtb_suite;
 mod system_task_value;
 #[path = "misc/time0_x_defaults.rs"]
 mod time0_x_defaults;
+#[path = "misc/unelaborated_top_port_connections.rs"]
+mod unelaborated_top_port_connections;
 #[path = "misc/unnamed_block_end_label.rs"]
 mod unnamed_block_end_label;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]

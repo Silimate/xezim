@@ -10,6 +10,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An old-style subroutine port declaration of a user-defined type with
+  packed dimensions (`input s_t [N-1:0] in;`) declares the port `in` of
+  type `s_t [N-1:0]` (§13.4, A.2.2.1). The type name was taken as the port,
+  so strict mode reported the next body declaration as following a
+  statement (§9.3.1), and a second declarator or a second packed dimension
+  was a parse error.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

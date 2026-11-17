@@ -2171,6 +2171,16 @@ impl Simulator {
                 });
                 return None;
             }
+            // §9.4.2.2: an `@*` whose statement reads nothing never wakes, and
+            // a plain `always` waits at it first. The comb-settle path strips
+            // the event control, so a suspending body (`always @* #5 x = 1;`)
+            // ran every delta there instead of never.
+            if self.stmt_is_blocking(&body)
+                && leading_event(&ab.stmt)
+                    .is_some_and(|e| matches!(e, EventControl::Star | EventControl::ParenStar))
+            {
+                return None;
+            }
             return Some(AlwaysBlock {
                 kind: ab.kind,
                 stmt: body,

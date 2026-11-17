@@ -3037,7 +3037,7 @@ impl Simulator {
                             Some(c) => c,
                             None => {
                                 let sens = if is_star {
-                                    self.star_sens_from_body(tbody)
+                                    self.star_sens_from_body(tbody, true)
                                 } else {
                                     self.event_to_sens(event)
                                 };

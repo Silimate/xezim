@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A package parameter's default is evaluated in the package that declares
+  it, with the names that package imports (§26.3, §6.20).
+  `package z; import e::*; localparam B = DataSize / 64;` gave `z::B == 0`
+  whenever `z` was evaluated before `e`, which depended only on the package
+  names, and a module that imported `z` evaluated `B` in its own scope. Typedef
+  widths sized by such a parameter, such as CORE-ET's
+  `icache_err_log_info_t`, came out short. Packages are now evaluated after
+  the packages they import, so an import chain of any length resolves.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

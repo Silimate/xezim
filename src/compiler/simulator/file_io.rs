@@ -1420,7 +1420,11 @@ impl Simulator {
 
     /// [`nd_memory_target`] for the array `base_expr` names, indexed by
     /// `selects`.
-    fn nd_memory_from(&mut self, base_expr: &Expression, selects: &[&Expression]) -> Option<NdMemory> {
+    fn nd_memory_from(
+        &mut self,
+        base_expr: &Expression,
+        selects: &[&Expression],
+    ) -> Option<NdMemory> {
         // A name that is a one-dimensional memory in scope stays on that
         // path; only a name found in no scope falls back to a suffix match.
         let base = match self.resolve_memory_name(base_expr, true, false) {
@@ -1459,7 +1463,12 @@ impl Simulator {
     /// `$readmemb` / `$readmemh` / `$readmemd` into a multidimensional
     /// array: [`read_memory_file`] with one address per element, in the
     /// order [`NdMemory`] describes.
-    fn read_nd_memory_file(&mut self, args: &[Expression], default_radix: u32, mem: NdMemory) -> Value {
+    fn read_nd_memory_file(
+        &mut self,
+        args: &[Expression],
+        default_radix: u32,
+        mem: NdMemory,
+    ) -> Value {
         let task = match default_radix {
             2 => "$readmemb",
             10 => "$readmemd",

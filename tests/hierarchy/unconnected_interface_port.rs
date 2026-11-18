@@ -86,6 +86,45 @@ fn every_way_of_connecting_an_interface_port_still_elaborates() {
     }
 }
 
+/// §23.11, §23.3.2.4: an interface a `bind` adds to the target is a name
+/// there, so it fills the `.*` interface port of an instance bound with it.
+/// Without it the port is unconnected. Verilator agrees on both.
+#[test]
+fn a_bound_interface_fills_a_bound_wildcard_interface_port() {
+    let src = |with_bus: bool| {
+        format!(
+            r#"
+interface mem_if; logic rq = 1'b1; endinterface
+module gen (interface bus, output logic o);
+  assign o = bus.rq;
+endmodule
+module tgt;
+  logic o;
+  initial begin #1 $display("BOUND o=%0d", o); $finish; end
+endmodule
+module t;
+  tgt u ();
+endmodule
+{}bind tgt gen g (.*);
+"#,
+            if with_bus { "bind tgt mem_if bus ();\n" } else { "" }
+        )
+    };
+    let sim = simulate(&src(true), 10).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        sim.output.iter().any(|l| l.message.trim() == "BOUND o=1"),
+        "{:?}",
+        sim.output.iter().map(|l| &l.message).collect::<Vec<_>>()
+    );
+    let err = simulate(&src(false), 10)
+        .err()
+        .expect("elaborated with no interface named bus in the target");
+    assert!(
+        err.contains("interface port 'bus'") && err.contains("is not connected"),
+        "{err}"
+    );
+}
+
 /// The switch and its environment variable elaborate the instance with a
 /// warning; a strict run after a relaxed one does not reuse its design.
 #[test]

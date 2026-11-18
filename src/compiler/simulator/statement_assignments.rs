@@ -4450,6 +4450,24 @@ impl Simulator {
                     } else {
                         exprs.iter().collect()
                     };
+                    // §11.3.2: an operand whose indices have side effects
+                    // (`aa[i++].ql`) has them evaluated once, here, before
+                    // the lookups below would run them again.
+                    let frozen: Vec<Option<Expression>> = items
+                        .iter()
+                        .map(|e| {
+                            if Self::cond_expr_is_effect_free(e, false) {
+                                None
+                            } else {
+                                self.freeze_side_effect_indices(e)
+                            }
+                        })
+                        .collect();
+                    let items: Vec<&Expression> = items
+                        .iter()
+                        .zip(&frozen)
+                        .map(|(e, f)| f.as_ref().unwrap_or(*e))
+                        .collect();
                     // §10.10 / §7.8: in a queue (or array) of ASSOCIATIVE
                     // arrays, an associative operand (`q = {src}`) is one
                     // whole element: its entries are copied into it.

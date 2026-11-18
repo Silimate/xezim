@@ -124,3 +124,46 @@ endmodule
         "missing `{want}` in {got:#?}"
     );
 }
+
+/// §10.6.2, §6.11.2: a forced container keeps its forced value under a
+/// compiled member write, and a two-state container stores x/z as 0.
+#[test]
+fn forced_and_two_state_containers() {
+    let got: Vec<String> = xezim::simulate(
+        r#"
+// a forced container ignores compiled member writes; a two-state container
+// stores x/z as 0
+module fz;
+  typedef struct packed { logic [7:0] value; } dw_t;
+  typedef struct packed { dw_t [1:0] dw; } nest_t;
+  typedef struct packed { nest_t [1:0] e; } nest2_t;
+  typedef struct packed { bit [7:0] value; } bdw_t;
+  typedef struct packed { bdw_t [1:0] dw; } bnest_t;
+  typedef struct packed { bnest_t [1:0] e; } bnest2_t;
+  nest2_t s;
+  bnest2_t b;
+  logic [7:0] d = 8'h11;
+  logic [7:0] dx = 8'h0f;
+  always_comb s.e[1].dw[0].value = d;
+  always_comb b.e[1].dw[0].value = dx;
+  initial begin
+    force s = 32'haaaa_aaaa;
+    #1 d = 8'h55;
+    dx = 8'bxxxx_0101;
+    #1 $display("fz: s=%h b=%h", s, b);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed")
+    .output
+    .iter()
+    .map(|o| o.message.clone())
+    .collect();
+    let want = "fz: s=aaaaaaaa b=00050000";
+    assert!(
+        got.iter().any(|l| l == want),
+        "missing `{want}` in {got:#?}"
+    );
+}

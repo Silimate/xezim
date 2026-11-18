@@ -9591,6 +9591,19 @@ impl<'a> BytecodeCompiler<'a> {
     /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
     /// packed structure or union variable `var` holds, from its declared
     /// type. None when the declaration or the member cannot be resolved.
+    /// §6.11.2: is the packed-struct container `var` (a layout key) declared
+    /// with a two-state type? A store into it converts x/z to 0, which the
+    /// range stores do not do on their own. `None` when the declared type is
+    /// not known here, which keeps the store on the interpreter's path.
+    fn packed_container_two_state(&self, var: &str) -> Option<bool> {
+        let decls = self.var_decl_types?;
+        let types = self.typedef_types?;
+        let dt = decls.get(var)?;
+        Some(crate::compiler::elaborate::is_type_two_state_resolved(
+            dt, types,
+        ))
+    }
+
     fn packed_member_signed(&self, var: &str, member: &str) -> Option<bool> {
         use crate::ast::types::DataType as D;
         let decls = self.var_decl_types?;
@@ -19992,10 +20005,15 @@ impl<'a> BytecodeCompiler<'a> {
                     return true;
                 }
                 // `s.e[1].dw[0].value <= v`: one static range of `s`.
-                if let Some((base_id, _, _, off, mw)) = self.packed_const_member_path_target(lhs) {
+                if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
+                    && let Some(two_state) = self.packed_container_two_state(&key)
+                {
                     let resized = self.alloc_reg();
                     self.emit(Insn::Move(resized, val_reg));
                     self.emit(Insn::Resize(resized, mw));
+                    if two_state {
+                        self.emit(Insn::DropXz(resized));
+                    }
                     self.emit(Insn::NbaAssignRange(
                         as_sig_id(base_id),
                         off + mw - 1,
@@ -20746,10 +20764,15 @@ impl<'a> BytecodeCompiler<'a> {
                     return true;
                 }
                 // `s.e[1].dw[0].value = v`: one static range of `s`.
-                if let Some((base_id, _, _, off, mw)) = self.packed_const_member_path_target(lhs) {
+                if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
+                    && let Some(two_state) = self.packed_container_two_state(&key)
+                {
                     let resized = self.alloc_reg();
                     self.emit(Insn::Move(resized, val_reg));
                     self.emit(Insn::Resize(resized, mw));
+                    if two_state {
+                        self.emit(Insn::DropXz(resized));
+                    }
                     self.emit(Insn::BlockingAssignRange(
                         as_sig_id(base_id),
                         off + mw - 1,

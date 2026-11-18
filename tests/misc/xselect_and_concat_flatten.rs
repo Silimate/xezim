@@ -192,7 +192,9 @@ endmodule
 /// operand of an unpacked array concatenation is evaluated once (§10.10,
 /// §11.3.2): deciding whether braces hold a collection runs nothing, and the
 /// concatenation is not also evaluated as one value, so `m[i++]` advances
-/// `i` once and a function operand is called once.
+/// `i` once and a function operand is called once. A queue selected through
+/// an index with a side effect (`aa[i++].ql`) still contributes all of its
+/// elements, with the index evaluated once.
 #[test]
 fn nested_braces_in_selected_queue_and_side_effects() {
     const SRC: &str = r#"
@@ -204,7 +206,12 @@ module tb;
   logic [15:0] q16[$];
   byte qb[$];
   int qi[$];
-  bit pass_rows, pass_once, pass_plain, pass_call;
+  bit pass_rows, pass_once, pass_plain, pass_call, pass_sel;
+  class R;
+    int ql[$];
+  endclass
+  R aa[int];
+  int qc[$];
   function int next_value();
     calls++;
     return calls;
@@ -226,6 +233,11 @@ module tb;
     qi = {qi, next_value()};
     qi = {qi, next_value()};
     pass_call = (calls == 2) && (qi.size() == 2) && (qi[0] == 1) && (qi[1] == 2);
+    aa[5] = new;
+    aa[5].ql = {7, 8};
+    i = 5;
+    qc = {aa[i++].ql};
+    pass_sel = (i == 6) && (qc.size() == 2) && (qc[0] == 7) && (qc[1] == 8);
   end
 endmodule
 "#;
@@ -249,5 +261,10 @@ endmodule
         flag(&sim, "pass_call"),
         1,
         "a function operand is called once per assignment"
+    );
+    assert_eq!(
+        flag(&sim, "pass_sel"),
+        1,
+        "{{aa[i++].ql}} copies the selected queue and advances i once"
     );
 }

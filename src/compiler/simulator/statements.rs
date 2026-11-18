@@ -155,6 +155,19 @@ impl Simulator {
             ExprKind::Paren(expr) => {
                 **expr = self.freeze_side_effect_indices(expr)?;
             }
+            // A slice's receiver is frozen like any other (`get_obj().q[0:1]`);
+            // its bounds, which `$` may name, are left to the slice's reader,
+            // so a bound with a side effect of its own is not frozen.
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                if !Self::cond_expr_is_effect_free(left, false)
+                    || !Self::cond_expr_is_effect_free(right, false)
+                {
+                    return None;
+                }
+                **expr = self.freeze_side_effect_indices(expr)?;
+            }
             ExprKind::Ident(h) => {
                 for seg in h.path.iter_mut() {
                     for sel in seg.selects.iter_mut() {

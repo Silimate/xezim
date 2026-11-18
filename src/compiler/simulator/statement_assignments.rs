@@ -4349,10 +4349,17 @@ impl Simulator {
                 {
                     let (l_lo, l_hi, _) = self.module.arrays[&*lname];
                     let is_dyn = self.module.dynamic_arrays.contains(&*lname);
+                    // §7.6: the first element goes to the target's left
+                    // bound, its high index when it is declared descending.
+                    let descending = self.module.descending_arrays.contains(&*lname);
                     for (i, v) in results.iter().enumerate() {
-                        let idx = l_lo + i as i64;
+                        let idx = if descending {
+                            l_hi - i as i64
+                        } else {
+                            l_lo + i as i64
+                        };
                         // A dynamic target grows to fit; a fixed one clips.
-                        if !is_dyn && idx > l_hi {
+                        if !is_dyn && (idx < l_lo || idx > l_hi) {
                             break;
                         }
                         self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v.clone());
@@ -4411,13 +4418,18 @@ impl Simulator {
                             };
                             let (l_lo, l_hi, _) = self.module.arrays[&*lname];
                             let is_dyn = self.module.dynamic_arrays.contains(&*lname);
+                            let descending = self.module.descending_arrays.contains(&*lname);
                             for (i, v) in results.iter().enumerate() {
-                                let idx = l_lo + i as i64;
+                                let idx = if descending {
+                                    l_hi - i as i64
+                                } else {
+                                    l_lo + i as i64
+                                };
                                 // Dynamic arrays / queues start
                                 // with `l_hi = -1` (empty). Skip
                                 // the bound check there — the
                                 // assignment is what GROWS them.
-                                if !is_dyn && idx > l_hi {
+                                if !is_dyn && (idx < l_lo || idx > l_hi) {
                                     break;
                                 }
                                 self.set_signal_value_by_name(

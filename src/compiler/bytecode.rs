@@ -2330,6 +2330,11 @@ struct SlotRun {
     count: u64,
 }
 
+/// The longest `SlotRun` whose elements are stored one at a time when it
+/// leaves its dimension. Each takes a few registers and instructions, so a
+/// longer run is stored as one range with run-time ends instead.
+const MAX_SLOT_RUN: u64 = 16;
+
 impl<'a> BytecodeCompiler<'a> {
     pub fn new(
         signal_name_to_id: &'a NameMap,
@@ -19551,8 +19556,11 @@ impl<'a> BytecodeCompiler<'a> {
     ///
     /// When the whole run is inside the dimension, one store of fixed width
     /// does it, as before. Otherwise each slot is stored on its own, if it is
-    /// inside. Every store has a constant width, which the two-state executor
-    /// needs. An x/z base fails both checks and writes nothing.
+    /// inside; every store then has a constant width, which the two-state
+    /// executor needs. A run longer than `MAX_SLOT_RUN` instead stores the
+    /// part inside as one range whose ends are clipped at run time, which
+    /// keeps its registers and instructions fixed. An x/z base fails every
+    /// check and writes nothing.
     fn emit_slot_run_store(&mut self, sig: SigId, run: SlotRun, val_reg: RegId, nba: bool) {
         let store = |c: &mut Self, lo: RegId, w: u32, v: RegId| {
             let hi = if w == 1 {
@@ -19609,6 +19617,55 @@ impl<'a> BytecodeCompiler<'a> {
         self.emit(Insn::Jump(0));
         let slots_pc = self.insns.len() as u32;
         self.insns[to_slots] = Insn::BranchIfFalse(inside, slots_pc);
+        if run.n > MAX_SLOT_RUN {
+            let any = self.alloc_reg();
+            self.emit(Insn::LogOr(any, first_in, last_in));
+            let skip = self.insns.len();
+            self.emit(Insn::BranchIfFalse(any, 0));
+            let pick = |c: &mut Self, cond: RegId, t: RegId, e: RegId| {
+                let out = c.alloc_reg();
+                c.emit(Insn::Select(out, cond, t, e));
+                out
+            };
+            // An end outside the dimension moves in to that end of it.
+            let lo_full = slot_bit(self, run.first);
+            let lo = pick(self, first_in, lo_full, run.base);
+            let hi_rel = self.emit_slot_bit(last, run.ew, run.ew - 1);
+            let hi_full = self.alloc_reg();
+            self.emit(Insn::Add(hi_full, run.base, hi_rel));
+            let top = self.alloc_reg();
+            self.emit(Insn::BinOpConst(
+                top,
+                run.base,
+                Box::new(Value::from_u64(run.count * u64::from(run.ew) - 1, 32)),
+                BinOpConstKind::Add,
+            ));
+            let hi = pick(self, last_in, hi_full, top);
+            // A run starting below slot 0 loses its low `n - 1 - last`
+            // elements: shift their bits out of the value.
+            let n_last = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                n_last,
+                Box::new(Value::from_u64(run.n - 1, 32)),
+            ));
+            let below = self.alloc_reg();
+            self.emit(Insn::Sub(below, n_last, last));
+            let below_bits = self.emit_slot_bit(below, run.ew, 0);
+            let zero = self.alloc_reg();
+            self.emit(Insn::LoadConst(zero, Box::new(Value::from_u64(0, 32))));
+            let shift = pick(self, first_in, zero, below_bits);
+            let shifted = self.alloc_reg();
+            self.emit(Insn::Shr(shifted, value, shift));
+            self.emit(if nba {
+                Insn::NbaAssignRangeDyn(sig, hi, lo, shifted)
+            } else {
+                Insn::BlockingAssignRangeDyn(sig, hi, lo, shifted)
+            });
+            let end = self.insns.len() as u32;
+            self.insns[skip] = Insn::BranchIfFalse(any, end);
+            self.insns[to_end] = Insn::Jump(end);
+            return;
+        }
         for k in 0..run.n {
             let slot = if k == 0 {
                 run.first

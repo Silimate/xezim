@@ -19,7 +19,7 @@
 //! range in the root signal, which is clipped to the root only, so
 //! `a[0][k +: 2]` with `k = 5` wrote its second byte into `a[1][0]`. The
 //! reference simulator matches every line. So does Verilator, except for the
-//! three writes past an end, which it lets spill into the neighbouring
+//! four writes past an end, which it lets spill into the neighbouring
 //! element as xezim did.
 
 fn lines(src: &str) -> Vec<String> {
@@ -107,6 +107,13 @@ module tb;
   end
   logic [15:0] r4;
   always_comb r4 = a1[0][k +: 2];
+  // A run too long to store element by element.
+  logic [1:0][10000:0][7:0] big;
+  logic [13:0] kb = 14'd9998;
+  always_comb begin
+    big = '0;
+    big[0][kb +: 10000] = {10000{8'h5a}};
+  end
   // Reads.
   logic [47:0] r1;
   logic [15:0] r2;
@@ -146,6 +153,7 @@ module tb;
     chk("below low end", o2, {48'h0, 48'h0, 48'h0000000000cc, 48'h0});
     chk("nba past end", o5, {48'h0, 48'h0, 48'h760000000000, 48'h0});
     chk("read past end", r4, 16'hxx06);
+    chk("long run past end", {big[1][1:0], big[0][10000:9997]}, 48'h00005a5a5a00);
     $finish;
   end
 endmodule
@@ -176,6 +184,7 @@ fn part_select_of_middle_packed_dimension_selects_whole_elements() {
         "below low end",
         "nba past end",
         "read past end",
+        "long run past end",
     ]
     .iter()
     .map(|n| format!("PASS {n}"))

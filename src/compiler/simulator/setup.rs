@@ -1819,8 +1819,8 @@ impl Simulator {
                 // in its sensitivity, and the NBA update wakes it again in
                 // the same time step. The comb path leaves every variable a
                 // block writes out of its dependencies, so it ran the block
-                // once and `prod` kept the old `dot`, a cycle late. The
-                // process below waits on the full inferred list.
+                // once and `prod` kept the old `dot`, a cycle late. Such a
+                // block runs as a waiting process below instead.
                 if all_level
                     && !clocking_head
                     && !has_named_event
@@ -1947,7 +1947,15 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
-                if clocking_head || self.event_needs_value_waiter(&sens, &ab.scope) {
+                // `star_reads_own_nba`: a process arms `@*` only after the
+                // body has run, so the body's own blocking writes (`x[7:4] =
+                // x[7:4] + 1` beside `x[3:0] <= b`) cannot wake it, while the
+                // NBA update does. An edge block re-detects writes made while
+                // it runs and would wake itself on them again and again.
+                if clocking_head
+                    || star_reads_own_nba
+                    || self.event_needs_value_waiter(&sens, &ab.scope)
+                {
                     if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
                         return None;
                     }

@@ -89,3 +89,42 @@ endmodule
         .collect();
     assert_eq!(lines, ["ws=-27 lt=1 wu=8165 lt=0"], "{lines:#?}");
 }
+
+/// An element of an unpacked array and a struct member reach the port with
+/// the port's signedness too: an unsigned port connected to a signed one
+/// reads 8165, and a signed port connected to an unsigned one reads -27.
+#[test]
+fn element_and_member_actuals_read_with_the_port_signedness() {
+    let src = r#"
+module ks (input logic signed [12:0] e_i);
+  initial #1 $display("%m e_i=%0d lt=%b", e_i, e_i < 0);
+endmodule
+module ku (input logic [12:0] e_i);
+  initial #1 $display("%m e_i=%0d lt=%b gt=%b", e_i, e_i < 0, e_i > 13'd100);
+endmodule
+module top;
+  typedef struct packed { logic signed [12:0] f; logic [2:0] g; } st_t;
+  logic signed [12:0] sa [2] = '{-13'sd27, -13'sd27};
+  logic [12:0] ua [2] = '{13'h1fe5, 13'h1fe5};
+  st_t st = '{f: -13'sd27, g: 3'd0};
+  ku u_elem (.e_i(sa[0]));
+  ku u_member (.e_i(st.f));
+  ks s_elem (.e_i(ua[1]));
+endmodule
+"#;
+    let sim = xezim::simulate(src, 100).expect("simulate");
+    let lines: Vec<String> = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim().to_string())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "top.u_elem e_i=8165 lt=0 gt=1",
+            "top.u_member e_i=8165 lt=0 gt=1",
+            "top.s_elem e_i=-27 lt=1",
+        ],
+        "{lines:#?}"
+    );
+}

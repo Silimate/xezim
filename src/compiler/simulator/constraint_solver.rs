@@ -1191,22 +1191,50 @@ impl Simulator {
                         continue;
                     };
                     let is_randc = matches!(rq, crate::ast::types::RandQualifier::Randc);
-                    let w = resolve_type_width(
-                        &m.data_type,
-                        Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
-                    )
-                    .max(1);
+                    let w = self
+                        .declared_packed_type(&m.data_type)
+                        .map(|(_, _, w)| w)
+                        .unwrap_or_else(|| {
+                            resolve_type_width(
+                                &m.data_type,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            )
+                        })
+                        .max(1);
                     let et = self.struct_member_enum_key(&m.data_type);
                     let signed = super::elaborate::is_type_signed_resolved(
                         &m.data_type,
                         &self.module.typedef_types,
                     );
                     for d in &m.declarators {
+                        // §18.4: a class handle is never drawn as a value;
+                        // drawing one overwrote the object reference.
+                        if let DataType::TypeReference { name, .. } = &m.data_type
+                            && self.module.classes.contains_key(&name.name.name)
+                        {
+                            continue;
+                        }
                         if signed {
                             unpacked_agg_signed.insert(format!("{}.{}", prop, d.name.name));
                         }
-                        members.push((d.name.name.clone(), w, is_randc, et.clone()));
+                        // §18.4: a fixed unpacked member contributes each
+                        // element's cell; the aggregate itself has no value.
+                        let indices = self.member_elem_indices(&d.dimensions);
+                        if let Some(indices) = indices {
+                            for tuple in indices {
+                                let mut name = d.name.name.clone();
+                                for i in tuple {
+                                    name.push_str(&format!("[{i}]"));
+                                }
+                                if signed {
+                                    unpacked_agg_signed.insert(format!("{prop}.{name}"));
+                                }
+                                members.push((name, w, is_randc, et.clone()));
+                            }
+                        } else {
+                            members.push((d.name.name.clone(), w, is_randc, et.clone()));
+                        }
                     }
                 }
                 unpacked_agg_props.push((prop.clone(), members));
@@ -1240,6 +1268,24 @@ impl Simulator {
         // `class_context_stack`; without pushing it the call fell through to the
         // "unknown name" path and silently yielded 0.
         self.class_context_stack.push(Some(class_name.clone()));
+        // §18.5.8.1: a `foreach` over an array of fixed declared shape that
+        // the solvers do not model as written (`g.item` of a packed-struct
+        // property, a row of a 2-D array, an omitted loop variable) iterates
+        // a known index set whatever the array's random values: unroll it
+        // here, before either solver extracts its constraints.
+        for con in &mut constraints {
+            self.expand_fixed_foreach_items(&mut con.items, false);
+        }
+        let expanded_inline: Option<Vec<ConstraintItem>> = inline
+            .iter()
+            .any(|it| self.expand_fixed_foreach(it, false).is_some())
+            .then(|| {
+                let mut items = inline.to_vec();
+                self.expand_fixed_foreach_items(&mut items, false);
+                items
+            });
+        let inline: &[ConstraintItem] = expanded_inline.as_deref().unwrap_or(inline);
+
         let mut has_post = self.class_has_method(&class_name, "post_randomize");
         let deferred_entry_len = self.rand_post_deferred.len();
         // §18.6.2: every randomized child waits for the enclosing solve.

@@ -1615,7 +1615,7 @@ impl Simulator {
                 return false;
             }
             let Some(names) = Self::member_chain(e) else {
-                return false;
+                return Self::rebase_selected_chain(e, t, hit);
             };
             let skip = usize::from(
                 t.recv
@@ -1672,6 +1672,48 @@ impl Simulator {
                 Self::rebase_expr(expr, t, hit)
                     && args.iter_mut().all(|a| Self::rebase_expr(a, t, hit))
             }
+            _ => false,
+        }
+    }
+
+    /// §18.5.9: `prop.g.item[1].key` — a path below `prop` that selects an
+    /// element on the way (an unrolled `foreach` over a member array of the
+    /// sub-object) — rebased like a plain chain, keeping its selects. Only
+    /// constant selects qualify: an index naming a variable of this object
+    /// could not be read in the sub-object's solve.
+    fn rebase_selected_chain(e: &mut Expression, t: &Rebase<'_>, hit: &mut bool) -> bool {
+        fn constant(x: &Expression) -> bool {
+            match &x.kind {
+                ExprKind::Number(_) => true,
+                ExprKind::Paren(i) | ExprKind::Unary { operand: i, .. } => constant(i),
+                ExprKind::Binary { left, right, .. } => constant(left) && constant(right),
+                _ => false,
+            }
+        }
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                let skip = usize::from(t.recv.is_some_and(|r| {
+                    h.path.len() >= 3 && h.path[0].name.name == r && h.path[1].name.name == t.prop
+                }));
+                if h.root.is_some()
+                    || h.path.len() < skip + 2
+                    || h.path[skip].name.name != t.prop
+                    || h.path[..=skip].iter().any(|s| !s.selects.is_empty())
+                    || !h.path[skip + 1..]
+                        .iter()
+                        .all(|s| s.selects.iter().all(constant))
+                {
+                    return false;
+                }
+                h.path.drain(..=skip);
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
+                *hit = true;
+                true
+            }
+            // `prop.g.item[1].key` parsed as a member access over an index:
+            // the index operand is rebased (a constant stays as it is).
+            ExprKind::MemberAccess { expr, .. } => Self::rebase_expr(expr, t, hit),
             _ => false,
         }
     }
@@ -1844,6 +1886,181 @@ impl Simulator {
         }
         // §11.4.7: an x/z condition is not true.
         Some(self.eval_expr(e).is_true())
+    }
+
+    /// §7.4.1/§18.5.8.1: the declared dimensions (unpacked, then packed) of
+    /// a `foreach` array operand, known before the solve even when its
+    /// values are random — including a row selected by an enclosing loop
+    /// (`grid[0]`) and a member reached through a struct or a sub-object
+    /// (`g.item`, `a.g.item`). None for a queue, dynamic or associative array.
+    fn fixed_constraint_foreach_dims(&self, array: &Expression) -> Option<Vec<(i64, i64)>> {
+        if let ExprKind::Ident(h) = &array.kind
+            && let Some(last) = h.path.last()
+            && !last.selects.is_empty()
+        {
+            let count = last.selects.len();
+            let mut h = h.clone();
+            h.path.last_mut()?.selects.clear();
+            let base = Expression::new(ExprKind::Ident(h), array.span);
+            let dims = self.fixed_constraint_foreach_dims(&base)?;
+            return Some(dims.get(count..)?.to_vec());
+        }
+        if let ExprKind::Index { expr, .. } = &array.kind {
+            let mut dims = self.fixed_constraint_foreach_dims(expr)?;
+            if dims.is_empty() {
+                return None;
+            }
+            dims.remove(0);
+            return Some(dims);
+        }
+        let shape = self.query_operand_decl_dims(array)?;
+        Some(shape.dims)
+    }
+
+    /// The iterations of `foreach (array[vars]) body` over the fixed shape of
+    /// `array` (see `fixed_constraint_foreach_dims`), each loop variable
+    /// replaced by its index; an omitted variable (`grid[, j]`) iterates
+    /// nothing of its own (§12.7.3).
+    fn unroll_fixed_foreach(
+        &self,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        body: &ConstraintItem,
+    ) -> Option<Vec<ConstraintItem>> {
+        let dims = self.fixed_constraint_foreach_dims(array)?;
+        let dims: Vec<(i64, i64)> = dims
+            .get(..vars.len())?
+            .iter()
+            .zip(vars)
+            .map(|(&(l, r), v)| {
+                if v.is_some() {
+                    (l.min(r), l.max(r))
+                } else {
+                    (0, 0)
+                }
+            })
+            .collect();
+        Self::unroll_foreach_dims(&dims, vars, body)
+    }
+
+    /// Whether the solvers already model `foreach (array[vars])` as written:
+    /// a plain class property (`a`, `this.a`) with one loop variable per
+    /// unpacked dimension, or a packed property iterated by its packed
+    /// dimensions.
+    fn foreach_shape_modeled(
+        &self,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+    ) -> bool {
+        let plain = match &array.kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && (h.path.len() == 1 || (h.path.len() == 2 && h.path[0].name.name == "this"))
+            }
+            ExprKind::MemberAccess { expr, .. } => matches!(expr.kind, ExprKind::This),
+            _ => false,
+        };
+        plain
+            && self.query_operand_decl_dims(array).is_some_and(|shape| {
+                shape.unpacked == 0
+                    || (shape.unpacked == vars.len() && vars.iter().all(Option::is_some))
+            })
+    }
+
+    /// §18.5.8.1: unroll every `foreach` of `item` whose array has a fixed
+    /// shape the solvers do not model as written — an array reached through
+    /// a struct member or a sub-object (`g.item`, `a.g.item`), a row of a
+    /// multi-dimensional array, fewer loop variables than unpacked
+    /// dimensions, an omitted variable — so its body is solved like any
+    /// other constraint instead of being dropped. `all` unrolls every
+    /// fixed-shape loop (for the `randomize(null)` check, which models no
+    /// `foreach`). None when nothing changed.
+    pub(super) fn expand_fixed_foreach(
+        &self,
+        item: &ConstraintItem,
+        all: bool,
+    ) -> Option<ConstraintItem> {
+        let recurse = |x: &ConstraintItem| self.expand_fixed_foreach(x, all);
+        match item {
+            ConstraintItem::Foreach {
+                array,
+                vars,
+                item: body,
+                span,
+            } => {
+                if all || !self.foreach_shape_modeled(array, vars) {
+                    if let Some(items) = self.unroll_fixed_foreach(array, vars, body) {
+                        return Some(ConstraintItem::Block(
+                            items
+                                .into_iter()
+                                .map(|x| recurse(&x).unwrap_or(x))
+                                .collect(),
+                        ));
+                    }
+                }
+                Some(ConstraintItem::Foreach {
+                    array: array.clone(),
+                    vars: vars.clone(),
+                    item: Box::new(recurse(body)?),
+                    span: *span,
+                })
+            }
+            ConstraintItem::Block(items) => {
+                let new: Vec<Option<ConstraintItem>> = items.iter().map(recurse).collect();
+                if new.iter().all(Option::is_none) {
+                    return None;
+                }
+                Some(ConstraintItem::Block(
+                    new.into_iter()
+                        .zip(items)
+                        .map(|(n, o)| n.unwrap_or_else(|| o.clone()))
+                        .collect(),
+                ))
+            }
+            ConstraintItem::Soft(body) => Some(ConstraintItem::Soft(Box::new(recurse(body)?))),
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                span,
+            } => {
+                let then_new = recurse(then_item);
+                let else_new = else_item.as_ref().map(|e| recurse(e));
+                if then_new.is_none() && else_new.as_ref().is_none_or(Option::is_none) {
+                    return None;
+                }
+                Some(ConstraintItem::IfElse {
+                    condition: condition.clone(),
+                    then_item: Box::new(then_new.unwrap_or_else(|| (**then_item).clone())),
+                    else_item: else_item
+                        .as_ref()
+                        .map(|e| Box::new(else_new.flatten().unwrap_or_else(|| (**e).clone()))),
+                    span: *span,
+                })
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                span,
+            } => Some(ConstraintItem::Implication {
+                condition: condition.clone(),
+                constraint: Box::new(recurse(constraint)?),
+                span: *span,
+            }),
+            _ => None,
+        }
+    }
+
+    /// `expand_fixed_foreach` over a list of items, rewriting in place (the
+    /// list's buffer is kept, so a scope keyed on it stays valid). Cheap when
+    /// no item holds a `foreach`.
+    pub(super) fn expand_fixed_foreach_items(&self, items: &mut [ConstraintItem], all: bool) {
+        for it in items {
+            if let Some(n) = self.expand_fixed_foreach(it, all) {
+                *it = n;
+            }
+        }
     }
 
     /// The iterations of `foreach (array[vars]) item` with every loop
@@ -2278,8 +2495,11 @@ impl Simulator {
                 // §18.5.8.1: a `foreach` over a STATE container iterates a
                 // known index set — unroll it, so each iteration's guards
                 // (`if (mask[i])`) are decided like any other state guard.
-                if let Some(unrolled) =
-                    self.unroll_state_foreach(array, vars, item, rand_roots, bound)
+                // So does one over a random array of fixed declared shape
+                // (`s.item` of a struct variable).
+                if let Some(unrolled) = self
+                    .unroll_state_foreach(array, vars, item, rand_roots, bound)
+                    .or_else(|| self.unroll_fixed_foreach(array, vars, item))
                 {
                     let body: Vec<ConstraintItem> = unrolled
                         .iter()

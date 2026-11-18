@@ -1223,6 +1223,53 @@ impl Insn {
                 | NbaAssignArrayRead(..)
         )
     }
+
+    /// Whether this instruction transfers control to a block-relative
+    /// instruction index: the plain and fused branch forms and the jump
+    /// tables. A pass that appends one block's instructions after another's
+    /// must relocate every such target or keep the block out.
+    pub fn is_branch(&self) -> bool {
+        use Insn::*;
+        matches!(
+            self,
+            Jump(..)
+                | BranchIfFalse(..)
+                | BranchUnlessZero(..)
+                | BranchIfSignalFalse(..)
+                | CmpBranch(..)
+                | CmpBranchConst(..)
+                | CaseJump(..)
+                | CaseMaskJump(..)
+        )
+    }
+
+    /// Shift every branch target of this instruction by `ib` (the index at
+    /// which its block now starts in a concatenated stream), leaving the
+    /// registers alone. Covers every form `is_branch` names.
+    pub fn offset_branch_targets(&mut self, ib: u32) {
+        use Insn::*;
+        match self {
+            Jump(t)
+            | BranchIfFalse(_, t)
+            | BranchUnlessZero(_, t)
+            | BranchIfSignalFalse(_, t, _)
+            | CmpBranch(_, _, _, _, t)
+            | CmpBranchConst(_, _, _, _, t) => *t += ib,
+            CaseJump(_, jump) => {
+                for t in &mut jump.table {
+                    *t += ib;
+                }
+                jump.default += ib;
+            }
+            CaseMaskJump(_, jump) => {
+                for t in &mut jump.table {
+                    *t += ib;
+                }
+                jump.xz_path += ib;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Insn {
@@ -1988,6 +2035,16 @@ pub struct BytecodeCompiler<'a> {
     /// variables, statics) are unresolvable storage for the compiled block
     /// — any read of one declines the whole body (see the Ident arm).
     free_function_mode: bool,
+    /// §26.3: the package that declares the subroutine or class being
+    /// compiled in method mode, and the table holding its `pkg::name`
+    /// parameters.
+    pub method_pkg: Option<(String, &'a HashMap<String, Value>)>,
+    /// §26.3: every package's imports (`def_pkg_imports`), for the names a
+    /// package's code reads through them.
+    pub method_pkg_imports: Option<&'a HashMap<String, Vec<(String, Option<String>)>>>,
+    /// The declaring package of each inlined callee on `inlining_stack`
+    /// (`None`: a callee declared outside a package).
+    inline_pkg_stack: Vec<Option<String>>,
     /// String-typed formal names (plan-provided). Any use of one outside the
     /// pass-through surface (read, compare, assign, concat, call arg, return)
     /// bails: indexing/string-methods/arith take interpreter-only paths.
@@ -2404,6 +2461,9 @@ impl<'a> BytecodeCompiler<'a> {
             method_result_is_string: false,
             method_ret_is_collection: false,
             free_function_mode: false,
+            method_pkg: None,
+            method_pkg_imports: None,
+            inline_pkg_stack: Vec::new(),
             string_formal_names: HashSet::default(),
             string_member_names: HashSet::default(),
             coll_member_names: HashSet::default(),
@@ -4496,6 +4556,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
         self.local_var_regs
             .insert(fd.name.name.name.clone(), (ret_slot, ret_w));
+        let callee_pkg = self.inlined_callee_pkg(&name, fd.span, false);
+        self.inline_pkg_stack.push(callee_pkg);
         self.inlining_stack.push(name);
         // AST fallback MUST be off inside an inlined body. `emit_fallback`
         // defers a statement to the AST interpreter, which resolves names
@@ -4535,6 +4597,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.named_block_patches = saved_named_block_patches;
         self.allow_ast_fallback = saved_fallback;
         self.inlining_stack.pop();
+        self.inline_pkg_stack.pop();
         self.local_var_regs = saved_locals;
         self.local_var_is_string = saved_local_strings;
         self.local_var_is_real = saved_local_reals;
@@ -5281,6 +5344,11 @@ impl<'a> BytecodeCompiler<'a> {
             // interpreter carrying the formals and locals it names (see
             // `fb_carry`); one that cannot be carried fails the inline, and
             // the call keeps the ordinary interpreted path.
+            let callee_pkg = self
+                .tasks
+                .and_then(|t| t.get(task_name))
+                .and_then(|td| self.inlined_callee_pkg(task_name, td.span, true));
+            self.inline_pkg_stack.push(callee_pkg);
             self.inlining_stack.push(task_name.to_string());
             let saved_ret = self.inline_ret;
             let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
@@ -5307,6 +5375,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.loop_continue_patches = saved_continue_patches;
             self.named_block_patches = saved_named_block_patches;
             self.inlining_stack.pop();
+            self.inline_pkg_stack.pop();
             self.inline_foreign -= foreign as u32;
             self.m_labels = saved_labels;
             self.local_var_regs = saved_locals;
@@ -11763,6 +11832,87 @@ impl<'a> BytecodeCompiler<'a> {
         unreachable!("pattern index out of range")
     }
 
+    /// §11.4.13: the compiled membership test compares integral operands
+    /// as unsigned values sized to the widest of them, which is `==?` for
+    /// x/z-free members. A real operand needs `==` with each member
+    /// converted to real by its own sign and a fill member kept at one bit
+    /// (§11.4.5, §5.7.1), so an operand that may be real keeps the
+    /// interpreter. The operand's type is not always known here (an element,
+    /// a member, or a continuous assignment compiled without signal types),
+    /// so a member whose value differs between the two comparisons — a
+    /// negative signed constant or a fill — keeps the interpreter too.
+    fn inside_needs_numeric_eq(&self, e: &Expression, members: &[Value]) -> bool {
+        self.expr_may_be_real(e)
+            || self.expr_is_real_static(e)
+            || members
+                .iter()
+                .any(|v| v.is_fill || (v.is_signed && v.to_i64().is_some_and(|x| x < 0)))
+    }
+
+    /// §12.5.4: true when the compiled chain matches every item of a `case
+    /// inside` as the `inside` operator does: an x/z-free integral constant
+    /// by `===`, an unsigned constant with x/z bits by the masked compare of
+    /// `case_inside_wildcard_item` (an unsigned selector of at most 64 bits,
+    /// `wild_sel_w`), and a selector compared as an integral (see
+    /// `inside_needs_numeric_eq`). A range, an array or any other item is
+    /// not.
+    fn case_inside_matches_by_case_eq(
+        &mut self,
+        sel: &Expression,
+        items: &[crate::ast::stmt::CaseItem],
+        wild_sel_w: Option<u32>,
+    ) -> bool {
+        let mut members: Vec<Value> = Vec::new();
+        for it in items.iter().filter(|it| !it.is_default) {
+            if it.pattern.is_some() || it.guard.is_some() {
+                return false;
+            }
+            for p in &it.patterns {
+                if let Some(v) = self.inside_member_const(p) {
+                    members.push(v);
+                } else if wild_sel_w.is_none_or(|w| self.case_inside_wildcard_item(p, w).is_none())
+                {
+                    return false;
+                }
+            }
+        }
+        !self.inside_needs_numeric_eq(sel, &members)
+    }
+
+    /// §11.4.6, §12.5.4: an unsigned integral constant `case inside` item
+    /// with x/z bits as the (care mask, value) pair its `==?` match compares
+    /// under, both 64 bits wide: the item's x/z bits match anything, and
+    /// every other bit — the zero extension to the selector's width
+    /// included — must be known and equal. `sel_w` is the unsigned
+    /// selector's width; the selector register, zero-extended, is masked and
+    /// compared by `===`, so an x/z selector bit under the mask matches
+    /// nothing, as `==?` makes it x.
+    fn case_inside_wildcard_item(&mut self, p: &Expression, sel_w: u32) -> Option<(Value, Value)> {
+        let v = match &p.kind {
+            ExprKind::Number(num) => self.eval_number_static(num)?,
+            ExprKind::Ident(h) => self.lookup_param_value(h)?,
+            ExprKind::Paren(inner) => return self.case_inside_wildcard_item(inner, sel_w),
+            _ => return None,
+        };
+        if v.is_real || v.is_fill || v.is_signed || v.width == 0 || v.width > 64 || sel_w > 64 {
+            return None;
+        }
+        let (val, xz) = v.inline_bits()?;
+        let width_mask = if v.width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << v.width) - 1
+        };
+        if xz & width_mask == 0 {
+            return None;
+        }
+        let care = !(xz & width_mask);
+        Some((
+            Value::from_u64(care, 64),
+            Value::from_u64(val & care & width_mask, 64),
+        ))
+    }
+
     /// A set-membership member as a compile-time CONSTANT with no x/z bits —
     /// the only shape `compile_inside` accepts (see there).
     fn inside_member_const(&mut self, m: &Expression) -> Option<Value> {
@@ -12247,6 +12397,11 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
+        // §26.3: package code's own parameter is a constant; its own (or
+        // imported) variable is that package's signal.
+        if let Some(key) = self.own_pkg_key(hier) {
+            return self.signal_name_to_id.get(key.as_str()).copied();
+        }
         let raw = Self::hier_raw_cow(hier);
         let raw: &str = &raw;
         // Targeted override for for-loop variables — see for_loop_var_ids
@@ -12396,9 +12551,152 @@ impl<'a> BytecodeCompiler<'a> {
             .cloned()
     }
 
+    /// §26.3: a bare name in a body declared in package P that neither the
+    /// frame nor the class declares names P's own parameter or variable,
+    /// else one P imports (an explicit import, or the one wildcard import
+    /// that supplies it), ahead of a same-named one of the design (the
+    /// interpreter's `resolve_hier_name` order): its qualified key. Inside
+    /// an inlined callee P is the callee's package, and a callee declared
+    /// outside a package resolves as before.
+    fn own_pkg_key(&self, hier: &HierarchicalIdentifier) -> Option<String> {
+        let (method_pkg, params) = self.method_pkg.as_ref()?;
+        let pkg = match self.inline_pkg_stack.last() {
+            Some(callee_pkg) => callee_pkg.as_deref()?,
+            None => method_pkg.as_str(),
+        };
+        let [seg] = hier.path.as_slice() else {
+            return None;
+        };
+        let n = seg.name.name.as_str();
+        if hier.root.is_some()
+            || n.contains("::")
+            || self.local_var_regs.contains_key(n)
+            || self.local_array_regs.contains_key(n)
+            || self.local_coll_names.contains(n)
+            || self.local_const_vars.contains_key(n)
+            || self.method_bound_names.contains(n)
+            || self.class_shadow_names.contains(n)
+            || self.bare_member_names.contains(n)
+            || self.string_member_names.contains(n)
+            || self.class_const_names.contains(n)
+        {
+            return None;
+        }
+        let has = |q: &str| params.contains_key(q) || self.signal_name_to_id.contains_key(q);
+        // Only where the bare name names something else: an uncontested
+        // package parameter is also registered bare with its own value, and
+        // that spelling keeps its packed shape (`C[i]` of a `[3:0][7:0]`
+        // parameter selects an element).
+        let contested = |q: String| -> Option<String> {
+            match params.get(q.as_str()) {
+                Some(v) => match params.get(n) {
+                    Some(bare) => (bare != v).then_some(q),
+                    // No bare parameter: only a same-named signal contests.
+                    None => self.signal_name_to_id.contains_key(n).then_some(q),
+                },
+                // A package variable keeps its `pkg::name` spelling only
+                // when another declaration took the bare name.
+                None => Some(q),
+            }
+        };
+        let key = format!("{pkg}::{n}");
+        if has(&key) {
+            return contested(key);
+        }
+        // §26.3: a name `pkg` imports (`import gp::*;` inside `pkg`).
+        let imports = self.method_pkg_imports?.get(pkg)?;
+        let mut wildcard: Option<String> = None;
+        for (src, item) in imports {
+            let q = format!("{src}::{n}");
+            match item.as_deref() {
+                Some(leaf) if leaf == n && has(&q) => return contested(q),
+                None if has(&q) => {
+                    // Two wildcard imports supplying it: no guess.
+                    if wildcard.is_some() {
+                        return None;
+                    }
+                    wildcard = Some(q);
+                }
+                _ => {}
+            }
+        }
+        wildcard.and_then(contested)
+    }
+
+    /// §26.3: the package that declares the subroutine `name` being inlined
+    /// into package code (`None` outside package code, or for a subroutine
+    /// declared outside a package): `P` of a `P::name` call, else the package
+    /// whose `P::name` entry is this very declaration.
+    fn inlined_callee_pkg(&self, name: &str, span: crate::ast::Span, task: bool) -> Option<String> {
+        self.method_pkg.as_ref()?;
+        if let Some((pkg, _)) = name.rsplit_once("::") {
+            return Some(pkg.to_string());
+        }
+        let suffix = format!("::{name}");
+        let owner = |k: &String| k.strip_suffix(suffix.as_str()).map(str::to_string);
+        if task {
+            let t = self.tasks?;
+            t.iter()
+                .find(|(k, td)| k.ends_with(suffix.as_str()) && td.span == span)
+                .and_then(|(k, _)| owner(k))
+        } else {
+            let f = self.functions?;
+            f.iter()
+                .find(|(k, fd)| k.ends_with(suffix.as_str()) && fd.span == span)
+                .and_then(|(k, _)| owner(k))
+        }
+    }
+
+    /// `own_pkg_key` when it names a parameter: its key and value.
+    fn own_pkg_param(&self, hier: &HierarchicalIdentifier) -> Option<(String, &'a Value)> {
+        let key = self.own_pkg_key(hier)?;
+        let (_, params) = self.method_pkg.as_ref()?;
+        let value = params.get(key.as_str())?;
+        Some((key, value))
+    }
+
+    /// `e` with its root spelled `P::name` when `own_pkg_key` answers it, so
+    /// a select or member of the parameter takes the qualified name's shape.
+    fn own_pkg_qualified(&self, e: &Expression) -> Option<Expression> {
+        self.method_pkg.as_ref()?;
+        let mut root = e;
+        while let ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. } = &root.kind
+        {
+            root = &**expr;
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return None;
+        };
+        let key = self.own_pkg_key(h)?;
+        let mut q = e.clone();
+        let mut root = &mut q;
+        loop {
+            root = match &mut root.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => &mut **expr,
+                ExprKind::Ident(h) => {
+                    h.path[0].name.name = key;
+                    h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    h.cached_resolved_name = crate::ast::cache::NameCache::new();
+                    h.bound = crate::ast::binding::Bound::UNSET;
+                    return Some(q);
+                }
+                _ => return None,
+            };
+        }
+    }
+
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
         if let Some(value) = self.method_enum_constant(hier) {
             return Some(value);
+        }
+        if let Some((_, value)) = self.own_pkg_param(hier)
+            && hier.path[0].selects.is_empty()
+        {
+            return Some(value.clone());
         }
         let params = self.params?;
         let raw = Self::hier_raw_cow(hier);
@@ -14783,6 +15081,33 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::Case {
                 kind, expr, items, ..
             } => {
+                // §12.5.4: `case inside` matches each item with the `inside`
+                // operator: a range by `>=`/`<=`, a value by `==?` (the
+                // item's x/z bits are wildcards) and a real by `==`
+                // (§11.4.13). The compare chain below matches by `===`, which
+                // agrees with that only for an integral selector and x/z-free
+                // integral constant items; anything else leaves the statement
+                // to the interpreter's matcher.
+                let inside_kind = matches!(kind, crate::ast::stmt::CaseKind::CaseInside);
+                // The masked compare reads the selector at its own width, so an
+                // operation selector (sized with the items, below) keeps `===`.
+                let wild_sel_w = if inside_kind
+                    && !matches!(
+                        expr.kind,
+                        ExprKind::Binary { .. }
+                            | ExprKind::Unary { .. }
+                            | ExprKind::Conditional { .. }
+                    )
+                    && self.expr_signedness(expr) == Some(false)
+                {
+                    Some(self.expr_max_width(expr)).filter(|w| (1..=64).contains(w))
+                } else {
+                    None
+                };
+                if inside_kind && !self.case_inside_matches_by_case_eq(expr, items, wild_sel_w) {
+                    self.bail("Stmt_CaseInside");
+                    return self.emit_fallback(stmt);
+                }
                 // §12.5: the selector and the items are sized to the widest
                 // of them. An operation selector (`a8 + 8'd1`) narrower than
                 // an item is computed at that width, in the compare chain.
@@ -14851,7 +15176,21 @@ impl<'a> BytecodeCompiler<'a> {
                         // Compile pattern match: val === pattern (or casez/casex
                         // wildcard match per CaseKind).
                         for pat in &item.patterns {
-                            if let Some(pat_reg) = self.compile_expr(pat, 0) {
+                            // §12.5.4: a wildcard `case inside` item compares
+                            // the masked selector with its known bits.
+                            let wild =
+                                wild_sel_w.and_then(|w| self.case_inside_wildcard_item(pat, w));
+                            let cmp_reg = if let Some((mask, known)) = wild {
+                                let mask_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(mask_reg, Box::new(mask)));
+                                let masked = self.alloc_reg();
+                                self.emit(Insn::BitAnd(masked, val_reg, mask_reg));
+                                let known_reg = self.alloc_reg();
+                                self.emit(Insn::LoadConst(known_reg, Box::new(known)));
+                                let cmp_reg = self.alloc_reg();
+                                self.emit(Insn::CaseEq(cmp_reg, masked, known_reg));
+                                Some(cmp_reg)
+                            } else if let Some(pat_reg) = self.compile_expr(pat, 0) {
                                 let cmp_reg = self.alloc_reg();
                                 self.emit(match kind {
                                     crate::ast::stmt::CaseKind::Casez => {
@@ -14862,6 +15201,11 @@ impl<'a> BytecodeCompiler<'a> {
                                     }
                                     _ => Insn::CaseEq(cmp_reg, val_reg, pat_reg),
                                 });
+                                Some(cmp_reg)
+                            } else {
+                                None
+                            };
+                            if let Some(cmp_reg) = cmp_reg {
                                 let branch_idx = self.insns.len();
                                 self.emit(Insn::BranchIfFalse(cmp_reg, 0));
                                 if !self.compile_stmt(&item.stmt) {
@@ -16193,6 +16537,9 @@ impl<'a> BytecodeCompiler<'a> {
         ctx_width: u32,
         unsigned_context: bool,
     ) -> Option<RegId> {
+        if let Some(q) = self.own_pkg_qualified(expr) {
+            return self.compile_expr_typed(&q, ctx_width, unsigned_context);
+        }
         // §10.8: only a pattern, or a parenthesised or conditional operand
         // holding one, takes the context type; other operands start without.
         let pattern_ctx = self.pattern_ctx.take();
@@ -18779,6 +19126,12 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                // §11.4.13, §11.4.5: a real operand is compared with `==`,
+                // converting each member to real, so the members must keep
+                // their own sign; the unsigned compare below is integral only.
+                if ok && self.inside_needs_numeric_eq(e, &members) {
+                    ok = false;
+                }
                 if !ok || members.is_empty() {
                     if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_Inside") {
                         return Some(r);
@@ -20062,7 +20415,13 @@ impl<'a> BytecodeCompiler<'a> {
             } => {
                 // §7.4.1/§11.5.1: ascending or element-of-collection bases
                 // need label mapping the stores below do not emit — AST only.
-                if self.sel_base_needs_ast(expr) {
+                // So does a multidimensional packed base, whose select names
+                // elements, not bits (the blocking store bails on it too).
+                let packed_elements = match &expr.kind {
+                    ExprKind::Ident(h) => self.packed_elem_width_of(h).is_some_and(|w| w > 1),
+                    _ => false,
+                };
+                if self.sel_base_needs_ast(expr) || packed_elements {
                     self.bail("nba_range_base_maps");
                     return false;
                 }
@@ -21150,6 +21509,15 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return true;
                     }
+                    // Any other class-scope name (a collection member,
+                    // static or not) must not fall through to a same-named
+                    // module signal, as on the bare read path.
+                    if !self.local_var_regs.contains_key(bare)
+                        && self.class_shadow_names.contains(bare)
+                    {
+                        self.bail("method_class_shadow");
+                        return false;
+                    }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     if self.signal_is_string_name(hier) {
@@ -22148,10 +22516,10 @@ impl<'a> BytecodeCompiler<'a> {
                 value,
                 cached_val,
             } => {
-                // §5.7.1 — see `Value::unsized_literal_width`.
+                // §5.7.1 — see `Value::unsized_integer_width`.
                 let w = match size {
                     Some(sz) => *sz,
-                    None => Value::unsized_literal_width(
+                    None => Value::unsized_integer_width(
                         value,
                         match base {
                             NumberBase::Binary => 2,
@@ -22159,6 +22527,7 @@ impl<'a> BytecodeCompiler<'a> {
                             NumberBase::Hex => 16,
                             NumberBase::Decimal => 10,
                         },
+                        *signed,
                     ),
                 };
                 // §5.7.1: unsized all-x/all-z literal is a FILL (see
@@ -22178,9 +22547,6 @@ impl<'a> BytecodeCompiler<'a> {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                // §5.7 (issue #31): compiled-path literals warn here — once
-                // per literal string, deduped with the elaboration/AST sites.
-                crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_literal_text(value, r, w);
                 // Same inline cache the AST evaluator keeps on this node: a
                 // literal in a declared range is re-evaluated for every
@@ -22271,7 +22637,9 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::Paren(i) => self.lrm_self_width(i),
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => *sz,
-            ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => 32,
+            ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
+                super::elaborate::number_literal_width(n)
+            }
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => 1,
             ExprKind::Unary { op, operand } => match op {
                 UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.lrm_self_width(operand),
@@ -22838,6 +23206,9 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn expr_max_width(&self, expr: &Expression) -> u32 {
+        if let Some(q) = self.own_pkg_qualified(expr) {
+            return self.expr_max_width(&q);
+        }
         if let Some((_, m)) = self.formal_struct_member(expr) {
             return m.width;
         }

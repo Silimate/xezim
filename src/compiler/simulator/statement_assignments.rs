@@ -31,7 +31,7 @@ impl Simulator {
                     Some(sz) => *sz,
                     None => match cached {
                         Some((_, _, cw)) => cw,
-                        None => Value::unsized_literal_width(value, r_for_w),
+                        None => Value::unsized_integer_width(value, r_for_w, *signed),
                     },
                 };
                 // §5.7.1: an unsized all-x/all-z literal ('bx, 'hz, 'b?) is a
@@ -53,12 +53,6 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                // §5.7 (issue #31): a PROCEDURAL-only literal never passes
-                // through elaboration const-eval, so the wrap warning has to
-                // fire here too. Slow path only (the cached-value fast path
-                // above returns first), and the shared dedupe means a literal
-                // already reported at elaboration stays quiet.
-                super::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_literal_text(value, r, w);
                 // Cache inline values (width <= 64)
                 if w <= 64 {
@@ -1522,6 +1516,60 @@ impl Simulator {
         true
     }
 
+    /// §10.4.1: whether an item of the pattern `rvalue` reads the variable
+    /// that `lvalue` writes (its root name, as any segment of a name in the
+    /// item). Keys and replication counts are constant expressions and are
+    /// not looked at; a function reading the target is not seen either.
+    fn pattern_reads_target(lvalue: &Expression, rvalue: &Expression) -> bool {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        let mut root = lvalue;
+        while let ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Paren(expr) = &root.kind
+        {
+            root = expr;
+        }
+        // `this.arr = '{this.arr[1], ...}`: any `this` in an item may read it.
+        let var = match &root.kind {
+            ExprKind::Ident(h) => match h.path.first() {
+                Some(s) => s.name.name.as_str(),
+                None => return false,
+            },
+            ExprKind::This => "this",
+            _ => return false,
+        };
+        fn reads(e: &Expression, var: &str) -> bool {
+            match &e.kind {
+                ExprKind::AssignmentPattern(items) => items.iter().any(|item| match item {
+                    Item::Ordered(x)
+                    | Item::Named(_, x)
+                    | Item::Typed(_, x)
+                    | Item::Default(x)
+                    | Item::Keyed(_, x) => reads(x, var),
+                }),
+                ExprKind::Replication { exprs, .. } => exprs.iter().any(|x| reads(x, var)),
+                ExprKind::Paren(x) => reads(x, var),
+                _ => {
+                    let mut hit = false;
+                    super::elaborate::for_each_sub_expr(e, &mut |x| {
+                        hit |= match &x.kind {
+                            ExprKind::Ident(h) => h.path.iter().any(|s| s.name.name == var),
+                            ExprKind::This => var == "this",
+                            // `arr = '{this.arr[1], ...}`
+                            ExprKind::MemberAccess { expr, member } => {
+                                matches!(expr.kind, ExprKind::This) && member.name == var
+                            }
+                            _ => false,
+                        };
+                    });
+                    hit
+                }
+            }
+        }
+        reads(rvalue, var)
+    }
+
     pub(super) fn exec_stmt_blocking_assign_body(
         &mut self,
         stmt: &Statement,
@@ -1583,6 +1631,25 @@ impl Simulator {
         }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
+            return;
+        }
+        // §10.4.1, §10.9.1, §10.9.2: the right-hand side is evaluated before
+        // the target is written, but a pattern store reads each item just
+        // before it writes that item's element, so a pattern reading its own
+        // target (`a = '{a[1], a[0]}`) read elements it had already written.
+        // Capture every item first, as an intra-assignment delay does (keys,
+        // nesting and element types kept), then store the captured values.
+        if matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
+            && Self::pattern_reads_target(lvalue, rvalue)
+        {
+            let (saved, release) = self.capture_intra_rhs(lvalue, rvalue, rvalue.span);
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, &saved);
+            if let Some(release) = release
+                && let StatementKind::Expr(e) = &release.kind
+                && let ExprKind::SystemCall { name, args } = &e.kind
+            {
+                self.exec_system_task(name, args);
+            }
             return;
         }
         // §7.6, §7.2: a whole multi-dimensional array of unpacked structs,
@@ -2254,6 +2321,7 @@ impl Simulator {
                             .and_then(|o| o.as_ref())
                             .map(|i| i.class_name.clone());
                         let mut mtn: Option<String> = None;
+                        let mut decl_cn: Option<String> = None;
                         let mut cur = hcn;
                         while let Some(cn) = cur {
                             if let Some(cd) = self.module.classes.get(&cn) {
@@ -2263,6 +2331,7 @@ impl Simulator {
                                     .and_then(|s| s.type_name.clone())
                                 {
                                     mtn = Some(tn);
+                                    decl_cn = Some(cn);
                                     break;
                                 }
                                 cur = cd.extends.clone();
@@ -2309,8 +2378,31 @@ impl Simulator {
                                 _ => &[],
                             };
                             let (cn, spec) = mcls;
+                            // §8.8, §8.25: an element of `C #(args) arr[N]`
+                            // takes those args, read where they mean the
+                            // same as in the declaring class: through
+                            // `this`, or for a class without parameters.
+                            let type_args = decl_cn
+                                .as_deref()
+                                .filter(|d| {
+                                    spec.is_none()
+                                        && (this_recv
+                                            || self.this_stack.last().copied().flatten()
+                                                == Some(handle)
+                                            || !self.class_is_parameterized(d))
+                                })
+                                .and_then(|d| self.module.classes.get(d))
+                                .and_then(|d| d.property_type_args.get(&member_name))
+                                .filter(|ta| !ta.is_empty())
+                                .cloned();
                             if let Some(cd) = self.module.classes.get(&cn).cloned() {
-                                let v = if let Some((b, s)) = spec {
+                                let v = if let Some(ta) = type_args {
+                                    self.instantiate_class_with_type_args(
+                                        &cd,
+                                        ctor_args,
+                                        Some(ta.as_slice()),
+                                    )
+                                } else if let Some((b, s)) = spec {
                                     let saved = self.current_spec.take();
                                     self.current_spec = Some((b, s));
                                     let r = self.instantiate_class(&cd, ctor_args);
@@ -3282,8 +3374,8 @@ impl Simulator {
             };
             // Distribute `ordered` MSB-first to each target in source order.
             let total = ordered.width as usize;
-            // Compute fixed-width targets; last target may be dynamic (remainder).
-            let mut fixed_ws: Vec<u32> = Vec::new();
+            // The last target may be a whole dynamic collection, which takes
+            // the remainder of the stream.
             let mut dyn_last: Option<String> = None;
             let mut dyn_last_elem_w: u32 = 8;
             for (i, e) in exprs.iter().enumerate() {
@@ -3306,18 +3398,27 @@ impl Simulator {
                             };
                             dyn_last = Some(n.to_string());
                             dyn_last_elem_w = ew;
-                            continue;
                         }
                     }
                 }
-                fixed_ws.push(self.infer_lhs_width(e));
             }
-            let fixed_total: u32 = fixed_ws.iter().sum();
             let mut msb = total; // bit position just above the MSB
             for (i, e) in exprs.iter().enumerate() {
                 let is_last = i == exprs.len() - 1;
+                // §11.4.14.4: a `with [range]` / slice operand targets a
+                // sub-range of a collection: only the selected elements are
+                // written, the rest of the array is unmodified. Its range
+                // "is evaluated immediately before its corresponding array
+                // is streamed", so it may read a target unpacked to its left
+                // by this same statement (`p.payload with [0 +: p.len]`).
+                let ranged = if Self::stream_operand_has_range(e) {
+                    self.stream_operand_elems(e, true)
+                } else {
+                    None
+                };
                 if is_last && dyn_last.is_some() {
-                    let remaining = (total as u32).saturating_sub(fixed_total);
+                    // Every earlier target took its width off the top.
+                    let remaining = msb as u32;
                     let elem_w = dyn_last_elem_w.max(1);
                     let n_elems = (remaining / elem_w) as usize;
                     let dname = dyn_last.clone().unwrap();
@@ -3347,6 +3448,31 @@ impl Simulator {
                             self.set_signal_value_by_name(&ename, slice_v);
                         }
                     }
+                } else if let Some((names, ew)) = ranged.as_ref() {
+                    // Collection-with-range target: unpack the operand's
+                    // portion of the stream into the selected elements,
+                    // MSB-first, leaving the array's other elements alone.
+                    let w = (names.len() as usize) * (*ew as usize);
+                    if w == 0 {
+                        continue;
+                    }
+                    let hi = msb.saturating_sub(1);
+                    let lo = msb.saturating_sub(w);
+                    let portion = if hi >= lo {
+                        ordered.range_select(hi, lo)
+                    } else {
+                        Value::zero(w as u32)
+                    };
+                    let ew = *ew as usize;
+                    for (k, en) in names.iter().enumerate() {
+                        let piece = if (k + 1) * ew <= w {
+                            portion.range_select(w - k * ew - 1, w - (k + 1) * ew)
+                        } else {
+                            Value::zero(ew as u32)
+                        };
+                        self.set_signal_value_by_name(en, piece.resize(ew as u32));
+                    }
+                    msb = lo;
                 } else {
                     let w = self.infer_lhs_width(e) as usize;
                     if w == 0 {

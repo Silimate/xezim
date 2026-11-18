@@ -4948,51 +4948,10 @@ impl Simulator {
                     // by row. A queue / dynamic-array SLICE `q[a:b]` streams
                     // elements a..b.
                     // §11.4.14: resolve the collection's backing storage,
-                    // including class members, before reading its elements.
-                    let elem_list = if let Some(name) = self.array_operand_name(p) {
-                        self.stream_elem_order(&name)
-                    } else {
-                        match &p.kind {
-                            ExprKind::Ident(h) => {
-                                let name = self.resolve_hier_name(h);
-                                self.stream_elem_order(&name)
-                            }
-                            ExprKind::RangeSelect {
-                                expr: base,
-                                left,
-                                right,
-                                ..
-                            } => {
-                                if let Some(name) = self.array_operand_name(base)
-                                    && self.module.dynamic_arrays.contains(&name)
-                                {
-                                    let left = self.eval_expr(left).to_i64();
-                                    let right = self.eval_expr(right).to_i64();
-                                    match (left, right) {
-                                        (Some(left), Some(right))
-                                            if left <= right && right - left < 1 << 20 =>
-                                        {
-                                            self.stream_elem_order(&name).map(|(_, width)| {
-                                                (
-                                                    (left..=right)
-                                                        .map(|i| format!("{name}[{i}]"))
-                                                        .collect(),
-                                                    width,
-                                                )
-                                            })
-                                        }
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            ExprKind::Paren(inner) => self
-                                .array_operand_name(inner)
-                                .and_then(|name| self.stream_elem_order(&name)),
-                            _ => None,
-                        }
-                    };
+                    // including class members, before reading its elements;
+                    // a `with [range]` / slice sub-range streams only the
+                    // selected elements (§11.4.14.4), in stream order.
+                    let elem_list = self.stream_operand_elems(p, false);
                     let piece = if let Some((names, ew)) = elem_list {
                         let mut acc = Value::zero(0);
                         for en in &names {
@@ -6672,7 +6631,7 @@ impl Simulator {
                             if let Some(keys) = self.inside_operand_keys(r) {
                                 for key in keys {
                                     if let Some(ev) = self.get_signal_value_by_name(&key) {
-                                        if val.wildcard_eq(&ev).is_true() {
+                                        if Self::inside_values_equal(&val, &ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
                                     }
@@ -6690,19 +6649,17 @@ impl Simulator {
                             if let Some(c) = self.resolve_class_scope_array_const(r) {
                                 for i in c.lo..=c.hi {
                                     if let Some(ev) = self.class_scope_array_const_elem(&c, i) {
-                                        if val.wildcard_eq(&ev).is_true() {
+                                        if Self::inside_values_equal(&val, &ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }
                                     }
                                 }
                                 continue;
                             }
-                            // §11.4.13: a set element is compared with the
-                            // tested expression using WILDCARD equality, so x/z
-                            // bits in the element are don't-cares — exactly what
-                            // `==?` does. Plain `==` missed `v inside {4'b10xx}`.
+                            // §11.4.13: real pairs use `==`; integral pairs
+                            // use `==?`, with x/z in the item as don't-cares.
                             let ev = item(self, r);
-                            if val.wildcard_eq(&ev).is_true() {
+                            if Self::inside_values_equal(&val, &ev).is_true() {
                                 return Value::from_u64(1, 1);
                             }
                         }

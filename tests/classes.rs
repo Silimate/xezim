@@ -41,6 +41,10 @@ mod class_descending_array_members;
 mod class_formal_named_like_struct;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
+#[path = "classes/param_typedef_formal_fast_call.rs"]
+mod param_typedef_formal_fast_call;
+#[path = "classes/param_typedef_formal_direct_call_shapes.rs"]
+mod param_typedef_formal_direct_call_shapes;
 #[path = "classes/implicit_formal_width_1044.rs"]
 mod implicit_formal_width_1044;
 #[path = "classes/class_interface_same_name.rs"]
@@ -300,6 +304,12 @@ mod compiled_method_static_local_vars;
 mod compiled_nonvirtual_dispatch;
 #[path = "classes/compiled_pkg_fn_scope.rs"]
 mod compiled_pkg_fn_scope;
+#[path = "classes/compiled_pkg_param_scope.rs"]
+mod compiled_pkg_param_scope;
+#[path = "classes/compiled_pkg_scope_names.rs"]
+mod compiled_pkg_scope_names;
+#[path = "classes/bare_name_scopes_1273.rs"]
+mod bare_name_scopes_1273;
 #[path = "classes/compiled_task_wait_analysis.rs"]
 mod compiled_task_wait_analysis;
 #[path = "classes/compiled_method_type_param_members.rs"]
@@ -1140,6 +1150,14 @@ mod review_pr720_followups;
 mod class_param_local_width_681;
 #[path = "classes/class_param_sized_method_widths.rs"]
 mod class_param_sized_method_widths;
+#[path = "classes/class_param_formal_width_per_spec.rs"]
+mod class_param_formal_width_per_spec;
+#[path = "classes/class_param_typedef_chain.rs"]
+mod class_param_typedef_chain;
+#[path = "classes/member_new_specialization.rs"]
+mod member_new_specialization;
+#[path = "classes/class_param_width_paths.rs"]
+mod class_param_width_paths;
 #[path = "classes/randc_wide_699.rs"]
 mod randc_wide_699;
 
@@ -1321,3 +1339,7 @@ mod named_param_typedef_spec;
 mod scoped_vif_typedef_local;
 #[path = "classes/subroutine_actual_width_1256.rs"]
 mod subroutine_actual_width_1256;
+#[path = "classes/packed_member_foreach_1192.rs"]
+mod packed_member_foreach_1192;
+#[path = "classes/unpacked_struct_packed_member_1192.rs"]
+mod unpacked_struct_packed_member_1192;

@@ -186,3 +186,44 @@ endmodule
         "braces around a queue operand still splice"
     );
 }
+
+/// §10.10.3 through the other assignment path: a selected queue of a queue
+/// array (`rows[0] = {rows[0], {pc, insn}}`) appends one element too, and
+/// deciding whether braces hold a collection runs nothing, so an operand
+/// with a side effect (`m[i++]`) is evaluated once.
+#[test]
+fn nested_braces_in_selected_queue_and_side_effects() {
+    const SRC: &str = r#"
+module tb;
+  logic [63:0] rows[2][$];
+  logic [31:0] pc, insn;
+  byte m[int];
+  int i;
+  logic [15:0] q16[$];
+  bit pass_rows, pass_once;
+  initial begin
+    pc = 32'h8000_0080; insn = 32'h03d0_01db;
+    rows[0] = {rows[0], {pc, insn}};
+    pc = 32'h8000_0084; insn = 32'h2002_05b7;
+    rows[0] = {rows[0], {pc, insn}};
+    pass_rows = (rows[0].size() == 2) && (rows[0][0] == 64'h80000080_03d001db)
+                && (rows[0][1] == 64'h80000084_200205b7) && (rows[1].size() == 0);
+    m[0] = 8'h11; m[1] = 8'h22;
+    i = 0;
+    q16 = {{m[i++], 8'h00}};
+    pass_once = (i == 1) && (q16.size() == 1) && (q16[0] == 16'h1100);
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    assert_eq!(
+        flag(&sim, "pass_rows"),
+        1,
+        "rows[0] = {{rows[0], {{pc, insn}}}} appends one 64-bit element"
+    );
+    assert_eq!(
+        flag(&sim, "pass_once"),
+        1,
+        "the braced operand m[i++] is evaluated once"
+    );
+}

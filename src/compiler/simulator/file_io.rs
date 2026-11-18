@@ -939,24 +939,34 @@ impl Simulator {
     }
 
     pub(super) fn resolve_array_name_from_expr(&self, expr: &Expression) -> Option<String> {
-        self.resolve_memory_name(expr, false, true)
+        self.resolve_memory_name(expr, MemKind::OneDim, true)
+            .map(|(n, _)| n)
     }
 
-    /// The storage name of the fixed unpacked array `expr` names: a
-    /// one-dimensional one (`module.arrays`), or with `multi_dim` a
-    /// multidimensional one (`arrays_2d` / `arrays_nd`). With `suffix`, a
-    /// name found in no scope may match the end of a longer storage name.
+    /// The storage name of the fixed unpacked array `expr` names, of the
+    /// `kind` asked for: one-dimensional (`module.arrays`), multidimensional
+    /// (`arrays_2d` / `arrays_nd`), or either, with whether it is
+    /// multidimensional. Each step of the lookup tries every kind asked for,
+    /// so with [`MemKind::Either`] the first array the name reaches wins: a
+    /// one-dimensional class property `mem` named in a method is not a
+    /// module's two-dimensional `mem`. With `suffix`, a name found in no
+    /// scope may match the end of a longer storage name.
     fn resolve_memory_name(
         &self,
         expr: &Expression,
-        multi_dim: bool,
+        kind: MemKind,
         suffix: bool,
-    ) -> Option<String> {
-        let is_mem = |n: &str| {
-            if multi_dim {
-                self.module.arrays_2d.contains_key(n) || self.module.arrays_nd.contains_key(n)
+    ) -> Option<(String, bool)> {
+        let is_mem = |n: &str| -> Option<bool> {
+            let one = kind != MemKind::MultiDim && self.module.arrays.contains_key(n);
+            let multi = kind != MemKind::OneDim
+                && (self.module.arrays_2d.contains_key(n) || self.module.arrays_nd.contains_key(n));
+            if one {
+                Some(false)
+            } else if multi {
+                Some(true)
             } else {
-                self.module.arrays.contains_key(n)
+                None
             }
         };
         // §8.5: fixed arrays declared as class properties live in the
@@ -964,8 +974,8 @@ impl Simulator {
         // module arrays, both through `obj.member` and a bare member inside a
         // method.
         if let Some(name) = self.handle_member_array_name(expr) {
-            if is_mem(&name) {
-                return Some(name);
+            if let Some(m) = is_mem(&name) {
+                return Some((name, m));
             }
         }
         // §23.6 / §21.4: a hierarchical memory name inside a subroutine body
@@ -975,7 +985,7 @@ impl Simulator {
         // `$readmemh("f", r.mem)` in a task loaded nothing.
         if matches!(expr.kind, ExprKind::MemberAccess { .. }) {
             if let Some(flat) = self.member_chain_ident(expr) {
-                return self.resolve_memory_name(&flat, multi_dim, suffix);
+                return self.resolve_memory_name(&flat, kind, suffix);
             }
         }
         let (resolved, raw) = match &expr.kind {
@@ -992,15 +1002,15 @@ impl Simulator {
             _ => return None,
         };
         if let Some(name) = self.instance_assoc_member(&raw) {
-            if is_mem(&name) {
-                return Some(name);
+            if let Some(m) = is_mem(&name) {
+                return Some((name, m));
             }
         }
-        if is_mem(&resolved) {
-            return Some(resolved.to_string());
+        if let Some(m) = is_mem(&resolved) {
+            return Some((resolved.to_string(), m));
         }
-        if is_mem(&raw) {
-            return Some(raw);
+        if let Some(m) = is_mem(&raw) {
+            return Some((raw, m));
         }
         if !suffix {
             return None;
@@ -1011,17 +1021,22 @@ impl Simulator {
                 || k.ends_with(&format!(".{}", resolved))
                 || k.ends_with(&format!(".{}", raw))
         };
-        let found = if multi_dim {
-            self.module
+        // A one-dimensional memory first, as before multidimensional ones
+        // were looked up.
+        if kind != MemKind::MultiDim
+            && let Some(found) = self.module.arrays.keys().find(suffix_match)
+        {
+            return Some((found.clone(), false));
+        }
+        if kind != MemKind::OneDim
+            && let Some(found) = self
+                .module
                 .arrays_2d
                 .keys()
                 .chain(self.module.arrays_nd.keys())
                 .find(suffix_match)
-        } else {
-            self.module.arrays.keys().find(suffix_match)
-        };
-        if let Some(found) = found {
-            return Some(found.clone());
+        {
+            return Some((found.clone(), true));
         }
         None
     }
@@ -1620,14 +1635,20 @@ impl Simulator {
         base_expr: &Expression,
         selects: &[&Expression],
     ) -> Option<NdMemory> {
-        // A name that is a one-dimensional memory in scope stays on that
-        // path; only a name found in no scope falls back to a suffix match.
-        let base = match self.resolve_memory_name(base_expr, true, false) {
-            Some(b) => b,
-            None if self.resolve_memory_name(base_expr, false, false).is_some() => return None,
-            None => self.resolve_memory_name(base_expr, true, true)?,
+        // The array the name reaches first, of either kind: one that is a
+        // one-dimensional memory stays on that path. Only a name that
+        // reaches no array, and no associative array, falls back to a
+        // suffix match, which could otherwise claim a same-named array in
+        // another instance.
+        let (base, multi) = match self.resolve_memory_name(base_expr, MemKind::Either, false) {
+            Some(hit) => hit,
+            None if self.assoc_operand_name(base_expr).is_some() => return None,
+            None => self.resolve_memory_name(base_expr, MemKind::Either, true)?,
         };
-        let dims = self.fixed_unpacked_dims(&base)?;
+        if !multi {
+            return None;
+        }
+        let dims = self.multi_dim_memory_dims(&base)?;
         let width = match self.module.arrays_2d.get(&base) {
             Some(&(_, _, w)) => w,
             None => self.module.arrays_nd.get(&base)?.1,
@@ -1652,6 +1673,32 @@ impl Simulator {
             prefix,
             dims,
             width,
+        })
+    }
+
+    /// Declared bounds of the multidimensional array `name`, outermost
+    /// first, when it can be a memory: a fixed unpacked array whose element
+    /// is a vector, a packed struct among them (§21.4.1), and not an
+    /// unpacked struct.
+    fn multi_dim_memory_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if self.module.dynamic_arrays.contains(name) || self.is_associative_array(name) {
+            return None;
+        }
+        if let Some(dt) = self.module.var_decl_types.get(name)
+            && matches!(self.resolve_dt(dt), DataType::Struct(su) if !su.packed)
+        {
+            return None;
+        }
+        if let Some(&(r0, r1, _)) = self.module.arrays_2d.get(name) {
+            return Some(match self.module.unpacked_decl_dims.get(name) {
+                Some(d) if d.len() == 2 => d.clone(),
+                _ => vec![r0, r1],
+            });
+        }
+        let (shape, _) = self.module.arrays_nd.get(name)?;
+        Some(match self.module.unpacked_decl_dims.get(name) {
+            Some(d) if d.len() == shape.len() => d.clone(),
+            _ => shape.clone(),
         })
     }
 
@@ -1704,8 +1751,10 @@ impl Simulator {
                 }
                 if let Some(rest) = raw_tok.strip_prefix('@') {
                     let addr_hex = rest.trim_start_matches("0x").trim_start_matches("0X");
-                    if let Ok(a) = i64::from_str_radix(addr_hex, 16) {
-                        addr = a;
+                    // A negative address is written as its 64-bit two's
+                    // complement (`{:x}` of an `i64`).
+                    if let Ok(a) = u64::from_str_radix(addr_hex, 16) {
+                        addr = a as i64;
                     }
                     continue;
                 }
@@ -1877,4 +1926,12 @@ impl MemDump {
         self.text.push('\n');
         self.next = addr + self.step;
     }
+}
+
+/// Which fixed unpacked arrays [`Simulator::resolve_memory_name`] looks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemKind {
+    OneDim,
+    MultiDim,
+    Either,
 }

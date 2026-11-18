@@ -71,10 +71,9 @@ fn untyped_output_port_error_says_it_is_a_net_and_how_to_declare_it() {
             "output port '{port}' of module 'flop' is the target of a procedural assignment"
         );
         assert!(text.contains(&want), "missing {want:?}:\n{text}");
-        let fix = format!("Declare it `output logic {port}`");
-        assert!(text.contains(&fix), "missing {fix:?}:\n{text}");
     }
     for want in [
+        "Declare it `output logic` rather than `output`",
         "its declaration has no data type",
         "§23.2.2.3",
         "§6.5",
@@ -107,6 +106,10 @@ fn relaxation_takes_the_port_as_a_variable() {
                 format!("[xezim][warning] output port '{port}' of module 'flop' has no data type");
             assert!(text.contains(&want), "missing {want:?}:\n{text}");
         }
+        assert!(
+            text.contains("as if it were declared `output logic`"),
+            "{args:?} {env:?}:\n{text}"
+        );
     }
 }
 
@@ -163,6 +166,9 @@ fn a_strict_run_does_not_reuse_a_relaxed_design() {
     assert!(ok, "relaxed:\n{text}");
     let (ok, text) = run_in(&d, FLOP, &["--cache-dir", cache], &[]);
     assert!(!ok, "a strict run took the relaxed design:\n{text}");
-    assert!(text.contains("Declare it `output logic q`"), "{text}");
+    assert!(
+        text.contains("output port 'q' of module 'flop' is the target"),
+        "{text}"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }

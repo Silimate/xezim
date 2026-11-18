@@ -87,8 +87,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * A procedural assignment to an ANSI output port declared with no data type
   (`output q`, `output [3:0] c`), which IEEE 1800-2023 §23.2.2.3 makes a net,
   is reported as such: the error names the port and module, says the port is a
-  net because its declaration has no data type (§6.5), and suggests
-  `output logic q`. `--relax-untyped-output-port` (or
+  net because its declaration has no data type (§6.5), and suggests declaring
+  it `output logic` rather than `output`, which keeps its range and signing.
+  `--relax-untyped-output-port` (or
   `XEZIM_RELAX_UNTYPED_OUTPUT_PORT=1`) takes such a port as a variable, with a
   warning, as Verilator does; OpenHW CORE-ET relies on it. A port declared as a
   net (`output wire q`) stays an error. It is not part of `--compat`: the

@@ -571,16 +571,17 @@ fn check_proc_net_assign(
                         eprintln!(
                             "[xezim][warning] output port '{b}' of module '{module}' has no data \
                              type, so it is a net (IEEE 1800-2023 §23.2.2.3), and a procedural \
-                             block assigns it (§6.5); taking it as a variable, `output logic {b}` \
-                             (--relax-untyped-output-port)"
+                             block assigns it (§6.5); taking it as a variable, as if it were \
+                             declared `output logic` (--relax-untyped-output-port)"
                         );
                     } else {
                         errs.push(format!(
                             "output port '{b}' of module '{module}' is the target of a \
                              procedural assignment, but it is a net: its declaration has no \
                              data type (IEEE 1800-2023 §23.2.2.3), and a net cannot be assigned \
-                             procedurally (§6.5). Declare it `output logic {b}`, or pass \
-                             --relax-untyped-output-port to take it as a variable"
+                             procedurally (§6.5). Declare it `output logic` rather than \
+                             `output`, or pass --relax-untyped-output-port to take it as a \
+                             variable"
                         ));
                     }
                 }

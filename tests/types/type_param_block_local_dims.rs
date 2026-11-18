@@ -68,3 +68,41 @@ endmodule
         "missing `{want}` in {got:#?}"
     );
 }
+
+/// §6.18: a typedef declared in a block hides a type parameter of the same
+/// name there, with or without packed dimensions on the declaration; in
+/// another block the parameter is visible again.
+#[test]
+fn block_typedef_hides_the_type_parameter() {
+    let got = lines(
+        r#"
+// a block-local typedef that hides a type parameter of the same name
+module child #(parameter type T = logic [7:0]) (output int bx, output int by, output int bz);
+  always_comb begin
+    typedef logic [3:0] T;
+    T [1:0] x;
+    T y;
+    x = '1;
+    y = '1;
+    bx = $bits(x);
+    by = $bits(y);
+  end
+  always_comb begin
+    T [1:0] z;
+    z = '1;
+    bz = $bits(z);
+  end
+endmodule
+module top;
+  int bx, by, bz;
+  child #(.T(logic [5:0])) c (.bx(bx), .by(by), .bz(bz));
+  initial #1 $display("t3: bx=%0d by=%0d bz=%0d", bx, by, bz);
+endmodule
+"#,
+    );
+    let want = "t3: bx=8 by=4 bz=12";
+    assert!(
+        got.iter().any(|l| l == want),
+        "missing `{want}` in {got:#?}"
+    );
+}

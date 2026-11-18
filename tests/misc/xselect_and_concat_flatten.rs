@@ -268,3 +268,105 @@ endmodule
         "{{aa[i++].ql}} copies the selected queue and advances i once"
     );
 }
+
+/// §11.3.2: an operand whose object comes from a call (`get_obj().data`)
+/// makes the call once, whether the member turns out to be a scalar or a
+/// queue. `data` is a queue in another class, so the operand is looked up
+/// as a collection before it is read; the lookup and the read use the one
+/// handle the call returned. Covers both assignment paths (a whole queue
+/// and a selected queue) with an associative array in scope, and a call
+/// whose return type is a typedef of the class.
+#[test]
+fn call_receiver_operand_is_called_once() {
+    const SRC: &str = r#"
+module tb;
+  typedef struct packed { byte hi; byte lo; } pair_t;
+  class C;
+    int data;
+    int ql[$];
+    pair_t s;
+  endclass
+  class D;
+    int data[$];
+  endclass
+  typedef C c_t;
+  C obj;
+  D other;
+  int gets;
+  int m[int];
+  int qa[$], qb[$], qc[$], qt[$];
+  byte qs[$];
+  int rows[2][$];
+  bit pass_scalar, pass_queue, pass_two, pass_struct, pass_rows, pass_typedef;
+  function C get_obj();
+    gets++;
+    return obj;
+  endfunction
+  function c_t get_t();
+    gets++;
+    return obj;
+  endfunction
+  initial begin
+    obj = new;
+    other = new;
+    m[1] = 1;
+    obj.data = 42;
+    obj.ql = {7, 8};
+    obj.s = 16'h1234;
+    gets = 0;
+    qa = {get_obj().data};
+    pass_scalar = (gets == 1) && (qa.size() == 1) && (qa[0] == 42);
+    gets = 0;
+    qb = {qb, get_obj().ql};
+    pass_queue = (gets == 1) && (qb.size() == 2) && (qb[0] == 7) && (qb[1] == 8);
+    gets = 0;
+    qc = {get_obj().data, get_obj().ql, 9};
+    pass_two = (gets == 2) && (qc.size() == 4) && (qc[0] == 42) && (qc[1] == 7)
+               && (qc[2] == 8) && (qc[3] == 9);
+    gets = 0;
+    qs = {get_obj().s.lo};
+    pass_struct = (gets == 1) && (qs.size() == 1) && (qs[0] == 8'h34);
+    gets = 0;
+    rows[1] = {rows[1], get_obj().data, get_obj().ql};
+    pass_rows = (gets == 2) && (rows[1].size() == 3) && (rows[1][0] == 42)
+                && (rows[1][1] == 7) && (rows[1][2] == 8);
+    gets = 0;
+    qt = {get_t().data, get_t().ql};
+    pass_typedef = (gets == 2) && (qt.size() == 3) && (qt[0] == 42) && (qt[1] == 7)
+                   && (qt[2] == 8);
+    $display("gets=%0d qa=%p qb=%p qc=%p qs=%p rows=%p", gets, qa, qb, qc, qs, rows);
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    assert_eq!(
+        flag(&sim, "pass_scalar"),
+        1,
+        "{{get_obj().data}} calls get_obj once"
+    );
+    assert_eq!(
+        flag(&sim, "pass_queue"),
+        1,
+        "{{qb, get_obj().ql}} calls get_obj once and copies the queue"
+    );
+    assert_eq!(
+        flag(&sim, "pass_two"),
+        1,
+        "two call-receiver operands make two calls"
+    );
+    assert_eq!(
+        flag(&sim, "pass_struct"),
+        1,
+        "a packed struct member through a call receiver"
+    );
+    assert_eq!(
+        flag(&sim, "pass_rows"),
+        1,
+        "a selected queue target calls get_obj once per operand"
+    );
+    assert_eq!(
+        flag(&sim, "pass_typedef"),
+        1,
+        "a call returning a typedef of a class is called once per operand"
+    );
+}

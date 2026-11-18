@@ -63,4 +63,6 @@ fn libc_import_needs_no_dpi_lib() {
         ),
         "{text}"
     );
+    // The unimplemented import is fatal, so the run fails.
+    assert_eq!(out.status.code(), Some(1), "{text}");
 }

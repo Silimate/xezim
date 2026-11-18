@@ -81,6 +81,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* A variable declared inside a procedural block or function with a type
+  parameter and packed dimensions (`T [1:0] tmp;`) is a packed array of the
+  bound type; it held one element of the wrong width (§6.20.3, §7.4.1).
+  (#333)
 
 **Usability**
 

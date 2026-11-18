@@ -101,3 +101,49 @@ endmodule
         ]
     );
 }
+
+/// The member's own edge also drives an `always` block whose `begin ... end`
+/// opens with the event control, and a control that names the member through
+/// the top module (`top.a.clk`). A procedural wait already did. Here `valid`,
+/// the struct's least significant bit, rises at 1000 and 4000 and `clk` at
+/// 2000 and 6000.
+#[test]
+fn wrapped_and_top_qualified_member_controls() {
+    let src = r#"
+`timescale 1ns/1ps
+typedef struct packed { logic [1:0] hi; logic clk; logic valid; } bus_t;
+module top;
+  bus_t a;
+  int n_w = 0, n_q = 0, n_p = 0;
+  initial begin
+    a = '0;
+    #1 a.valid = 1;
+    #1 a.clk = 1;
+    #1 a.valid = 0;
+    #1 a.valid = 1;
+    #1 a.clk = 0;
+    #1 a.clk = 1;
+    #1 a.valid = 0;
+    #1 $display("n_w=%0d n_q=%0d n_p=%0d", n_w, n_q, n_p);
+    $finish;
+  end
+  always begin @(posedge a.clk); n_w++; $display("%0t wrapped a=%b", $time, a); end
+  always @(posedge top.a.clk) begin n_q++; $display("%0t qualified a=%b", $time, a); end
+  initial forever begin @(posedge a.clk) n_p++; $display("%0t procedural a=%b", $time, a); end
+endmodule
+"#;
+    let mut got = lines(src);
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "2000 procedural a=0011",
+            "2000 qualified a=0011",
+            "2000 wrapped a=0011",
+            "6000 procedural a=0011",
+            "6000 qualified a=0011",
+            "6000 wrapped a=0011",
+            "n_w=2 n_q=2 n_p=2",
+        ]
+    );
+}

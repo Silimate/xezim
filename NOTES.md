@@ -81,6 +81,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* A part-select bounded by `$clog2` of a constant (`a[$clog2(N)-1:3]`), as in
+  a port connection read by the child's clocked blocks, selects the declared
+  bits. Compiled code did not fold the `$clog2`, and its select with unfolded
+  bounds took the labels as physical bit positions, so on `input [11:2] a`
+  the upper bits read x (§11.5.1, §20.8.1). (#332)
 
 **Usability**
 

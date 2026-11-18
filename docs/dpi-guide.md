@@ -54,12 +54,17 @@ A `.so`/`.dylib`/`.dll` named among the sources is loaded as it is.
 arguments (`-CFLAGS "-I csrc -DMODEL=2"`, `-LDFLAGS -lm`); they come after
 xezim's own, so `-CFLAGS "-O0 -g"` builds a debuggable library.
 
-The library is cached in `xezim/dpi` under `$XEZIM_CACHE_DIR`,
-`$XDG_CACHE_HOME` or `~/.cache`. The key is each source's preprocessed text
-and compile command, the object files' contents and the link command, so
-an edit to a source or to a header it includes rebuilds the library, and an
-unchanged one is reused without compiling. A compile or link error stops
-the run before it starts.
+The build is cached in `xezim/dpi` under `$XEZIM_CACHE_DIR`,
+`$XDG_CACHE_HOME` or `~/.cache`; with none of them set, in `xezim-<uid>` in
+the temporary directory, which must belong to you and be writable by no
+one else. Each source's object is keyed by its preprocessed text and
+compile command, and the library by those objects, the listed object
+files' contents and the link command, so an edit to a source or to a
+header it includes rebuilds the library, and an unchanged one is reused
+without compiling. `-LDFLAGS` can name files outside the key (an archive,
+a `-l` library), so with `-LDFLAGS` the library is linked again on every
+run, from the cached objects. A compile or link error stops the run before
+it starts.
 
 ---
 

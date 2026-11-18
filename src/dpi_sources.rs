@@ -13,10 +13,13 @@
 //! own `svdpi.h`, `vpi_user.h`, `sv_vpi_user.h` and `veriuser.h` are on the
 //! include path. `-CFLAGS`/`-LDFLAGS` add compiler and linker arguments.
 //!
-//! The library is cached by content under `<cache>/xezim/dpi`: the key covers
-//! each source's PREPROCESSED text (so an edited header misses), the
-//! compiler commands, the object files' bytes and the link flags. A hit
-//! skips the compiler entirely, apart from the preprocessing pass.
+//! Builds are cached by content under `<cache>/xezim/dpi`. Each source's
+//! object is keyed by its PREPROCESSED text (so an edited header misses) and
+//! its compile command; the library by those objects, the listed object
+//! files' bytes and the link command. A hit skips the compiler, apart from
+//! the preprocessing pass. `-LDFLAGS` can name files the key does not see
+//! (`./libmodel.a`, a `-l` library on the search path), so with them the
+//! library is linked again on every run, from the cached objects.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -85,6 +88,11 @@ impl ForeignInputs {
         self.sources.is_empty() && self.objects.is_empty() && self.shared_libraries.is_empty()
     }
 
+    /// Whether there is a library to build: a source, object or archive.
+    pub fn needs_build(&self) -> bool {
+        !self.sources.is_empty() || !self.objects.is_empty()
+    }
+
     /// Every file, for `--dump-files-list`.
     pub fn files(&self) -> impl Iterator<Item = &str> {
         self.sources
@@ -106,16 +114,63 @@ pub fn loadable_path(path: &str) -> String {
 }
 
 /// Where built libraries are kept: `xezim/dpi` under `$XEZIM_CACHE_DIR`,
-/// `$XDG_CACHE_HOME` or `~/.cache`, as the native-code cache does.
-pub fn default_cache_dir() -> PathBuf {
+/// `$XDG_CACHE_HOME` or `~/.cache`, as the native-code cache does. With none
+/// of them set, a directory of this user's in the temporary directory,
+/// `xezim-<uid>`, which must be private (see `private_dir`): the library
+/// built there is loaded into the simulator.
+pub fn default_cache_dir() -> Result<PathBuf, String> {
     let set = |v: &str| std::env::var_os(v).filter(|p| !p.is_empty());
-    set("XEZIM_CACHE_DIR")
+    let base = match set("XEZIM_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(|| set("XDG_CACHE_HOME").map(PathBuf::from))
         .or_else(|| set("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("xezim")
-        .join("dpi")
+    {
+        Some(base) => base,
+        None => {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let uid = unsafe { libc::geteuid() };
+            let dir = std::env::temp_dir().join(format!("xezim-{uid}"));
+            private_dir(&dir)?;
+            dir
+        }
+    };
+    Ok(base.join("xezim").join("dpi"))
+}
+
+/// Create `dir` for this user only, or check that the existing one is a
+/// directory (not a symbolic link) that this user owns and nobody else can
+/// write to. In a shared temporary directory anyone may create the name
+/// first, with headers or a library of their own in it.
+fn private_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let err = |why: String| {
+        format!(
+            "the DPI cache {} {}; set $XEZIM_CACHE_DIR to a directory of your own",
+            dir.display(),
+            why
+        )
+    };
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(err(format!("cannot be created ({e})"))),
+    }
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| err(format!("cannot be read ({e})")))?;
+    // SAFETY: as above.
+    let uid = unsafe { libc::geteuid() };
+    if !meta.file_type().is_dir() {
+        return Err(err("is not a directory".into()));
+    }
+    if meta.uid() != uid {
+        return Err(err(format!("belongs to another user (uid {})", meta.uid())));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(err(format!(
+            "can be written by other users (mode {:o})",
+            meta.mode() & 0o777
+        )));
+    }
+    Ok(())
 }
 
 /// The headers DPI-C code includes, as xezim ships them in `include/`.
@@ -169,6 +224,7 @@ fn run(cmd: &[OsString], what: &str) -> Result<(), String> {
 }
 
 /// Write the shipped headers into a directory named by their content, once.
+/// An existing copy is used only when every header in it is xezim's own.
 fn header_dir(cache: &Path) -> Result<PathBuf, String> {
     let mut h = crate::CacheHash::new();
     for (name, text) in HEADERS {
@@ -176,7 +232,12 @@ fn header_dir(cache: &Path) -> Result<PathBuf, String> {
         h.text(text);
     }
     let dir = cache.join(format!("include-{}", &h.finish()[..16]));
-    if HEADERS.iter().all(|(n, _)| dir.join(n).is_file()) {
+    let intact = || {
+        HEADERS
+            .iter()
+            .all(|(n, text)| std::fs::read(dir.join(n)).is_ok_and(|b| b == text.as_bytes()))
+    };
+    if intact() {
         return Ok(dir);
     }
     // Written beside it and renamed, so a concurrent run never reads a
@@ -191,9 +252,17 @@ fn header_dir(cache: &Path) -> Result<PathBuf, String> {
         Ok(())
     };
     write().map_err(|e| format!("cannot write DPI headers under {}: {}", cache.display(), e))?;
+    // A copy that is not intact (edited, or cut short) is replaced; one
+    // another run has put there meanwhile is kept.
+    if dir.exists() && !intact() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     if std::fs::rename(&tmp, &dir).is_err() {
         // Another run put them there first.
         let _ = std::fs::remove_dir_all(&tmp);
+        if !intact() {
+            return Err(format!("cannot write DPI headers to {}", dir.display()));
+        }
     }
     Ok(dir)
 }
@@ -202,14 +271,16 @@ fn header_dir(cache: &Path) -> Result<PathBuf, String> {
 /// archives into one shared library under `cache`, or reuse the library an
 /// earlier run built from the same inputs. `None` when there is nothing to
 /// build. `cflags` go to every compile after xezim's own arguments, so they
-/// can override them (`-O0 -g`); `ldflags` go last on the link.
+/// can override them (`-O0 -g`); `ldflags` go last on the link. With
+/// `ldflags` the library is linked again every run (they can name files the
+/// key does not cover); the compiled objects are reused either way.
 pub fn build_library(
     inputs: &ForeignInputs,
     cflags: &[String],
     ldflags: &[String],
     cache: &Path,
 ) -> Result<Option<PathBuf>, String> {
-    if inputs.sources.is_empty() && inputs.objects.is_empty() {
+    if !inputs.needs_build() {
         return Ok(None);
     }
     std::fs::create_dir_all(cache)
@@ -225,14 +296,18 @@ pub fn build_library(
         cmd
     };
 
-    // The key: what each source preprocesses to under its exact compile
-    // command, the objects' bytes, and the link.
+    // Each source's object is keyed by what the source preprocesses to under
+    // its exact compile command; the library by those objects, the listed
+    // objects' bytes, and the link.
     let mut key = crate::CacheHash::new();
-    key.text("dpi-sources-1");
+    key.text("dpi-library-2");
     key.text(std::env::consts::OS);
     key.text(std::env::consts::ARCH);
+    // (cached object, source, language)
+    let mut compiled: Vec<(PathBuf, &str, ForeignKind)> = Vec::new();
     for (src, lang) in &inputs.sources {
-        let mut pp = flags(*lang);
+        let compile = flags(*lang);
+        let mut pp = compile.clone();
         pp.extend(["-E".into(), src.into()]);
         let out = Command::new(&pp[0])
             .args(&pp[1..])
@@ -254,8 +329,15 @@ pub fn build_library(
                 String::from_utf8_lossy(&out.stderr).trim_end()
             ));
         }
-        key.text(&display(&flags(*lang)));
-        key.bytes(&out.stdout);
+        let mut obj_key = crate::CacheHash::new();
+        obj_key.text("dpi-object-1");
+        obj_key.text(std::env::consts::OS);
+        obj_key.text(std::env::consts::ARCH);
+        obj_key.text(&display(&compile));
+        obj_key.bytes(&out.stdout);
+        let obj_key = obj_key.finish();
+        key.text(&obj_key);
+        compiled.push((cache.join(format!("obj-{}.o", &obj_key[..24])), src.as_str(), *lang));
     }
     for obj in &inputs.objects {
         let bytes = std::fs::read(obj)
@@ -277,7 +359,9 @@ pub fn build_library(
     }
     let key = key.finish();
     let lib = cache.join(format!("dpi-{}.so", &key[..24]));
-    if lib.is_file() {
+    // `-LDFLAGS "./libmodel.a"` or `-lmodel`: an edit to that library leaves
+    // the key as it was, so the link is not skipped then.
+    if ldflags.is_empty() && lib.is_file() {
         return Ok(Some(lib));
     }
 
@@ -286,17 +370,20 @@ pub fn build_library(
     std::fs::create_dir_all(&build)
         .map_err(|e| format!("cannot create {}: {}", build.display(), e))?;
     let result = (|| -> Result<(), String> {
-        let mut objs: Vec<OsString> = Vec::new();
-        for (i, (src, lang)) in inputs.sources.iter().enumerate() {
-            let obj = build.join(format!("{}.o", i));
+        for (i, (obj, src, lang)) in compiled.iter().enumerate() {
+            if obj.is_file() {
+                continue;
+            }
+            let tmp = build.join(format!("{}.o", i));
             let mut cmd = flags(*lang);
-            cmd.extend(["-c".into(), src.into(), "-o".into(), obj.clone().into()]);
+            cmd.extend(["-c".into(), (*src).into(), "-o".into(), tmp.clone().into()]);
             run(&cmd, &format!("compiling DPI source '{}'", src))?;
-            objs.push(obj.into());
+            std::fs::rename(&tmp, obj)
+                .map_err(|e| format!("cannot move a DPI object to {}: {}", obj.display(), e))?;
         }
         let tmp = build.join("lib.so");
         link.extend(["-o".into(), tmp.clone().into()]);
-        link.extend(objs);
+        link.extend(compiled.iter().map(|(obj, _, _)| OsString::from(obj)));
         for obj in &inputs.objects {
             // Every member of an archive: nothing in the library references
             // them, the simulator looks them up by name.
@@ -358,6 +445,29 @@ mod tests {
         );
         assert_eq!(f.objects, ["x.o"]);
         assert_eq!(f.shared_libraries, ["l.so"]);
+    }
+
+    #[test]
+    fn private_dir_refuses_shared_and_linked_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("xezim_private_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let own = base.join("own");
+        private_dir(&own).expect("a new directory");
+        let mode = std::fs::metadata(&own).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        private_dir(&own).expect("the same directory again");
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let e = private_dir(&open).unwrap_err();
+        assert!(e.contains("can be written by other users (mode 775)"), "{e}");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&own, &link).unwrap();
+        let e = private_dir(&link).unwrap_err();
+        assert!(e.contains("is not a directory"), "{e}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -3863,12 +3863,19 @@ suppressed but the explicit SDF annotation still applies."
     // loaded after the `--dpi-lib` libraries, with the shared libraries
     // named among the files. Only a simulation loads DPI code.
     if mode == Mode::Simulate && !foreign.is_empty() {
-        match xezim::dpi_sources::build_library(
-            &foreign,
-            &compat.dpi_cflags,
-            &compat.dpi_ldflags,
-            &xezim::dpi_sources::default_cache_dir(),
-        ) {
+        let built = if foreign.needs_build() {
+            xezim::dpi_sources::default_cache_dir().and_then(|cache| {
+                xezim::dpi_sources::build_library(
+                    &foreign,
+                    &compat.dpi_cflags,
+                    &compat.dpi_ldflags,
+                    &cache,
+                )
+            })
+        } else {
+            Ok(None)
+        };
+        match built {
             Ok(lib) => dpi_libs.extend(lib.map(|p| p.to_string_lossy().into_owned())),
             Err(e) => {
                 eprintln!("Error: {}", e);

@@ -89,9 +89,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   Clang, else `cc`/`c++`), with xezim's `svdpi.h` and `vpi_user.h` on the
   include path, linked with any `.o`/`.a` files named the same way into one
   shared library and loaded like `--dpi-lib`; they used to be parsed as
-  SystemVerilog. The library is cached by its preprocessed sources and
-  commands, under `xezim/dpi` in the cache directory. `-CFLAGS`/`-LDFLAGS`
-  (also `-ccflags`/`-ldflags`) add compiler and linker arguments. A
+  SystemVerilog. The objects and library are cached by the preprocessed
+  sources and the commands, under `xezim/dpi` in the cache directory (a
+  private `xezim-<uid>` in the temporary directory when none is set).
+  `-CFLAGS`/`-LDFLAGS` (also `-ccflags`/`-ldflags`) add compiler and linker
+  arguments; with `-LDFLAGS` the library is linked again every run. A
   `.so`/`.dylib`/`.dll` named among the files is loaded as `--dpi-lib`
   (§35). (Silimate/xezim#307)
 * FSM coverage: `--code-coverage=fsm` (part of `all` and of bare

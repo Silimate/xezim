@@ -33,9 +33,11 @@ impl Simulator {
             // assoc-of-queue element (`assoc[key]`) —
             // contributes each of its elements in order.
             // Looking an operand up as a collection evaluates its index
-            // expressions, and so does reading it. An operand whose indices
-            // have side effects (`m[i++]`, `aa[i++].ql`) has them evaluated
-            // once, first, so it selects the same element either way.
+            // expressions and receivers, and so does reading it. An operand
+            // whose indices have side effects (`m[i++]`, `aa[i++].ql`), or
+            // whose object a call returns (`get_obj().data`), has them
+            // evaluated once, first, so it selects the same element either
+            // way.
             let frozen;
             let expr: &Expression = if Self::cond_expr_is_effect_free(expr, false) {
                 expr
@@ -117,9 +119,11 @@ impl Simulator {
     /// `e` with each index expression that has a side effect evaluated now,
     /// once, left to right, and replaced by a literal of its value, so the
     /// operand selects the same element however often it is then looked up
-    /// and read (§11.3.2: an operand is evaluated once). `None` when a side
-    /// effect sits outside an index (a call, an increment of its own) or an
-    /// index value is real.
+    /// and read (§11.3.2: an operand is evaluated once). A call that returns
+    /// the object a member is read from (`get_obj().data`) is made now too,
+    /// and replaced by a literal of the handle it returns. `None` when a side
+    /// effect sits anywhere else (another call, an increment of its own) or
+    /// an index value is real.
     pub(super) fn freeze_side_effect_indices(&mut self, e: &Expression) -> Option<Expression> {
         if Self::cond_expr_is_effect_free(e, false) {
             return Some(e.clone());
@@ -133,7 +137,13 @@ impl Simulator {
                     **index = Self::value_literal(&v, index.span)?;
                 }
             }
-            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => {
+            ExprKind::MemberAccess { expr, .. } => {
+                **expr = match self.freeze_side_effect_indices(expr) {
+                    Some(f) => f,
+                    None => self.freeze_handle_receiver(expr)?,
+                };
+            }
+            ExprKind::Paren(expr) => {
                 **expr = self.freeze_side_effect_indices(expr)?;
             }
             ExprKind::Ident(h) => {
@@ -151,6 +161,31 @@ impl Simulator {
             _ => return None,
         }
         Some(out)
+    }
+
+    /// The receiver `e` of a member access when it is a call whose declared
+    /// return type is a class or a typedef of one (`get_obj()` of
+    /// `get_obj().data`): the call is made now and replaced by a literal of
+    /// the handle it returns, which `expr_assoc_name` and the member read
+    /// take as that object. `None` for any other receiver, which is left to
+    /// run where it stands.
+    fn freeze_handle_receiver(&mut self, e: &Expression) -> Option<Expression> {
+        let mut call = e;
+        while let ExprKind::Paren(inner) = &call.kind {
+            call = inner;
+        }
+        let ExprKind::Call { func, .. } = &call.kind else {
+            return None;
+        };
+        let DataType::TypeReference { name, .. } = self.call_return_type(func)? else {
+            return None;
+        };
+        let tn = self
+            .resolve_type_param_binding(&name.name.name)
+            .unwrap_or_else(|| name.name.name.clone());
+        self.resolved_class_key(&tn)?;
+        let h = self.eval_expr(call);
+        Self::value_literal(&h, e.span)
     }
 
     /// A sized literal of `v`'s bits, width and signedness (x and z digits

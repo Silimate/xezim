@@ -4451,8 +4451,9 @@ impl Simulator {
                         exprs.iter().collect()
                     };
                     // §11.3.2: an operand whose indices have side effects
-                    // (`aa[i++].ql`) has them evaluated once, here, before
-                    // the lookups below would run them again.
+                    // (`aa[i++].ql`), or whose object a call returns
+                    // (`get_obj().data`), has them evaluated once, here,
+                    // before the lookups below would run them again.
                     let frozen: Vec<Option<Expression>> = items
                         .iter()
                         .map(|e| {

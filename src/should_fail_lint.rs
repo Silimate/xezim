@@ -521,7 +521,7 @@ fn check_proc_net_assign(
     use std::collections::HashSet;
     let mut nets: HashSet<String> = HashSet::new();
     // The output ports that are nets because they have no data type and no
-    // net kind of their own (or inherit that from the port before them).
+    // net kind.
     let mut untyped: HashSet<String> = HashSet::new();
     for it in items {
         if let ModuleItem::NetDeclaration(nd) = it {
@@ -532,7 +532,6 @@ fn check_proc_net_assign(
     }
     if let PortList::Ansi(ps) = ports {
         let mut prev_net = false;
-        let mut prev_untyped = false;
         for p in ps {
             let omitted =
                 p.direction.is_none() && p.net_type.is_none() && !p.var_kw && p.data_type.is_none();
@@ -547,11 +546,12 @@ fn check_proc_net_assign(
                     && !p.var_kw
                     && matches!(p.data_type, None | Some(DataType::Implicit { .. }))
             };
-            let no_type = if omitted {
-                prev_untyped
-            } else {
-                net && p.net_type.is_none()
-            };
+            // The parser has already copied an omitted direction, kind and
+            // data type from the port before (§23.2.2.3), so in `output q, r`
+            // the port `r` arrives declared like `q`, and its own fields
+            // decide. A port that still omits all of them has no declaration
+            // to point at, so it keeps the plain net message.
+            let no_type = net && !omitted && p.net_type.is_none();
             if net {
                 nets.insert(p.name.name.clone());
                 if no_type {
@@ -559,7 +559,6 @@ fn check_proc_net_assign(
                 }
             }
             prev_net = net;
-            prev_untyped = net && no_type;
         }
         // A body declaration of the same name is not a net port (and is
         // diagnosed elsewhere if illegal).

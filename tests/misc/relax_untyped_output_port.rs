@@ -44,8 +44,9 @@ fn run(tag: &str, source: &str, args: &[&str], env: &[(&str, &str)]) -> (bool, S
     r
 }
 
-/// `q` and `cnt` have no data type, and `r` inherits that from `q`; `v` is a
-/// variable, and so is `u`, which inherits `logic` from `v`.
+/// `q` and `cnt` have no data type, and `r` inherits that from `q`
+/// (§23.2.2.3); `v` is a variable, and so is `u`, which inherits `logic`
+/// from `v`.
 const FLOP: &str = r#"
 module flop (input logic clk, input logic rst, input logic d,
              output q, r, output [3:0] cnt, output logic v, u);

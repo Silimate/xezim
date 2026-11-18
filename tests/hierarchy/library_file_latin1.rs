@@ -1,8 +1,9 @@
-//! A `-v`/`-y` library file is decoded as source files are: a byte that is
-//! not UTF-8 (a Latin-1 `®`, 0xAE, in a comment, as in some vendor
-//! simulation libraries) becomes U+FFFD. The read used to fail with "stream
-//! did not contain valid UTF-8", the whole file was dropped, and its modules
-//! were "not found", while the same byte in a source file was accepted.
+//! IEEE 1800-2023 §5.4: the text of a comment is not interpreted. A `-v`/`-y`
+//! library file is decoded as source files are: a byte that is not UTF-8 (a
+//! Latin-1 `®`, 0xAE, in a comment, as in some vendor simulation libraries)
+//! becomes U+FFFD. The read used to fail with "stream did not contain valid
+//! UTF-8", the whole file was dropped, and its modules were "not found",
+//! while the same byte in a source file was accepted.
 
 use std::process::Command;
 

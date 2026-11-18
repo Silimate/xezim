@@ -154,3 +154,29 @@ endmodule
     ));
     assert_has(&got, "s4: d1=16 d2=128 a1=16 n1=8 n2=8");
 }
+
+/// A typedef of a value-parameterized specialization used as a scope
+/// names that class's typedef, not a same-named typedef outside it: the
+/// member's signedness comes from the class (§8.25.1).
+#[test]
+fn alias_scope_keeps_the_class_typedef() {
+    let got = lines(
+        r#"
+typedef logic [7:0] m;
+class C #(int N = 1);
+  typedef logic signed [7:0] m;
+endclass
+module top;
+  typedef C#(2) c_t;
+  c_t::m v;
+  C#(2)::m w;
+  initial begin
+    v = 8'hff;
+    w = 8'hff;
+    $display("g1: v<0=%0d w<0=%0d bits=%0d", v < 0, w < 0, $bits(v));
+  end
+endmodule
+"#,
+    );
+    assert_has(&got, "g1: v<0=1 w<0=1 bits=8");
+}

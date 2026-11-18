@@ -12,7 +12,15 @@
 //! `assign level_intpend_id[0][pt.PIC_TOTAL_INT_PLUS1+2:0] = {...}` on
 //! `logic [N:0][PIC_TOTAL_INT_PLUS1+2:0][7:0]`; the tree went x at reset
 //! release and instruction fetch stalled (Silimate/xezim#309). Expected
-//! values follow the LRM; Verilator agrees on every line.
+//! values follow the LRM.
+//!
+//! §11.5.1: such a part-select with a run-time base writes only its elements
+//! inside the dimension. The compiled store places the whole path as one bit
+//! range in the root signal, which is clipped to the root only, so
+//! `a[0][k +: 2]` with `k = 5` wrote its second byte into `a[1][0]`. The
+//! reference simulator matches every line. So does Verilator, except for the
+//! three writes past an end, which it lets spill into the neighbouring
+//! element as xezim did.
 
 fn lines(src: &str) -> Vec<String> {
     let sim = xezim::simulate(src, 100).expect("simulate");
@@ -82,6 +90,23 @@ module tb;
   // Outer-dimension slice through an NBA.
   logic [5:0][7:0] p;
   always_ff @(posedge clk) p[4:3] <= 16'h4443;
+  // §11.5.1: run-time bases past an end of their dimension.
+  logic [2:0] k = 3'd5, k0 = 3'd0;
+  logic [3:0][5:0][7:0] o1, o2, o5;
+  always_comb begin
+    o1 = '0;
+    o1[0][k +: 2] = 16'hbbaa;
+  end
+  always_comb begin
+    o2 = '0;
+    o2[1][k0 -: 2] = 16'hccdd;
+  end
+  always_ff @(posedge clk) begin
+    o5 <= '0;
+    o5[1][k +: 2] <= 16'h7776;
+  end
+  logic [15:0] r4;
+  always_comb r4 = a1[0][k +: 2];
   // Reads.
   logic [47:0] r1;
   logic [15:0] r2;
@@ -117,6 +142,10 @@ module tb;
     chk("read", r1, 48'h060504030201);
     chk("read var", r2, 16'h0403);
     chk("read concat", r3, 64'h0201_0605_0403_0000);
+    chk("past high end", o1, {48'h0, 48'h0, 48'h0, 48'haa0000000000});
+    chk("below low end", o2, {48'h0, 48'h0, 48'h0000000000cc, 48'h0});
+    chk("nba past end", o5, {48'h0, 48'h0, 48'h760000000000, 48'h0});
+    chk("read past end", r4, 16'hxx06);
     $finish;
   end
 endmodule
@@ -143,6 +172,10 @@ fn part_select_of_middle_packed_dimension_selects_whole_elements() {
         "read",
         "read var",
         "read concat",
+        "past high end",
+        "below low end",
+        "nba past end",
+        "read past end",
     ]
     .iter()
     .map(|n| format!("PASS {n}"))

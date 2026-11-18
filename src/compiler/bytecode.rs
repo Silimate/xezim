@@ -2310,6 +2310,26 @@ pub struct BytecodeCompiler<'a> {
     packed_struct_fields: Option<&'a HashMap<String, Vec<(String, u32, u32)>>>,
 }
 
+/// Where `packed_path_dyn_range` places a store in its root signal.
+enum PackedPathTarget {
+    /// `width` bits from the bit in register `lo`.
+    Range(RegId, u32),
+    /// A part-select with a run-time base, which may run past either end of
+    /// its dimension (see `emit_slot_run_store`).
+    Slots(SlotRun),
+}
+
+/// `n` consecutive slots of `ew` bits, the lowest at run-time slot `first`,
+/// of a dimension of `count` slots whose slot 0 starts at the bit in `base`.
+/// Value bits `[k*ew +: ew]` go to slot `first + k`.
+struct SlotRun {
+    base: RegId,
+    first: RegId,
+    n: u64,
+    ew: u32,
+    count: u64,
+}
+
 impl<'a> BytecodeCompiler<'a> {
     pub fn new(
         signal_name_to_id: &'a NameMap,
@@ -19221,11 +19241,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// one dynamic bit offset into the ROOT signal, which the existing
     /// dynamic-range stores take as-is.
     ///
-    /// Returns `(root signal id, lo-bit register, width)`, or `None` when a
-    /// level is not statically resolvable — the caller's bail then stands.
-    /// An x/z index poisons the offset arithmetic, so the dynamic-range store
-    /// discards the write exactly as the single-level arms do (§11.5.1).
-    fn packed_path_dyn_range(&mut self, lhs: &Expression) -> Option<(usize, RegId, u32)> {
+    /// Returns the root signal id and where the store goes in it, or `None`
+    /// when a level is not statically resolvable — the caller's bail then
+    /// stands. An x/z index poisons the offset arithmetic, so the
+    /// dynamic-range store discards the write exactly as the single-level
+    /// arms do (§11.5.1).
+    fn packed_path_dyn_range(&mut self, lhs: &Expression) -> Option<(usize, PackedPathTarget)> {
         // A member or part-select may only sit at the LEAF; everything above
         // it must be an index chain over a packed root.
         let mut tail_member: Option<&str> = None;
@@ -19315,6 +19336,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
 
         let mut acc: Option<RegId> = None;
+        let mut slots: Option<(RegId, u64, u32, u64)> = None;
         let add_term = |c: &mut Self, term: RegId, acc: &mut Option<RegId>| match *acc {
             None => *acc = Some(term),
             Some(a) => {
@@ -19408,6 +19430,9 @@ impl<'a> BytecodeCompiler<'a> {
                         let lsb = u32::try_from(low).ok()?.checked_mul(ew)?;
                         const_off = const_off.checked_add(lsb)?;
                     } else {
+                        // §11.5.1: a run-time base can run past either end
+                        // of the dimension; only the slots inside it are
+                        // written (see `emit_slot_run_store`).
                         let base = self.compile_expr(left, 0)?;
                         let slot = self.emit_packed_slot_index(Some(dim), base);
                         let low = if up {
@@ -19422,8 +19447,7 @@ impl<'a> BytecodeCompiler<'a> {
                             ));
                             out
                         };
-                        let term = self.emit_slot_bit(low, ew, 0);
-                        add_term(self, term, &mut acc);
+                        slots = Some((low, w, ew, count as u64));
                     }
                     w
                 }
@@ -19504,7 +19528,119 @@ impl<'a> BytecodeCompiler<'a> {
                 sum
             }
         };
-        Some((id, lo_reg, width))
+        Some(match slots {
+            Some((first, n, ew, count)) => (
+                id,
+                PackedPathTarget::Slots(SlotRun {
+                    base: lo_reg,
+                    first,
+                    n,
+                    ew,
+                    count,
+                }),
+            ),
+            None => (id, PackedPathTarget::Range(lo_reg, width)),
+        })
+    }
+
+    /// §11.5.1: store a part-select whose base is only known at run time,
+    /// writing only its slots inside the dimension. The store instructions
+    /// clip to the whole ROOT signal, so a slice that ran past the end of its
+    /// own dimension wrote into the neighbouring element: `a[0][j +: 2]` on
+    /// `logic [3:0][5:0][7:0] a` with `j = 5` put its second byte in `a[1][0]`.
+    ///
+    /// When the whole run is inside the dimension, one store of fixed width
+    /// does it, as before. Otherwise each slot is stored on its own, if it is
+    /// inside. Every store has a constant width, which the two-state executor
+    /// needs. An x/z base fails both checks and writes nothing.
+    fn emit_slot_run_store(&mut self, sig: SigId, run: SlotRun, val_reg: RegId, nba: bool) {
+        let store = |c: &mut Self, lo: RegId, w: u32, v: RegId| {
+            let hi = if w == 1 {
+                lo
+            } else {
+                let hi = c.alloc_reg();
+                c.emit(Insn::BinOpConst(
+                    hi,
+                    lo,
+                    Box::new(Value::from_u64(u64::from(w) - 1, 32)),
+                    BinOpConstKind::Add,
+                ));
+                hi
+            };
+            c.emit(if nba {
+                Insn::NbaAssignRangeDyn(sig, hi, lo, v)
+            } else {
+                Insn::BlockingAssignRangeDyn(sig, hi, lo, v)
+            });
+        };
+        let slot_bit = |c: &mut Self, slot: RegId| {
+            let rel = c.emit_slot_bit(slot, run.ew, 0);
+            let bit = c.alloc_reg();
+            c.emit(Insn::Add(bit, run.base, rel));
+            bit
+        };
+        let total = u32::try_from(run.n).unwrap_or(u32::MAX).saturating_mul(run.ew);
+        let value = self.alloc_reg();
+        self.emit(Insn::MoveResize(value, val_reg, total));
+        let count = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            count,
+            Box::new(Value::from_u64(run.count, 32)),
+        ));
+        // Unsigned compares: a slot below 0 has wrapped to a large value.
+        let last = self.alloc_reg();
+        self.emit(Insn::BinOpConst(
+            last,
+            run.first,
+            Box::new(Value::from_u64(run.n - 1, 32)),
+            BinOpConstKind::Add,
+        ));
+        let first_in = self.alloc_reg();
+        self.emit(Insn::Lt(first_in, run.first, count));
+        let last_in = self.alloc_reg();
+        self.emit(Insn::Lt(last_in, last, count));
+        let inside = self.alloc_reg();
+        self.emit(Insn::LogAnd(inside, first_in, last_in));
+        let to_slots = self.insns.len();
+        self.emit(Insn::BranchIfFalse(inside, 0));
+        let lo = slot_bit(self, run.first);
+        store(self, lo, total, value);
+        let to_end = self.insns.len();
+        self.emit(Insn::Jump(0));
+        let slots_pc = self.insns.len() as u32;
+        self.insns[to_slots] = Insn::BranchIfFalse(inside, slots_pc);
+        for k in 0..run.n {
+            let slot = if k == 0 {
+                run.first
+            } else {
+                let s = self.alloc_reg();
+                self.emit(Insn::BinOpConst(
+                    s,
+                    run.first,
+                    Box::new(Value::from_u64(k, 32)),
+                    BinOpConstKind::Add,
+                ));
+                s
+            };
+            let ok = self.alloc_reg();
+            self.emit(Insn::Lt(ok, slot, count));
+            let skip = self.insns.len();
+            self.emit(Insn::BranchIfFalse(ok, 0));
+            let part = self.alloc_reg();
+            let k = k as u32;
+            self.emit(Insn::RangeSelectConst(
+                part,
+                value,
+                (k + 1) * run.ew - 1,
+                k * run.ew,
+            ));
+            let lo = slot_bit(self, slot);
+            store(self, lo, run.ew, part);
+            let next = self.insns.len() as u32;
+            self.insns[skip] = Insn::BranchIfFalse(ok, next);
+        }
+        let end = self.insns.len() as u32;
+        self.insns[to_end] = Insn::Jump(end);
     }
 
     /// `(hi, lo)` registers and the value resized to `width`, for the dynamic
@@ -19541,9 +19677,16 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
-        if let Some((id, lo_reg, w)) = self.packed_path_dyn_range(lhs) {
-            let (hi_reg, resized) = self.packed_path_store_regs(lo_reg, w, val_reg);
+        if let Some((id, target)) = self.packed_path_dyn_range(lhs) {
             let sig = as_sig_id(id);
+            let (lo_reg, w) = match target {
+                PackedPathTarget::Range(lo, w) => (lo, w),
+                PackedPathTarget::Slots(run) => {
+                    self.emit_slot_run_store(sig, run, val_reg, nba);
+                    return true;
+                }
+            };
+            let (hi_reg, resized) = self.packed_path_store_regs(lo_reg, w, val_reg);
             self.emit(if nba {
                 Insn::NbaAssignRangeDyn(sig, hi_reg, lo_reg, resized)
             } else {

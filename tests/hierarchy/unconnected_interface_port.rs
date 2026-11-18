@@ -126,7 +126,8 @@ endmodule
 }
 
 /// The switch and its environment variable elaborate the instance with a
-/// warning; a strict run after a relaxed one does not reuse its design.
+/// warning; a strict run after a relaxed one does not reuse its design;
+/// `--help` and `--show-env-avail` list them.
 #[test]
 fn the_relaxation_elaborates_with_a_warning() {
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -173,5 +174,19 @@ fn the_relaxation_elaborates_with_a_warning() {
         out.contains("is not connected") && !out.contains("RAN q="),
         "{out}"
     );
+    // `--help` lists the switch and `--show-env-avail` lists the variable.
+    for (arg, expected) in [
+        ("--help", "--relax-unconnected-interface-port"),
+        ("--show-env-avail", RELAX_ENV),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .arg(arg)
+            .output()
+            .expect("run xezim");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{arg} failed:\n{text}");
+        assert!(text.contains(expected), "{arg} omitted {expected}:\n{text}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

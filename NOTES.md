@@ -81,6 +81,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* An unpacked-array-of-struct `localparam` in a module below the top works in
+  that module's generate conditions (`if (Info[k].variant == ...)`) and keeps
+  its values when its struct typedef is declared in the same module; every
+  branch took `else` and the assignments in the others were lost (§6.20.2,
+  §27.5). (#342)
 
 **Usability**
 

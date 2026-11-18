@@ -531,6 +531,19 @@ impl Simulator {
                 }
                 true
             }
+            // §7.4.6, §7.10.1: a slice of a queue or array (`obj.q[1:$]`),
+            // read in full before the target is written.
+            ExprKind::RangeSelect { .. } if !is_assoc => {
+                let Some((vals, _)) = self.collection_slice_values(e) else {
+                    return false;
+                };
+                self.set_queue_size(name, vals.len() as u64);
+                for (i, v) in vals.into_iter().enumerate() {
+                    let v = self.fit_queue_push_elem(name, v);
+                    self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
+                }
+                true
+            }
             // §7.5.1, §8.7: `new[n]` / `new[n](src)` parse as calls of
             // `new` (see `sized_new_parts`). A collection target makes them
             // the dynamic-array constructor, which the caller's sized-new

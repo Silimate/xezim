@@ -67,6 +67,15 @@ impl Simulator {
                 }
                 continue;
             }
+            // A slice of a queue or array, however it is reached (`q[a:b]`,
+            // `obj.q[1:$]`, `this.q[i+:2]`, `get_obj().q[0:1]`), contributes
+            // the elements it selects (§7.4.6, §7.10.1).
+            if matches!(expr.kind, ExprKind::RangeSelect { .. })
+                && let Some((vals, _)) = self.collection_slice_values(expr)
+            {
+                all_vals.extend(vals);
+                continue;
+            }
             // Slice of a queue: q[a:b]
             if let ExprKind::RangeSelect {
                 expr: rbase,

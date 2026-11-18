@@ -3774,6 +3774,19 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §7.4.6, §7.10.1: a slice of a queue or array (`obj.q[1:$]`,
+        // `get_obj().q[0:1]`) assigned to a queue or dynamic array copies the
+        // elements it selects, finding the collection with one evaluation of
+        // its receiver, before the right side would run as a value.
+        if let ExprKind::RangeSelect { .. } = &rvalue.kind
+            && let Some(n) = self
+                .pending_coll_dst(lvalue)
+                .filter(|n| self.module.dynamic_arrays.contains(n) || self.class_queue_prop(n))
+            && self.assign_whole_coll(&n, None, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         // §8.8: `lhs = C::new(...)` builds a `C`, not the class `lhs` is
         // declared with (the `new` branch below), and the bare `C::new`
         // constructs too rather than reading a name.
@@ -4326,7 +4339,30 @@ impl Simulator {
                 class_dyn = true;
             }
             if self.module.arrays.contains_key(&*lname) || class_dyn {
-                // Queue/array slice assignment: lq = rq[a:b]
+                // Queue/array slice assignment: lq = rq[a:b]. A slice of a
+                // member (`lq = obj.q[1:$]`, `lq = this.q[i+:2]`) or an
+                // indexed slice (§7.4.6, §7.10.1); the bare-name form below
+                // keeps the shapes this does not model (a descending array,
+                // struct elements).
+                if matches!(rvalue.kind, ExprKind::RangeSelect { .. })
+                    && let Some((results, _)) = self.collection_slice_values(rvalue)
+                {
+                    let (l_lo, l_hi, _) = self.module.arrays[&*lname];
+                    let is_dyn = self.module.dynamic_arrays.contains(&*lname);
+                    for (i, v) in results.iter().enumerate() {
+                        let idx = l_lo + i as i64;
+                        // A dynamic target grows to fit; a fixed one clips.
+                        if !is_dyn && idx > l_hi {
+                            break;
+                        }
+                        self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v.clone());
+                    }
+                    if is_dyn {
+                        self.set_queue_size(&lname, results.len() as u64);
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
                 if let ExprKind::RangeSelect {
                     expr: rbase,
                     left,

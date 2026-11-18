@@ -70,6 +70,9 @@ fn zero_delay_task_recursion_stops_at_the_stall_limit() {
 }
 
 /// On a small native stack the check stops the run before the stack runs out.
+/// The stack bounds are read on Linux and macOS only (`thread_stack_bounds`);
+/// elsewhere the call limit is the only check.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn zero_delay_task_recursion_stops_before_the_stack_runs_out() {
     let (status, text) = run("stack", &[("XEZIM_STACK_MB", "64")]);

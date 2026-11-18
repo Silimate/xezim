@@ -23,7 +23,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the reference simulator. In a `.sv` file, or with `-sv`, it still sets
   the value before time 0 with no event (§6.8). The clock of the Analog
   Devices HDL testbenches (`reg clk = 1'b0; always @(*) #10 clk <= ~clk;`)
-  never started.
+  never started. A runtime initializer in a `.v` file
+  (`reg m = $test$plusargs("MODE");`) runs at time 0 with the others, and a
+  `--compile -o` artifact keeps the `-sv` choice it was compiled with.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

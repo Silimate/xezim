@@ -4354,6 +4354,10 @@ suppressed but the explicit SDF annotation still applies."
                     // `#[serde(skip)]` and would be silently dropped.
                     // Materialize before serialize so the artifact is complete.
                     elab.materialize_pending();
+                    // The language choice (`-sv`) is part of the design: a
+                    // `.v` file's declaration assignments become time-0
+                    // processes now, and the loaded artifact keeps them.
+                    xezim::compiler::Simulator::seal_verilog_decl_inits(&mut elab);
                     match xezim::write_compiled(&elab, out) {
                         Ok(()) => println!("Wrote compiled artifact to {}", out),
                         Err(e) => {

@@ -1619,7 +1619,12 @@ impl Simulator {
         // block (and the lazy-prefix pending ones) so package globals are
         // populated before user code reads them. Schedule them first so they
         // receive the lowest pids (the time-0 queue runs lower pids first).
+        let mut decl_blocks: Vec<super::elaborate::InitialBlock> = Vec::new();
         for ib in std::mem::take(&mut self.module.static_init_blocks) {
+            if Self::verilog_decl_block(&ib.stmt).is_some() {
+                decl_blocks.push(ib);
+                continue;
+            }
             let span = ib.stmt.span;
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
@@ -1639,36 +1644,29 @@ impl Simulator {
             self.event_queue.schedule(0, pid, stmts.into());
         }
         // IEEE 1364-2005 §6.2.1: the declaration assignments of Verilog
-        // variables, as one `initial` process (see `take_verilog_decl_inits`).
-        if !self.verilog_decl_inits.is_empty() {
-            let span = crate::ast::Span::dummy();
-            let stmts: Vec<Statement> = std::mem::take(&mut self.verilog_decl_inits)
-                .into_iter()
-                .map(|(name, v)| {
-                    let rvalue = Expression::new(
-                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                            size: Some(v.width),
-                            signed: v.is_signed,
-                            base: crate::ast::expr::NumberBase::Binary,
-                            value: v.to_bin_string(),
-                            cached_val: crate::ast::cache::LiteralCache::new(None),
-                        }),
-                        span,
-                    );
-                    Statement::new(
-                        StatementKind::BlockingAssign {
-                            lvalue: super::vpi_model::ident_expr(&name),
-                            rvalue,
-                        },
-                        span,
-                    )
-                })
-                .collect();
+        // variables (see `seal_verilog_decl_inits`): the literal values as
+        // one process, then each runtime initializer in its order. They run
+        // after the `always` processes that arm first (`t0_decl_init_pids`).
+        decl_blocks.sort_by_key(|ib| {
+            Self::verilog_decl_block(&ib.stmt) != Some(super::VERILOG_DECL_INIT_MARKER)
+        });
+        for ib in decl_blocks {
+            let span = ib.stmt.span;
+            let StatementKind::SeqBlock { mut stmts, .. } = ib.stmt.kind else {
+                continue;
+            };
+            stmts.remove(0);
+            if stmts.is_empty() {
+                continue;
+            }
             let pid = self.next_pid;
             self.next_pid += 1;
+            if !ib.scope.is_empty() {
+                self.process_scope_hint.insert(pid, ib.scope);
+            }
             self.process_origin
                 .insert(pid, (span, "declaration assignment"));
-            self.t0_decl_init_pid = Some(pid);
+            self.t0_decl_init_pids.insert(pid);
             self.event_queue.schedule(0, pid, stmts.into());
         }
         // §16.5/§16.14: declarative concurrent assertions exist before

@@ -741,7 +741,7 @@ impl Simulator {
     /// they only arm the wait, so a time-0 write such as `initial clk = 0;`
     /// wakes `always @(clk) #10 clk = ~clk;` wherever the two sit in the
     /// source, as in the reference simulator and Icarus. Then the Verilog
-    /// declaration assignments (`t0_decl_init_pid`), which run before every
+    /// declaration assignments (`t0_decl_init_pids`), which run before every
     /// `initial` block there too.
     pub(super) fn order_time0_processes(&mut self) {
         let pids = self.event_queue.slot_pids(0);
@@ -815,7 +815,7 @@ impl Simulator {
             type Key = (u8, usize, Vec<usize>, Vec<usize>, usize);
             let key_of = |i: usize, pid: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
                 match info {
-                    _ if self.t0_decl_init_pid == Some(pid) => (2, 0, Vec::new(), Vec::new(), i),
+                    _ if self.t0_decl_init_pids.contains(&pid) => (2, 0, Vec::new(), Vec::new(), i),
                     None => (0, 0, Vec::new(), Vec::new(), i),
                     Some((root, pos, _)) if self.t0_event_led.contains(&pid) => {
                         (1, *root, pos.clone(), pos.clone(), i)

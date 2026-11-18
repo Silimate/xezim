@@ -41,3 +41,51 @@ fn constant_element_member_writes_compile_and_match() {
         "a member write through element selects fell back to the interpreter:\n{text}"
     );
 }
+
+/// §11.6.1: a sized index expression keeps its width (`1'b1 + 1'b1` is 0,
+/// so the NBA writes `e[0]`), and a function's own struct shadows the
+/// module signal of the same name. Both stay on the interpreter's path.
+#[test]
+fn index_width_and_a_shadowing_local() {
+    let got: Vec<String> = xezim::simulate(
+        r#"
+// width of an index expression, and a function-local container that shadows a module signal
+package gp;
+  typedef struct packed { logic [7:0] value; } dw_t;
+  typedef struct packed { dw_t [1:0] dw; } nest_t;
+  typedef struct packed { nest_t [2:0] e; } nest3_t;
+endpackage
+module gsub import gp::*; (input logic clk, output nest3_t st, output logic [7:0] fr);
+  nest3_t s;
+  function automatic logic [7:0] rd_local();
+    nest3_t s;
+    s = '0;
+    s.e[1].dw[0].value = 8'h77;
+    return s.e[1].dw[0].value;
+  endfunction
+  always_ff @(posedge clk) begin
+    st <= '0;
+    st.e[1'b1 + 1'b1].dw[0].value <= 8'h5A;
+  end
+  initial begin s = '0; s.e[1].dw[0].value = 8'h11; end
+  always_comb fr = rd_local();
+endmodule
+module gtop;
+  logic clk = 0; gp::nest3_t st; logic [7:0] fr;
+  gsub u (.clk(clk), .st(st), .fr(fr));
+  initial begin #1 clk = 1; #1 $display("g1: st=%h fr=%h", st, fr); end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed")
+    .output
+    .iter()
+    .map(|o| o.message.clone())
+    .collect();
+    let want = "g1: st=00000000005a fr=77";
+    assert!(
+        got.iter().any(|l| l == want),
+        "missing `{want}` in {got:#?}"
+    );
+}

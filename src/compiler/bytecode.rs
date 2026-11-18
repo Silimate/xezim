@@ -2530,6 +2530,11 @@ impl<'a> BytecodeCompiler<'a> {
         lhs: &Expression,
     ) -> Option<(usize, String, String, u32, u32)> {
         let fields_map = self.packed_struct_fields?;
+        // A local of the frame (a function's own struct) shadows a module
+        // signal of the same name; it is not this signal's layout.
+        if self.frame_bound_target(lhs) {
+            return None;
+        }
         // The selects below the root, innermost (leaf) first.
         let mut tail: Vec<String> = Vec::new();
         let mut has_index = false;
@@ -2544,7 +2549,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if self.is_xz_literal(index) {
                         return None;
                     }
-                    tail.push(format!("[{}]", self.eval_const_bound(index)?));
+                    tail.push(format!("[{}]", self.plain_const_index(index)?));
                     has_index = true;
                     cur = expr;
                 }
@@ -2604,6 +2609,26 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         None
+    }
+
+    /// §11.6.1: an index whose value does not depend on expression width: a
+    /// literal, a parameter or a bound constant, optionally negated or in
+    /// parentheses. An expression such as `1'b1 + 1'b1` is self-determined
+    /// (it wraps to 0) and `eval_const_bound` does not model that, so it is
+    /// left to the interpreter.
+    fn plain_const_index(&self, e: &Expression) -> Option<i64> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.plain_const_index(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand,
+            } if matches!(operand.kind, ExprKind::Number(_)) => self.eval_const_bound(e),
+            ExprKind::Number(_) => self.eval_const_bound(e),
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                self.eval_const_bound(e)
+            }
+            _ => None,
+        }
     }
 
     /// Resolve a packed-struct container and clone its flattened field layout.

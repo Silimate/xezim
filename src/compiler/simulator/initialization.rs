@@ -1138,11 +1138,19 @@ impl Simulator {
                 .map(|s| s.name.name.as_str())
                 .collect::<Vec<_>>()
                 .join(".");
-            let spellings: Vec<String> = if scope.is_empty() || h.root.is_some() {
+            let mut spellings: Vec<String> = if scope.is_empty() || h.root.is_some() {
                 vec![full]
             } else {
                 vec![format!("{}.{}", scope, full), full]
             };
+            // §23.6: `top.a.clk` names the top module's `a`, stored as `a`.
+            if let Some(rest) = spellings
+                .last()
+                .and_then(|f| f.strip_prefix(module.name.as_str()))
+                .and_then(|r| r.strip_prefix('.'))
+            {
+                spellings.push(rest.to_string());
+            }
             spellings.iter().find_map(|name| {
                 if module.signals.contains_key(name.as_str()) {
                     return None;
@@ -1237,26 +1245,40 @@ impl Simulator {
                 }
             }));
         for (stmt, scope, mut patched) in headers {
-            let StatementKind::TimingControl {
-                control: TimingControl::Event(EventControl::EventExpr(exprs)),
-                ..
-            } = &mut stmt.kind
-            else {
-                if dbg {
-                    eprintln!(
-                        "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
-                        scope,
-                        std::mem::discriminant(&stmt.kind)
-                    );
+            let discriminant = std::mem::discriminant(&stmt.kind);
+            // `always begin @(...); ... end` starts with its event control
+            // too (`extract_sensitivity`); only the member rewrite below
+            // applies to that shape.
+            let (exprs, wrapped) = match &mut stmt.kind {
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                    ..
+                } => (exprs, false),
+                StatementKind::SeqBlock { stmts, .. } => match stmts.first_mut().map(|s| &mut s.kind)
+                {
+                    Some(StatementKind::TimingControl {
+                        control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                        ..
+                    }) => (exprs, true),
+                    _ => continue,
+                },
+                _ => {
+                    if dbg {
+                        eprintln!(
+                            "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
+                            scope, discriminant
+                        );
+                    }
+                    continue;
                 }
-                continue;
             };
             for (term, ee) in exprs.iter_mut().enumerate() {
                 // Port substitution leaves `@(dq[3])` as a select of the
                 // connection (`bus[15:8][3]`); spell such a term as the net
                 // bit it reads first (see `event_bits`).
-                if let Some(f) =
-                    event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
+                if !wrapped
+                    && let Some(f) =
+                        event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
                 {
                     ee.expr = f;
                     if let Some(p) = patched.as_mut() {
@@ -1322,7 +1344,7 @@ impl Simulator {
                     }
                     continue;
                 }
-                if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
+                if wrapped || !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
                     continue;
                 }
                 let mut idxs: Vec<i64> = Vec::new();

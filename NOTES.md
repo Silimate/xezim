@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* In a module instance, an `always_comb` that reads one bit of a vector and
+  writes another bit of it runs again whenever the bit it reads changes, also
+  when the vector's range depends on a parameter (`logic [P+1:0] b`). The
+  block used to run once at time zero and never again: its sensitivity sized
+  the vector with the top module's parameters instead of the instance's
+  (§9.2.2.2.1). Caliptra's `caliptra_prim_arbiter_fixed`, whose priority tree
+  is built from such blocks in a generate loop, now follows its requests; its
+  index had stayed x. (Silimate/xezim#395)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

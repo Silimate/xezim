@@ -215,3 +215,41 @@ endmodule
 "#;
     assert_lines(&lines(src), &["V01 00000030"]);
 }
+
+/// §11.6.1 Table 11-21: the operands of `&&`, `||`, `->` and `<->` stay
+/// self-determined inside an input actual, so the formal's width does not
+/// reach them: `(a << 1)` of `logic [7:0] a = 8'h80` is 8'h00 and false.
+#[test]
+fn logical_operands_in_an_input_actual_stay_self_determined() {
+    let src = r#"
+module t;
+  logic [7:0] a = 8'h80;
+  logic [31:0] r32;
+  task automatic ta32(input logic [31:0] v); r32 = v; endtask
+  function automatic logic [31:0] fa32(input logic [31:0] v); return v; endfunction
+  initial begin
+    ta32((a << 1) || 1'b0);     $display("L01 %h", r32);
+    ta32((a << 1) && 1'b1);     $display("L02 %h", r32);
+    ta32(1'b1 && (a << 1));     $display("L03 %h", r32);
+    ta32(!(a << 1));            $display("L04 %h", r32);
+    ta32((a << 1) -> 1'b0);     $display("L05 %h", r32);
+    ta32((a << 1) <-> 1'b0);    $display("L06 %h", r32);
+    ta32(((a << 1) || 1'b0) << 4); $display("L07 %h", r32);
+    $display("L08 %h", fa32((a << 1) || 1'b0));
+  end
+endmodule
+"#;
+    assert_lines(
+        &lines(src),
+        &[
+            "L01 00000000",
+            "L02 00000000",
+            "L03 00000000",
+            "L04 00000001",
+            "L05 00000001",
+            "L06 00000001",
+            "L07 00000000",
+            "L08 00000000",
+        ],
+    );
+}

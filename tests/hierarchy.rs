@@ -485,3 +485,5 @@ mod shared_net_initializer_targets;
 mod negative_genvar_cached;
 #[path = "hierarchy/unit_storage_shared_bodies_721.rs"]
 mod unit_storage_shared_bodies_721;
+#[path = "hierarchy/struct_array_localparam_generate.rs"]
+mod struct_array_localparam_generate;

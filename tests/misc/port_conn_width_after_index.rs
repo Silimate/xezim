@@ -45,6 +45,11 @@ fn range_after_index_connection_has_the_port_width() {
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "xezim --compile failed ({}):\n{text}",
+        out.status
+    );
 
     let mismatches: Vec<&str> = text
         .lines()

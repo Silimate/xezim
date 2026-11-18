@@ -136,6 +136,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
 
+**Performance**
+
+* A `release` finds the drivers of the released net through an index of the
+  continuous assignments and combinational blocks that write each signal,
+  built at the first release, instead of scanning every one of them two or
+  three times (§10.6.2). A testbench that releases a signal on every clock
+  paid for those scans every cycle. (#356)
+
 **Maintenance**
 
 * Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned

@@ -10,6 +10,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A packed struct whose members are all 2-state starts at 0 also when a
+  member is a packed array of another 2-state struct (`s_t [1:0] e;`); it
+  started as x, while its writes already dropped x/z (§7.2.1, §6.8). (#387)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

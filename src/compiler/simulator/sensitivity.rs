@@ -21,9 +21,9 @@ thread_local! {
     /// formal or local), in every spelling registered. Such a read that
     /// resolves to no signal is not an unresolved operand (§10.3.2, §13.4).
     static FRAME_LOCAL_READS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
-    /// While set, `collect_stmt_rw` leaves the targets of nonblocking
-    /// assignments out of the write set (`star_excluded_writes`).
-    static SKIP_NBA_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When `Some`: `collect_stmt_rw` puts the targets of nonblocking
+    /// assignments here instead of in the write set (`star_excluded_writes`).
+    static NBA_TARGETS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
     /// Set when `collect_stmt_rw` meets a nonblocking assignment.
     static NBA_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Set by `star_sens_from_body` when the `@*` sensitivity it inferred
@@ -1736,7 +1736,19 @@ impl Simulator {
                 if nba {
                     NBA_SEEN.with(|c| c.set(true));
                 }
-                if !(nba && SKIP_NBA_WRITES.with(|c| c.get())) {
+                if nba && NBA_TARGETS.with(|c| c.borrow().is_some()) {
+                    // Only the names: no write origins (packed ranges, whole
+                    // writes) for a target kept out of the write set.
+                    let mut targets: HashSet<String> = HashSet::default();
+                    let origins = WHOLE_READS.with(|c| c.replace(None));
+                    Self::collect_lhs_writes(lvalue, module, &mut targets);
+                    WHOLE_READS.with(|c| *c.borrow_mut() = origins);
+                    NBA_TARGETS.with(|c| {
+                        if let Some(n) = c.borrow_mut().as_mut() {
+                            n.extend(targets);
+                        }
+                    });
+                } else {
                     Self::collect_lhs_writes_ex(lvalue, module, writes, arrays.as_deref_mut());
                 }
                 // Also read the index expression of the LHS if it's an array/range select
@@ -2574,10 +2586,13 @@ impl Simulator {
     /// settle from re-running the block on its own writes). A NONBLOCKING
     /// write is different: its update lands in the NBA region, after the
     /// block is back at `@*`, and wakes it (§4.4). `dot <= b; prod <= a *
-    /// dot;` must run again on the new `dot`, so only the other writes count
-    /// here, and `take_star_kept_own_write` then reports that the list keeps
-    /// one of the block's own writes. (`always_comb` leaves out every
-    /// variable it writes, §9.2.2.2.1(b), and does not come here.)
+    /// dot;` must run again on the new `dot`, so a variable the body writes
+    /// with `<=` stays, even when a blocking assignment writes it as well
+    /// (`if (rst) d = 0; else d <= b;`): only variables written by blocking
+    /// assignments alone count here. `take_star_kept_own_write` then reports
+    /// that the list keeps one of the block's own writes. (`always_comb`
+    /// leaves out every variable it writes, §9.2.2.2.1(b), and does not come
+    /// here.)
     fn star_excluded_writes(
         body: &Statement,
         module: &ElaboratedModule,
@@ -2597,9 +2612,12 @@ impl Simulator {
         }
         let mut r2: HashSet<String> = HashSet::default();
         let mut w2: HashSet<String> = HashSet::default();
-        SKIP_NBA_WRITES.with(|c| c.set(true));
+        NBA_TARGETS.with(|c| *c.borrow_mut() = Some(HashSet::default()));
         let o2 = Self::collect_stmt_reads_whole(body, module, &mut r2, &mut w2);
-        SKIP_NBA_WRITES.with(|c| c.set(false));
+        let nba = NBA_TARGETS
+            .with(|c| c.borrow_mut().take())
+            .unwrap_or_default();
+        w2.retain(|w| !nba.contains(w));
         let kept = reads.iter().any(|r| {
             Self::self_written_read(r, reads, &writes, &whole)
                 && !Self::self_written_read(r, reads, &w2, &o2)
@@ -2609,7 +2627,7 @@ impl Simulator {
     }
 
     /// Did the last `star_sens_from_body` keep a variable the body writes
-    /// (through nonblocking assignments only)? Clears the flag. The
+    /// (with a nonblocking assignment)? Clears the flag. The
     /// comb-settle path cannot run such a block: it takes a block's
     /// dependencies to be what it reads minus everything it writes.
     pub(super) fn take_star_kept_own_write() -> bool {

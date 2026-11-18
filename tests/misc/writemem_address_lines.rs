@@ -228,3 +228,68 @@ endmodule
     assert_eq!(whole, "@0 aa\n@1 bb\n@2 cc\n@3 dd\n");
     assert_eq!(range, "@2 cc\n@3 dd\n");
 }
+
+/// An associative `mem` in scope is the memory even when another instance
+/// holds a multidimensional `mem`; and keys outside `0..=i64::MAX` keep
+/// their value in the one-word-per-line layout: a negative key's address
+/// line is its 64-bit two's complement, an unsigned 64-bit key above
+/// `i64::MAX` is written as it is, and both read back.
+#[test]
+fn writemem_associative_name_collision_and_wide_keys() {
+    let dir = scratch("assockeys");
+    let f = |n: &str| dir.join(n);
+    std::fs::write(f("a.hex"), "@10\n11 22\n").unwrap();
+    let src = r#"
+module other;
+  bit [7:0] mem [2][2];
+endmodule
+module t;
+  other o ();
+  bit [7:0] mem [int];
+  bit [7:0] sm [int];
+  bit [7:0] sr [int];
+  bit [7:0] um [bit [63:0]];
+  bit [7:0] ur [bit [63:0]];
+  initial begin
+    $readmemh("@A@", mem);
+    $writememh("@MW@", mem);
+    $display("T|assoc num=%0d [10]=%h [11]=%h other=%h %h", mem.num(), mem[16], mem[17], o.mem[0][0], o.mem[0][1]);
+    sm[-2] = 8'h22; sm[-1] = 8'h11; sm[5] = 8'h33;
+    $writememh("@SW@", sm);
+    $readmemh("@SW@", sr);
+    $display("T|signed num=%0d [-2]=%h [-1]=%h [5]=%h", sr.num(), sr[-2], sr[-1], sr[5]);
+    um[64'h8000_0000_0000_0000] = 8'h44; um[64'h8000_0000_0000_0001] = 8'h55;
+    $writememh("@UW@", um);
+    $readmemh("@UW@", ur);
+    $display("T|unsigned num=%0d [8000..00]=%h [8000..01]=%h exists0=%0d", ur.num(),
+             ur[64'h8000_0000_0000_0000], ur[64'h8000_0000_0000_0001], ur.exists(0));
+  end
+endmodule
+"#
+    .replace("@A@", &f("a.hex").display().to_string())
+    .replace("@MW@", &f("mw.hex").display().to_string())
+    .replace("@SW@", &f("sw.hex").display().to_string())
+    .replace("@UW@", &f("uw.hex").display().to_string());
+    let got = t_lines(&src);
+    let files: Vec<String> = ["mw.hex", "sw.hex", "uw.hex"]
+        .iter()
+        .map(|n| read(&f(n)))
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        files,
+        [
+            "@10\n11\n22\n",
+            "@fffffffffffffffe\n22\n11\n@5\n33\n",
+            "@8000000000000000\n44\n55\n",
+        ]
+    );
+    assert_eq!(
+        got,
+        [
+            "T|assoc num=2 [10]=11 [11]=22 other=00 00",
+            "T|signed num=3 [-2]=22 [-1]=11 [5]=33",
+            "T|unsigned num=2 [8000..00]=44 [8000..01]=55 exists0=0",
+        ]
+    );
+}

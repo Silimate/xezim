@@ -263,10 +263,11 @@ impl Simulator {
 
     /// Is there an input char at `i`? `$sscanf` input is all of `s` up
     /// front. A `$fscanf` stream (`stream: Some(fd)`) is read on demand
-    /// instead: `s` holds the chars read so far and grows a byte at a time
-    /// (one char per byte, like `sv_read_line`), so white space, literals
-    /// and `%c` are read across line ends as far as the format examines,
-    /// and only a read that comes up empty raises `$feof`'s flag.
+    /// instead: `s` holds the chars read so far (less the white space
+    /// `scan_skip_ws` drops) and grows a byte at a time (one char per byte,
+    /// like `sv_read_line`), so white space, literals and `%c` are read
+    /// across line ends as far as the format examines, and only a read that
+    /// comes up empty raises `$feof`'s flag.
     fn scan_has(&mut self, s: &mut Vec<char>, i: usize, stream: Option<i32>) -> bool {
         while i >= s.len() {
             match stream.and_then(|fd| self.sv_read_byte(fd)) {
@@ -279,11 +280,20 @@ impl Simulator {
 
     /// Skip input white space from `i` (a white-space directive, or the
     /// leading white space of a conversion); returns the first other index.
+    /// A `$fscanf` stream does not keep what it skips: once everything read
+    /// so far has matched, `s` is emptied (the scan never looks back past
+    /// `i`), so skipping any number of blank lines holds one char at a time.
     fn scan_skip_ws(&mut self, s: &mut Vec<char>, mut i: usize, stream: Option<i32>) -> usize {
-        while self.scan_has(s, i, stream) && s[i].is_whitespace() {
+        loop {
+            if stream.is_some() && i == s.len() {
+                s.clear();
+                i = 0;
+            }
+            if !(self.scan_has(s, i, stream) && s[i].is_whitespace()) {
+                return i;
+            }
             i += 1;
         }
-        i
     }
 
     /// Read a `$fscanf` stream on to the end of the current line, so the

@@ -6,10 +6,12 @@
 //! (issue #389). These came out as 32-bit types, with no diagnostic, and
 //! writes to the struct's members were lost.
 //!
-//! Expected values are Verilator's (5.046) for the first test. Verilator
-//! rejects the type-parameter default of the second (`Expecting a data
-//! type`), and in the third prints 128 for both instances, where §6.20.3
-//! binds `C` to `cfg2_t` in `w2`, whose `hw_t` is 16 bits.
+//! Expected values are Verilator's (5.046) for the first test, and for all
+//! but `d1` in the last. Verilator rejects the type-parameter default of
+//! the second (`Expecting a data type`); in the third it prints 128 for
+//! both instances, where §6.20.3 binds `C` to `cfg2_t` in `w2`, whose
+//! `hw_t` is 16 bits; and in the last it gives `d1` 128, where the default
+//! `U = T` takes the argument `cfg2_t` (§6.20.2).
 
 use xezim::simulate;
 
@@ -121,4 +123,34 @@ endmodule
     ));
     assert_has(&got, "s3: top.w $bits=128");
     assert_has(&got, "s3: top.w2 $bits=16");
+}
+
+/// A type parameter whose default names an earlier one, a typedef of a
+/// specialization used as a scope, and an argument that is itself a
+/// specialization of a class with a value parameter.
+#[test]
+fn dependent_defaults_aliases_and_nested_specializations() {
+    let got = lines(&format!(
+        "{CLASSES}{}",
+        r#"
+class cfgw #(int W = 4);
+  typedef logic [W-1:0] hw_t;
+endclass
+class pair #(type T = cfg_t, type U = T);
+  typedef U::hw_t hw_t;
+endclass
+module top;
+  pair#(cfg2_t)::hw_t d1;
+  pair#(cfg2_t, cfg_t)::hw_t d2;
+  typedef extractor#(cfg2_t) e2_t;
+  e2_t::hw_t a1;
+  typedef cfgw#(8) cfg8_t;
+  extractor#(cfg8_t)::hw_t n1;
+  cfg8_t::hw_t n2;
+  initial $display("s4: d1=%0d d2=%0d a1=%0d n1=%0d n2=%0d", $bits(d1), $bits(d2), $bits(a1),
+                   $bits(n1), $bits(n2));
+endmodule
+"#
+    ));
+    assert_has(&got, "s4: d1=16 d2=128 a1=16 n1=8 n2=8");
 }

@@ -89,3 +89,38 @@ endmodule
         "missing `{want}` in {got:#?}"
     );
 }
+
+/// A member wider than 32 bits keeps every bit in a compiled blocking write:
+/// the right-hand side is sized by the member, not by a 32-bit default.
+#[test]
+fn wide_member_through_element_selects() {
+    let got: Vec<String> = xezim::simulate(
+        r#"
+// a 64-bit member written through constant element selects
+module w64;
+  typedef struct packed { logic [63:0] value; } dw_t;
+  typedef struct packed { dw_t [1:0] dw; } nest_t;
+  typedef struct packed { nest_t [1:0] e; } nest2_t;
+  nest2_t s, t;
+  logic clk = 0;
+  always_comb begin
+    s = '0;
+    s.e[1].dw[0].value = 64'h1122334455667788;
+  end
+  always_ff @(posedge clk) t.e[0].dw[1].value <= 64'h99aabbccddeeff00;
+  initial begin t = '0; #1 clk = 1; #1 $display("w64: s=%h t=%h", s.e[1].dw[0].value, t.e[0].dw[1].value); end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed")
+    .output
+    .iter()
+    .map(|o| o.message.clone())
+    .collect();
+    let want = "w64: s=1122334455667788 t=99aabbccddeeff00";
+    assert!(
+        got.iter().any(|l| l == want),
+        "missing `{want}` in {got:#?}"
+    );
+}

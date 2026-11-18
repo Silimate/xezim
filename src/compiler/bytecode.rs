@@ -21489,10 +21489,20 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // §20.8.1: `$clog2` of a constant is a constant (`a[$clog2(N)-1:3]`).
             ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
-                let v = u64::try_from(self.eval_const_bound(&args[0])?).ok()?;
-                Some(i64::from(clog2_u64(v)))
+                Some(i64::from(clog2_u64(self.const_u64_operand(&args[0])?)))
             }
             _ => self.eval_const_expr(e).map(|v| v as i64),
+        }
+    }
+
+    /// A constant operand at its full value up to 64 bits: a literal keeps
+    /// every bit (`64'h1_0000_0000`), where `eval_const_expr` would narrow it
+    /// to 32. `None` for anything wider, x/z or negative.
+    fn const_u64_operand(&self, e: &Expression) -> Option<u64> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.const_u64_operand(inner),
+            ExprKind::Number(n) => self.eval_number_static(n)?.to_u64(),
+            _ => u64::try_from(self.eval_const_bound(e)?).ok(),
         }
     }
 

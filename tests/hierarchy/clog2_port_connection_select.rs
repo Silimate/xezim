@@ -109,3 +109,22 @@ endmodule
         &["j1: qa=101001110 qb=100101011 qc=1010"],
     );
 }
+
+/// A `$clog2` argument wider than 32 bits keeps its value in the fold.
+#[test]
+fn wide_clog2_argument() {
+    assert_has(
+        r#"
+// a $clog2 argument wider than 32 bits in a clocked select bound
+module leaf (input wire clk, input logic [31:0] a, output logic [31:0] q);
+  always @(posedge clk) q <= a[$clog2(64'h1_0000_0000)-1:0];
+endmodule
+module tb;
+  reg clk = 0; logic [31:0] q;
+  leaf u (.clk(clk), .a(32'hDEADBEEF), .q(q));
+  initial begin #1 clk = 1; #1 $display("c3w: q=%h", q); end
+endmodule
+"#,
+        &["c3w: q=deadbeef"],
+    );
+}

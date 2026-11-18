@@ -166,4 +166,33 @@ endmodule
         got.iter().any(|l| l == want),
         "missing `{want}` in {got:#?}"
     );
+    // the same 2-state container inside an instance
+    let got: Vec<String> = xezim::simulate(
+        r#"
+module leaf;
+  typedef struct packed { bit [7:0] value; } bdw_t;
+  typedef struct packed { bdw_t [1:0] dw; } bnest_t;
+  typedef struct packed { bnest_t [1:0] e; } bnest2_t;
+  bnest2_t b;
+  logic [7:0] dx = 8'h0f;
+  always_comb b.e[1].dw[0].value = dx;
+  initial begin
+    #1 dx = 8'bxxxx_0101;
+    #1 $display("fz2: b=%h", b);
+  end
+endmodule
+module top; leaf u(); endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed")
+    .output
+    .iter()
+    .map(|o| o.message.clone())
+    .collect();
+    let want = "fz2: b=00050000";
+    assert!(
+        got.iter().any(|l| l == want),
+        "missing `{want}` in {got:#?}"
+    );
 }

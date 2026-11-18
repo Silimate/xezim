@@ -163,6 +163,87 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A library named in `-LDFLAGS` is not in the cache key, so the library is
+/// linked again on every run: an edit to that archive reaches the next run.
+/// The C source's object is compiled once.
+#[test]
+fn ldflags_archive_edit_reaches_the_next_run() {
+    let d = scratch("ldflags");
+    write(&d, "add.c", "int model(int a, int b);\nint c_add(int a, int b) { return model(a, b); }\n");
+    write(&d, "t.sv", ADD_SV);
+    let archive = |body: &str| {
+        write(&d, "model.c", &format!("int model(int a, int b) {{ return {body}; }}\n"));
+        let ok = |c: &mut Command| c.current_dir(&d).status().is_ok_and(|s| s.success());
+        assert!(ok(Command::new(cc()).args(["-fPIC", "-c", "model.c", "-o", "model.o"])));
+        let _ = std::fs::remove_file(d.join("libmodel.a"));
+        let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
+        assert!(ok(Command::new(ar).args(["rcs", "libmodel.a", "model.o"])));
+    };
+    let objects = || -> Vec<(PathBuf, std::time::SystemTime)> {
+        let rd = std::fs::read_dir(d.join("cache").join("xezim").join("dpi")).unwrap();
+        rd.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("obj-"))
+            .map(|e| (e.path(), e.metadata().unwrap().modified().unwrap()))
+            .collect()
+    };
+    archive("a + b");
+    let (out, text) = run(&d, &["-LDFLAGS", "./libmodel.a", "add.c", "t.sv"]);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("sum=5"), "{text}");
+    let first = objects();
+    archive("a + b + 100");
+    let (out, text) = run(&d, &["-LDFLAGS", "./libmodel.a", "add.c", "t.sv"]);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("sum=105"), "the edited archive was not linked: {text}");
+    assert_eq!(built_libraries(&d), 1, "{text}");
+    assert_eq!(first.len(), 1);
+    assert_eq!(objects(), first, "the unchanged source was compiled again");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// With no cache directory set (`$XEZIM_CACHE_DIR`, `$XDG_CACHE_HOME`,
+/// `$HOME`), the library is built in `xezim-<uid>` in the temporary
+/// directory, created private. One that other users can write to, where
+/// anyone could have put headers or a library of their own, is refused.
+#[test]
+fn temporary_cache_directory_must_be_private() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let d = scratch("tmpcache");
+    write(&d, "add.c", "int c_add(int a, int b) { return a + b; }\n");
+    write(&d, "t.sv", ADD_SV);
+    let tmp = d.join("tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    let uid = std::fs::metadata(&d).unwrap().uid();
+    let private = tmp.join(format!("xezim-{uid}"));
+    let run_in_tmp = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .args(["--no-cache", "add.c", "t.sv"])
+            .current_dir(&d)
+            .env_remove("XEZIM_CACHE_DIR")
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("HOME")
+            .env("TMPDIR", &tmp)
+            .output()
+            .expect("failed to run xezim");
+        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out, text)
+    };
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let (out, text) = run_in_tmp();
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("can be written by other users"), "{text}");
+    assert!(!text.contains("sum="), "{text}");
+    std::fs::remove_dir(&private).unwrap();
+    let (out, text) = run_in_tmp();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("sum=5"), "{text}");
+    assert_eq!(std::fs::metadata(&private).unwrap().mode() & 0o777, 0o700);
+    assert!(private.join("xezim").join("dpi").is_dir(), "{text}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A source that does not compile stops the run before it starts.
 #[test]
 fn compile_error_stops_the_run() {

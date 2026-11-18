@@ -174,3 +174,74 @@ endmodule
         ]
     );
 }
+
+/// Keys outside `0..=i64::MAX` keep their value through a dump and a load
+/// (§21.4, §21.5, §7.8): a negative key of an `int` index is written as its
+/// 64-bit two's complement and read back as negative (an `int`-width
+/// `@ffffffff` reads as -1 too), and a `bit [63:0]` key above `i64::MAX`
+/// keeps its value in the file, in a start address and in the default
+/// finish address. Negative indices of an unpacked memory round-trip the
+/// same way.
+#[test]
+fn readmem_writemem_keys_beyond_i64_range() {
+    let dir = scratch("wide");
+    let f = |n: &str| dir.join(n).display().to_string();
+    std::fs::write(dir.join("i.hex"), "@ffffffff\n5a\n").unwrap();
+    std::fs::write(dir.join("u.hex"), "@8000000000000000\naa bb\n").unwrap();
+    std::fs::write(dir.join("n.hex"), "aa bb cc\n").unwrap();
+    let src = r#"
+module t;
+  bit [7:0] sm [int];
+  bit [7:0] sr [int];
+  bit [7:0] si [int];
+  bit [7:0] um [bit [63:0]];
+  bit [7:0] ur [bit [63:0]];
+  bit [7:0] uf [bit [63:0]];
+  bit [7:0] us [longint unsigned];
+  bit [7:0] pm [-2:1];
+  bit [7:0] pr [-2:1];
+  initial begin
+    sm[-1] = 8'h11; sm[-2] = 8'h22; sm[5] = 8'h33;
+    $writememh("@SW@", sm);
+    $readmemh("@SW@", sr);
+    $display("T|signed num=%0d [-2]=%h [-1]=%h [5]=%h exists0=%0d", sr.num(), sr[-2], sr[-1], sr[5], sr.exists(0));
+    $readmemh("@I@", si);
+    $display("T|int-width num=%0d [-1]=%h", si.num(), si[-1]);
+    um[64'h8000_0000_0000_0000] = 8'h44; um[64'hffff_ffff_ffff_fffe] = 8'h55; um[1] = 8'h66;
+    $writememh("@UW@", um);
+    $readmemh("@UW@", ur);
+    $display("T|unsigned num=%0d [1]=%h [8000..]=%h [ff..fe]=%h exists0=%0d", ur.num(), ur[1],
+             ur[64'h8000_0000_0000_0000], ur[64'hffff_ffff_ffff_fffe], ur.exists(0));
+    $readmemh("@U@", uf);
+    $display("T|unsigned-file num=%0d [8000..]=%h [8000..01]=%h", uf.num(),
+             uf[64'h8000_0000_0000_0000], uf[64'h8000_0000_0000_0001]);
+    $readmemh("@B@", us, 64'hffff_ffff_ffff_fffe);
+    $display("T|unsigned-start num=%0d [ff..fe]=%h [ff..ff]=%h", us.num(),
+             us[64'hffff_ffff_ffff_fffe], us[64'hffff_ffff_ffff_ffff]);
+    pm = '{8'h01, 8'h02, 8'h03, 8'h04};
+    $writememh("@PW@", pm, -1, 1);
+    $readmemh("@PW@", pr);
+    $display("T|unpacked [-2]=%h [-1]=%h [0]=%h [1]=%h", pr[-2], pr[-1], pr[0], pr[1]);
+  end
+endmodule
+"#
+    .replace("@SW@", &f("sw.hex"))
+    .replace("@UW@", &f("uw.hex"))
+    .replace("@PW@", &f("pw.hex"))
+    .replace("@I@", &f("i.hex"))
+    .replace("@U@", &f("u.hex"))
+    .replace("@B@", &f("n.hex"));
+    let got = t_lines(&src);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        got,
+        [
+            "T|signed num=3 [-2]=22 [-1]=11 [5]=33 exists0=0",
+            "T|int-width num=1 [-1]=5a",
+            "T|unsigned num=3 [1]=66 [8000..]=44 [ff..fe]=55 exists0=0",
+            "T|unsigned-file num=2 [8000..]=aa [8000..01]=bb",
+            "T|unsigned-start num=2 [ff..fe]=aa [ff..ff]=bb",
+            "T|unpacked [-2]=00 [-1]=02 [0]=03 [1]=04",
+        ]
+    );
+}

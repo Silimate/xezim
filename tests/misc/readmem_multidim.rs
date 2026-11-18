@@ -269,3 +269,65 @@ endmodule
         "{got:?}"
     );
 }
+
+/// The array a name reaches first is the memory, whatever its kind: in a
+/// class method, the class's one-dimensional `mem` property, not the
+/// module's two-dimensional `mem`. An element that is a packed struct is a
+/// vector word (§21.4.1), loaded and written like any other; an unpacked
+/// struct is not. Negative addresses of a multidimensional array are written
+/// as 64-bit two's complement and read back.
+#[test]
+fn readmem_multidim_name_kind_packed_struct_and_negative_addresses() {
+    let dir = scratch("kinds");
+    let f = |n: &str| dir.join(n).display().to_string();
+    std::fs::write(dir.join("a.hex"), "11 22 33 44\n").unwrap();
+    let src = r#"
+module t;
+  typedef struct packed { logic [3:0] hi; logic [3:0] lo; } pair_t;
+  typedef struct { logic [3:0] hi; logic [3:0] lo; } upair_t;
+  logic [7:0] mem [2][2];
+  pair_t ps [2][2];
+  pair_t pb [2][2];
+  upair_t us [2][2];
+  logic [7:0] ng [-2:-1][2];
+  logic [7:0] nb [-2:-1][2];
+  class C;
+    logic [7:0] mem [0:3];
+    function void ld(string fn);
+      $readmemh(fn, mem);
+    endfunction
+  endclass
+  initial begin
+    C c = new;
+    foreach (mem[i, j]) mem[i][j] = 8'h00;
+    c.ld("@A@");
+    $display("T|class %h %h %h %h module %h", c.mem[0], c.mem[1], c.mem[2], c.mem[3], mem[0][0]);
+    $readmemh("@A@", ps);
+    $display("T|packed %h %h %h %h hi=%h lo=%h", ps[0][0], ps[0][1], ps[1][0], ps[1][1], ps[1][1].hi, ps[1][1].lo);
+    $writememh("@PW@", ps);
+    $readmemh("@PW@", pb);
+    $display("T|packed back %h %h %h %h", pb[0][0], pb[0][1], pb[1][0], pb[1][1]);
+    $readmemh("@A@", us);
+    ng = '{'{8'h01, 8'h02}, '{8'h03, 8'h04}};
+    foreach (nb[i, j]) nb[i][j] = 8'h00;
+    $writememh("@NW@", ng, -1, 0);
+    $readmemh("@NW@", nb);
+    $display("T|negative %h %h %h %h", nb[-2][0], nb[-2][1], nb[-1][0], nb[-1][1]);
+  end
+endmodule
+"#
+    .replace("@A@", &f("a.hex"))
+    .replace("@PW@", &f("pw.hex"))
+    .replace("@NW@", &f("nw.hex"));
+    let got = t_lines(&src);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got.len(), 5, "{got:?}");
+    assert_eq!(got[0], "T|class 11 22 33 44 module 00");
+    assert_eq!(got[1], "T|packed 11 22 33 44 hi=4 lo=4");
+    assert_eq!(got[2], "T|packed back 11 22 33 44");
+    assert!(
+        got[3].contains("$readmemh") && got[3].contains("does not name an unpacked memory"),
+        "{got:?}"
+    );
+    assert_eq!(got[4], "T|negative 00 02 03 00");
+}

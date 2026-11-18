@@ -215,3 +215,37 @@ endmodule
         &["q1: o=a55a r=a5"],
     );
 }
+
+/// §26.3: the array bounds written on a package struct member take the
+/// module's parameter, not the package's parameter of the same name.
+#[test]
+fn package_struct_array_member_bounds_take_the_module_parameter() {
+    assert_has(
+        r#"
+// array bounds of a package struct member written with the module's parameter
+package q;
+  parameter int N = 2;
+  typedef struct packed { logic [7:0] value; } entry_t;
+endpackage
+module m #(parameter int N = 4) (output logic [31:0] o, output logic [7:0] r);
+  typedef struct packed { q::entry_t [N-1:0] a; } s_t;
+  s_t s;
+  always_comb begin
+    s = '0;
+    s.a[3].value = 8'hD3;
+    s.a[2].value = 8'hC2;
+    s.a[1].value = 8'hB1;
+    s.a[0].value = 8'hA0;
+  end
+  assign o = s;
+  assign r = s.a[2].value;
+endmodule
+module top;
+  logic [31:0] o; logic [7:0] r;
+  m u (.o(o), .r(r));
+  initial #1 $display("q2: o=%h r=%h", o, r);
+endmodule
+"#,
+        &["q2: o=d3c2b1a0 r=c2"],
+    );
+}

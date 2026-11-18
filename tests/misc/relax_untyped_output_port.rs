@@ -1,7 +1,7 @@
 //! IEEE 1800-2023 §23.2.2.3: an ANSI output port declared with no data type
 //! (`output q`, `output [3:0] cnt`) is a net of the default net type, and §6.5
 //! forbids a procedural assignment to a net. OpenHW CORE-ET's
-//! `txfmactl_top` declares many outputs that way and assigns them in an
+//! `txfmactl_top` declares an output that way and assigns it in an
 //! `always_ff`; Verilator accepts that and takes the port as a variable, and
 //! the reference simulator rejects it. The error now says the port is a net
 //! because its declaration has no data type and suggests `output logic`, and

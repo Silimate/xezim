@@ -188,9 +188,11 @@ endmodule
 }
 
 /// §10.10.3 through the other assignment path: a selected queue of a queue
-/// array (`rows[0] = {rows[0], {pc, insn}}`) appends one element too, and
-/// deciding whether braces hold a collection runs nothing, so an operand
-/// with a side effect (`m[i++]`) is evaluated once.
+/// array (`rows[0] = {rows[0], {pc, insn}}`) appends one element too. Each
+/// operand of an unpacked array concatenation is evaluated once (§10.10,
+/// §11.3.2): deciding whether braces hold a collection runs nothing, and the
+/// concatenation is not also evaluated as one value, so `m[i++]` advances
+/// `i` once and a function operand is called once.
 #[test]
 fn nested_braces_in_selected_queue_and_side_effects() {
     const SRC: &str = r#"
@@ -198,9 +200,15 @@ module tb;
   logic [63:0] rows[2][$];
   logic [31:0] pc, insn;
   byte m[int];
-  int i;
+  int i, calls;
   logic [15:0] q16[$];
-  bit pass_rows, pass_once;
+  byte qb[$];
+  int qi[$];
+  bit pass_rows, pass_once, pass_plain, pass_call;
+  function int next_value();
+    calls++;
+    return calls;
+  endfunction
   initial begin
     pc = 32'h8000_0080; insn = 32'h03d0_01db;
     rows[0] = {rows[0], {pc, insn}};
@@ -212,6 +220,12 @@ module tb;
     i = 0;
     q16 = {{m[i++], 8'h00}};
     pass_once = (i == 1) && (q16.size() == 1) && (q16[0] == 16'h1100);
+    i = 0;
+    qb = {m[i++], m[i++]};
+    pass_plain = (i == 2) && (qb.size() == 2) && (qb[0] == 8'h11) && (qb[1] == 8'h22);
+    qi = {qi, next_value()};
+    qi = {qi, next_value()};
+    pass_call = (calls == 2) && (qi.size() == 2) && (qi[0] == 1) && (qi[1] == 2);
   end
 endmodule
 "#;
@@ -225,5 +239,15 @@ endmodule
         flag(&sim, "pass_once"),
         1,
         "the braced operand m[i++] is evaluated once"
+    );
+    assert_eq!(
+        flag(&sim, "pass_plain"),
+        1,
+        "each operand m[i++] is evaluated once"
+    );
+    assert_eq!(
+        flag(&sim, "pass_call"),
+        1,
+        "a function operand is called once per assignment"
     );
 }

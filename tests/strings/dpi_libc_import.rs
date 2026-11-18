@@ -46,7 +46,14 @@ fn libc_import_needs_no_dpi_lib() {
     let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("T|")).collect();
     assert_eq!(
         lines,
-        ["T|getenv=from the environment", "T|unset=[]", "T|abs=7"],
+        [
+            "T|getenv=from the environment",
+            "T|unset=[]",
+            "T|abs=7",
+            // The call that has no implementation returns 0 and ends the run
+            // after its statement.
+            "T|missing=0",
+        ],
         "{text}"
     );
     assert!(

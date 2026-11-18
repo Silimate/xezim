@@ -340,3 +340,57 @@ fn a_compiled_artifact_keeps_the_language_choice() {
         }
     }
 }
+
+/// A Verilog declaration assignment happens at time 0, after the Preponed
+/// region, so a concurrent assertion that samples the variable on a time-0
+/// clock edge reads the x from before it (§16.5.1, IEEE 1364-2005 §6.2.1).
+/// With `-sv` the declared value is there before time 0 and is the sample.
+/// The reference simulator agrees with full debug visibility; its optimized
+/// flow samples the declared values in the Verilog case too.
+#[test]
+fn a_time0_assertion_samples_the_x_before_a_verilog_declaration_assignment() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("time0_startup")
+        .join("sampled");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("v.v"),
+        "module v;\n  reg q = 1'b1;\n  reg [3:0] w = 4'd9;\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("t.sv"),
+        r#"module t;
+  logic clk = 1'b0;
+  v u();
+  initial clk = 1'b1;
+  initial #1 clk = 1'b0;
+  initial #2 clk = 1'b1;
+  a_q: assert property (@(posedge clk) u.q) $display("%0t pass q", $time); else $display("%0t fail q", $time);
+  a_w: assert property (@(posedge clk) u.w == 4'd9) $display("%0t pass w", $time); else $display("%0t fail w", $time);
+  initial #3 $finish;
+endmodule
+"#,
+    )
+    .unwrap();
+    let run = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .args(["--no-cache", "-s", "t"])
+            .args(extra)
+            .arg(dir.join("v.v"))
+            .arg(dir.join("t.sv"))
+            .output()
+            .unwrap();
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        text
+    };
+    assert_lines(
+        &run(&[]),
+        &["0 fail q", "0 fail w", "2 pass q", "2 pass w"],
+    );
+    assert_lines(
+        &run(&["-sv"]),
+        &["0 pass q", "0 pass w", "2 pass q", "2 pass w"],
+    );
+}

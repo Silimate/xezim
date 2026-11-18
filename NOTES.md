@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A typedef of a parameterized class that names a member type of its type
+  parameter (`class E #(type T); typedef T::hw_t hw_t;`) is that member type
+  in the specialization a class scope names: `E#(cfg_t)::hw_t` is
+  `cfg_t::hw_t`, also through a typedef of the specialization and as a type
+  parameter's default (`parameter type H = E#(C)::hw_t`). A type parameter
+  bound to a class names that class as a scope (`C::hw_t`). These were
+  32-bit types with no diagnostic, and member writes were lost (§8.25.1,
+  §6.20.3). (#389)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

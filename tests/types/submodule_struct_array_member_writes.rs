@@ -182,3 +182,36 @@ endmodule
         &["n2: o=a n=a5"],
     );
 }
+
+/// §26.3: a member that is a packed array of a package struct whose fields
+/// are sized by the package's parameter, in a module with a parameter of the
+/// same name.
+#[test]
+fn package_struct_array_member_keeps_the_package_parameters() {
+    assert_has(
+        r#"
+// a member that is a packed array of a package struct sized by the package's parameter
+package q;
+  parameter int W = 8;
+  typedef struct packed { logic [W-1:0] value; } entry_t;
+endpackage
+module m #(parameter int W = 1) (input logic [7:0] d, output logic [15:0] o, output logic [7:0] r);
+  typedef struct packed { q::entry_t [1:0] a; } s_t;
+  s_t s;
+  always_comb begin
+    s = '0;
+    s.a[1].value = d;
+    s.a[0].value = ~d;
+  end
+  assign o = s;
+  assign r = s.a[1].value;
+endmodule
+module top;
+  logic [15:0] o; logic [7:0] r;
+  m #(.W(1)) u (.d(8'hA5), .o(o), .r(r));
+  initial #1 $display("q1: o=%h r=%h", o, r);
+endmodule
+"#,
+        &["q1: o=a55a r=a5"],
+    );
+}

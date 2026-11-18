@@ -178,3 +178,71 @@ fn imported_enum_label_in_port_actual_reads_at_every_depth() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// §6.10: the net `LINK` that connects a driver to a receiver below the
+/// top, two procedural blocks. `{PRE}` comes first in the file, `{BLOCK}`
+/// in the wrapper.
+const LINK_NET: &str = r#"{PRE}
+module drv (output logic o);
+  initial #1 o = 1'b1;
+endmodule
+module rcv (input logic i, output logic seen);
+  always @(i) seen = i;
+endmodule
+module wrap (output logic seen);
+  {BLOCK}
+  drv d (.o(LINK));
+  rcv r (.i(LINK), .seen(seen));
+endmodule
+module t;
+  logic seen;
+  wrap w (.seen(seen));
+  initial begin
+    #5;
+    if (seen === 1'b1) $display("PASS");
+    else $display("FAIL seen=%b", seen);
+    $finish;
+  end
+endmodule
+"#;
+
+fn run_link(tag: &str, pre: &str, block: &str) {
+    let dir = std::env::temp_dir().join(format!(
+        "xezim_enum_port_actual_link_{tag}_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let sv = dir.join("link.sv");
+    std::fs::write(&sv, LINK_NET.replace("{PRE}", pre).replace("{BLOCK}", block))
+        .expect("write sv");
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .env("XEZIM_NO_CACHE", "1")
+        .args(["-s", "t"])
+        .arg(&sv)
+        .output()
+        .expect("run xezim");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("PASS"), "{tag}: stdout:\n{stdout}\nstderr:\n{stderr}");
+}
+
+/// §6.10, §27.5: a label declared in a generate block is the block's, so a
+/// port actual of the same name in the module scope is still an implicit
+/// net of the module. Taken for a declared constant, the net was not
+/// created and the receiver never saw the driver's value.
+#[test]
+fn generate_block_label_keeps_the_module_implicit_net() {
+    run_link(
+        "block_label",
+        "",
+        "if (0) begin : g\n    typedef enum logic {LINK, IDLE} t;\n  end",
+    );
+}
+
+/// §3.13, §6.10: definitions have a name space of their own, so a module
+/// named `LINK` leaves the bare port actual `LINK` an implicit net.
+#[test]
+fn module_name_keeps_the_implicit_net() {
+    run_link("module_name", "module LINK;\nendmodule", "");
+}

@@ -235,3 +235,108 @@ endmodule
         &["first a=5", "final a=7"],
     );
 }
+
+/// Runtime declaration initializers in a Verilog module, at the top and in
+/// an instance. Verilog requires a constant there (IEEE 1364-2005 §6.2.1),
+/// and the reference simulator and Icarus Verilog reject this file as `.v`;
+/// as `.sv` both print the SystemVerilog values below. xezim accepts it as
+/// `.v` and runs each such initializer at time 0 with the module's other
+/// declaration assignments, after their literal values: `r` reads `k`, `m`
+/// keeps the value `$test$plusargs` gave it, and the `@(m)` and `@(r)`
+/// blocks wake at time 0. (As SystemVerilog, those blocks stay asleep on the
+/// reference simulator but wake in xezim, Silimate/xezim#385, so only the
+/// values are checked there.)
+const RUNTIME_INIT: &str = r#"`timescale 1ns/1ns
+module c;
+  reg m = $test$plusargs("MODE");
+  time any_m;
+  always @(m) any_m = $time;
+  initial #1 begin $display("c.m=%b", m); $display("c.any_m=%0d", any_m); end
+endmodule
+module t;
+  reg m = $test$plusargs("MODE");
+  reg [7:0] k = 8'd5;
+  integer r = k + $test$plusargs("MODE");
+  integer seen_m, seen_r;
+  time any_m, any_r;
+  always @(m) any_m = $time;
+  always @(r) any_r = $time;
+  initial begin seen_m = m; seen_r = r; end
+  c u();
+  initial #1 begin
+    $display("m=%b seen_m=%0d r=%0d seen_r=%0d", m, seen_m, r, seen_r);
+    $display("any_m=%0d any_r=%0d", any_m, any_r);
+    $finish;
+  end
+endmodule
+"#;
+
+const RUNTIME_INIT_V: [&str; 4] = [
+    "m=1 seen_m=1 r=6 seen_r=6",
+    "any_m=0 any_r=0",
+    "c.m=1",
+    "c.any_m=0",
+];
+const RUNTIME_INIT_SV: [&str; 2] = ["m=1 seen_m=1 r=6 seen_r=6", "c.m=1"];
+
+#[test]
+fn verilog_runtime_initializers_run_with_the_declaration_assignments() {
+    assert_lines(
+        &run_file("runtime", "t.v", RUNTIME_INIT, &["+MODE"]),
+        &RUNTIME_INIT_V,
+    );
+    assert_lines(
+        &run_file("runtime_off", "t.v", RUNTIME_INIT, &[]),
+        &[
+            "m=0 seen_m=0 r=5 seen_r=5",
+            "any_m=0 any_r=0",
+            "c.m=0",
+            "c.any_m=0",
+        ],
+    );
+    assert_lines(
+        &run_file("runtime_sv", "t.v", RUNTIME_INIT, &["-sv", "+MODE"]),
+        &RUNTIME_INIT_SV,
+    );
+}
+
+/// `--compile -o` keeps the language the design was compiled as: an
+/// artifact of a `.v` file compiled with `-sv` runs it as SystemVerilog
+/// without `-sv`, and one compiled without it runs the Verilog rule,
+/// runtime initializers included (`r=6`: `r` still reads `k` after it is
+/// assigned).
+#[test]
+fn a_compiled_artifact_keeps_the_language_choice() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("time0_startup")
+        .join("artifact");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_xezim");
+    let run = |cmd: &mut Command| {
+        let out = cmd.output().unwrap();
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{text}");
+        text
+    };
+    for (src, file) in [(DECL_INIT, "clk.v"), (RUNTIME_INIT, "rt.v")] {
+        std::fs::write(dir.join(file), src).unwrap();
+        for (model, extra) in [("v", &[][..]), ("sv", &["-sv"][..])] {
+            let out = dir.join(format!("{}_{model}_model", &file[..file.len() - 2]));
+            run(Command::new(bin)
+                .args(["--no-cache", "--compile", "-s", "t"])
+                .args(extra)
+                .arg(dir.join(file))
+                .arg("-o")
+                .arg(&out));
+            let text = run(Command::new(bin).arg(&out).arg("+MODE"));
+            let want: &[&str] = match (file, model) {
+                ("clk.v", "v") => &["n1=100 n2=100 n3=1", "any_a=0 neg_a=0 pos_b=0 any_v=0"],
+                ("clk.v", _) => &["n1=0 n2=0 n3=0", "any_a=x neg_a=x pos_b=x any_v=x"],
+                (_, "v") => &RUNTIME_INIT_V,
+                _ => &RUNTIME_INIT_SV,
+            };
+            assert_lines(&text, want);
+        }
+    }
+}

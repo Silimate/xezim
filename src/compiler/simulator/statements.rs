@@ -33,16 +33,25 @@ impl Simulator {
             // assoc-of-queue element (`assoc[key]`) —
             // contributes each of its elements in order.
             // Looking an operand up as a collection evaluates its index
-            // expressions, so an operand with a side effect (`m[i++]`) is
-            // taken for one element and evaluated once, below.
-            let qn = if Self::cond_expr_is_effect_free(expr, false) {
-                self.array_operand_name(expr).or_else(|| {
-                    self.nested_index_name(expr)
-                        .filter(|cn| self.module.dynamic_arrays.contains(cn))
-                })
+            // expressions, and so does reading it. An operand whose indices
+            // have side effects (`m[i++]`, `aa[i++].ql`) has them evaluated
+            // once, first, so it selects the same element either way.
+            let frozen;
+            let expr: &Expression = if Self::cond_expr_is_effect_free(expr, false) {
+                expr
             } else {
-                None
+                match self.freeze_side_effect_indices(expr) {
+                    Some(f) => {
+                        frozen = f;
+                        &frozen
+                    }
+                    None => expr,
+                }
             };
+            let qn = self.array_operand_name(expr).or_else(|| {
+                self.nested_index_name(expr)
+                    .filter(|cn| self.module.dynamic_arrays.contains(cn))
+            });
             if let Some(ename) = qn {
                 let lo = self.module.arrays.get(&ename).map_or(0, |a| a.0);
                 let mut idx: Vec<i64> = (lo..lo + self.get_queue_size(&ename) as i64).collect();
@@ -103,6 +112,69 @@ impl Simulator {
             all_vals.push(self.eval_expr(expr));
         }
         all_vals
+    }
+
+    /// `e` with each index expression that has a side effect evaluated now,
+    /// once, left to right, and replaced by a literal of its value, so the
+    /// operand selects the same element however often it is then looked up
+    /// and read (§11.3.2: an operand is evaluated once). `None` when a side
+    /// effect sits outside an index (a call, an increment of its own) or an
+    /// index value is real.
+    pub(super) fn freeze_side_effect_indices(&mut self, e: &Expression) -> Option<Expression> {
+        if Self::cond_expr_is_effect_free(e, false) {
+            return Some(e.clone());
+        }
+        let mut out = e.clone();
+        match &mut out.kind {
+            ExprKind::Index { expr, index } => {
+                **expr = self.freeze_side_effect_indices(expr)?;
+                if !Self::cond_expr_is_effect_free(index, false) {
+                    let v = self.eval_expr(index);
+                    **index = Self::value_literal(&v, index.span)?;
+                }
+            }
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => {
+                **expr = self.freeze_side_effect_indices(expr)?;
+            }
+            ExprKind::Ident(h) => {
+                for seg in h.path.iter_mut() {
+                    for sel in seg.selects.iter_mut() {
+                        if !Self::cond_expr_is_effect_free(sel, false) {
+                            let v = self.eval_expr(sel);
+                            *sel = Self::value_literal(&v, sel.span)?;
+                        }
+                    }
+                }
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+
+    /// A sized literal of `v`'s bits, width and signedness (x and z digits
+    /// included). `None` for a real value.
+    fn value_literal(v: &Value, span: crate::ast::Span) -> Option<Expression> {
+        if v.is_real || v.width == 0 {
+            return None;
+        }
+        // Binary digits carry x and z bit by bit; hex is shorter otherwise.
+        let (base, value) = if v.has_xz() {
+            (NumberBase::Binary, v.to_bin_string())
+        } else {
+            (NumberBase::Hex, v.to_hex_string())
+        };
+        Some(Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: Some(v.width),
+                signed: v.is_signed,
+                base,
+                value,
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        ))
     }
 
     /// The size and optional source of a §7.5.1 dynamic-array constructor:

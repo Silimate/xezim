@@ -485,3 +485,5 @@ mod shared_net_initializer_targets;
 mod negative_genvar_cached;
 #[path = "hierarchy/unit_storage_shared_bodies_721.rs"]
 mod unit_storage_shared_bodies_721;
+#[path = "hierarchy/clog2_port_connection_select.rs"]
+mod clog2_port_connection_select;

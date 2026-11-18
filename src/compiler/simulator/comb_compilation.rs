@@ -977,7 +977,20 @@ impl Simulator {
             let direct_copy = if let Some((dst_id, src_id)) = ident_copy_ids {
                 let width = self.signal_widths[dst_id];
                 let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
-                if width == self.signal_widths[src_id] {
+                // A raw-bit copy cannot carry a REAL across a type change:
+                // `assign r = n;` where `r` is a real variable and `n` a net
+                // whose value is held as an integer would copy the integer
+                // bit pattern into the real's float storage. The typed path
+                // (compiled / AST cont-assign) does the conversion the LRM
+                // asks for, so a copy BETWEEN a real and a non-real keeps
+                // that path. A copy between two reals (or two non-reals)
+                // carries the same representation on both sides and stays
+                // on the fast path.
+                let dst_real = self.signal_real.get(dst_id).copied().unwrap_or(false);
+                let src_real = self.signal_real.get(src_id).copied().unwrap_or(false);
+                if dst_real != src_real {
+                    None
+                } else if width == self.signal_widths[src_id] {
                     if width <= 64 && delay == 0 {
                         Some(CombItem::FastDirectCopy { dst_id, src_id })
                     } else if self
@@ -2023,9 +2036,7 @@ impl Simulator {
                             bound: crate::ast::binding::Bound::UNSET,
                         };
                         let saved = self.name_resolve_hint.borrow().clone();
-                        if !ab.scope.is_empty() {
-                            *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
-                        }
+                        *self.name_resolve_hint.borrow_mut() = (!ab.scope.is_empty()).then(|| ab.scope.clone());
                         let resolved = self.resolve_hier_name(&ident);
                         *self.name_resolve_hint.borrow_mut() = saved;
                         if resolved != *r {

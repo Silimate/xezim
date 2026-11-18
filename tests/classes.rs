@@ -238,6 +238,18 @@ mod compiled_method_string_members;
 mod compiled_method_foreach;
 #[path = "classes/compiled_method_local_colls.rs"]
 mod compiled_method_local_colls;
+#[path = "classes/compiled_method_regs_across_settle.rs"]
+mod compiled_method_regs_across_settle;
+#[path = "classes/typedef_static_call_actual.rs"]
+mod typedef_static_call_actual;
+#[path = "classes/compiled_method_string_coll_member_assign.rs"]
+mod compiled_method_string_coll_member_assign;
+#[path = "classes/compiled_method_queue_literal_arg.rs"]
+mod compiled_method_queue_literal_arg;
+#[path = "classes/compiled_method_coll_formal_actual.rs"]
+mod compiled_method_coll_formal_actual;
+#[path = "classes/static_collection_through_handle.rs"]
+mod static_collection_through_handle;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
@@ -898,6 +910,8 @@ mod vif_static_roundtrip;
 mod class_member_named_like_instance;
 #[path = "classes/covergroup_class_param_bins.rs"]
 mod covergroup_class_param_bins;
+#[path = "classes/covergroup_array_element_new.rs"]
+mod covergroup_array_element_new;
 #[path = "classes/class_method_scalar_formal_width.rs"]
 mod class_method_scalar_formal_width;
 #[path = "classes/typedef_packed_return_prototype.rs"]
@@ -910,6 +924,8 @@ mod dynamic_array_property_new_init;
 mod dynamic_array_new_in_method;
 #[path = "classes/spec_args_module_params.rs"]
 mod spec_args_module_params;
+#[path = "classes/spec_type_name_module_instance.rs"]
+mod spec_type_name_module_instance;
 #[path = "classes/null_receiver_nonvirtual_call.rs"]
 mod null_receiver_nonvirtual_call;
 #[path = "classes/builtin_class_typedef_handles.rs"]
@@ -1230,8 +1246,14 @@ mod rand_dyn_array_of_unpacked_structs;
 #[path = "classes/class_scoped_assoc_queue_element.rs"]
 mod class_scoped_assoc_queue_element;
 
+#[path = "classes/rand_sub_object_array_back_handle.rs"]
+mod rand_sub_object_array_back_handle;
+
 #[path = "classes/rand_sub_object_back_handle.rs"]
 mod rand_sub_object_back_handle;
+
+#[path = "classes/rand_sub_object_back_handle_edges.rs"]
+mod rand_sub_object_back_handle_edges;
 
 #[path = "classes/rand_solver_sparse_1003.rs"]
 mod rand_solver_sparse_1003;
@@ -1266,3 +1288,36 @@ mod builtin_class_struct_members_1161;
 mod null_receiver_builtin_names_1139;
 #[path = "classes/static_call_in_param_initializer_1130.rs"]
 mod static_call_in_param_initializer_1130;
+#[path = "classes/back_reference_completion.rs"]
+mod back_reference_completion;
+
+#[path = "classes/part_select_index_once.rs"]
+mod part_select_index_once;
+
+#[path = "classes/undeclared_type_name.rs"]
+mod undeclared_type_name;
+#[path = "classes/duplicate_class_definition.rs"]
+mod duplicate_class_definition;
+
+#[path = "classes/virtual_type_specialization_231.rs"]
+mod virtual_type_specialization_231;
+#[path = "classes/property_shadowed_by_outer_name.rs"]
+mod property_shadowed_by_outer_name;
+
+#[path = "classes/method_cache_local_shadow.rs"]
+mod method_cache_local_shadow;
+
+#[path = "classes/randomize_size_from_sub_object.rs"]
+mod randomize_size_from_sub_object;
+#[path = "classes/randomize_size_from_sub_object_ipv4.rs"]
+mod randomize_size_from_sub_object_ipv4;
+#[path = "classes/randomize_size_sub_object_forms.rs"]
+mod randomize_size_sub_object_forms;
+#[path = "classes/rand_mode_sub_object_member.rs"]
+mod rand_mode_sub_object_member;
+#[path = "classes/named_param_typedef_spec.rs"]
+mod named_param_typedef_spec;
+#[path = "classes/scoped_vif_typedef_local.rs"]
+mod scoped_vif_typedef_local;
+#[path = "classes/subroutine_actual_width_1256.rs"]
+mod subroutine_actual_width_1256;

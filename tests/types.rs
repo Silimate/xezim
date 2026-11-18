@@ -113,6 +113,8 @@ mod divide_operand_width;
 mod division_operand_width;
 #[path = "types/dollar_lvalue_and_assoc_width.rs"]
 mod dollar_lvalue_and_assoc_width;
+#[path = "types/duplicate_typedef.rs"]
+mod duplicate_typedef;
 #[path = "types/enum_base_and_packed_members.rs"]
 mod enum_base_and_packed_members;
 #[path = "types/enum_cross_cast_assignment.rs"]
@@ -235,6 +237,8 @@ mod packed_struct_array_local;
 mod packed_struct_array_param_pattern_in_instance;
 #[path = "types/packed_struct_formal_member.rs"]
 mod packed_struct_formal_member;
+#[path = "types/packed_struct_formal_member_elements.rs"]
+mod packed_struct_formal_member_elements;
 #[path = "types/packed_struct_member_width.rs"]
 mod packed_struct_member_width;
 #[path = "types/param_cb_isolation.rs"]
@@ -715,6 +719,8 @@ mod struct_array_member_elem_select;
 
 #[path = "types/packed_select_geometry_1002.rs"]
 mod packed_select_geometry_1002;
+#[path = "types/array_member_pattern_replication.rs"]
+mod array_member_pattern_replication;
 #[path = "types/struct_pattern_replication.rs"]
 mod struct_pattern_replication;
 #[path = "types/struct_pattern_replication_constant_counts.rs"]
@@ -759,3 +765,19 @@ mod review_struct_pattern_return;
 mod enum_receiver_types_1132;
 #[path = "types/signed_named_packed_props_ports_1107.rs"]
 mod signed_named_packed_props_ports_1107;
+
+#[path = "types/owned_aggregate_storage_1132_1147.rs"]
+mod owned_aggregate_storage_1132_1147;
+
+#[path = "types/net_typedef_metadata_1212.rs"]
+mod net_typedef_metadata_1212;
+
+#[path = "types/real_relational_unknown_bits.rs"]
+mod real_relational_unknown_bits;
+
+#[path = "types/struct_param_localparam_type.rs"]
+mod struct_param_localparam_type;
+#[path = "types/wide_packed_select_store.rs"]
+mod wide_packed_select_store;
+#[path = "types/nd_struct_array_members_1240.rs"]
+mod nd_struct_array_members_1240;

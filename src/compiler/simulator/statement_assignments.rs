@@ -256,7 +256,9 @@ impl Simulator {
         let saved_auto_len = self.auto_loop_vars.len();
         let mut processes = Vec::with_capacity(stmts.len());
         for s in stmts {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 self.exec_statement(s);
                 for d in declarators {
                     self.auto_loop_vars.push(d.name.name.clone());
@@ -1332,6 +1334,59 @@ impl Simulator {
         true
     }
 
+    /// Whether `flat` names a whole multi-dimensional unpacked array or a
+    /// row of one (`m`, `m[1]` of `m[2][3]`), rather than one element.
+    pub(super) fn names_nd_subarray(&self, flat: &str) -> bool {
+        let mut base = flat;
+        let mut selects = 0;
+        loop {
+            if self.module.arrays_2d.contains_key(base) {
+                return selects < 2;
+            }
+            if let Some((dims, _)) = self.module.arrays_nd.get(base) {
+                return selects < dims.len();
+            }
+            match base.strip_suffix(']').and_then(|b| b.rfind('[')) {
+                Some(open) => {
+                    base = &base[..open];
+                    selects += 1;
+                }
+                None => return false,
+            }
+        }
+    }
+
+    /// §7.2: the unpacked struct an element of the multi-dimensional array
+    /// `flat` names, or a row of, has as its type (`m`, `m[1]`).
+    pub(super) fn nd_elem_struct(&self, flat: &str) -> Option<crate::ast::types::StructUnionType> {
+        let mut base = flat;
+        loop {
+            if self.module.arrays_2d.contains_key(base) || self.module.arrays_nd.contains_key(base)
+            {
+                let dt = self.module.var_decl_types.get(base)?;
+                return self.unpacked_struct_of(dt);
+            }
+            let open = base.strip_suffix(']').and_then(|b| b.rfind('['))?;
+            base = &base[..open];
+        }
+    }
+
+    /// Whether `e` is a multi-dimensional unpacked-struct array, or a select
+    /// of one, named by a plain identifier.
+    fn nd_struct_array_root(&mut self, e: &Expression) -> bool {
+        let mut root = e;
+        while let ExprKind::Index { expr, .. } = &root.kind {
+            root = expr;
+        }
+        match &root.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                let name = self.resolve_hier_name(h).into_owned();
+                self.nd_elem_struct(&name).is_some()
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn exec_stmt_blocking_assign(
         &mut self,
         stmt: &Statement,
@@ -1473,6 +1528,40 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
+        // is evaluated exactly ONCE. The assign_value machinery
+        // re-evaluates the index in several candidate branches, so
+        // fold side-effecting indices before any aggregate probe. A
+        // compound assign (`x[i++] += 2`) was desugared by the parser
+        // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
+        // on the RHS — point that clone at the same folded index so
+        // the increment still happens once.
+        if Self::lvalue_has_incdec_index(lvalue) {
+            if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
+                let new_rhs: Expression = match &rvalue.kind {
+                    ExprKind::Binary { op, left, right }
+                        if left.span == lvalue.span
+                            && std::mem::discriminant(&left.kind)
+                                == std::mem::discriminant(&lvalue.kind) =>
+                    {
+                        Expression::new(
+                            ExprKind::Binary {
+                                op: *op,
+                                left: Box::new(new_lhs.clone()),
+                                right: right.clone(),
+                            },
+                            rvalue.span,
+                        )
+                    }
+                    _ => (*rvalue).clone(),
+                };
+                // The frozen target can still be an unpacked aggregate.
+                // Keep its member-wise assignment paths instead of forcing
+                // the value-only scalar store.
+                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
+                return;
+            }
+        }
         // #1108: a whole array member of an instance-array element on either
         // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
         // An element select is folded where it is read or written.
@@ -1494,6 +1583,17 @@ impl Simulator {
         }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
+            return;
+        }
+        // §7.6, §7.2: a whole multi-dimensional array of unpacked structs,
+        // or a row of one, copies element by element and member by member.
+        // Ahead of the element and struct paths below, which took a row
+        // (`b[1] = a[0]`) for one element.
+        if (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+            && self.nd_struct_array_root(lvalue)
+            && self.copy_multi_dim_array(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
             return;
         }
         // §7.4.6, §7.6: a slice of an unpacked array on either side pairs
@@ -1558,14 +1658,6 @@ impl Simulator {
         }
         // (A side-effecting lvalue index is folded first, below, and
         // comes back through here.)
-        if self.indexed_colls_live()
-            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
-            && !Self::lvalue_has_incdec_index(lvalue)
-            && self.try_indexed_coll_assign(lvalue, rvalue)
-        {
-            self.settle_after_proc_write();
-            return;
-        }
         if (matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
             || self.lvalue_may_name_struct_coll(lvalue))
             && self.try_struct_aggregate_assign(stmt, lvalue, rvalue)
@@ -1578,39 +1670,19 @@ impl Simulator {
         if self.try_event_handle_assign(lvalue, rvalue) {
             return;
         }
-        // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
-        // is evaluated exactly ONCE. The assign_value machinery
-        // re-evaluates the index in several candidate branches, so
-        // fold side-effecting indices to literals up front. A
-        // compound assign (`x[i++] += 2`) was desugared by the parser
-        // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
-        // on the RHS — point that clone at the same folded index so
-        // the increment still happens once.
-        if Self::lvalue_has_incdec_index(lvalue) {
-            if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
-                let new_rhs: Expression = match &rvalue.kind {
-                    ExprKind::Binary { op, left, right }
-                        if left.span == lvalue.span
-                            && std::mem::discriminant(&left.kind)
-                                == std::mem::discriminant(&lvalue.kind) =>
-                    {
-                        Expression::new(
-                            ExprKind::Binary {
-                                op: *op,
-                                left: Box::new(new_lhs.clone()),
-                                right: right.clone(),
-                            },
-                            rvalue.span,
-                        )
-                    }
-                    _ => (*rvalue).clone(),
-                };
-                // The frozen target can still be an unpacked aggregate.
-                // Keep its member-wise assignment paths instead of forcing
-                // the value-only scalar store.
-                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
-                return;
-            }
+        let sized_new = Self::sized_new_parts(rvalue);
+        let row_sized_new: Option<String> = sized_new
+            .is_some()
+            .then(|| self.sized_new_row_lvalue(lvalue))
+            .flatten();
+        if self.indexed_colls_live()
+            && row_sized_new.is_none()
+            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
+            && !Self::lvalue_has_incdec_index(lvalue)
+            && self.try_indexed_coll_assign(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
         }
         // LRM §25.8 virtual-interface binding. When the LHS is a
         // class-property write whose property is declared
@@ -1716,7 +1788,21 @@ impl Simulator {
         // min(n, src.size()) elements and default-initialises the rest.
         // A `d[i] = new[n]` lvalue sizes the ELEMENT of an array of
         // dynamic arrays.
-        if let Some((n_expr, src_expr)) = Self::sized_new_parts(rvalue) {
+        if let Some((n_expr, src_expr)) = sized_new {
+            if let Some(row) = row_sized_new {
+                if !self.ensure_row(&row) {
+                    let _ = self.eval_expr(n_expr);
+                    if let Some(src) = src_expr {
+                        let _ = self.eval_expr(src);
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
+                self.module.dynamic_arrays.insert(row.clone());
+                self.fill_sized_new(&row, n_expr, src_expr);
+                self.settle_after_proc_write();
+                return;
+            }
             let target = match &lvalue.kind {
                 ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
                 // `dq[1] = new[n]` on an array-of-dynamic-arrays
@@ -1853,6 +1939,7 @@ impl Simulator {
                         sim.module.associative_arrays.contains_key(n)
                             || sim.module.dynamic_arrays.contains(n)
                             || sim.module.arrays.contains_key(n)
+                            || sim.names_nd_subarray(n)
                     };
                     let has_dyn = has_dyn && !whole_coll(self, &dst) && !whole_coll(self, &src);
                     if has_dyn && self.struct_storage_exists(&src, &su) {
@@ -2003,8 +2090,12 @@ impl Simulator {
             // identical code at top level worked.
             let (dst, spread_su) = self.struct_copy_target(dst);
             if let Some(su) = spread_su {
+                // §7.4.2: a multi-dimensional array of structs, or a row of
+                // one, is a collection too; it copies element by element
+                // below.
                 let dst_is_collection = self.module.dynamic_arrays.contains(&dst)
                     || self.module.arrays.contains_key(&dst)
+                    || self.names_nd_subarray(&dst)
                     || self.module.associative_arrays.contains_key(&dst);
                 // Freeze only after the destination is known to be a struct;
                 // rejected speculative probes must not execute selectors. The
@@ -2030,6 +2121,7 @@ impl Simulator {
                 if Self::is_struct_elem_ref(rvalue)
                     && !self.module.dynamic_arrays.contains(&dst)
                     && !self.module.arrays.contains_key(&dst)
+                    && !self.names_nd_subarray(&dst)
                     && !self.module.associative_arrays.contains_key(&dst)
                 {
                     self.assign_struct_memberwise(lvalue, rvalue, &su, 0);
@@ -2186,6 +2278,11 @@ impl Simulator {
                             && let Some(b) = self.prop_class_type(handle, &member_name)
                         {
                             mtn = Some(b);
+                        }
+                        if let Some(t) = mtn.as_deref()
+                            && self.construct_covergroup_into(t, lvalue, rvalue)
+                        {
+                            return;
                         }
                         if let Some(mcls) = mtn.as_deref().and_then(|t| {
                             self.resolve_typedef_spec(t)
@@ -2417,6 +2514,11 @@ impl Simulator {
                     } else {
                         None
                     };
+                    if let Some(t) = elem_cls.as_deref()
+                        && self.construct_covergroup_into(t, lvalue, rvalue)
+                    {
+                        return;
+                    }
                     // The element type is often a TYPEDEF alias (e.g.
                     // `typedef elem_pool pool_t;` or a parameterized alias).
                     // The maps above record the TYPEDEF name, which isn't a key in
@@ -3012,7 +3114,16 @@ impl Simulator {
                                 r_prefix.into_owned(),
                                 &mut pairs,
                             );
+                            // §7.2: an element of an unpacked-struct array is
+                            // its member leaves.
+                            let elem_su = self
+                                .nd_elem_struct(&rname)
+                                .or_else(|| self.nd_elem_struct(&lname));
                             for (lp, rp) in pairs {
+                                if let Some(su) = &elem_su {
+                                    self.copy_unpacked_struct(&lp, &rp, &su.clone());
+                                    continue;
+                                }
                                 let v =
                                     self.get_signal_value_by_name(&rp).unwrap_or(Value::zero(1));
                                 self.set_signal_value_by_name(&lp, v);
@@ -3757,9 +3868,12 @@ impl Simulator {
             return;
         }
         // §10.10: `cfg.r = {…}` writes a queue member before the right side runs as a value.
+        // §8.9: so does a static queue reached through the object.
         if let ExprKind::MemberAccess { .. } = &lvalue.kind
             && let ExprKind::Concatenation(_) = &rvalue.kind
-            && let Some(n) = self.expr_assoc_name(lvalue).filter(|n| self.class_queue_prop(n))
+            && let Some(n) = self
+                .expr_assoc_name(lvalue)
+                .filter(|n| self.class_queue_prop(n) || self.module.arrays.contains_key(n))
             && self.assign_whole_coll(&n, None, rvalue)
         {
             self.settle_after_proc_write();
@@ -4314,10 +4428,16 @@ impl Simulator {
             if matches!(rvalue.kind, ExprKind::Concatenation(_))
                 && !self.module.arrays.contains_key(&*lname)
                 && let Some(n) = self.expr_assoc_name(lvalue)
-                && self.class_queue_prop(&n)
             {
-                lname = std::borrow::Cow::Owned(n);
-                class_dyn = true;
+                if self.class_queue_prop(&n) {
+                    lname = std::borrow::Cow::Owned(n);
+                    class_dyn = true;
+                } else if self.module.arrays.contains_key(&n) {
+                    // §8.9: a static queue or dynamic array reached
+                    // through an object (`h.sq = {h.sq, v}`) is the
+                    // class's store.
+                    lname = std::borrow::Cow::Owned(n);
+                }
             }
             if self.module.arrays.contains_key(&*lname) || class_dyn {
                 // Queue/array slice assignment: lq = rq[a:b]

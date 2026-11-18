@@ -1369,7 +1369,7 @@ impl Simulator {
         }
         // Blocked on @(...) — if it is also a top spinner, something keeps
         // re-triggering it at this timestamp.
-        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+        if let Some(w) = self.event_waiters.first_of_pid(pid) {
             let sens = w
                 .resolved_sensitivities
                 .iter()
@@ -3075,6 +3075,13 @@ impl Simulator {
             self.cond_waiter_rechecks
         );
         chatter!("[PROF] vm_direct_calls={}", self.vm_direct_calls);
+        chatter!("[PROF] queue_elem_moves={}", self.queue_elem_moves);
+        chatter!(
+            "[PROF] timing_conds compiled={} interpreted={}",
+            self.timing_cond_evals[0],
+            self.timing_cond_evals[1]
+        );
+        chatter!("[PROF] select_store_copies={}", self.select_store_copies);
         chatter!("[PROF] local_meta_reapplies={}", self.local_meta_reapplies);
         chatter!(
             "[PROF] local_meta_swaps={} local_meta_scans={}",
@@ -3086,6 +3093,10 @@ impl Simulator {
             self.prof_edge_waiters as f64 / 1e6,
             self.prof_edge_cg as f64 / 1e6,
             self.prof_waiter_iters
+        );
+        chatter!(
+            "[PROF] implicit_net_scope_steps={}",
+            initialization::IMPLICIT_NET_SCOPE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
         );
         chatter!(
             "[PROF] clocks_only_detect={} nba_elided={} (iters with clocks-only scan / NBAs dropped at eval because value matched signal_table)",

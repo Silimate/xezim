@@ -719,6 +719,8 @@ impl Simulator {
         // above, in the caller's context.
         self.this_stack.push(None);
         self.class_context_stack.push(None);
+        self.method_local_base
+            .push(self.local_stack.len().saturating_sub(1));
         // Track the running subroutine name so `%m` inside a package function
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
@@ -870,6 +872,7 @@ impl Simulator {
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
         self.class_context_stack.pop();
+        self.method_local_base.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
             rv
         } else if let Some(su) = self.unpacked_struct_of(&fd.return_type) {
@@ -1669,7 +1672,7 @@ impl Simulator {
                 .unwrap_or_default()
         };
         FormalMetaParts {
-            declared_type: self.module.var_decl_types.get(name).cloned(),
+            declared_type: self.module.var_decl_types.get_shared(name).cloned(),
             packed_fields: self.module.packed_struct_fields.get(name).cloned(),
             packed_element_widths,
             packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
@@ -2000,7 +2003,11 @@ impl Simulator {
                 }
             }
         }
-        put(&mut self.module.var_decl_types, name, saved.declared_type);
+        put(
+            self.module.var_decl_types.as_map_mut(),
+            name,
+            saved.declared_type,
+        );
         put(
             &mut self.module.packed_struct_fields,
             name,
@@ -2741,9 +2748,15 @@ impl Simulator {
                 }
                 _ => {
                     let mut val = if arg_supplied(i) {
+                        // §13.5, §11.6.1: as a function's (`exec_function_call`),
+                        // a task's input actual is context-determined by its
+                        // formal; `t(x + y)` over 8-bit operands lost the carry.
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
-                            None => self.eval_expr(&args[i]),
+                            None => match self.actual_context_width(port) {
+                                Some(w) => self.eval_expr_ctx(&args[i], w),
+                                None => self.eval_expr(&args[i]),
+                            },
                         };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {

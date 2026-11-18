@@ -120,3 +120,52 @@ endmodule
         "missing {want:?}; got {out:?}"
     );
 }
+
+/// §11.3.2: a part-select through a call receiver of a member that is a
+/// packed vector here but a queue in another class makes the call once.
+/// §7.6: a slice assigned to a descending fixed array fills it from its left
+/// bound.
+#[test]
+fn packed_member_receiver_and_descending_target() {
+    let src = r#"
+module tb;
+  class C;
+    bit [7:0] vec;
+    int ql[$];
+  endclass
+  class D;
+    int vec[$];
+  endclass
+  C obj;
+  D other;
+  int gets;
+  bit [3:0] qv[$];
+  int q[$];
+  int dst[1:0], dst2[1:0];
+  function C get_obj();
+    gets++;
+    return obj;
+  endfunction
+  initial begin
+    obj = new;
+    other = new;
+    obj.vec = 8'ha5;
+    obj.ql = {7, 8};
+    q = {3, 4};
+    gets = 0;
+    qv = {get_obj().vec[7:4], get_obj().vec[3:0]};
+    $display("qv=%0d,%0d,%0d gets=%0d", qv.size(), qv[0], qv[1], gets);
+    dst = obj.ql[0:1];
+    dst2 = q[0:1];
+    $display("dst=%0d,%0d dst2=%0d,%0d", dst[1], dst[0], dst2[1], dst2[0]);
+  end
+endmodule
+"#;
+    let out = lines(src);
+    for want in ["qv=2,10,5 gets=2", "dst=7,8 dst2=3,4"] {
+        assert!(
+            out.iter().any(|m| m == want),
+            "missing {want:?}; got {out:?}"
+        );
+    }
+}

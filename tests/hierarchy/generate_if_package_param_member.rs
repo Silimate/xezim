@@ -12,6 +12,16 @@ fn lines(src: &str) -> Vec<String> {
     sim.output.iter().map(|o| o.message.clone()).collect()
 }
 
+/// Exactly the expected branch messages, each once, in any order: a branch
+/// that was not selected must not run.
+fn expect_exactly(src: &str, want: &[&str]) {
+    let mut got = lines(src);
+    got.sort();
+    let mut want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+    want.sort();
+    assert_eq!(got, want, "{src}");
+}
+
 const PKG: &str = "package p;
   typedef struct packed { logic [1:0] variant; logic [3:0] lanes; } info_t;
   parameter info_t Info [3] = '{'{2'd0, 4'd1}, '{2'd1, 4'd2}, '{2'd2, 4'd4}};
@@ -35,10 +45,7 @@ fn generate_if_reads_a_scoped_struct_array_member() {
 endmodule
 "
     );
-    let got = lines(&src);
-    for want in ["g[0] b0", "g[1] b1", "g[2] b2"] {
-        assert!(got.iter().any(|l| l == want), "missing {want:?} in {got:?}");
-    }
+    expect_exactly(&src, &["g[0] b0", "g[1] b1", "g[2] b2"]);
 }
 
 #[test]
@@ -58,8 +65,5 @@ fn generate_case_and_constant_index_read_the_scoped_member() {
 endmodule
 "
     );
-    let got = lines(&src);
-    for want in ["g[0] one", "g[1] two", "g[2] other", "last"] {
-        assert!(got.iter().any(|l| l == want), "missing {want:?} in {got:?}");
-    }
+    expect_exactly(&src, &["g[0] one", "g[1] two", "g[2] other", "last"]);
 }

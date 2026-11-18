@@ -1268,6 +1268,16 @@ impl Simulator {
                         return Some(access);
                     }
                 }
+                // §8.11: a current-object property precedes a same-named
+                // module declaration. Its packed layout belongs to the class.
+                if (h.path.len() == 1 && self.this_prop_hides(&h.path[0].name.name))
+                    || (h.path.len() > 1
+                        && (matches!(h.path[0].name.name.as_str(), "this" | "super")
+                            || self.bare_name_is_class_channel(&h.path[0].name.name)
+                            || self.hier_parent_handle(h).is_some()))
+                {
+                    return None;
+                }
                 let name = self
                     .frame_bound_bare_name(h)
                     .map(str::to_owned)
@@ -1315,8 +1325,18 @@ impl Simulator {
                 } else {
                     0
                 };
+                // §23.6: keep an absolute top-level access absolute after
+                // resolving its declaration; a later scope hint must not
+                // redirect the storage lookup to a same-named child variable.
+                let storage = if !name.contains('.')
+                    && (h.root.is_some() || h.path.len() > 1)
+                {
+                    format!("{}.{}", self.module.name, name)
+                } else {
+                    name
+                };
                 Some(DeclaredPackedAccess {
-                    storage: name,
+                    storage,
                     params: scope,
                     is_signed: super::elaborate::is_type_signed_resolved(
                         dt,
@@ -3149,7 +3169,7 @@ impl Simulator {
                         // parameterized instances don't collide. Resolve
                         // through the process's scope hint, outermost
                         // scope walked inward (ivtest sv_enum1).
-                        let typedef_w = self.module.typedefs.get(&*name).copied().or_else(|| {
+                        let scope_typedef_w = (|| {
                             let mut h = self.name_resolve_hint.borrow().clone()?;
                             loop {
                                 if let Some(&w) =
@@ -3162,7 +3182,36 @@ impl Simulator {
                                     None => return None,
                                 }
                             }
-                        });
+                        })();
+                        // §8.23: a `::`-chained scoped TYPE name
+                        // (`$bits(pkg::cls::td)`) may parse as a multi-
+                        // segment HierarchicalIdentifier whose package first
+                        // segment `resolve_hier_name` strips, joining the
+                        // rest with `.` (`pkg::cls::td` -> `cls.td`). That
+                        // does not match the typedef table's `::`-qualified
+                        // key, so reconstruct the `::`-joined candidates
+                        // (longest first) and consult the type tables.
+                        let scoped_typedef_w = if name.contains('.') && hier.path.len() >= 2 {
+                            let segs: Vec<&str> = hier
+                                .path
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect();
+                            let mut cands = Vec::new();
+                            for start in 0..segs.len() {
+                                cands.push(segs[start..].join("::"));
+                            }
+                            cands.into_iter().find_map(|k| self.module.typedefs.get(&k).copied())
+                        } else {
+                            None
+                        };
+                        let typedef_w = self
+                            .module
+                            .typedefs
+                            .get(&*name)
+                            .copied()
+                            .or(scope_typedef_w)
+                            .or(scoped_typedef_w);
                         if let Some(w) = typedef_w {
                             // §20.6.2: a typedef carrying UNPACKED dims is
                             // element_bits × the dimension sizes —

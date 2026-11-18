@@ -115,9 +115,9 @@ pub fn loadable_path(path: &str) -> String {
 
 /// Where built libraries are kept: `xezim/dpi` under `$XEZIM_CACHE_DIR`,
 /// `$XDG_CACHE_HOME` or `~/.cache`, as the native-code cache does. With none
-/// of them set, a directory of this user's in the temporary directory,
-/// `xezim-<uid>`, which must be private (see `private_dir`): the library
-/// built there is loaded into the simulator.
+/// of them set, a directory of this user's in the temporary directory
+/// (`xezim-<uid>` on Unix), which must be private (see `private_dir`): the
+/// library built there is loaded into the simulator.
 pub fn default_cache_dir() -> Result<PathBuf, String> {
     let set = |v: &str| std::env::var_os(v).filter(|p| !p.is_empty());
     let base = match set("XEZIM_CACHE_DIR")
@@ -127,9 +127,7 @@ pub fn default_cache_dir() -> Result<PathBuf, String> {
     {
         Some(base) => base,
         None => {
-            // SAFETY: geteuid has no preconditions and cannot fail.
-            let uid = unsafe { libc::geteuid() };
-            let dir = std::env::temp_dir().join(format!("xezim-{uid}"));
+            let dir = std::env::temp_dir().join(private_dir_name());
             private_dir(&dir)?;
             dir
         }
@@ -137,10 +135,23 @@ pub fn default_cache_dir() -> Result<PathBuf, String> {
     Ok(base.join("xezim").join("dpi"))
 }
 
+/// The fallback cache's name in the temporary directory.
+#[cfg(unix)]
+fn private_dir_name() -> String {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    format!("xezim-{}", unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn private_dir_name() -> String {
+    "xezim".to_string()
+}
+
 /// Create `dir` for this user only, or check that the existing one is a
 /// directory (not a symbolic link) that this user owns and nobody else can
 /// write to. In a shared temporary directory anyone may create the name
 /// first, with headers or a library of their own in it.
+#[cfg(unix)]
 fn private_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let err = |why: String| {
@@ -171,6 +182,13 @@ fn private_dir(dir: &Path) -> Result<(), String> {
         )));
     }
     Ok(())
+}
+
+/// Elsewhere (Windows) the temporary directory is the user's own.
+#[cfg(not(unix))]
+fn private_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("cannot create the DPI cache {}: {}", dir.display(), e))
 }
 
 /// The headers DPI-C code includes, as xezim ships them in `include/`.
@@ -447,6 +465,7 @@ mod tests {
         assert_eq!(f.shared_libraries, ["l.so"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_dir_refuses_shared_and_linked_directories() {
         use std::os::unix::fs::PermissionsExt;

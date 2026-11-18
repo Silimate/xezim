@@ -205,6 +205,7 @@ fn ldflags_archive_edit_reaches_the_next_run() {
 /// `$HOME`), the library is built in `xezim-<uid>` in the temporary
 /// directory, created private. One that other users can write to, where
 /// anyone could have put headers or a library of their own, is refused.
+#[cfg(unix)]
 #[test]
 fn temporary_cache_directory_must_be_private() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

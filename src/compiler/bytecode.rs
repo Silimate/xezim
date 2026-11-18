@@ -1757,6 +1757,9 @@ pub struct BytecodeCompiler<'a> {
     /// absent means "assume possibly-real", which only costs missed
     /// `Resize` elisions, never correctness.
     signal_real: Option<&'a [bool]>,
+    /// The runtime's per-signal 2-state marks (`Simulator::signal_two_state`),
+    /// which its writes use to drop x/z (§6.11.2). `None` until set.
+    signal_two_state: Option<&'a [bool]>,
     arrays: &'a HashMap<String, (i64, i64, u32)>,
     array_first_id: Option<&'a HashMap<Arc<str>, (usize, i64, i64)>>,
     widths: &'a HashMap<String, u32>,
@@ -2326,6 +2329,7 @@ impl<'a> BytecodeCompiler<'a> {
             signal_signed,
             signal_widths,
             signal_real: None,
+            signal_two_state: None,
             arrays,
             array_first_id: None,
             widths,
@@ -3154,6 +3158,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// survives — measured at ~337K of the ~553K resizes still executing.
     pub fn set_signal_real(&mut self, r: &'a [bool]) {
         self.signal_real = Some(r);
+    }
+
+    /// The runtime's 2-state marks, by signal id. A compiled range store
+    /// into a container declines when its signal may be 2-state.
+    pub fn set_signal_two_state(&mut self, t: &'a [bool]) {
+        self.signal_two_state = Some(t);
     }
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
@@ -9588,22 +9598,31 @@ impl<'a> BytecodeCompiler<'a> {
         depth == Some(selects)
     }
 
+    /// §6.11.2: can a range store into the packed container `var` (signal
+    /// `id`) skip the 2-state conversion? A 2-state variable stores x/z as 0
+    /// across its whole value on the interpreter's path, which a range store
+    /// does not do, so the compiled store is taken only when neither the
+    /// runtime's mark for the signal nor its declared type is 2-state. Without
+    /// the runtime table the answer is no, which keeps the interpreter.
+    fn packed_container_four_state(&self, id: usize, var: &str) -> bool {
+        let Some(marks) = self.signal_two_state else {
+            return false;
+        };
+        if marks.get(id).copied().unwrap_or(true) {
+            return false;
+        }
+        let (Some(decls), Some(types)) = (self.var_decl_types, self.typedef_types) else {
+            return true;
+        };
+        let leaf = var.rsplit_once('.').map_or(var, |(_, leaf)| leaf);
+        decls.get(var).or_else(|| decls.get(leaf)).is_none_or(|dt| {
+            !crate::compiler::elaborate::is_type_two_state_resolved(dt, types)
+        })
+    }
+
     /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
     /// packed structure or union variable `var` holds, from its declared
     /// type. None when the declaration or the member cannot be resolved.
-    /// §6.11.2: is the packed-struct container `var` (a layout key) declared
-    /// with a two-state type? A store into it converts x/z to 0, which the
-    /// range stores do not do on their own. `None` when the declared type is
-    /// not known here, which keeps the store on the interpreter's path.
-    fn packed_container_two_state(&self, var: &str) -> Option<bool> {
-        let decls = self.var_decl_types?;
-        let types = self.typedef_types?;
-        let dt = decls.get(var)?;
-        Some(crate::compiler::elaborate::is_type_two_state_resolved(
-            dt, types,
-        ))
-    }
-
     fn packed_member_signed(&self, var: &str, member: &str) -> Option<bool> {
         use crate::ast::types::DataType as D;
         let decls = self.var_decl_types?;
@@ -20006,14 +20025,11 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 // `s.e[1].dw[0].value <= v`: one static range of `s`.
                 if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
-                    && let Some(two_state) = self.packed_container_two_state(&key)
+                    && self.packed_container_four_state(base_id, &key)
                 {
                     let resized = self.alloc_reg();
                     self.emit(Insn::Move(resized, val_reg));
                     self.emit(Insn::Resize(resized, mw));
-                    if two_state {
-                        self.emit(Insn::DropXz(resized));
-                    }
                     self.emit(Insn::NbaAssignRange(
                         as_sig_id(base_id),
                         off + mw - 1,
@@ -20765,14 +20781,11 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 // `s.e[1].dw[0].value = v`: one static range of `s`.
                 if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
-                    && let Some(two_state) = self.packed_container_two_state(&key)
+                    && self.packed_container_four_state(base_id, &key)
                 {
                     let resized = self.alloc_reg();
                     self.emit(Insn::Move(resized, val_reg));
                     self.emit(Insn::Resize(resized, mw));
-                    if two_state {
-                        self.emit(Insn::DropXz(resized));
-                    }
                     self.emit(Insn::BlockingAssignRange(
                         as_sig_id(base_id),
                         off + mw - 1,

@@ -29,10 +29,30 @@ use xezim_core::elaborate::ElaboratedModule;
 /// The elaboration's parameter table type (`ElaboratedModule::parameters`).
 type ParamMap = xezim_core::hasher::HashMap<String, Value>;
 
-/// Run the second-pass lint over every top-level definition. Returns a list of
-/// error messages (empty == clean).
+/// What the second-pass lint found: the errors that reject the design, and the
+/// warnings for what a `--relax-*` switch accepted instead.
+#[derive(Debug, Default)]
+pub struct LintReport {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Run the second-pass lint over every top-level definition and print its
+/// warnings. Returns a list of error messages (empty == clean).
 pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
+    let report = lint_design(defs, elab);
+    for w in &report.warnings {
+        eprintln!("{w}");
+    }
+    report.errors
+}
+
+/// Run the second-pass lint over every top-level definition. The caller
+/// prints the warnings, so it can also keep them for a warm design-cache hit
+/// to replay.
+pub fn lint_design(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> LintReport {
     let mut errs = Vec::new();
+    let mut warns = Vec::new();
     // §23.3.2: map every module/interface/program to its declared port names,
     // so a named port connection to a non-existent port can be rejected.
     let port_map = build_port_map(defs);
@@ -82,7 +102,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &local_types,
                     &mut errs,
                 );
-                check_proc_net_assign(&m.name.name, &m.ports, &m.items, &mut errs);
+                check_proc_net_assign(&m.name.name, &m.ports, &m.items, &mut errs, &mut warns);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, scope, &mut errs);
@@ -180,7 +200,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
         // §23.8: a hierarchical name that does not resolve is an error.
         errs.extend(crate::hier_ref_lint::check(defs, elab));
     }
-    errs
+    LintReport {
+        errors: errs,
+        warnings: warns,
+    }
 }
 
 /// A module, interface or program, as the scope checks see it.
@@ -493,6 +516,7 @@ fn check_proc_net_assign(
     ports: &PortList,
     items: &[ModuleItem],
     errs: &mut Vec<String>,
+    warns: &mut Vec<String>,
 ) {
     use std::collections::HashSet;
     let mut nets: HashSet<String> = HashSet::new();
@@ -568,12 +592,12 @@ fn check_proc_net_assign(
                             b
                         ));
                     } else if RELAX_UNTYPED_OUTPUT_PORT.get() {
-                        eprintln!(
+                        warns.push(format!(
                             "[xezim][warning] output port '{b}' of module '{module}' has no data \
                              type, so it is a net (IEEE 1800-2023 §23.2.2.3), and a procedural \
                              block assigns it (§6.5); taking it as a variable, as if it were \
                              declared `output logic` (--relax-untyped-output-port)"
-                        );
+                        ));
                     } else {
                         errs.push(format!(
                             "output port '{b}' of module '{module}' is the target of a \

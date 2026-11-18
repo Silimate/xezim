@@ -44,23 +44,32 @@ fn run(tag: &str, source: &str, args: &[&str], env: &[(&str, &str)]) -> (bool, S
     r
 }
 
-/// `q` and `cnt` have no data type; `r` inherits that from `q`.
+/// `q` and `cnt` have no data type, and `r` inherits that from `q`; `v` is a
+/// variable, and so is `u`, which inherits `logic` from `v`.
 const FLOP: &str = r#"
 module flop (input logic clk, input logic rst, input logic d,
-             output q, output [3:0] cnt, output logic v, output r);
+             output q, r, output [3:0] cnt, output logic v, u);
   always_ff @(posedge clk)
-    if (rst) begin q <= 1'b0; cnt <= 4'd0; v <= 1'b0; r <= 1'b1; end
-    else begin q <= d; cnt <= cnt + 4'd1; v <= ~v; r <= ~d; end
+    if (rst) begin q <= 1'b0; cnt <= 4'd0; v <= 1'b0; r <= 1'b1; u <= 1'b0; end
+    else begin q <= d; cnt <= cnt + 4'd1; v <= ~v; r <= ~d; u <= d; end
 endmodule
 module t;
   logic clk = 0, rst = 1, d = 1;
-  wire q, v, r;
+  wire q, v, r, u;
   wire [3:0] cnt;
-  flop u (.clk, .rst, .d, .q, .cnt, .v, .r);
+  flop dut (.clk, .rst, .d, .q, .cnt, .v, .r, .u);
   always #5 clk = ~clk;
-  initial begin #12 rst = 0; #30; $display("R|q=%b cnt=%0d v=%b r=%b", q, cnt, v, r); $finish; end
+  initial begin
+    #12 rst = 0; #30;
+    $display("R|q=%b cnt=%0d v=%b r=%b u=%b", q, cnt, v, r, u);
+    $finish;
+  end
 endmodule
 "#;
+
+/// What `FLOP` prints once its untyped ports are taken as variables. Edges at
+/// 5 (reset), 15, 25 and 35; the display is at 42.
+const FLOP_OUT: &str = "R|q=1 cnt=3 v=1 r=0 u=1";
 
 #[test]
 fn untyped_output_port_error_says_it_is_a_net_and_how_to_declare_it() {
@@ -81,11 +90,13 @@ fn untyped_output_port_error_says_it_is_a_net_and_how_to_declare_it() {
     ] {
         assert!(text.contains(want), "missing {want:?}:\n{text}");
     }
-    // `output logic v` is a variable.
-    assert!(
-        !text.contains("port 'v'"),
-        "a typed port was flagged:\n{text}"
-    );
+    // `output logic v, u` are variables.
+    for port in ["v", "u"] {
+        assert!(
+            !text.contains(&format!("port '{port}'")),
+            "a typed port was flagged:\n{text}"
+        );
+    }
 }
 
 #[test]
@@ -96,11 +107,7 @@ fn relaxation_takes_the_port_as_a_variable() {
     ] {
         let (ok, text) = run("relax", FLOP, args, env);
         assert!(ok, "{args:?} {env:?}:\n{text}");
-        // Edges at 5 (reset), 15, 25, 35; the display is at 42.
-        assert!(
-            text.contains("R|q=1 cnt=3 v=1 r=0"),
-            "{args:?} {env:?}:\n{text}"
-        );
+        assert!(text.contains(FLOP_OUT), "{args:?} {env:?}:\n{text}");
         for port in ["q", "cnt", "r"] {
             let want =
                 format!("[xezim][warning] output port '{port}' of module 'flop' has no data type");
@@ -113,27 +120,28 @@ fn relaxation_takes_the_port_as_a_variable() {
     }
 }
 
-/// A port declared as a net keeps the plain net error, relaxed or not.
+/// A port declared as a net keeps the plain net error, relaxed or not, and so
+/// does `x`, which inherits `wire` from `w`.
 #[test]
 fn an_explicit_net_port_stays_an_error() {
     let src = r#"
-module m (input logic clk, output wire w);
-  always @(posedge clk) w <= 1'b1;
+module m (input logic clk, output wire w, x);
+  always @(posedge clk) begin w <= 1'b1; x <= 1'b0; end
 endmodule
 module t;
   logic clk = 0;
-  wire w;
-  m u (.clk, .w);
+  wire w, x;
+  m u (.clk, .w, .x);
   initial $finish;
 endmodule
 "#;
     for args in [&[][..], &["--relax-untyped-output-port"][..]] {
         let (ok, text) = run("wire", src, args, &[]);
         assert!(!ok, "{args:?} accepted:\n{text}");
-        assert!(
-            text.contains("net 'w' is the target of a procedural assignment"),
-            "{args:?}:\n{text}"
-        );
+        for port in ["w", "x"] {
+            let want = format!("net '{port}' is the target of a procedural assignment");
+            assert!(text.contains(&want), "{args:?} missing {want:?}:\n{text}");
+        }
         assert!(!text.contains("no data type"), "{args:?}:\n{text}");
     }
 }
@@ -148,6 +156,37 @@ fn help_lists_the_relaxation() {
         String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("--relax-untyped-output-port"), "{text}");
     assert!(text.contains("XEZIM_RELAX_UNTYPED_OUTPUT_PORT=1"), "{text}");
+}
+
+/// A warm design-cache hit, which skips the lint, replays its warnings: each
+/// once, as on the cold run.
+#[test]
+fn a_warm_cache_hit_replays_the_warnings() {
+    let d = scratch("warm");
+    let cache = d.join("cache");
+    let cache = cache.to_str().unwrap();
+    let args = [
+        "--cache-dir",
+        cache,
+        "--verbose",
+        "--relax-untyped-output-port",
+    ];
+    for (run_no, want_cache) in [(1, "CACHE] miss"), (2, "CACHE] hit")] {
+        let (ok, text) = run_in(&d, FLOP, &args, &[]);
+        assert!(ok, "run {run_no}:\n{text}");
+        assert!(text.contains(want_cache), "run {run_no}:\n{text}");
+        assert!(text.contains(FLOP_OUT), "run {run_no}:\n{text}");
+        for port in ["q", "cnt", "r"] {
+            let want =
+                format!("[xezim][warning] output port '{port}' of module 'flop' has no data type");
+            assert_eq!(
+                text.matches(&want).count(),
+                1,
+                "run {run_no}: {want:?} not printed once:\n{text}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// The relaxation is part of the design-cache key: a strict run never reuses

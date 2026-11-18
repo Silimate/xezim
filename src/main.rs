@@ -777,8 +777,8 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
     }
 }
 
-/// The opt-in parser relaxations (`--relax-<name>`, one per
-/// `sv_parser::RelaxFlag`), `--no-config-keywords` and `--keywords=<ver>`
+/// The opt-in relaxations (`--relax-<name>`, one per `xezim::relax_flags()`
+/// entry: the parser's and the lint's), `--no-config-keywords` and `--keywords=<ver>`
 /// (#608, #622-#629). True when `flag` is one of them.
 fn handle_relax_flag(flag: &str) -> bool {
     if let Some(name) = flag.strip_prefix("--relax-")

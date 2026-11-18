@@ -1469,11 +1469,24 @@ fn simulate_multi_inner(
         // no extra cost; does not alter elaborate/simulate behavior). Rejecting
         // here makes `:type: simulation` should_fail tests exit non-zero too, not
         // just the `--compile` path.
+        //
+        // The lint's warnings are xezim's, so the core's capture does not see
+        // them: splice them into the captured diagnostics where they were
+        // printed, so a warm hit replays them in the same order.
+        let mut diags_through_lint: Vec<String> = Vec::new();
         {
             let dv: Vec<&SourceDefinition> = definitions.values().collect();
-            let lint = should_fail_lint::lint_should_fail(&dv, &elab);
-            if !lint.is_empty() {
-                return Err(lint.join("; "));
+            let lint = should_fail_lint::lint_design(&dv, &elab);
+            for w in &lint.warnings {
+                eprintln!("{w}");
+            }
+            if !lint.errors.is_empty() {
+                return Err(lint.errors.join("; "));
+            }
+            if cache.is_some() && !lint.warnings.is_empty() {
+                diags_through_lint = xezim_core::elab_diag_capture_take();
+                diags_through_lint.extend(lint.warnings);
+                xezim_core::elab_diag_capture_begin();
             }
         }
 
@@ -1499,7 +1512,8 @@ fn simulate_multi_inner(
             elab.materialize_pending();
             // Fold the captured elaboration diagnostics into the artifact so a
             // later warm hit replays them instead of running silent.
-            elab.elab_diagnostics = xezim_core::elab_diag_capture_take();
+            diags_through_lint.extend(xezim_core::elab_diag_capture_take());
+            elab.elab_diagnostics = diags_through_lint;
             write_design_cache(config, key, &elab);
         }
         elab

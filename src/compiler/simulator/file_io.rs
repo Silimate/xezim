@@ -9,14 +9,18 @@ pub(super) struct MemoryTaskTarget {
     name: String,
     /// An unpacked memory's declared `(left, right)` address bounds; for an
     /// associative array, the least and greatest address its index type
-    /// holds.
-    lo: i64,
-    hi: i64,
+    /// holds. Wide enough for every address of a 64-bit index type, signed
+    /// or unsigned.
+    lo: i128,
+    hi: i128,
     /// Element width.
     width: u32,
     /// An associative array with an integral index type, its elements keyed
     /// by address.
     assoc: bool,
+    /// The index type's width (at most 64) and signedness, for an
+    /// associative array.
+    key: (u32, bool),
 }
 
 impl Simulator {
@@ -1040,10 +1044,11 @@ impl Simulator {
             if let Some(&(lo, hi, width)) = self.module.arrays.get(&name) {
                 return Some(MemoryTaskTarget {
                     name,
-                    lo,
-                    hi,
+                    lo: lo.into(),
+                    hi: hi.into(),
                     width,
                     assoc: false,
+                    key: (64, true),
                 });
             }
         }
@@ -1096,12 +1101,14 @@ impl Simulator {
         }
         let (kw, signed) = self.assoc_index_width_for(&name)?;
         let width = self.assoc_elem_width(&name)?;
-        // The addresses the index type can hold.
-        let (lo, hi) = match (signed, kw) {
-            (true, 64..) => (i64::MIN, i64::MAX),
-            (true, _) => (-(1i64 << (kw - 1)), (1i64 << (kw - 1)) - 1),
-            (false, 63..) => (0, i64::MAX),
-            (false, _) => (0, (1i64 << kw) - 1),
+        // The addresses the index type can hold: all of a `longint` or a
+        // `bit [63:0]`, unsigned ones above `i64::MAX` too. A wider index
+        // type is addressed through its low 64 bits.
+        let kw = kw.clamp(1, 64);
+        let (lo, hi) = if signed {
+            (-(1i128 << (kw - 1)), (1i128 << (kw - 1)) - 1)
+        } else {
+            (0, (1i128 << kw) - 1)
         };
         Some(MemoryTaskTarget {
             name,
@@ -1109,16 +1116,60 @@ impl Simulator {
             hi,
             width,
             assoc: true,
+            key: (kw, signed),
         })
+    }
+
+    /// The address a `$readmem*` start or finish argument names: its value
+    /// as written, signed or unsigned, so an unsigned 64-bit address above
+    /// `i64::MAX` keeps its value.
+    fn memory_task_address(&mut self, e: &Expression) -> Option<i128> {
+        let v = self.eval_expr(e);
+        if v.is_signed {
+            v.to_i64().map(i128::from)
+        } else {
+            v.to_u64().map(i128::from)
+        }
+    }
+
+    /// The address an `@<hex>` entry of a memory file names (§21.4). A
+    /// negative address is written as its 64-bit two's complement, so
+    /// `@ffffffffffffffff` is -1; for a signed index type the index type's
+    /// own two's complement (`@ffffffff` for an `int` index) is -1 too.
+    fn memory_file_address(hex: &str, key: (u32, bool)) -> Option<i128> {
+        let a = u128::from_str_radix(hex, 16).ok()?;
+        let (kw, signed) = key;
+        Some(
+            if signed && kw < 64 && a < (1u128 << kw) && a >> (kw - 1) == 1 {
+                a as i128 - (1i128 << kw)
+            } else if a >> 63 == 1 && a >> 64 == 0 && (signed || kw < 64) {
+                a as u64 as i64 as i128
+            } else {
+                a as i128
+            },
+        )
+    }
+
+    /// `addr` as `$writemem*` writes it after `@`: hexadecimal, a negative
+    /// address as its 64-bit two's complement ([`memory_file_address`]
+    /// reads both back).
+    fn memory_file_address_text(addr: i128) -> String {
+        if addr < 0 {
+            format!("{:x}", addr as i64)
+        } else {
+            format!("{:x}", addr)
+        }
     }
 
     /// §21.4: load `val` into address `addr` of associative memory `name`,
     /// as `name[addr] = val` would: the address converted to the index type
     /// is the key (§7.8), and the value takes the element type. Returns
     /// whether the element changed.
-    fn assoc_memory_store(&mut self, name: &str, addr: i64, mut val: Value) -> bool {
+    fn assoc_memory_store(&mut self, name: &str, addr: i128, mut val: Value) -> bool {
+        // Two's complement bits of a negative address, and an unsigned one
+        // above `i64::MAX` as it is: the key text takes the index type.
         let mut key = Value::from_u64(addr as u64, 64);
-        key.is_signed = true;
+        key.is_signed = addr < 0;
         let elem = Self::name_with_key(name, &self.assoc_key_str(name, &key));
         if let Some(signed) = self.assoc_elem_signed(name) {
             val.is_signed = signed;
@@ -1275,6 +1326,7 @@ impl Simulator {
             hi,
             width,
             assoc,
+            key,
         }) = self.memory_task_target(task, &args[1])
         else {
             return Value::zero(32);
@@ -1282,17 +1334,15 @@ impl Simulator {
         // §21.4: with no start address, loading begins at the memory's left
         // bound; an associative array has none and begins at address 0.
         let first = if assoc { 0 } else { lo };
-        let mut addr = if args.len() >= 3 {
-            self.eval_expr(&args[2]).to_i64().unwrap_or(first)
-        } else {
-            first
+        let mut addr = match args.get(2) {
+            Some(a) => self.memory_task_address(a).unwrap_or(first),
+            None => first,
         };
-        let end_addr = if args.len() >= 4 {
-            self.eval_expr(&args[3]).to_i64().unwrap_or(hi)
-        } else {
-            hi
+        let end_addr = match args.get(3) {
+            Some(a) => self.memory_task_address(a).unwrap_or(hi),
+            None => hi,
         };
-        let step: i64 = if addr <= end_addr { 1 } else { -1 };
+        let step: i128 = if addr <= end_addr { 1 } else { -1 };
         let min_idx = lo.min(hi);
         let max_idx = lo.max(hi);
         let content = match std::fs::read_to_string(&path) {
@@ -1332,7 +1382,7 @@ impl Simulator {
                 }
                 if let Some(rest) = raw_tok.strip_prefix('@') {
                     let addr_hex = rest.trim_start_matches("0x").trim_start_matches("0X");
-                    if let Ok(a) = i64::from_str_radix(addr_hex, 16) {
+                    if let Some(a) = Self::memory_file_address(addr_hex, key) {
                         addr = a;
                     }
                     continue;
@@ -1345,6 +1395,7 @@ impl Simulator {
                     if assoc {
                         assoc_changed |= self.assoc_memory_store(&mem_name, addr, val);
                     } else if let Some((first_id, arr_lo, arr_hi)) = dense_array {
+                        let (arr_lo, arr_hi) = (i128::from(arr_lo), i128::from(arr_hi));
                         if addr >= arr_lo && addr <= arr_hi {
                             let id = first_id + (addr - arr_lo) as usize;
                             if is_packed_id(id) {
@@ -1417,19 +1468,18 @@ impl Simulator {
             hi,
             width,
             assoc,
+            ..
         }) = self.memory_task_target(tn, &args[1])
         else {
             return Value::zero(32);
         };
-        let start = if args.len() >= 3 {
-            self.eval_expr(&args[2]).to_i64().unwrap_or(lo)
-        } else {
-            lo
+        let start = match args.get(2) {
+            Some(a) => self.memory_task_address(a).unwrap_or(lo),
+            None => lo,
         };
-        let end = if args.len() >= 4 {
-            self.eval_expr(&args[3]).to_i64().unwrap_or(hi)
-        } else {
-            hi
+        let end = match args.get(3) {
+            Some(a) => self.memory_task_address(a).unwrap_or(hi),
+            None => hi,
         };
         let radix: u32 = if tn.ends_with('b') {
             2
@@ -1442,9 +1492,19 @@ impl Simulator {
             // §21.5: an associative array writes the elements that exist,
             // in index order, between the start and finish addresses.
             let (from, to) = (start.min(end), start.max(end));
-            let mut words: Vec<(i64, Value)> = Vec::new();
+            // A key's text is its decimal value (hex digits for an index
+            // wider than 64 bits), the full value of an unsigned 64-bit key.
+            let hex_keys = self
+                .assoc_index_width_for(&mem_name)
+                .is_some_and(|(kw, _)| kw > 64);
+            let mut words: Vec<(i128, Value)> = Vec::new();
             for key in self.assoc_top_level_keys_shared(&mem_name).iter() {
-                let Some(addr) = self.assoc_foreach_key_value(&mem_name, key).to_i64() else {
+                let parsed = if hex_keys {
+                    i128::from_str_radix(key, 16)
+                } else {
+                    key.parse::<i128>()
+                };
+                let Ok(addr) = parsed else {
                     continue;
                 };
                 if addr < from || addr > to {
@@ -1465,7 +1525,7 @@ impl Simulator {
             let _ = std::fs::write(&path, out.text);
             return Value::zero(32);
         }
-        let step: i64 = if start <= end { 1 } else { -1 };
+        let step: i128 = if start <= end { 1 } else { -1 };
         let min_idx = lo.min(hi);
         let max_idx = lo.max(hi);
         let dense_array = self.array_first_id.get(mem_name.as_str()).copied();
@@ -1474,7 +1534,7 @@ impl Simulator {
         while (step > 0 && addr <= end) || (step < 0 && addr >= end) {
             if addr >= min_idx && addr <= max_idx {
                 let val = if let Some((first_id, arr_lo, _)) = dense_array {
-                    let id = first_id + (addr - arr_lo) as usize;
+                    let id = first_id + (addr - i128::from(arr_lo)) as usize;
                     if is_packed_id(id) {
                         self.packed.read(id)
                     } else {
@@ -1703,13 +1763,13 @@ impl Simulator {
         } else {
             Box::new((end.max(lo)..=start.min(hi)).rev())
         };
-        let mut out = MemDump::new(lo, if start <= end { 1 } else { -1 }, radix);
+        let mut out = MemDump::new(lo.into(), if start <= end { 1 } else { -1 }, radix);
         for addr in addrs {
             let val = match self.elem_cell(&mem.base, &mem.indices(addr)) {
                 Some(id) => self.cell_read(id),
                 None => Value::zero(mem.width),
             };
-            out.word(addr, &val);
+            out.word(addr.into(), &val);
         }
         let _ = std::fs::write(&path, out.text);
         Value::zero(32)
@@ -1782,9 +1842,9 @@ impl NdMemory {
 struct MemDump {
     text: String,
     /// The address the next word lands at without an `@` line.
-    next: i64,
+    next: i128,
     /// +1 or -1: the direction from the start address to the finish one.
-    step: i64,
+    step: i128,
     radix: u32,
     every: bool,
 }
@@ -1792,7 +1852,7 @@ struct MemDump {
 impl MemDump {
     /// A dump whose words run in direction `step`, read back by a load that
     /// begins at address `first`.
-    fn new(first: i64, step: i64, radix: u32) -> Self {
+    fn new(first: i128, step: i128, radix: u32) -> Self {
         MemDump {
             text: String::new(),
             next: first,
@@ -1802,11 +1862,12 @@ impl MemDump {
         }
     }
 
-    fn word(&mut self, addr: i64, val: &Value) {
-        if self.every {
-            self.text.push_str(&format!("@{:x} ", addr));
-        } else if addr != self.next {
-            self.text.push_str(&format!("@{:x}\n", addr));
+    fn word(&mut self, addr: i128, val: &Value) {
+        if self.every || addr != self.next {
+            self.text.push('@');
+            self.text
+                .push_str(&Simulator::memory_file_address_text(addr));
+            self.text.push(if self.every { ' ' } else { '\n' });
         }
         self.text.push_str(&match self.radix {
             2 => val.to_bin_string(),
@@ -1814,6 +1875,6 @@ impl MemDump {
             _ => val.to_dec_string(),
         });
         self.text.push('\n');
-        self.next = addr.wrapping_add(self.step);
+        self.next = addr + self.step;
     }
 }

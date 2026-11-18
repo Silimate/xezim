@@ -62,6 +62,14 @@ pub fn rss_trace(label: &str) {
     );
 }
 
+/// Every opt-in `--relax-<name>` switch: the parser's and the second-pass
+/// lint's, for the command line, `--help` and the design-cache key.
+pub fn relax_flags() -> impl Iterator<Item = &'static sv_parser::RelaxFlag> {
+    sv_parser::relax_flags()
+        .into_iter()
+        .chain(should_fail_lint::LINT_RELAX_FLAGS)
+}
+
 pub mod benchw;
 pub mod compiler;
 pub mod env_vars;
@@ -200,8 +208,8 @@ fn design_cache_key(
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
     // §6.21: the accepted initializer's lifetime changes elaboration.
     hash.bytes(&[xezim_core::elaborate::relax_implicit_static() as u8]);
-    // An opt-in parser relaxation or keyword set accepts other source.
-    for f in sv_parser::relax_flags() {
+    // An opt-in relaxation or keyword set accepts other source.
+    for f in relax_flags() {
         hash.bytes(&[f.get() as u8]);
     }
     hash.bytes(&[sv_parser::lexer::scanner::default_keywords_key()]);

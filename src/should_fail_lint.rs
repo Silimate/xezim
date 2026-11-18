@@ -82,7 +82,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &local_types,
                     &mut errs,
                 );
-                check_proc_net_assign(&m.ports, &m.items, &mut errs);
+                check_proc_net_assign(&m.name.name, &m.ports, &m.items, &mut errs);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, scope, &mut errs);
@@ -461,6 +461,23 @@ fn check_array_flat_init(d: &VarDeclarator, scope: ConstScope, errs: &mut Vec<St
     }
 }
 
+/// `--relax-untyped-output-port` (`XEZIM_RELAX_UNTYPED_OUTPUT_PORT`): an ANSI
+/// output port declared with no data type (`output q`, `output [3:0] c`) is a
+/// net (§23.2.2.3), so a procedural assignment to it is illegal (§6.5). Some
+/// tools take such a port as a variable; with this relaxation xezim does too,
+/// with a warning. A port declared as a net (`output wire q`) stays an error.
+pub static RELAX_UNTYPED_OUTPUT_PORT: xezim_core::sv_parser::RelaxFlag =
+    xezim_core::sv_parser::RelaxFlag::new(
+        "untyped-output-port",
+        "XEZIM_RELAX_UNTYPED_OUTPUT_PORT",
+        "take an output port declared with no data type (`output q`), which is a net, as a \
+         variable when a procedural block assigns it (§23.2.2.3, §6.5)",
+    );
+
+/// The relaxations this lint owns. `crate::relax_flags` adds them to the
+/// parser's for the command line, `--help` and the design-cache key.
+pub static LINT_RELAX_FLAGS: [&xezim_core::sv_parser::RelaxFlag; 1] = [&RELAX_UNTYPED_OUTPUT_PORT];
+
 /// §6.5: a net (an explicit `wire`/`tri`/... declaration) may not be the target
 /// of a procedural assignment (`=`/`<=` inside always/initial) — only a
 /// continuous assignment or `force`. Catches `wire w; initial w = ...;`.
@@ -468,10 +485,20 @@ fn check_array_flat_init(d: &VarDeclarator, scope: ConstScope, errs: &mut Vec<St
 /// §23.2.2.3 makes nets (`output b`, `output [3:0] c`, `output wire d`, and
 /// the ports inheriting from one); `output logic q` / `output reg q` are
 /// variables. Only `=`/`<=` targets are checked (force/release/assign are
-/// separate statement kinds).
-fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<String>) {
+/// separate statement kinds). An output port that is a net only because its
+/// declaration has no data type (`output b`, `output [3:0] c`) gets a message
+/// that says so, and `--relax-untyped-output-port` takes it as a variable.
+fn check_proc_net_assign(
+    module: &str,
+    ports: &PortList,
+    items: &[ModuleItem],
+    errs: &mut Vec<String>,
+) {
     use std::collections::HashSet;
     let mut nets: HashSet<String> = HashSet::new();
+    // The output ports that are nets because they have no data type and no
+    // net kind of their own (or inherit that from the port before them).
+    let mut untyped: HashSet<String> = HashSet::new();
     for it in items {
         if let ModuleItem::NetDeclaration(nd) = it {
             for d in &nd.declarators {
@@ -481,6 +508,7 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
     }
     if let PortList::Ansi(ps) = ports {
         let mut prev_net = false;
+        let mut prev_untyped = false;
         for p in ps {
             let omitted =
                 p.direction.is_none() && p.net_type.is_none() && !p.var_kw && p.data_type.is_none();
@@ -495,10 +523,19 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
                     && !p.var_kw
                     && matches!(p.data_type, None | Some(DataType::Implicit { .. }))
             };
+            let no_type = if omitted {
+                prev_untyped
+            } else {
+                net && p.net_type.is_none()
+            };
             if net {
                 nets.insert(p.name.name.clone());
+                if no_type {
+                    untyped.insert(p.name.name.clone());
+                }
             }
             prev_net = net;
+            prev_untyped = net && no_type;
         }
         // A body declaration of the same name is not a net port (and is
         // diagnosed elsewhere if illegal).
@@ -524,11 +561,28 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
         for_each_proc_assign_lhs(stmt, &mut |lv| {
             if let Some(b) = base_ident(lv) {
                 if nets.contains(&b) && flagged.insert(b.clone()) {
-                    errs.push(format!(
-                        "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
-                         §6.5 — nets need a continuous assignment)",
-                        b
-                    ));
+                    if !untyped.contains(&b) {
+                        errs.push(format!(
+                            "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
+                             §6.5 — nets need a continuous assignment)",
+                            b
+                        ));
+                    } else if RELAX_UNTYPED_OUTPUT_PORT.get() {
+                        eprintln!(
+                            "[xezim][warning] output port '{b}' of module '{module}' has no data \
+                             type, so it is a net (IEEE 1800-2023 §23.2.2.3), and a procedural \
+                             block assigns it (§6.5); taking it as a variable, `output logic {b}` \
+                             (--relax-untyped-output-port)"
+                        );
+                    } else {
+                        errs.push(format!(
+                            "output port '{b}' of module '{module}' is the target of a \
+                             procedural assignment, but it is a net: its declaration has no \
+                             data type (IEEE 1800-2023 §23.2.2.3), and a net cannot be assigned \
+                             procedurally (§6.5). Declare it `output logic {b}`, or pass \
+                             --relax-untyped-output-port to take it as a variable"
+                        ));
+                    }
                 }
             }
         });

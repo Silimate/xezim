@@ -15,7 +15,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   already did: `t({2{1'b1}} << 4)` into `input [31:0] v` binds `32'h30`,
   not 0, and `t(-b)` sign-fills the formal. A task or function formal whose
   bounds name a parameter (`input [W-1:0] v`) now gives its actual that
-  width too. (Silimate/xezim#331)
+  width too. The operands of `&&`, `||`, `->` and `<->` stay
+  self-determined there: `(a << 1) || 1'b0` shifts at `a`'s width.
+  (Silimate/xezim#331)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

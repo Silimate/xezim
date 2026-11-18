@@ -3779,8 +3779,14 @@ impl Simulator {
         // constructs too rather than reading a name.
         let typed_ctor = Self::typed_ctor_call(rvalue)
             .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
+        // §10.10: an unpacked array concatenation assigned to a queue or
+        // array is evaluated item by item below. Evaluating it here as one
+        // value first ran every operand an extra time: a call twice,
+        // `m[i++]` twice.
         let val = if let Some(v) = typed_ctor {
             v
+        } else if self.is_unpacked_concat_assign(lvalue, rvalue) {
+            Value::zero(1)
         } else if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
                 let method_name = hier.path.last().unwrap().name.name.as_str();
@@ -4563,6 +4569,29 @@ impl Simulator {
                 _ => out.push(e),
             }
         }
+    }
+
+    /// Whether `lvalue = rvalue` is an unpacked array concatenation assigned
+    /// to a queue or array: a concatenation whose target the whole-array
+    /// branch of [`exec_stmt_blocking_assign_body`] takes (a variable in
+    /// `module.arrays`, or a class queue or dynamic-array member). Mirrors
+    /// that branch's target lookup.
+    fn is_unpacked_concat_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        if !matches!(rvalue.kind, ExprKind::Concatenation(_)) {
+            return false;
+        }
+        let ExprKind::Ident(lhier) = &lvalue.kind else {
+            return false;
+        };
+        if !self.ident_shadowed_by_non_collection(lhier) {
+            let n = self.resolve_hier_name(lhier).into_owned();
+            let n = self.instance_assoc_member(&n).unwrap_or(n);
+            if self.module.arrays.contains_key(&n) {
+                return true;
+            }
+        }
+        self.expr_assoc_name(lvalue)
+            .is_some_and(|n| self.class_queue_prop(&n))
     }
 
     /// Whether a braced list holds, at any depth, an operand that is a

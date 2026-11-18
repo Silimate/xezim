@@ -32,10 +32,17 @@ impl Simulator {
             // scoped member (`obj.q`, `arr[i].q`), or a nested
             // assoc-of-queue element (`assoc[key]`) —
             // contributes each of its elements in order.
-            let qn = self.array_operand_name(expr).or_else(|| {
-                self.nested_index_name(expr)
-                    .filter(|cn| self.module.dynamic_arrays.contains(cn))
-            });
+            // Looking an operand up as a collection evaluates its index
+            // expressions, so an operand with a side effect (`m[i++]`) is
+            // taken for one element and evaluated once, below.
+            let qn = if Self::cond_expr_is_effect_free(expr, false) {
+                self.array_operand_name(expr).or_else(|| {
+                    self.nested_index_name(expr)
+                        .filter(|cn| self.module.dynamic_arrays.contains(cn))
+                })
+            } else {
+                None
+            };
             if let Some(ename) = qn {
                 let lo = self.module.arrays.get(&ename).map_or(0, |a| a.0);
                 let mut idx: Vec<i64> = (lo..lo + self.get_queue_size(&ename) as i64).collect();

@@ -5,7 +5,10 @@
 //! Wujian100 uses the name for a real latch-based clock gate, which then
 //! never gated, and whose signals and sub-instances did not exist for
 //! hierarchical references (Silimate/xezim#344). The pass-through keeps the
-//! direct assignment. Expected values follow Verilator.
+//! direct assignment, but not when its clock net has a delay (§6.7.1,
+//! §28.16): the direct assignment would drop it and every edge would arrive
+//! early. Expected values follow the reference simulator; Verilator agrees
+//! except that it does not apply the net delay.
 
 fn lines(src: &str) -> Vec<String> {
     let sim = xezim::simulate(src, 1000).expect("simulate");
@@ -71,6 +74,30 @@ module tb;
 endmodule
 "#;
 
+const DELAYED: &str = r#"
+// The pass-through body, but its output net delays each edge by 3. The
+// output drives a variable, so the port is an assignment from that net
+// (§23.3.3) and the variable sees the delayed edge.
+module gated_clk_cell(clk_in, en, clk_out);
+  input  clk_in;
+  input  en;
+  output clk_out;
+  wire #3 clk_out;
+  assign clk_out = clk_in;
+endmodule
+module tb;
+  reg clk = 0;
+  always #5 clk = ~clk;
+  logic g;
+  gated_clk_cell u (.clk_in(clk), .en(1'b1), .clk_out(g));
+  initial begin
+    @(posedge g);
+    $display("delayed first edge at %0t", $time);
+    $finish;
+  end
+endmodule
+"#;
+
 #[test]
 fn real_clock_gate_named_gated_clk_cell_gates() {
     let out = lines(GATE);
@@ -86,5 +113,14 @@ fn passthrough_gated_clk_cell_follows_its_clock() {
     assert!(
         out.iter().any(|l| l == "passthrough n=10"),
         "the OpenC910 pass-through follows clk_in: {out:?}"
+    );
+}
+
+#[test]
+fn passthrough_with_a_net_delay_keeps_the_delay() {
+    let out = lines(DELAYED);
+    assert!(
+        out.iter().any(|l| l == "delayed first edge at 8"),
+        "the clock rises at 5 and its net delay adds 3: {out:?}"
     );
 }

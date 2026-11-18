@@ -4550,7 +4550,11 @@ impl Simulator {
     /// braced item that holds a queue or unpacked array operand replaced by
     /// its operands. Every other braced item is a vector or string
     /// concatenation, one element.
-    fn splice_array_braces<'a>(&mut self, exprs: &'a [Expression], out: &mut Vec<&'a Expression>) {
+    pub(super) fn splice_array_braces<'a>(
+        &mut self,
+        exprs: &'a [Expression],
+        out: &mut Vec<&'a Expression>,
+    ) {
         for e in exprs {
             match &e.kind {
                 ExprKind::Concatenation(inner) if self.braces_hold_array(inner) => {
@@ -4563,7 +4567,10 @@ impl Simulator {
 
     /// Whether a braced list holds, at any depth, an operand that is a
     /// queue or unpacked array, a slice of one, or a call returning one:
-    /// an operand no vector concatenation can take (§11.4.12).
+    /// an operand no vector concatenation can take (§11.4.12). Decided
+    /// without running anything: an operand with a side effect
+    /// (`m[i++]`, a call that is not a collection) is taken for a vector
+    /// operand, so it is evaluated once, with the braces.
     fn braces_hold_array(&mut self, exprs: &[Expression]) -> bool {
         exprs.iter().any(|e| match &e.kind {
             ExprKind::Concatenation(inner) => self.braces_hold_array(inner),
@@ -4576,6 +4583,7 @@ impl Simulator {
                 }
                 _ => false,
             },
+            _ if !Self::cond_expr_is_effect_free(e, false) => false,
             _ => {
                 self.array_operand_name(e).is_some()
                     || self

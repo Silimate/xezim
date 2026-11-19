@@ -383,8 +383,10 @@ fn method_boost_enabled() -> bool {
 // §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional packed range NBAs decline.
 // §26.3: package code reads its own package's parameters, variables and imports, and an
 // inlined package callee its own, ahead of the design's same-named declarations.
+// §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
+// §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
 // §7.2: reads of nested packed-struct members (`s.inner.f`) compile to a range select.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308A;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308e;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1813,8 +1815,14 @@ struct CombEntryCold {
 // §10.3.2, §9.2.2.1: shared-read batches leave out members with fused branches or jump
 // tables, chain fusion relocates branches within one process class, and an instance's
 // read of an unnamed memory cell stays unresolved.
+// §7.2, §7.4.2: a member select through constant element selects of a packed
+// struct is a compiled store.
+// §20.8.1, §7.4.1: `$clog2` of a constant folds, and a select bound that does
+// not fold still maps its label to a physical bit.
+// §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
+// process, not as a combinational entry.
 // §7.2: a read of a nested packed-struct member (`s.inner.f`) compiles to a range select.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB043";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB048";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

@@ -934,6 +934,8 @@ impl Simulator {
             match &entry.item {
                 CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(&entry),
                 CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                    // §13.4: see `enter_private_regs`.
+                    let caller_regs = (!self.settling).then(|| self.enter_private_regs());
                     if self.vm_regs.len() < compiled.num_regs as usize {
                         self.vm_regs
                             .resize(compiled.num_regs as usize, Value::zero(1));
@@ -945,12 +947,11 @@ impl Simulator {
                         )
                     };
                     let saved_ts = self.timescale_scope_override.take();
-                    self.timescale_scope_override = entry.cold.scope_hint.clone();
+                    self.timescale_scope_override =
+                        Some(entry.cold.scope_hint.clone().unwrap_or_default());
                     let saved_hint = if compiled.has_fallback {
                         let prev = self.name_resolve_hint.borrow().clone();
-                        if let Some(sc) = entry.cold.scope_hint.as_ref() {
-                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
-                        }
+                        *self.name_resolve_hint.borrow_mut() = entry.cold.scope_hint.clone();
                         Some(prev)
                     } else {
                         None
@@ -960,6 +961,9 @@ impl Simulator {
                         *self.name_resolve_hint.borrow_mut() = prev;
                     }
                     self.timescale_scope_override = saved_ts;
+                    if let Some(caller_regs) = caller_regs {
+                        self.leave_private_regs(caller_regs);
+                    }
                 }
                 _ => {}
             }
@@ -1967,7 +1971,7 @@ impl Simulator {
                         } else {
                             let w =
                                 self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                         f.pc = npc;
                         break;
@@ -2057,7 +2061,7 @@ impl Simulator {
                         } else {
                             let w =
                                 self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                     }
                 }
@@ -2487,6 +2491,94 @@ impl Simulator {
         }
     }
 
+    /// §10.10: capture a one-dimensional unpacked array in element order.
+    pub(super) fn capture_array_rhs(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+    ) -> Option<Vec<Value>> {
+        let dst = self.array_operand_name(lhs)?;
+        if self.is_associative_array(&dst)
+            || self.module.arrays_2d.contains_key(&dst)
+            || self.module.arrays_nd.contains_key(&dst)
+            || self.queue_elem_struct(&dst).is_some()
+        {
+            return None;
+        }
+        let mut rhs = rhs;
+        while let ExprKind::Paren(inner) = &rhs.kind {
+            rhs = inner;
+        }
+        // Existing slice capture retains indexed direction and declared bounds.
+        if matches!(rhs.kind, ExprKind::RangeSelect { .. }) {
+            return None;
+        }
+        let mut items = Vec::new();
+        fn flatten<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
+            match &e.kind {
+                ExprKind::Concatenation(xs) => {
+                    for x in xs {
+                        flatten(x, out);
+                    }
+                }
+                ExprKind::Paren(x) => flatten(x, out),
+                _ => out.push(e),
+            }
+        }
+        if let ExprKind::AssignmentPattern(xs) = &rhs.kind {
+            // Positional patterns include already captured intra-assignment
+            // operands. Keyed/default patterns retain their existing path.
+            if !xs
+                .iter()
+                .all(|x| matches!(x, AssignmentPatternItem::Ordered(_)))
+            {
+                return None;
+            }
+            // §11.6.1: each item in the element type, as without the delay.
+            let shape = self.intra_element_shape(&dst);
+            let mut values = Vec::new();
+            for x in xs {
+                match &x.expr().kind {
+                    // §10.9.1 `'{n{a, b}}`: the items, read once, repeated
+                    // n times.
+                    ExprKind::Replication { count, exprs } => {
+                        let n = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                        let once: Vec<Value> = exprs
+                            .iter()
+                            .map(|e| self.intra_item_value(shape.as_ref(), e))
+                            .collect();
+                        for _ in 0..n {
+                            values.extend(once.iter().cloned());
+                        }
+                    }
+                    _ => values.push(self.intra_item_value(shape.as_ref(), x.expr())),
+                }
+            }
+            return Some(values);
+        }
+        if !matches!(
+            rhs.kind,
+            ExprKind::Concatenation(_) | ExprKind::Call { .. }
+        ) && self.array_operand_name(rhs).is_none()
+        {
+            return None;
+        }
+        flatten(rhs, &mut items);
+        Some(self.unpacked_concat_operand_values(items))
+    }
+
+    pub(super) fn saved_array_pattern(
+        &mut self,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        let items = values
+            .into_iter()
+            .map(|v| AssignmentPatternItem::Ordered(self.make_intra_saved_expr(v, span)))
+            .collect();
+        Expression::new(ExprKind::AssignmentPattern(items), span)
+    }
+
     /// §9.4.5: capture the right-hand side of an intra-assignment timing
     /// control when the statement runs, against its target as an
     /// assignment without the timing control would evaluate it: at the
@@ -2520,6 +2612,9 @@ impl Simulator {
             }
             return self.capture_intra_rhs(lvalue, &selected, span);
         }
+        if let Some(values) = self.capture_array_rhs(lvalue, inner) {
+            return (self.saved_array_pattern(values, span), None);
+        }
         if matches!(inner.kind, ExprKind::AssignmentPattern(_)) {
             // A packed target shapes the pattern now; its value is the one
             // evaluation of the items (a second would repeat their calls).
@@ -2527,7 +2622,8 @@ impl Simulator {
                 return (self.make_intra_saved_expr(v, span), None);
             }
             let mut slots = Vec::new();
-            let captured = self.capture_intra_pattern(inner, &mut slots);
+            let shape = self.intra_target_shape(lvalue);
+            let captured = self.capture_intra_pattern(inner, &mut slots, shape.as_ref());
             let args = slots
                 .iter()
                 .map(|&idx| Self::intra_slot_literal(idx, span))
@@ -2548,35 +2644,61 @@ impl Simulator {
         (self.make_intra_saved_expr(val, span), None)
     }
 
-    /// The pattern `e` with each item's value captured (`capture_intra_rhs`).
-    fn capture_intra_pattern(&mut self, e: &Expression, slots: &mut Vec<u64>) -> Expression {
+    /// The pattern `e` with each item's value captured (`capture_intra_rhs`),
+    /// each in the type of the element `shape` matches it to, if known.
+    fn capture_intra_pattern(
+        &mut self,
+        e: &Expression,
+        slots: &mut Vec<u64>,
+        shape: Option<&super::intra_pattern_shape::ItemShape>,
+    ) -> Expression {
         use crate::ast::expr::AssignmentPatternItem as Item;
         match &e.kind {
-            ExprKind::Paren(inner) => self.capture_intra_pattern(inner, slots),
+            ExprKind::Paren(inner) => self.capture_intra_pattern(inner, slots, shape),
             ExprKind::AssignmentPattern(items) => {
+                if let Some(super::intra_pattern_shape::ItemShape::Struct(su)) = shape {
+                    let members = su.members.iter().map(|m| m.declarators.len()).sum();
+                    if let Some(expanded) = self.struct_replication_items(su, items, members) {
+                        // §10.9.2: each replicated member takes its own type.
+                        // Capturing the repeated expression in only the first
+                        // member's type loses wider bits and four-state values.
+                        let expanded = expanded
+                            .into_iter()
+                            .map(|e| Item::Ordered(e.clone()))
+                            .collect();
+                        let pattern = Expression::new(ExprKind::AssignmentPattern(expanded), e.span);
+                        return self.capture_intra_pattern(&pattern, slots, shape);
+                    }
+                }
+                let shapes = match shape {
+                    Some(s) => self.intra_item_shapes(s, items),
+                    None => Vec::new(),
+                };
                 let mut out = Vec::with_capacity(items.len());
-                for item in items {
+                for (k, item) in items.iter().enumerate() {
+                    let sh = shapes.get(k).and_then(Option::as_ref);
                     out.push(match item {
-                        Item::Ordered(x) => Item::Ordered(self.capture_intra_pattern(x, slots)),
+                        Item::Ordered(x) => Item::Ordered(self.capture_intra_pattern(x, slots, sh)),
                         Item::Named(n, x) => {
-                            Item::Named(n.clone(), self.capture_intra_pattern(x, slots))
+                            Item::Named(n.clone(), self.capture_intra_pattern(x, slots, sh))
                         }
                         Item::Typed(t, x) => {
-                            Item::Typed(t.clone(), self.capture_intra_pattern(x, slots))
+                            Item::Typed(t.clone(), self.capture_intra_pattern(x, slots, sh))
                         }
-                        Item::Default(x) => Item::Default(self.capture_intra_pattern(x, slots)),
+                        Item::Default(x) => Item::Default(self.capture_intra_pattern(x, slots, sh)),
                         Item::Keyed(k, x) => {
-                            Item::Keyed(k.clone(), self.capture_intra_pattern(x, slots))
+                            Item::Keyed(k.clone(), self.capture_intra_pattern(x, slots, sh))
                         }
                     });
                 }
                 Expression::new(ExprKind::AssignmentPattern(out), e.span)
             }
-            // `'{n{a, b}}`: the count stays, the items are captured.
+            // `'{n{a, b}}`: the count stays, the items are captured, each
+            // matched to an element as the replication is.
             ExprKind::Replication { count, exprs } => {
                 let mut out = Vec::with_capacity(exprs.len());
                 for x in exprs {
-                    out.push(self.capture_intra_pattern(x, slots));
+                    out.push(self.capture_intra_pattern(x, slots, shape));
                 }
                 Expression::new(
                     ExprKind::Replication {
@@ -2587,7 +2709,7 @@ impl Simulator {
                 )
             }
             _ => {
-                let val = self.eval_expr(e);
+                let val = self.intra_item_value(shape, e);
                 let idx = self.intra_saved_next;
                 self.intra_saved_next += 1;
                 self.intra_saved.insert(idx, val);
@@ -2603,7 +2725,7 @@ impl Simulator {
         }
     }
 
-    fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
+    pub(super) fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
         Expression::new(
             ExprKind::Number(NumberLiteral::Integer {
                 size: None,
@@ -4563,7 +4685,7 @@ impl Simulator {
                         {
                             {
                                 let w = self.make_event_waiter(pid, sens, cont);
-                                self.event_waiters.push(w);
+                                self.park_event_waiter(w);
                             }
                         } else {
                             eprintln!(
@@ -4866,7 +4988,7 @@ impl Simulator {
                                 }];
                                 {
                                     let w = self.make_event_waiter_kind(pid, sens, cont, false);
-                                    self.event_waiters.push(w);
+                                    self.park_event_waiter(w);
                                 }
                                 return;
                             }
@@ -4927,7 +5049,7 @@ impl Simulator {
                                 }
                             } else if has_real {
                                 let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev);
-                                self.event_waiters.push(w);
+                                self.park_event_waiter(w);
                             } else {
                                 // `@(x)` where x is not a real signal — a
                                 // procedural local that was NBA-assigned then
@@ -5135,7 +5257,7 @@ impl Simulator {
                                     pc.resume_at(pc.start + i + 1),
                                 );
                                 waiter.remaining_events = n;
-                                self.event_waiters.push(waiter);
+                                self.park_event_waiter(waiter);
                                 return;
                             }
                         }

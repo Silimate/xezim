@@ -159,7 +159,7 @@ impl Simulator {
         let pkg_scope = self
             .pending_pkg_scope
             .take()
-            .or_else(|| self.module.func_decl_scope.get(&fd.name.name.name).cloned());
+            .or_else(|| self.subroutine_decl_scope(&fd.name.name.name, fd.span, false));
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let supplied = normalized
             .as_ref()
@@ -719,6 +719,8 @@ impl Simulator {
         // above, in the caller's context.
         self.this_stack.push(None);
         self.class_context_stack.push(None);
+        self.method_local_base
+            .push(self.local_stack.len().saturating_sub(1));
         // Track the running subroutine name so `%m` inside a package function
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
@@ -870,6 +872,7 @@ impl Simulator {
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
         self.class_context_stack.pop();
+        self.method_local_base.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
             rv
         } else if let Some(su) = self.unpacked_struct_of(&fd.return_type) {
@@ -1046,6 +1049,29 @@ impl Simulator {
         result
     }
 
+    /// §26.3: the scope a bare-named subroutine body runs in: the package a
+    /// design unit imports it from, else the package whose qualified entry is
+    /// this very body, so one reached only from another package's code still
+    /// runs in its own package.
+    pub(super) fn subroutine_decl_scope(
+        &self,
+        name: &str,
+        span: crate::ast::Span,
+        task: bool,
+    ) -> Option<String> {
+        if let Some(scope) = self.module.func_decl_scope.get(name) {
+            return Some(scope.clone());
+        }
+        let pkg = self.module.pkg_subr_owner.get(name)?;
+        let key = format!("{pkg}::{name}");
+        let declared = if task {
+            self.module.tasks.get(&key).map(|t| t.span)
+        } else {
+            self.module.functions.get(&key).map(|f| f.span)
+        };
+        (declared == Some(span)).then(|| pkg.clone())
+    }
+
     /// Execute a module-level task call with arguments.
     pub(super) fn exec_task_call(&mut self, td: &TaskDeclaration, args: &[Expression]) {
         // §26.3: the package this body belongs to — see `exec_function_call`.
@@ -1054,7 +1080,7 @@ impl Simulator {
         let pkg_scope = self
             .pending_pkg_scope
             .take()
-            .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
+            .or_else(|| self.subroutine_decl_scope(&td.name.name.name, td.span, true));
         let mut cleanup = self.bind_task_frame(td, args, None);
         self.enter_free_task_scope(td, &mut cleanup);
         self.open_decl_shadow_frame();
@@ -1669,7 +1695,7 @@ impl Simulator {
                 .unwrap_or_default()
         };
         FormalMetaParts {
-            declared_type: self.module.var_decl_types.get(name).cloned(),
+            declared_type: self.module.var_decl_types.get_shared(name).cloned(),
             packed_fields: self.module.packed_struct_fields.get(name).cloned(),
             packed_element_widths,
             packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
@@ -2000,7 +2026,11 @@ impl Simulator {
                 }
             }
         }
-        put(&mut self.module.var_decl_types, name, saved.declared_type);
+        put(
+            self.module.var_decl_types.as_map_mut(),
+            name,
+            saved.declared_type,
+        );
         put(
             &mut self.module.packed_struct_fields,
             name,
@@ -2741,9 +2771,15 @@ impl Simulator {
                 }
                 _ => {
                     let mut val = if arg_supplied(i) {
+                        // §13.5, §11.6.1: as a function's (`exec_function_call`),
+                        // a task's input actual is context-determined by its
+                        // formal; `t(x + y)` over 8-bit operands lost the carry.
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
-                            None => self.eval_expr(&args[i]),
+                            None => match self.actual_context_width(port) {
+                                Some(w) => self.eval_expr_ctx(&args[i], w),
+                                None => self.eval_expr(&args[i]),
+                            },
                         };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {

@@ -136,6 +136,41 @@ module top; logic [3:0] req; ctrl dut(.req(req)); initial #1 $display("pv3: req=
     }
 }
 
+/// §26.3: two submodules that import a same-named array parameter from
+/// different packages, one by name and one by `*`, each read their own
+/// package's elements.
+#[test]
+fn same_named_package_arrays_in_two_submodules() {
+    for import_q in ["import q::V;", "import q::*;"] {
+        let src = r#"
+package p; parameter int V [4] = '{0, 1, 0, 2}; endpackage
+package q; parameter int V [4] = '{1, 0, 1, 1}; endpackage
+module cq (output logic [3:0] req);
+  IMPORT_Q
+  for (genvar k = 0; k < 4; k++) begin : g
+    if (V[k] == 1) begin : b1 assign req[k] = 1'b1; end
+    else begin : b0 assign req[k] = 1'b0; end
+  end
+endmodule
+module cp (output logic [3:0] req);
+  import p::*;
+  for (genvar k = 0; k < 4; k++) begin : g
+    if (V[k] == 1) begin : b1 assign req[k] = 1'b1; end
+    else begin : b0 assign req[k] = 1'b0; end
+  end
+endmodule
+module top;
+  logic [3:0] a, b;
+  cq u0(.req(b));
+  cp u1(.req(a));
+  initial #1 $display("two packages: p=%b q=%b", a, b);
+endmodule
+"#
+        .replace("IMPORT_Q", import_q);
+        assert_has(&src, &["two packages: p=0010 q=1101"]);
+    }
+}
+
 /// The issue's package struct-array forms: element assignments to a parent
 /// vector, downward hierarchical assignments, and the otp_ctrl shape.
 #[test]

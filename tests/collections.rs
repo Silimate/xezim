@@ -385,3 +385,11 @@ mod pattern_array_items;
 mod struct_concat_forms;
 #[path = "collections/queue_front_shift.rs"]
 mod queue_front_shift;
+#[path = "collections/stream_with_range_1197.rs"]
+mod stream_with_range_1197;
+#[path = "collections/stream_with_range_unpack.rs"]
+mod stream_with_range_unpack;
+#[path = "collections/pattern_self_read.rs"]
+mod pattern_self_read;
+#[path = "collections/pattern_self_read_scopes.rs"]
+mod pattern_self_read_scopes;

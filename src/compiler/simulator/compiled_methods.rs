@@ -1656,7 +1656,7 @@ impl Simulator {
     pub(super) fn free_call_pkg(
         &mut self,
         call_name: &str,
-        decl_name: &str,
+        fd: &crate::ast::decl::FunctionDeclaration,
     ) -> Option<std::rc::Rc<str>> {
         if let Some(p) = self.free_call_pkgs.get(call_name) {
             return p.clone();
@@ -1664,10 +1664,8 @@ impl Simulator {
         let p: Option<std::rc::Rc<str>> = match call_name.rsplit_once("::") {
             Some((pkg, _)) => Some(std::rc::Rc::from(pkg)),
             None => self
-                .module
-                .func_decl_scope
-                .get(decl_name)
-                .map(|p| std::rc::Rc::from(p.as_str())),
+                .subroutine_decl_scope(&fd.name.name.name, fd.span, false)
+                .map(std::rc::Rc::from),
         };
         self.free_call_pkgs.insert(call_name.to_string(), p.clone());
         p
@@ -2259,8 +2257,14 @@ impl Simulator {
                     Some(&self.module.typedefs),
                 )
             } else {
-                let scope = self.instance_param_scope(handle);
-                resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs))
+                let values: HashMap<String, Value> =
+                    self.instance_value_params(handle).into_iter().collect();
+                let scope = self.instance_param_env(&values);
+                super::elaborate::resolve_type_width_env(
+                    &pre.return_type,
+                    Some(&scope),
+                    Some(&self.module.typedefs),
+                )
             };
             if w > 0 { w } else { pre.static_result_width }
         } else {
@@ -3299,6 +3303,12 @@ impl Simulator {
                         &self.module.queue_vars,
                     );
                     compiler.method_enum_constants = method_enum_constants;
+                    compiler.method_pkg = cname
+                        .strip_prefix("__free_fn__")
+                        .filter(|p| !p.is_empty())
+                        .or_else(|| self.module.class_decl_pkg.get(cname).map(String::as_str))
+                        .map(|p| (p.to_string(), &self.module.parameters));
+                    compiler.method_pkg_imports = Some(&self.module.def_pkg_imports);
                     compiler.class_scoped_enums = Some(match &self.class_scoped_enum_cache {
                         Some(rc) => rc.clone(),
                         None => {
@@ -3962,13 +3972,15 @@ impl Simulator {
         // the declared width and stamp; other packed formals keep width.
         use crate::ast::types::DataType as DT;
         let mut coerce: Vec<(Box<str>, u32, Option<bool>)> = Vec::with_capacity(f.ports.len());
-        for port in f.ports.iter() {
+        for (i, port) in f.ports.iter().enumerate() {
             let dt = &port.data_type;
             let c = if self.typeref_names_class(dt) || Self::is_string_data_type(dt) {
                 (0, None)
             } else if matches!(dt, DT::TypeReference { .. }) {
                 if let Some((pw, signed)) = self.scalar_formal_integral(dt) {
-                    (pw, Some(signed))
+                    // `scalar_formal_integral` sizes a class typedef from module
+                    // scope; the plan's width is this specialization's.
+                    (pre.formal_widths.get(i).copied().unwrap_or(pw), Some(signed))
                 } else if self.type_is_signed_concrete(dt) {
                     (0, Some(true))
                 } else {
@@ -4137,10 +4149,10 @@ impl Simulator {
         // width resolution is fully deterministic. Mirror it so the block
         // cache key matches.
         let result_width = if pre.param_able_result {
-            let scope = self.instance_param_scope(0);
+            // Handle 0 binds no class parameters: the design table alone.
             let w = super::elaborate::resolve_type_width(
                 &pre.return_type,
-                Some(&scope),
+                Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
             if w > 0 { w } else { pre.static_result_width }

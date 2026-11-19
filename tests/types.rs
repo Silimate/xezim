@@ -271,6 +271,8 @@ mod range_select_param_arith;
 mod real_conversion_of_integral_operands;
 #[path = "types/real_literal_comb_eval.rs"]
 mod real_literal_comb_eval;
+#[path = "types/real_fill_literals.rs"]
+mod real_fill_literals;
 #[path = "types/real_valued_delay.rs"]
 mod real_valued_delay;
 #[path = "types/scoped_type_cast.rs"]
@@ -484,6 +486,8 @@ mod real_to_int_wide;
 mod real_to_integral_local;
 #[path = "types/real_to_integral_stores_889.rs"]
 mod real_to_integral_stores_889;
+#[path = "types/real_inside_equality.rs"]
+mod real_inside_equality;
 #[path = "types/rtoi_out_of_range.rs"]
 mod rtoi_out_of_range;
 #[path = "types/ref_formal_element_write.rs"]
@@ -781,3 +785,13 @@ mod struct_param_localparam_type;
 mod wide_packed_select_store;
 #[path = "types/nd_struct_array_members_1240.rs"]
 mod nd_struct_array_members_1240;
+#[path = "types/nettype_driver_delays_1204.rs"]
+mod nettype_driver_delays_1204;
+#[path = "types/inside_compiled_forms.rs"]
+mod inside_compiled_forms;
+#[path = "types/nettype_declaration_initializer_drivers.rs"]
+mod nettype_declaration_initializer_drivers;
+#[path = "types/unsized_decimal_width_1120.rs"]
+mod unsized_decimal_width_1120;
+#[path = "types/negative_bound_packed_slice_write_1193.rs"]
+mod negative_bound_packed_slice_write_1193;

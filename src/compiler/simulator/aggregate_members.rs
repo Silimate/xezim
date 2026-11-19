@@ -715,17 +715,18 @@ impl Simulator {
         if dimensions.is_empty() {
             return Some(base);
         }
-        let params = match self.this_stack.last().copied().flatten() {
-            Some(h) => std::borrow::Cow::Owned(self.instance_param_scope(h)),
-            None => std::borrow::Cow::Borrowed(&self.module.parameters),
+        let values: HashMap<String, Value> = match self.this_stack.last().copied().flatten() {
+            Some(h) => self.instance_value_params(h).into_iter().collect(),
+            None => HashMap::default(),
         };
+        let params = self.instance_param_env(&values);
         let mut w = u64::from(base);
         for d in dimensions {
             let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
-            let l = crate::elaborate::const_eval_i64_with_params(left, Some(params.as_ref()))?;
-            let r = crate::elaborate::const_eval_i64_with_params(right, Some(params.as_ref()))?;
+            let l = crate::elaborate::const_eval_i64_with_params_env(left, Some(&params))?;
+            let r = crate::elaborate::const_eval_i64_with_params_env(right, Some(&params))?;
             w = w.checked_mul((l - r).unsigned_abs() + 1)?;
         }
         u32::try_from(w).ok()
@@ -942,9 +943,13 @@ impl Simulator {
             return None;
         }
         let b = self.bind_type_params_in(dt, &|n| self.resolve_type_param_binding(n))?;
-        let spec = self.params_with_class_spec();
-        let params = spec.as_ref().unwrap_or(&self.module.parameters);
-        let w = resolve_type_width(&b, Some(params), Some(&self.module.typedefs));
+        let spec = self.class_spec_value_params();
+        let params = self.spec_param_env(&spec);
+        let w = super::elaborate::resolve_type_width_env(
+            &b,
+            Some(&params),
+            Some(&self.module.typedefs),
+        );
         Some(w).filter(|w| *w > 0)
     }
 
@@ -2291,6 +2296,30 @@ impl Simulator {
         None
     }
 
+    /// The `.member` / `[index]` steps of a leaf suffix such as
+    /// `.item[1].key`; `None` for anything else.
+    fn member_suffix_steps(suffix: &str) -> Option<Vec<MemberSel>> {
+        let mut steps = Vec::new();
+        let mut rest = suffix;
+        while !rest.is_empty() {
+            if let Some(r) = rest.strip_prefix('.') {
+                let end = r.find(['.', '[']).unwrap_or(r.len());
+                if end == 0 {
+                    return None;
+                }
+                steps.push(MemberSel::Member(r[..end].to_string()));
+                rest = &r[end..];
+            } else if let Some(r) = rest.strip_prefix('[') {
+                let end = r.find(']')?;
+                steps.push(MemberSel::Index(r[..end].parse().ok()?));
+                rest = &r[end + 1..];
+            } else {
+                return None;
+            }
+        }
+        Some(steps)
+    }
+
     /// One candidate split: `base` names the property, `suffix` addresses a
     /// leaf beneath it. `None` when the property is not an unpacked struct or
     /// the suffix names no leaf of it — which is what lets the caller try
@@ -2315,10 +2344,19 @@ impl Simulator {
         } else {
             format!("X{}", suffix)
         };
-        let (_, w, _) = self
+        let Some((_, w, _)) = self
             .unpacked_struct_leaf_keys("X", &su)
             .into_iter()
-            .find(|(k, ..)| *k == probe)?;
+            .find(|(k, ..)| *k == probe)
+        else {
+            // §7.2.1: not a leaf of its own — a member below a packed
+            // struct/union member (`s.e.key`) slices that member's cell.
+            if !suffix.starts_with('.') {
+                return None;
+            }
+            let steps = Self::member_suffix_steps(suffix)?;
+            return self.unpacked_member_select(handle, &prop, &su, &steps);
+        };
         Some(ClassAggRef::Unpacked {
             handle,
             key: format!("{}{}", prop, suffix),
@@ -2637,6 +2675,41 @@ impl Simulator {
             let tail = &rest[i..];
             if tail.is_empty() {
                 return Some(ClassAggRef::Unpacked { handle, key, w: mw });
+            }
+            // §7.2.1/§7.3.1: a member of a PACKED struct or union member (or
+            // of an element of a packed array of them) is a bit slice of that
+            // member's one cell, as it is of a packed-struct variable; it has
+            // no cell of its own.
+            if tail.iter().any(|s| matches!(s, MemberSel::Member(_)))
+                && let Some(inner) = self.packed_struct_with_dims(&dt).map(|s| s.into_owned())
+                && !Self::spreads_member_wise(&inner)
+            {
+                let (fields, iw) = self.packed_agg_layout_with(&inner, &inst_params);
+                let ClassAggRef::Packed { off, w, .. } = self.packed_member_walk(
+                    handle,
+                    &key,
+                    &inner,
+                    &inner,
+                    &fields,
+                    iw.max(1),
+                    &inst_params,
+                    tail,
+                    0,
+                    mw,
+                )?
+                else {
+                    return None;
+                };
+                if off.checked_add(w)? > mw {
+                    return None;
+                }
+                return Some(ClassAggRef::UnpackedSlice {
+                    handle,
+                    key,
+                    off,
+                    w,
+                    cell_w: mw,
+                });
             }
             let (off, w) = self.packed_array_slice(&dt, &inst_params, mw, tail)?;
             return Some(ClassAggRef::UnpackedSlice {
@@ -4074,6 +4147,24 @@ impl Simulator {
             params.entry(n).or_insert(v);
         }
         params
+    }
+
+    /// `instance_param_scope` borrowed rather than copied, for a lookup on
+    /// every method call (#1276): `values` holds `instance_value_params`
+    /// of the object, and a design parameter of the same name keeps its
+    /// precedence, as there.
+    pub(super) fn instance_param_env<'a>(
+        &'a self,
+        values: &'a HashMap<String, Value>,
+    ) -> super::elaborate::ParamEnv<'a> {
+        if values.is_empty() {
+            super::elaborate::ParamEnv::Single(&self.module.parameters)
+        } else {
+            super::elaborate::ParamEnv::Overlay {
+                base: values,
+                top: &self.module.parameters,
+            }
+        }
     }
 
     /// The class value parameters bound on object `handle`, leaf class first

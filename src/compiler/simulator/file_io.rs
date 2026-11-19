@@ -1571,9 +1571,8 @@ impl Simulator {
                             let val = match mem.base.split_once('#') {
                                 Some((h, prop))
                                     if val.has_xz()
-                                        && h.parse::<usize>().is_ok_and(|h| {
-                                            self.class_prop_two_state(h, prop)
-                                        }) =>
+                                        && h.parse::<usize>()
+                                            .is_ok_and(|h| self.class_prop_two_state(h, prop)) =>
                                 {
                                     val.to_two_state()
                                 }

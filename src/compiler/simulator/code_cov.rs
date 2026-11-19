@@ -1606,10 +1606,6 @@ pub(crate) struct CodeCov {
     /// made while evaluations were pending (`Simulator::cov_block_ran`).
     blocks: HashMap<usize, HashMap<String, u32>>,
     pub(super) ran: Vec<u64>,
-    /// The last `if` of an `else if` chain, by branch site: where block
-    /// granularity puts the chain's implicit `else`, as without branch
-    /// coverage.
-    tails: HashMap<usize, Span>,
     /// Inside a read that only coverage makes (`Simulator::cov_quietly`):
     /// count nothing.
     quiet: u32,
@@ -2146,25 +2142,6 @@ impl Instr<'_> {
         }
     }
 
-    /// In block granularity without branch coverage, the counter of an
-    /// implicit `else` or `default` (`kind`), as a statement to put in it.
-    /// With branch coverage the arm's count comes from the branch instead
-    /// (see `cov_report`).
-    fn implicit_block(&mut self, span: Span, kind: &'static str) -> Option<Statement> {
-        if !self.blocks || self.kinds & KIND_STATEMENT == 0 {
-            return None;
-        }
-        let counter = self.counter();
-        self.cov.stmts.push(StmtSite {
-            scope: self.scope,
-            span,
-            kind,
-            counter,
-            excluded: false,
-        });
-        Some(hit(counter, span))
-    }
-
     /// An `always` construct's own count, each time its body starts; in
     /// block granularity the body's first block counts that instead.
     fn process(&mut self, span: Span, kind: &'static str, out: &mut Vec<Statement>) {
@@ -2489,14 +2466,7 @@ impl Instr<'_> {
             let cond = self.skeleton(&condition);
             self.cond(&mut condition, "if", true);
             let (then_stmt, t) = self.region(|me| Box::new(me.wrap(*then_stmt)));
-            let implicit = else_stmt.is_none() && unique_priority.is_none();
-            let (else_stmt, e) = self.region(|me| match else_stmt {
-                Some(e) => Some(Box::new(me.wrap(*e))),
-                // Block granularity counts the implicit `else` without
-                // branch coverage too: an `else` holding only its counter.
-                None if implicit => me.implicit_block(span, "else (implicit)").map(Box::new),
-                None => None,
-            });
+            let (else_stmt, e) = self.region(|me| else_stmt.map(|e| Box::new(me.wrap(*e))));
             if !matches!(cond, Cond::Unknown) {
                 self.decide(Choice::If(vec![cond]), None, vec![t, e], Vec::new());
             }
@@ -2513,7 +2483,6 @@ impl Instr<'_> {
         }
         let mut conds = vec![self.skeleton(&condition)];
         let mut has_else = false;
-        let mut last = span;
         let mut tail = else_stmt.as_deref();
         while let Some(e) = tail {
             match &e.kind {
@@ -2523,7 +2492,6 @@ impl Instr<'_> {
                     ..
                 } => {
                     conds.push(self.skeleton(condition));
-                    last = e.span;
                     tail = else_stmt.as_deref();
                 }
                 _ => {
@@ -2543,9 +2511,6 @@ impl Instr<'_> {
             arms: Vec::new(),
             excluded: false,
         });
-        if last.start != span.start {
-            self.cov.tails.insert(site, last);
-        }
         let mut chain = Chain::default();
         let ((), c) = self.region(|me| me.cond(&mut condition, "if", true));
         chain.conds.push(c);
@@ -2668,32 +2633,12 @@ impl Instr<'_> {
         let choice = self.case_choice(kind, &expr, &items);
         let mut regions = Vec::with_capacity(items.len() + 1);
         let mut site = None;
-        // What the implicit `default` holds: nothing, or its block.
-        let mut fallback: Region = (0..0, 0..0, 0..0);
         if self.kinds & KIND_BRANCH == 0 {
             for it in items.iter_mut() {
                 let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
                 let (s, r) = self.region(|me| me.wrap(st));
                 it.stmt = s;
                 regions.push(r);
-            }
-            // Block granularity counts the implicit `default` without branch
-            // coverage too: a `default` item holding only its counter (an
-            // ordinary `case`; not a `case matches`).
-            let implicit = !items.iter().any(|it| it.is_default)
-                && unique_priority.is_none()
-                && items.first().is_some_and(|it| it.pattern.is_none());
-            if implicit {
-                let (stmt, r) = self.region(|me| me.implicit_block(span, "default (implicit)"));
-                fallback = r;
-                if let Some(stmt) = stmt {
-                    let mut d = items[0].clone();
-                    d.patterns.clear();
-                    d.is_default = true;
-                    d.stmt = stmt;
-                    d.span = span;
-                    items.push(d);
-                }
             }
         } else {
             let implicit = !items.iter().any(|it| it.is_default) && unique_priority.is_none();
@@ -2741,7 +2686,8 @@ impl Instr<'_> {
                 out.push(hit(e, span));
             }
         }
-        regions.push(fallback);
+        // The implicit `default` holds nothing.
+        regions.push((0..0, 0..0, 0..0));
         if let Some(choice) = choice {
             self.decide(choice, site, regions, Vec::new());
         }
@@ -4294,7 +4240,6 @@ impl Simulator {
             assigned: Vec::new(),
             pending: HashMap::default(),
             blocks: HashMap::default(),
-            tails: HashMap::default(),
             ran: Vec::new(),
             quiet: 0,
         };
@@ -6417,7 +6362,7 @@ impl Simulator {
                 excluded: s.excluded,
             });
         }
-        for (i, b) in cov.branches.iter().enumerate() {
+        for b in &cov.branches {
             let src = cov.scopes[b.scope as usize].src;
             let (file, line) = lines.locate(b.span, src).unwrap_or_default();
             let taken: u64 = b.arms.iter().filter_map(|a| a.counter).map(count).sum();
@@ -6434,23 +6379,6 @@ impl Simulator {
                     excluded: a.excluded,
                 })
                 .collect();
-            // In block granularity an implicit `else` or `default` is a
-            // block of its own, run when no written arm is.
-            if cov.blockwise && cov.kinds & KIND_STATEMENT != 0 {
-                let at = cov.tails.get(&i).copied();
-                for a in arms.iter().filter(|a| a.label.ends_with("(implicit)")) {
-                    reports[b.scope as usize].stmts.push(StmtRow {
-                        file: file.clone(),
-                        line: at
-                            .and_then(|t| lines.locate(t, src))
-                            .map_or(a.line, |(_, l)| l),
-                        start: at.map_or(b.span.start, |t| t.start),
-                        kind: a.label,
-                        count: a.count,
-                        excluded: b.excluded || a.excluded,
-                    });
-                }
-            }
             reports[b.scope as usize].branches.push(BranchRow {
                 file,
                 line,

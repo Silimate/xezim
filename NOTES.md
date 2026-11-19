@@ -136,6 +136,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
 
+**Performance**
+
+* A dotted call (`u_a.c_fn()`) finds whether its prefix names an instance
+  in the sorted instance index instead of scanning every instance (§35.5.3).
+  (#356)
+
 **Maintenance**
 
 * Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned

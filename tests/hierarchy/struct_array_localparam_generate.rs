@@ -171,6 +171,45 @@ endmodule
     }
 }
 
+/// §26.3, §23.10: a parameter override is evaluated in the instantiating
+/// scope, so `#(.N(V[0]))` reads the parent's imported `V`, not the one the
+/// child imports, while the child's own generate condition reads its own.
+#[test]
+fn override_reads_the_parent_import() {
+    for (packages, leaf_import, cond) in [
+        ("", "", "N == 3"),
+        (
+            "package q; parameter int V [2] = '{7, 9}; endpackage",
+            "import q::V;",
+            "V[1] == 9",
+        ),
+    ] {
+        let src = r#"
+package p; parameter int V [2] = '{3, 5}; endpackage
+PACKAGES
+module leaf #(parameter int N = 0) (output int n, output int m);
+  LEAF_IMPORT
+  assign n = N;
+  if (COND) begin : g9 assign m = 1; end
+  else begin : gx assign m = 0; end
+endmodule
+module mid (output int n, output int m);
+  import p::V;
+  leaf #(.N(V[0])) u(.n(n), .m(m));
+endmodule
+module top;
+  int n, m;
+  mid u(.n(n), .m(m));
+  initial #1 $display("override: N=%0d leaf=%0d", n, m);
+endmodule
+"#
+        .replace("PACKAGES", packages)
+        .replace("LEAF_IMPORT", leaf_import)
+        .replace("COND", cond);
+        assert_has(&src, &["override: N=3 leaf=1"]);
+    }
+}
+
 /// The issue's package struct-array forms: element assignments to a parent
 /// vector, downward hierarchical assignments, and the otp_ctrl shape.
 #[test]

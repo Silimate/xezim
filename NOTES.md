@@ -24,13 +24,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   succeeds vacuously while `c` is false, so it runs no pass action and a
   `cover` of it does not match, and `p or q` with a sequence operand is never
   vacuous.
-* A size cast whose width is a field of a struct parameter (`pt.DEPTH'(x)`,
-  `(pt.DEPTH)'(x)`) evaluates its operand at that width and resizes to it
-  (§6.24.1). The width was ignored: the operand passed through at its own
-  width, or a same-named parameter sized it. The VeeR EL2 branch predictor
-  never updated its BHT, and every taken loop branch cost a cycle (EL2
-  hello_world: mcycle 809, now 742 as on the reference simulator); VeeR EH2
-  sizes its fetch bus tags this way. (Silimate/xezim#322)
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.

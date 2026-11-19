@@ -238,6 +238,12 @@ impl Simulator {
             {
                 let mut stripped = hier.clone();
                 stripped.path.remove(0);
+                if let Some(key) =
+                    self.pkg_qual_collection_key(&hier.path[0].name.name, &hier.path[1].name.name)
+                {
+                    stripped.path[0].name.name = key;
+                }
+                stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
                 stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 let f = Expression::new(ExprKind::Ident(stripped), func.span);
                 return self.eval_call_inner(&f, args);
@@ -2676,6 +2682,12 @@ impl Simulator {
                             | "reverse"
                             | "shuffle"
                             | "unique"
+                            // §7.9.4-§7.9.7: the traversal methods of an
+                            // associative array take the same receiver.
+                            | "first"
+                            | "last"
+                            | "next"
+                            | "prev"
                     )
                 {
                     let arr = hier.path[hier.path.len() - 2].name.name.clone();
@@ -2709,20 +2721,12 @@ impl Simulator {
                                 .and_then(|v| v.to_u64())
                                 .unwrap_or(0) as usize;
                         }
-                        if handle != 0 {
-                            let cn = self
-                                .heap
-                                .get(handle)
-                                .and_then(|x| x.as_ref())
-                                .map(|i| i.class_name.clone());
-                            if let Some(cn) = cn {
-                                if self.class_assoc_member(&cn, &arr) {
-                                    let scoped = format!("{}#{}", handle, arr);
-                                    if let Some(res) = self.eval_builtin_method(&scoped, m, args) {
-                                        return res;
-                                    }
-                                }
-                            }
+                        // §8.9: a static collection of the object's class
+                        // is the class's one store (`handle_collection_name`).
+                        if let Some(scoped) = self.handle_collection_name(handle, &arr)
+                            && let Some(res) = self.eval_builtin_method(&scoped, m, args)
+                        {
+                            return res;
                         }
                     }
                     // A collection reached through a hierarchical path —
@@ -2815,6 +2819,13 @@ impl Simulator {
                             Some(parts.join("."))
                         } else {
                             None
+                        };
+                        let (h_val, target_name) = match target_name {
+                            Some(t) if t.contains('.') => {
+                                let (h, t) = self.rand_mode_owner(h_val, &t);
+                                (h, Some(t))
+                            }
+                            t => (h_val, t),
                         };
                         // §18.5.11: a static constraint block's mode is shared
                         // by every instance of the class — route it to the
@@ -3773,6 +3784,30 @@ impl Simulator {
             if hier.path.len() == 1 {
                 if let Some(full) = self.class_module_subroutine_key(name) {
                     return self.call_scoped_subroutine(&full, args);
+                }
+            }
+            // §26.3: a bare call in a method of a class DECLARED inside a
+            // package binds to that package's own function/task — the class
+            // body scopes through its declaring package before the module
+            // instance scope (mirrors the ident fix in
+            // `resolve_hier_name_uncached`).
+            if hier.path.len() == 1
+                && let Some(pkg) = self
+                    .class_context_stack
+                    .last()
+                    .and_then(|c| c.as_ref())
+                    .and_then(|ctx| self.module.class_decl_pkg.get(ctx.as_str()))
+                    .map(ToOwned::to_owned)
+            {
+                let qual = format!("{}::{}", pkg, name);
+                if let Some(fd) = self.fn_decl_rc(&qual) {
+                    self.pending_pkg_scope = Some(pkg.clone());
+                    return self.exec_function_call(&fd, args);
+                }
+                if let Some(td) = self.task_decl_rc(&qual) {
+                    self.pending_pkg_scope = Some(pkg.clone());
+                    self.exec_task_call(&td, args);
+                    return Value::zero(32);
                 }
             }
             // Module-level function call

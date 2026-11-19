@@ -196,3 +196,61 @@ module top; leaf u(); endmodule
         "missing `{want}` in {got:#?}"
     );
 }
+
+/// §23.9: a frame local hides a module parameter of the same name, so
+/// `s.e[I]` with a function's own `int I` is a dynamic element select, not
+/// `parameter I`'s element. A block's static `int I` likewise.
+#[test]
+fn frame_local_index_hides_a_parameter() {
+    let got: Vec<String> = xezim::simulate(
+        r#"
+// a frame local `I` hides `parameter I` in an element select
+module psh;
+  typedef struct packed { logic [7:0] value; } dw_t;
+  typedef struct packed { dw_t [1:0] dw; } nest_t;
+  typedef struct packed { nest_t [2:0] e; } nest3_t;
+  parameter int I = 0;
+  nest3_t st, rs;
+  logic [1:0] sel = 2'd2;
+  logic [7:0] rd, cm, fn;
+  logic clk = 0;
+  function automatic logic [7:0] f(input int k);
+    int I;
+    I = k;
+    return rs.e[I].dw[1].value;
+  endfunction
+  always_ff @(posedge clk) begin
+    int I;
+    I = sel;
+    st.e[I].dw[0].value <= 8'h5A;
+    rd <= rs.e[I].dw[1].value;
+  end
+  always_comb begin
+    int I;
+    I = sel;
+    cm = rs.e[I].dw[1].value;
+  end
+  always_comb fn = f(sel);
+  initial begin
+    st = '0;
+    rs = '0;
+    rs.e[2].dw[1].value = 8'h3C;
+    rs.e[0].dw[1].value = 8'hC3;
+    #1 clk = 1;
+    #1 $display("psh: st=%h rd=%h cm=%h fn=%h", st, rd, cm, fn);
+  end
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed")
+    .output
+    .iter()
+    .map(|o| o.message.clone())
+    .collect();
+    let want = "psh: st=005a00000000 rd=3c cm=3c fn=3c";
+    assert!(
+        got.iter().any(|l| l == want),
+        "missing `{want}` in {got:#?}"
+    );
+}

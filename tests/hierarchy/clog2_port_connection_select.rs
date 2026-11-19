@@ -128,3 +128,52 @@ endmodule
         &["c3w: q=deadbeef"],
     );
 }
+
+/// A folded `$clog2` is a signed 32-bit value, as the interpreter types it,
+/// so `$clog2(1) - 1 < 0` is true in a clocked block. Its operand is folded
+/// only when it is a literal or a parameter: an operator expression is
+/// self-determined (§11.6.1), so `$clog2(8'hff + 8'h01)` is 0 and
+/// `$clog2(64'd1 << 33)` is 33, and the interpreter computes both. A frame
+/// local `I` hides `parameter I` (§23.9).
+#[test]
+fn folded_clog2_is_signed_and_only_of_a_literal_or_parameter() {
+    assert_has(
+        r#"
+// a folded $clog2 is signed; an operator operand is self-determined; a frame local hides a parameter
+module c3s;
+  parameter int N = 4;
+  parameter int I = 4;
+  logic clk = 0;
+  logic [63:0] a = 64'hfedc_ba9b_7654_3210;
+  logic lt1, lt2, lt3;
+  logic [63:0] q0, q1, q2;
+  logic [7:0] m, mf;
+  int sel = 100;
+  function automatic int g(input int k);
+    int I;
+    I = k;
+    return $clog2(I);
+  endfunction
+  always @(posedge clk) begin
+    lt1 <= ($clog2(1) - 1 < 0);
+    lt2 <= ($clog2(N) - 4 < 0);
+    q0 <= a[$clog2(8'hff + 8'h01):0];
+    q1 <= a[$clog2(64'd1 << 33)-1:0];
+    q2 <= a[$clog2(64'h1_0000_0000 + 64'h1):0];
+  end
+  always @(posedge clk) begin
+    int I;
+    I = sel;
+    m <= $clog2(I);
+  end
+  always_comb mf = g(sel);
+  assign lt3 = ($clog2(1) - 1 < 0);
+  initial begin
+    #1 clk = 1;
+    #1 $display("c3s: lt=%b%b%b q0=%h q1=%h q2=%h m=%0d mf=%0d", lt1, lt2, lt3, q0, q1, q2, m, mf);
+  end
+endmodule
+"#,
+        &["c3s: lt=111 q0=0000000000000000 q1=0000000176543210 q2=0000000376543210 m=7 mf=7"],
+    );
+}

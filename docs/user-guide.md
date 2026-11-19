@@ -8,6 +8,9 @@ of options and environment variables is in the
 [debugging](DEBUGGING.md).
 
 * [Running a simulation](#running-a-simulation)
+* [Cocotb Python testbenches](#cocotb-python-testbenches)
+* [VPI assertion integration](#vpi-assertion-integration)
+* [Random seeds and weighted distributions](#random-seeds-and-weighted-distributions)
 * [Waveforms](#waveforms)
 * [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
@@ -60,12 +63,104 @@ let time advance, an SDF file `$sdf_annotate` cannot read), a
 (`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
 unless `--error-exit` is given.
 
+Current `main` also diagnoses undeclared type names and duplicate class
+definitions. Declare or import the intended type before using it, and keep
+one class definition per name in a scope. A forward class typedef is not a
+second class definition.
+
 A run stops at 100 ms of simulated time unless the design calls `$finish`
 first or runs out of events; `--max-time <time>` sets another limit and
 `--max-time none` removes it. For a flow written for a commercial simulator,
 `--compat` lifts the limit and turns on `--relax-implicit-static`,
 `--relax-driver-conflicts` and `--error-exit` (see the
 [command-line reference](command-line.md#commercial-simulators-defaults---compat)).
+
+## Cocotb Python testbenches
+
+The runner in `contrib/cocotb/xezim_runner.py` supports cocotb 2.0.x and 2.1.0;
+its integration tests cover 2.0.1 and 2.1.0. The 2.1 compatibility changes are
+available on `main` after 0.11.6.
+
+From the repository root, make the runner importable and select your binary:
+
+```bash
+export PYTHONPATH="$PWD/contrib/cocotb${PYTHONPATH:+:$PYTHONPATH}"
+export XEZIM_BIN="$PWD/target/release/xezim"
+python run_test.py
+```
+
+A minimal `run_test.py`, with your `dut.sv` and cocotb `test_dut.py` beside it:
+
+```python
+import xezim_runner  # registers the xezim backend
+from cocotb_tools.runner import get_runner
+
+runner = get_runner("xezim")
+runner.build(sources=["dut.sv"], hdl_toplevel="dut", build_dir="sim_build")
+runner.test(hdl_toplevel="dut", test_module="test_dut")
+```
+
+`build()` records the source files and options; `test()` invokes xezim to
+elaborate and simulate them. Use `parameters={"WIDTH": 8}` for parameter
+overrides and `waves=True` for an FST waveform in the build directory.
+
+Macro values follow the installed cocotb version. For a macro that expands
+to the SystemVerilog string literal `"hi"`, use `defines={"MSG": "hi"}` with
+2.0, or `defines={"MSG": '"hi"'}` with 2.1. Version 2.1 takes HDL text as
+written; it does not add quotes. In either version, `None` defines a macro
+without a value. See the [runner documentation](../contrib/cocotb/xezim_runner.py)
+for option and parameter-rebuild behavior.
+
+## VPI assertion integration
+
+On `main` after 0.11.6, VPI clients can discover concurrent assertion objects,
+register callbacks with `vpi_register_assertion_cb`, query assertion coverage,
+and control assertions through `vpi_control`. Build the client against
+`include/vpi_user.h` and `include/sv_vpi_user.h`, then load its shared library:
+
+```bash
+xezim --vpi-lib ./assertion_monitor.so top.sv
+```
+
+Step controls select an attempt by its start time. `vpiAssertionEnableStep`
+takes the assertion handle, a time pointer and `vpiAssertionClockSteps`;
+`vpiAssertionDisableStep` takes only the handle and time pointer after its
+operation code. `vpiAssertionSysKill` discards pending attempts and disables
+new ones while retaining callbacks. `vpiAssertionSysOn` allows new attempts
+to start again; it does not revive discarded attempts.
+`vpiAssertionSysEnd` removes callbacks and ends the assertion system; later
+controls or callback registrations cannot restart it.
+
+This is the Phase 1 interface. Phase 2 action and lock callbacks are not
+supported. Step callbacks report clock-level progress, callback `detail` is
+NULL, and some coverage counts are approximations. See the
+[DPI and VPI guide](dpi-guide.md#classic-vpi-modules---vpi-lib) for the supported
+objects, callback semantics, coverage limits and checkpoint behavior.
+
+## Random seeds and weighted distributions
+
+Use `+seed=<integer>` to reproduce a randomized run. Compare the sequence
+of generated values when checking that a seed changes a run; a histogram
+alone can hide the difference.
+
+For a class variable constrained only by a `dist` list, xezim can deal
+items from a balanced schedule. Each complete schedule contains items in
+their declared weight proportions. The seed changes their order and the
+starting position, so different seeds can produce identical total counts.
+For example, singleton weights `40,20,12,10,8,5,3,2` give counts
+`800,400,240,200,160,100,60,40` over 2,000 successful calls, even though
+the generated sequences differ. This is intentional xezim solver policy,
+not a requirement that SystemVerilog distributions have exact counts.
+
+Schedules belong to an object and variable and are selected using the
+evaluated weights. They are used only when the reduced schedule fits within
+4,096 entries. Other solver paths, including the same distribution combined
+with a separate range constraint, can use independent weighted draws instead;
+their counts need not match the proportions exactly. Adding a redundant
+constraint can therefore change both the sequence and its histogram.
+Values within a range item are sampled, so balanced item counts do not imply
+exact counts for each value inside the range. Do not rely on a particular
+sequence or solver strategy remaining unchanged across releases.
 
 ## Waveforms
 
@@ -386,7 +481,7 @@ relaxed run's design. Every switch also has an environment variable,
 | `--relax-casex-inside` | `casex (e) inside`, `casez (e) inside` (§12.5.4) | `case (e) inside` |
 | `--relax-macro-space` | `` ` NAME `` (§22.5.1) | `` `NAME `` |
 | `--relax-nul-bytes` | a NUL byte in the source (§5.3) | white space |
-| `--relax-cross-hier-item` | `cross vif.mode, cp_a;` (§19.6) | a cross over an implicit coverpoint of `vif.mode` |
+| `--relax-cross-hier-item` | `cross vif.mode, cp_a;` (§19.6), and `binsof(vif.mode)` in its bin selects (§19.6.1) | a cross over an implicit coverpoint of `vif.mode` |
 | `--relax-use-before-decl` | a reference to module data before its declaration, including in call arguments (§6.5) | a reference to the later declaration, with a warning |
 | `--relax-library-packages` | a package declared in a `-v` library file, which supplies only modules, interfaces, programs and primitives (#937) | a package compiled as if the file were also a source file |
 | `--relax-unconnected-interface-port` | an instance that leaves an interface port unconnected (§25.3, §23.3.3) | an instance whose port members are signals of its own, reading x until written |

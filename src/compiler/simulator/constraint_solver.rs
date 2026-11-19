@@ -32,6 +32,7 @@ impl Simulator {
         let subset = self.randomize_subset.take();
         self.randomize_depth += 1;
         self.obj_rng_stack.push(sub);
+        self.rand_solve_nested = true;
         self.exec_randomize_inner(sub, pushed, None);
         self.obj_rng_stack.pop();
         self.randomize_depth -= 1;
@@ -735,7 +736,41 @@ impl Simulator {
         self.push_local_frame(HashMap::default());
         self.method_local_base.push(self.local_stack.len() - 1);
         let scopes = std::mem::take(&mut self.constraint_scopes);
+        // §18.5.9: a sub-object's solve extends the chain of the call that
+        // randomizes it; any other call (one made from a method the solve
+        // runs, too) is a solve of its own.
+        let outer_chain = if std::mem::take(&mut self.rand_solve_nested) {
+            None
+        } else {
+            Some(std::mem::take(&mut self.rand_solve_chain))
+        };
+        self.rand_solve_chain.push(handle);
+        let outer_defer = std::mem::take(&mut self.rand_post_defer_self);
+        let outer_post = outer_chain
+            .is_some()
+            .then(|| std::mem::take(&mut self.rand_post_deferred));
         let r = self.exec_randomize_solve(handle, inline, inline_src_file);
+        self.rand_solve_chain.pop();
+        let ok = r.to_u64() == Some(1);
+        if std::mem::replace(&mut self.rand_post_defer_self, outer_defer) && ok {
+            self.rand_post_deferred.push(handle);
+        }
+        if let Some(chain) = outer_chain {
+            self.rand_solve_chain = chain;
+        }
+        // §18.6.2: the call succeeded, so every variable has its final
+        // value: run the `post_randomize` of the sub-objects that waited.
+        if let Some(outer) = outer_post {
+            let waiting = std::mem::replace(&mut self.rand_post_deferred, outer);
+            if ok {
+                let mut done: HashSet<usize> = HashSet::default();
+                for sub in waiting {
+                    if done.insert(sub) {
+                        self.exec_method_call(sub, "post_randomize", &[]);
+                    }
+                }
+            }
+        }
         self.constraint_scopes = scopes;
         self.method_local_base.pop();
         self.pop_local_frame();
@@ -831,6 +866,8 @@ impl Simulator {
         // Their solved values must keep `is_signed`, or a later compare
         // (`x < 0`, `x inside {[-100:100]}`) silently goes unsigned.
         let mut signed_rand_props: HashSet<String> = HashSet::default();
+        // The enclosing objects of this call's chain: all but this one.
+        let nested_under = self.rand_solve_chain.len().saturating_sub(1);
         let mut cur = Some(class_name.clone());
         while let Some(cname) = cur {
             if let Some(class_def) = self.module.classes.get(&cname) {
@@ -964,7 +1001,23 @@ impl Simulator {
                         continue;
                     }
                     if seen_constraint_names.insert(con_name.clone()) {
-                        constraints.push(con.clone());
+                        let mut con = con.clone();
+                        // §18.5.9: an item that reads a rand variable of an
+                        // enclosing object of this call through a handle
+                        // back to it (`item.addr`) constrains that object's
+                        // variable, which this sub-object's own solve cannot
+                        // move: drawn against the value the variable held
+                        // before the call, it failed although the call has a
+                        // solution. The item is left to the enclosing solve,
+                        // which judges it on the final values
+                        // (`sub_object_constraints_ok`) and solves it jointly
+                        // (`rand_csp_subs`).
+                        if nested_under > 0 {
+                            con.items.retain(|it| {
+                                !self.rand_item_reads_enclosing(handle, it, nested_under)
+                            });
+                        }
+                        constraints.push(con);
                         // §18.5/§8.14: a base class's block names what that
                         // class sees, which a derived class's redeclaration
                         // can change.
@@ -1082,51 +1135,8 @@ impl Simulator {
         Self::regroup_unique_colls(&mut constraints, &rand_colls);
         // `unique {c}` / `unique {a, b}` items naming those collections
         // (§18.5.5), one group per item, with the group's other members.
-        let unique_colls: Vec<(Vec<RandColl>, Vec<String>)> = {
-            let mut out: Vec<(Vec<RandColl>, Vec<String>)> = Vec::new();
-            fn walk(item: &ConstraintItem, out: &mut Vec<Vec<String>>) {
-                match item {
-                    ConstraintItem::Unique { exprs, .. } => {
-                        let mut group = Vec::new();
-                        for e in exprs {
-                            if let ExprKind::Ident(h) = &e.kind {
-                                if let Some(s) = h.path.last() {
-                                    group.push(s.name.name.clone());
-                                }
-                            }
-                        }
-                        out.push(group);
-                    }
-                    ConstraintItem::Block(items) => {
-                        for i in items {
-                            walk(i, out);
-                        }
-                    }
-                    ConstraintItem::Soft(i) => walk(i, out),
-                    _ => {}
-                }
-            }
-            let mut groups: Vec<Vec<String>> = Vec::new();
-            for con in &constraints {
-                for it in &con.items {
-                    walk(it, &mut groups);
-                }
-            }
-            for g in groups {
-                let mut cs: Vec<RandColl> = Vec::new();
-                let mut scalars: Vec<String> = Vec::new();
-                for n in g {
-                    match rand_colls.iter().find(|c| c.prop == n) {
-                        Some(c) => cs.push(c.clone()),
-                        None => scalars.push(n),
-                    }
-                }
-                if !cs.is_empty() {
-                    out.push((cs, scalars));
-                }
-            }
-            out
-        };
+        let mut unique_colls: Vec<(Vec<RandColl>, Vec<String>)> = Vec::new();
+        Self::append_unique_colls(&constraints, &rand_colls, &mut unique_colls);
 
         // An array of unpacked structs is solved through its member
         // collections, never as one scalar or one struct.
@@ -1181,22 +1191,50 @@ impl Simulator {
                         continue;
                     };
                     let is_randc = matches!(rq, crate::ast::types::RandQualifier::Randc);
-                    let w = resolve_type_width(
-                        &m.data_type,
-                        Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
-                    )
-                    .max(1);
+                    let w = self
+                        .declared_packed_type(&m.data_type)
+                        .map(|(_, _, w)| w)
+                        .unwrap_or_else(|| {
+                            resolve_type_width(
+                                &m.data_type,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            )
+                        })
+                        .max(1);
                     let et = self.struct_member_enum_key(&m.data_type);
                     let signed = super::elaborate::is_type_signed_resolved(
                         &m.data_type,
                         &self.module.typedef_types,
                     );
                     for d in &m.declarators {
+                        // §18.4: a class handle is never drawn as a value;
+                        // drawing one overwrote the object reference.
+                        if let DataType::TypeReference { name, .. } = &m.data_type
+                            && self.module.classes.contains_key(&name.name.name)
+                        {
+                            continue;
+                        }
                         if signed {
                             unpacked_agg_signed.insert(format!("{}.{}", prop, d.name.name));
                         }
-                        members.push((d.name.name.clone(), w, is_randc, et.clone()));
+                        // §18.4: a fixed unpacked member contributes each
+                        // element's cell; the aggregate itself has no value.
+                        let indices = self.member_elem_indices(&d.dimensions);
+                        if let Some(indices) = indices {
+                            for tuple in indices {
+                                let mut name = d.name.name.clone();
+                                for i in tuple {
+                                    name.push_str(&format!("[{i}]"));
+                                }
+                                if signed {
+                                    unpacked_agg_signed.insert(format!("{prop}.{name}"));
+                                }
+                                members.push((name, w, is_randc, et.clone()));
+                            }
+                        } else {
+                            members.push((d.name.name.clone(), w, is_randc, et.clone()));
+                        }
                     }
                 }
                 unpacked_agg_props.push((prop.clone(), members));
@@ -1230,7 +1268,33 @@ impl Simulator {
         // `class_context_stack`; without pushing it the call fell through to the
         // "unknown name" path and silently yielded 0.
         self.class_context_stack.push(Some(class_name.clone()));
-        let has_post = self.class_has_method(&class_name, "post_randomize");
+        // §18.5.8.1: a `foreach` over an array of fixed declared shape that
+        // the solvers do not model as written (`g.item` of a packed-struct
+        // property, a row of a 2-D array, an omitted loop variable) iterates
+        // a known index set whatever the array's random values: unroll it
+        // here, before either solver extracts its constraints.
+        for con in &mut constraints {
+            self.expand_fixed_foreach_items(&mut con.items, false);
+        }
+        let expanded_inline: Option<Vec<ConstraintItem>> = inline
+            .iter()
+            .any(|it| self.expand_fixed_foreach(it, false).is_some())
+            .then(|| {
+                let mut items = inline.to_vec();
+                self.expand_fixed_foreach_items(&mut items, false);
+                items
+            });
+        let inline: &[ConstraintItem] = expanded_inline.as_deref().unwrap_or(inline);
+
+        let mut has_post = self.class_has_method(&class_name, "post_randomize");
+        let deferred_entry_len = self.rand_post_deferred.len();
+        // §18.6.2: every randomized child waits for the enclosing solve.
+        // A sibling with no back-reference can still be rewritten by the
+        // joint solve; its callback must run once, on the final values.
+        if has_post && nested_under > 0 {
+            has_post = false;
+            self.rand_post_defer_self = true;
+        }
 
         // §18.6: a failed enclosing solve restores the rand state of its
         // reachable children as well as its own scalar/collection state.
@@ -1280,7 +1344,7 @@ impl Simulator {
                 }
             }
             for _ in 0..256 {
-                if !self.take_randomize_budget(handle, &class_name, &constraints) {
+                if !self.take_randomize_budget(handle, &class_name, &constraints, &rand_colls) {
                     break;
                 }
                 for (name, width) in &rand_props {
@@ -1328,15 +1392,13 @@ impl Simulator {
                         .all(|it| self.check_constraint_item(handle, it))
                 });
                 if ok && !self.randomize_budget_exhausted {
-                    if has_post {
-                        self.exec_method_call(handle, "post_randomize", &[]);
-                    }
-                    self.this_stack.pop();
-                    self.class_context_stack.pop();
-                    if has_rand_children {
-                        self.rand_child_snapshots.pop();
-                    }
-                    return Value::from_u64(1, 32);
+                    return self.finish_randomize_success(
+                        handle,
+                        nested_under,
+                        deferred_entry_len,
+                        has_post,
+                        has_rand_children,
+                    );
                 }
             }
             // No sample landed — restore and fall through to propagation.
@@ -1476,15 +1538,13 @@ impl Simulator {
             }
             match csp_outcome {
                 rand_csp::CspOutcome::Sat if !self.randomize_budget_exhausted => {
-                    if has_post {
-                        self.exec_method_call(handle, "post_randomize", &[]);
-                    }
-                    self.this_stack.pop();
-                    self.class_context_stack.pop();
-                    if has_rand_children {
-                        self.rand_child_snapshots.pop();
-                    }
-                    return Value::from_u64(1, 32);
+                    return self.finish_randomize_success(
+                        handle,
+                        nested_under,
+                        deferred_entry_len,
+                        has_post,
+                        has_rand_children,
+                    );
                 }
                 out => {
                     match out {
@@ -1529,14 +1589,26 @@ impl Simulator {
             .filter(|(k, _)| k.0 == handle)
             .map(|(k, ds)| (k.clone(), ds.iter().map(|d| (d.0, d.2)).collect()))
             .collect();
+        let mut back_ref_added = false;
+        let mut prior_props: Option<HashMap<String, Value>> = None;
         for trial in 0..trials {
+            let deferred_trial_mark = self.rand_post_deferred.len();
             // Ctrl-C / SIGTERM: stop searching and let the run shut down.
             if interrupt_requested() {
+                if let Some(saved) = prior_props.take() {
+                    self.restore_instance_props(handle, saved);
+                }
                 self.take_interrupt();
                 break;
             }
-            if !self.take_randomize_budget(handle, &class_name, &constraints) {
+            if !self.take_randomize_budget(handle, &class_name, &constraints, &rand_colls) {
+                if let Some(saved) = prior_props.take() {
+                    self.restore_instance_props(handle, saved);
+                }
                 break;
+            }
+            if let Some(saved) = prior_props.take() {
+                self.restore_instance_props(handle, saved);
             }
             if trial > 0 && trial < REDEAL_TRIALS {
                 for (k, ds) in self.dist_decks.iter_mut().filter(|(k, _)| k.0 == handle) {
@@ -1558,6 +1630,33 @@ impl Simulator {
             self.dist_dealt.clear();
             let mut solved_props: HashMap<String, Value> = HashMap::default();
             let mut backup = HashMap::default();
+
+            // When the joint CSP solver is inactive (`!csp_ok`, e.g. `randc` or
+            // associative handle containers), materialize stripped back-ref items
+            // from child objects so this object's non-CSP solver handles them.
+            if !csp_ok && !rand_obj_props.is_empty() && !back_ref_added {
+                back_ref_added = true;
+                let items = self.collect_enclosing_back_ref_items(handle, &rand_obj_props);
+                if !items.is_empty() {
+                    let start = constraints.len();
+                    constraints.push(ClassConstraint {
+                        is_static: false,
+                        is_extern: false,
+                        has_body: true,
+                        name: crate::ast::Identifier {
+                            name: "__back_ref__".to_string(),
+                            span: crate::ast::Span::new(0, 0),
+                        },
+                        items,
+                        span: crate::ast::Span::new(0, 0),
+                    });
+                    constraint_depth.push(0);
+                    constraint_src_files.push(None);
+                    Self::regroup_unique_colls(&mut constraints[start..], &rand_colls);
+                    Self::append_unique_colls(&constraints[start..], &rand_colls, &mut unique_colls);
+                    pushdown.clear();
+                }
+            }
 
             // §18.4/§18.5.9: recursively randomize every `rand` OBJECT HANDLE,
             // so the sub-object's own constraints hold before this object's
@@ -2738,42 +2837,50 @@ impl Simulator {
                     *e = (*e).max(n);
                 }
             }
+            let mut sizes_ok = true;
             let mut pinned_elems: HashSet<String> = HashSet::default();
             if !rand_colls.is_empty() {
-                self.solve_array_sizes(&rand_colls, &constraints);
-                // Fresh random baseline for every element of a dynamic /
-                // associative member (fixed arrays keep the legacy pool pass).
-                // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
-                // object handles that are randomized RECURSIVELY — never drawn
-                // as scalars, or the handle is overwritten with junk.
-                for c in &rand_colls {
-                    if c.kind == CollKind::Fixed || c.is_object_elem {
-                        continue;
+                sizes_ok = self.solve_array_sizes(&rand_colls, &constraints);
+                if sizes_ok {
+                    // Fresh random baseline for every element of a dynamic /
+                    // associative member (fixed arrays keep the legacy pool pass).
+                    // §18.4.1: a CLASS-element collection (`rand obj arr[]`) holds
+                    // object handles that are randomized RECURSIVELY — never drawn
+                    // as scalars, or the handle is overwritten with junk.
+                    for c in &rand_colls {
+                        if c.kind == CollKind::Fixed || c.is_object_elem {
+                            continue;
+                        }
+                        for key in self.coll_elem_keys(c) {
+                            let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
+                            let members = array_enums
+                                .get(&c.prop)
+                                .and_then(|tn| self.module.enum_members.get(tn))
+                                .filter(|m| !m.is_empty());
+                            let v = if let Some(members) = members {
+                                let values: Vec<u64> = members.iter().map(|m| m.1).collect();
+                                let i = self.cur_rng().gen_range(0..values.len());
+                                Value::from_u64(values[i], c.width)
+                            } else {
+                                self.draw_elem(c.width, prev)
+                            };
+                            self.write_coll_elem(&key, v);
+                        }
                     }
-                    for key in self.coll_elem_keys(c) {
-                        let prev = self.read_coll_elem(&key).and_then(|v| v.to_u64());
-                        let members = array_enums
-                            .get(&c.prop)
-                            .and_then(|tn| self.module.enum_members.get(tn))
-                            .filter(|m| !m.is_empty());
-                        let v = if let Some(members) = members {
-                            let values: Vec<u64> = members.iter().map(|m| m.1).collect();
-                            let i = self.cur_rng().gen_range(0..values.len());
-                            Value::from_u64(values[i], c.width)
-                        } else {
-                            self.draw_elem(c.width, prev)
-                        };
-                        self.write_coll_elem(&key, v);
+                    self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
+                    self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
+                    for (cs, scalars) in &unique_colls {
+                        self.enforce_unique_coll(handle, cs, scalars, &constraints, &pinned_elems);
                     }
+                    self.enforce_conditional_unique_colls(
+                        handle,
+                        &constraints,
+                        &rand_colls,
+                        &pinned_elems,
+                    );
                 }
-                self.solve_coll_foreach(handle, &rand_colls, &constraints, &mut pinned_elems);
-                self.solve_top_level_elems(handle, &constraints, &mut pinned_elems);
-                for (cs, scalars) in &unique_colls {
-                    self.enforce_unique_coll(handle, cs, scalars, &constraints, &pinned_elems);
-                }
-                self.enforce_conditional_unique_colls(handle, &constraints, &rand_colls, &pinned_elems);
             }
-            {
+            if sizes_ok {
                 fn collect_unique_items<'a>(
                     item: &'a ConstraintItem,
                     out: &mut Vec<&'a ConstraintItem>,
@@ -2819,50 +2926,55 @@ impl Simulator {
                         break;
                     }
                 }
-            }
 
-            // §18.5.8.2: `arr.sum() == K` cannot be met by rejection over a wide
-            // domain — distribute a random valid assignment onto the elements so
-            // their total lands exactly on the target (respecting per-element
-            // ranges and any element already pinned by another constraint).
-            if !rand_colls.is_empty() {
-                self.solve_array_sum_eqs(&constraints, &rand_colls, &rand_set, &mut pinned_elems);
-            }
+                // §18.5.8.2: `arr.sum() == K` cannot be met by rejection over a wide
+                // domain — distribute a random valid assignment onto the elements so
+                // their total lands exactly on the target (respecting per-element
+                // ranges and any element already pinned by another constraint).
+                if !rand_colls.is_empty() {
+                    self.solve_array_sum_eqs(
+                        &constraints,
+                        &rand_colls,
+                        &rand_set,
+                        &mut pinned_elems,
+                    );
+                }
 
-            // §18.5.7 foreach over a PACKED vector's bits (`foreach
-            // (possible[i]) if (possible[i]) pattern[i] dist …; else
-            // pattern[i] == 0;`). Not a rand COLLECTION, so every collection
-            // arm skips it, and `constraint_unmodeled` then excused it from
-            // the satisfaction check — the guard bits were silently ignored.
-            // Pin the bits deterministically here, after the draws.
-            for con in &constraints {
-                for item in &con.items {
+                // §18.5.7 foreach over a PACKED vector's bits (`foreach
+                // (possible[i]) if (possible[i]) pattern[i] dist …; else
+                // pattern[i] == 0;`). Not a rand COLLECTION, so every collection
+                // arm skips it, and `constraint_unmodeled` then excused it from
+                // the satisfaction check — the guard bits were silently ignored.
+                // Pin the bits deterministically here, after the draws.
+                for con in &constraints {
+                    for item in &con.items {
+                        self.apply_packed_bit_foreach(handle, item, &rand_set);
+                    }
+                }
+                for item in inline {
                     self.apply_packed_bit_foreach(handle, item, &rand_set);
                 }
             }
-            for item in inline {
-                self.apply_packed_bit_foreach(handle, item, &rand_set);
-            }
 
             let mut fe_failed = false;
-            let mut all_ok =
-                self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
+            let mut all_ok = sizes_ok
+                && self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
             // Repairs can overwrite the baseline. Check the implicit enum
             // domain too, including when all explicit constraints are off.
-            for c in &rand_colls {
-                if let Some(tn) = array_enums.get(&c.prop) {
-                    let values: Vec<u64> = self.module.enum_members[tn]
-                        .iter()
-                        .map(|m| m.1)
-                        .collect();
-                    for key in self.coll_elem_keys(c) {
-                        if !self
-                            .read_coll_elem(&key)
-                            .and_then(|v| v.to_u64())
-                            .is_some_and(|v| values.contains(&v))
-                        {
-                            all_ok = false;
-                            fe_failed = true;
+            if sizes_ok {
+                for c in &rand_colls {
+                    if let Some(tn) = array_enums.get(&c.prop) {
+                        let values: Vec<u64> =
+                            self.module.enum_members[tn].iter().map(|m| m.1).collect();
+                        for key in self.coll_elem_keys(c) {
+                            if !self
+                                .read_coll_elem(&key)
+                                .and_then(|v| v.to_u64())
+                                .is_some_and(|v| values.contains(&v))
+                            {
+                                all_ok = false;
+                                fe_failed = true;
+                            }
                         }
                     }
                 }
@@ -2901,15 +3013,13 @@ impl Simulator {
             if all_ok && !(has_soft && csp_ok) && !self.randomize_budget_exhausted {
                 // SV semantics: randomize() calls post_randomize() on success
                 // (e.g. riscv_instr builds its imm_str / formats operands here).
-                if has_post {
-                    self.exec_method_call(handle, "post_randomize", &[]);
-                }
-                self.this_stack.pop();
-                self.class_context_stack.pop();
-                if has_rand_children {
-                    self.rand_child_snapshots.pop();
-                }
-                return Value::from_u64(1, 32);
+                return self.finish_randomize_success(
+                    handle,
+                    nested_under,
+                    deferred_entry_len,
+                    has_post,
+                    has_rand_children,
+                );
             }
 
             // §18.5: constraints that couple many variables at once (an array
@@ -2921,10 +3031,14 @@ impl Simulator {
             if csp_ok && csp_runs < 8 {
                 // §18.5.8.1: the joint solve sizes an array whose size a
                 // constraint reads itself (`csp_size_phase`).
+                // (A queue of handles whose elements joined the solve as
+                // sub-objects keeps its size: `rand_csp_subs` leaves out one
+                // a constraint sizes.)
                 let sized = rand_colls.iter().any(|c| {
                     c.kind == CollKind::Dyn
-                        && !(sub_objs.is_empty() && Self::csp_size_solved(c, &constraints))
-                });
+                        && !c.is_object_elem
+                        && !Self::csp_size_solved(c, &constraints)
+                }) || self.csp_subs_have_dyn(&sub_objs);
                 csp_runs += 1;
                 // §18.5.4: the first joint solve keeps each dist target in
                 // the item its trial dealt. Repairing the trial's values, it
@@ -2977,28 +3091,13 @@ impl Simulator {
                         if !self.randomize_budget_exhausted
                             && self.sub_object_constraints_ok(handle, &rand_obj_props) =>
                     {
-                        // The joint solve rewrote the sub-objects after
-                        // their own post_randomize ran: run it on the final
-                        // values.
-                        for (_, sub) in &sub_objs {
-                            let cls = self
-                                .heap
-                                .get(*sub)
-                                .and_then(|o| o.as_ref())
-                                .map(|i| i.class_name.clone());
-                            if cls.is_some_and(|c| self.class_has_method(&c, "post_randomize")) {
-                                self.exec_method_call(*sub, "post_randomize", &[]);
-                            }
-                        }
-                        if has_post {
-                            self.exec_method_call(handle, "post_randomize", &[]);
-                        }
-                        self.this_stack.pop();
-                        self.class_context_stack.pop();
-                        if has_rand_children {
-                            self.rand_child_snapshots.pop();
-                        }
-                        return Value::from_u64(1, 32);
+                        return self.finish_randomize_success(
+                            handle,
+                            nested_under,
+                            deferred_entry_len,
+                            has_post,
+                            has_rand_children,
+                        );
                     }
                     rand_csp::CspOutcome::Unsat if !sized && !pinned => {
                         if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -3057,10 +3156,11 @@ impl Simulator {
                 }
             }
 
-            if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                for (name, val) in backup {
-                    inst.properties.insert(name, val);
-                }
+            self.rand_post_deferred.truncate(deferred_trial_mark);
+            if trial + 1 == trials {
+                self.restore_instance_props(handle, backup);
+            } else {
+                prior_props = Some(backup);
             }
         }
 
@@ -3102,10 +3202,96 @@ impl Simulator {
                 self.restore_rand_children(transaction.children);
             }
         }
+        self.rand_post_deferred.truncate(deferred_entry_len);
         self.randc_rollback_all();
         self.this_stack.pop();
         self.class_context_stack.pop();
         Value::zero(32)
+    }
+
+    fn restore_instance_props(&mut self, handle: usize, saved: HashMap<String, Value>) {
+        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            for (name, val) in saved {
+                inst.properties.insert(name, val);
+            }
+        }
+    }
+
+    fn append_unique_colls(
+        constraints: &[ClassConstraint],
+        rand_colls: &[RandColl],
+        out: &mut Vec<(Vec<RandColl>, Vec<String>)>,
+    ) {
+        fn walk(item: &ConstraintItem, groups: &mut Vec<Vec<String>>) {
+            match item {
+                ConstraintItem::Unique { exprs, .. } => {
+                    let mut group = Vec::new();
+                    for e in exprs {
+                        if let ExprKind::Ident(h) = &e.kind {
+                            if let Some(s) = h.path.last() {
+                                group.push(s.name.name.clone());
+                            }
+                        }
+                    }
+                    groups.push(group);
+                }
+                ConstraintItem::Block(items) => {
+                    for i in items {
+                        walk(i, groups);
+                    }
+                }
+                ConstraintItem::Soft(i) => walk(i, groups),
+                _ => {}
+            }
+        }
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for con in constraints {
+            for it in &con.items {
+                walk(it, &mut groups);
+            }
+        }
+        for g in groups {
+            let mut cs: Vec<RandColl> = Vec::new();
+            let mut scalars: Vec<String> = Vec::new();
+            for n in g {
+                match rand_colls.iter().find(|c| c.prop == n) {
+                    Some(c) => cs.push(c.clone()),
+                    None => scalars.push(n),
+                }
+            }
+            if !cs.is_empty() {
+                out.push((cs, scalars));
+            }
+        }
+    }
+
+    fn finish_randomize_success(
+        &mut self,
+        handle: usize,
+        nested_under: usize,
+        deferred_entry_len: usize,
+        has_post: bool,
+        has_rand_children: bool,
+    ) -> Value {
+        if nested_under == 0 {
+            // Drain deferred child post_randomize hooks before our own.
+            let waiting: Vec<usize> = self.rand_post_deferred.drain(deferred_entry_len..).collect();
+            let mut done: HashSet<usize> = HashSet::default();
+            for sub in waiting {
+                if done.insert(sub) {
+                    self.exec_method_call(sub, "post_randomize", &[]);
+                }
+            }
+            if has_post {
+                self.exec_method_call(handle, "post_randomize", &[]);
+            }
+        }
+        self.this_stack.pop();
+        self.class_context_stack.pop();
+        if has_rand_children {
+            self.rand_child_snapshots.pop();
+        }
+        Value::from_u64(1, 32)
     }
 
     /// The trial acceptance judge of `exec_randomize_inner`: every constraint
@@ -3711,6 +3897,12 @@ impl Simulator {
                     .collect()
             })
             .unwrap_or_default();
+        // The objects of the chain above `handle`.
+        let above = self
+            .rand_solve_chain
+            .iter()
+            .position(|&h| h == handle)
+            .unwrap_or(0);
         for sub in self.rand_child_handles(handle, obj_props) {
             if off.contains(&sub) {
                 continue;
@@ -3758,6 +3950,24 @@ impl Simulator {
             );
             let mut ok = true;
             for item in &items {
+                // §18.5.9: an item that reads an enclosing object's rand
+                // variable through a handle back to it was left out of the
+                // sub-object's own solve, so this check is the one that
+                // enforces it — a `foreach` too, which no solver arm of the
+                // sub-object covered. An object above `handle` in the chain
+                // has not drawn its final values yet; its own check judges
+                // the item.
+                let back = self.rand_item_reads_enclosing(sub, item, self.rand_solve_chain.len());
+                if back {
+                    if above > 0 && self.rand_item_reads_enclosing(sub, item, above) {
+                        continue;
+                    }
+                    if !self.check_back_reference_item(sub, item) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
                 if Self::constraint_unmodeled(item) {
                     continue;
                 }
@@ -3907,17 +4117,15 @@ impl Simulator {
                 }
             }
         }
-        let mut full: Option<HashMap<String, Value>> = None;
-        let mut ev = |e: &Expression| -> Option<i64> {
+        let ev = |e: &Expression| -> Option<i64> {
             if let Some(v) = super::elaborate::const_eval_i64_with_params(e, Some(&m)) {
                 return Some(v);
             }
-            let f = full.get_or_insert_with(|| {
-                let mut f = self.module.parameters.clone();
-                f.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
-                f
-            });
-            super::elaborate::const_eval_i64_with_params(e, Some(f))
+            let f = super::elaborate::ParamEnv::Overlay {
+                base: &self.module.parameters,
+                top: &m,
+            };
+            super::elaborate::const_eval_i64_with_params_env(e, Some(&f))
         };
         dims.iter()
             .map(|d| match d {
@@ -3946,24 +4154,28 @@ impl Simulator {
         else {
             return None;
         };
-        let mut m = self.module.parameters.clone();
+        let mut overrides: HashMap<String, Value> = HashMap::default();
         let mut bound: HashSet<&str> = HashSet::default();
         for c in chain {
             for (pn, _) in &c.param_defaults {
                 if let Some(v) = instance.properties.get(pn)
                     && bound.insert(pn.as_str())
                 {
-                    m.insert(pn.clone(), v.clone());
+                    overrides.insert(pn.clone(), v.clone());
                 }
             }
         }
+        let m = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &overrides,
+        };
         let mut w: u64 = 1;
         for d in dimensions {
             let crate::ast::types::PackedDimension::Range { left, right, .. } = d else {
                 return None;
             };
-            let l = super::elaborate::const_eval_i64_with_params(left, Some(&m))?;
-            let r = super::elaborate::const_eval_i64_with_params(right, Some(&m))?;
+            let l = super::elaborate::const_eval_i64_with_params_env(left, Some(&m))?;
+            let r = super::elaborate::const_eval_i64_with_params_env(right, Some(&m))?;
             w = w.checked_mul(l.abs_diff(r) + 1)?;
         }
         u32::try_from(w).ok().filter(|&w| w > 0)

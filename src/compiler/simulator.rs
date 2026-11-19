@@ -384,7 +384,8 @@ fn method_boost_enabled() -> bool {
 // §26.3: package code reads its own package's parameters, variables and imports, and an
 // inlined package callee its own, ahead of the design's same-named declarations.
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308a;
+// §23.9: a frame local that hides a parameter is not a constant element select.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308f;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1815,7 +1816,8 @@ struct CombEntryCold {
 // read of an unnamed memory cell stays unresolved.
 // §7.2, §7.4.2: a member select through constant element selects of a packed
 // struct is a compiled store.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB044";
+// §23.9: an index naming a frame local that hides a parameter is not constant.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB049";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

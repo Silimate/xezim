@@ -10,12 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* A process whose task calls never wait at one time step (a task that can
-  wait but does not, calling itself or another such task) is reported as a
-  zero-delay loop, naming the process and its source, at
-  `XEZIM_STALL_LIMIT` nested calls or before the native stack runs out. It
-  overflowed the stack and aborted with SIGABRT, with no message about the
-  design.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

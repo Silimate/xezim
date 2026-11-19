@@ -10,12 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* A variable declared inside a process, task or function of an instantiated
-  module whose packed dimension calls a value system function on the
-  instance's parameters (`logic [$clog2(P)-1:0] v;`, `$signed(P)`,
-  `int'(P)`) has this instance's width. It was one bit wide in a process and
-  32 bits wide in a subroutine; a keccak `theta()` sized that way computed
-  every SHA3 digest wrong (§6.20.2, §20.8.1, §23.10).
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

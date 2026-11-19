@@ -81,14 +81,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
-* An `always @*` whose statement starts with a delay or a `wait`
-  (`always @(*) #10 clk <= ~clk;`, the clock generator of the ADI HDL
-  testbenches) waits at `@*` for what that statement reads, as §9.4.2.2
-  says. Its inferred sensitivity came out empty, so the block ran as
-  combinational logic without its event control and spun in delta cycles at
-  one timestamp. A block that suspends is also woken by a nonblocking update
-  of a variable it writes, which lands after it is back at `@*`; a blocking
-  write it makes as it runs still wakes nothing. (Silimate/xezim#303)
 
 **Usability**
 

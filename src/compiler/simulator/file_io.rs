@@ -1752,12 +1752,19 @@ impl Simulator {
                 let Some((radix, digits)) = Self::parse_mem_token(raw_tok, default_radix) else {
                     continue;
                 };
-                if addr >= lo
-                    && addr <= hi
-                    && let Some(id) = self.elem_cell(&mem.base, &mem.indices(addr))
-                {
+                if addr >= lo && addr <= hi {
+                    let idx = mem.indices(addr);
                     let val = Value::from_str_radix(&digits, radix, mem.width);
-                    self.fast_signal_write_id(id, &val);
+                    match self.elem_cell(&mem.base, &idx) {
+                        Some(id) => {
+                            self.fast_signal_write_id(id, &val);
+                        }
+                        // A class property's elements have no cell; they
+                        // are stored by name.
+                        None => {
+                            self.fast_signal_write(&Self::elem_name(&mem.base, &idx), val);
+                        }
+                    }
                     loaded += 1;
                 }
                 addr += step;
@@ -1805,9 +1812,13 @@ impl Simulator {
         };
         let mut out = MemDump::new(lo.into(), if start <= end { 1 } else { -1 }, radix);
         for addr in addrs {
-            let val = match self.elem_cell(&mem.base, &mem.indices(addr)) {
+            let idx = mem.indices(addr);
+            let val = match self.elem_cell(&mem.base, &idx) {
                 Some(id) => self.cell_read(id),
-                None => Value::zero(mem.width),
+                // A class property's elements are stored by name.
+                None => self
+                    .lookup_signal_value(&Self::elem_name(&mem.base, &idx))
+                    .unwrap_or_else(|| Value::zero(mem.width)),
             };
             out.word(addr.into(), &val);
         }

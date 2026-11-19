@@ -331,3 +331,59 @@ endmodule
     );
     assert_eq!(got[4], "T|negative 00 02 03 00");
 }
+
+/// A multidimensional class property is a memory too, through a handle
+/// and as a bare name in a method. Its elements live in the object's
+/// store rather than in signal cells, so a load must reach them and a
+/// write must read them back, not write zeros.
+#[test]
+fn readmem_writemem_multidim_class_property() {
+    let dir = scratch("classprop");
+    let f = |n: &str| dir.join(n).display().to_string();
+    std::fs::write(dir.join("a.hex"), "11 22 33 44\n").unwrap();
+    std::fs::write(dir.join("b.hex"), "55 66 77 88\n").unwrap();
+    let src = r#"
+class C;
+  logic [7:0] mem [2][2];
+  function void ld(string fn);
+    $readmemh(fn, mem);
+  endfunction
+  function void wr(string fn);
+    $writememh(fn, mem);
+  endfunction
+endclass
+module t;
+  logic [7:0] back [2][2];
+  logic [7:0] back2 [2][2];
+  initial begin
+    C c = new;
+    $readmemh("@A@", c.mem);
+    $display("T|load %h %h %h %h", c.mem[0][0], c.mem[0][1], c.mem[1][0], c.mem[1][1]);
+    c.mem[1][1] = 8'h5a;
+    $writememh("@W@", c.mem);
+    $readmemh("@W@", back);
+    $display("T|back %h %h %h %h", back[0][0], back[0][1], back[1][0], back[1][1]);
+    c.ld("@B@");
+    $display("T|method %h %h %h %h", c.mem[0][0], c.mem[0][1], c.mem[1][0], c.mem[1][1]);
+    c.wr("@W2@");
+    $readmemh("@W2@", back2);
+    $display("T|method back %h %h %h %h", back2[0][0], back2[0][1], back2[1][0], back2[1][1]);
+  end
+endmodule
+"#
+    .replace("@A@", &f("a.hex"))
+    .replace("@B@", &f("b.hex"))
+    .replace("@W@", &f("w.hex"))
+    .replace("@W2@", &f("w2.hex"));
+    let got = t_lines(&src);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        got,
+        [
+            "T|load 11 22 33 44",
+            "T|back 11 22 33 5a",
+            "T|method 55 66 77 88",
+            "T|method back 55 66 77 88",
+        ]
+    );
+}

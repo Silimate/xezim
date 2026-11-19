@@ -1760,8 +1760,20 @@ impl Simulator {
                             self.fast_signal_write_id(id, &val);
                         }
                         // A class property's elements have no cell; they
-                        // are stored by name.
+                        // are stored by name, and a 2-state property drops
+                        // X/Z as any write to it does (§6.11.1).
                         None => {
+                            let val = match mem.base.split_once('#') {
+                                Some((h, prop))
+                                    if val.has_xz()
+                                        && h.parse::<usize>().is_ok_and(|h| {
+                                            self.class_prop_two_state(h, prop)
+                                        }) =>
+                                {
+                                    val.to_two_state()
+                                }
+                                _ => val,
+                            };
                             self.fast_signal_write(&Self::elem_name(&mem.base, &idx), val);
                         }
                     }

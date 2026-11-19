@@ -27,15 +27,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
-* A part-select after an index into a multi-dimensional packed array selects
-  whole elements of the next dimension (§7.4.3, §11.5.1): `a[0][5:0]` on
-  `logic [3:0][5:0][7:0] a` is 48 bits. Continuous assignments, compiled
-  `always` blocks and NBAs wrote and read it as 6 bits, and its RHS was
-  evaluated at that width (§11.6.1); this included indexed part-selects,
-  variable indices and an element of an unpacked array. An NBA to a range of
-  the outer dimension (`pv[4:3] <= v` on `logic [5:0][7:0] pv`) wrote 2 bits.
-  The VeeR EH2 interrupt controller's priority tree went x at reset and
-  instruction fetch stalled. (Silimate/xezim#309)
 * `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
   adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
   `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so

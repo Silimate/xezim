@@ -136,14 +136,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
 
-**Performance**
-
-* A read of a packed-struct member below the first level
-  (`hwif_out.REG.field.value`, `decoded_reg_strb.rf.trig_r`) compiles to one
-  range select of the root variable instead of running in the interpreter,
-  as a write to it already did (§7.2). Register blocks read their field
-  storage this way in every flop and read-back mux. (#356)
-
 **Maintenance**
 
 * Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned

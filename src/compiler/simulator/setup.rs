@@ -1482,7 +1482,7 @@ impl Simulator {
                 };
                 ok && self.stmt_is_plain_stimulus(stmt)
             }
-            StatementKind::VarDecl { .. } => true,
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. } => true,
             _ => false,
         }
     }

@@ -335,16 +335,19 @@ endmodule
 /// A multidimensional class property is a memory too, through a handle
 /// and as a bare name in a method. Its elements live in the object's
 /// store rather than in signal cells, so a load must reach them and a
-/// write must read them back, not write zeros.
+/// write must read them back, not write zeros. A 2-state (`bit`) property
+/// drops the X/Z digits of a loaded word (§6.11.1).
 #[test]
 fn readmem_writemem_multidim_class_property() {
     let dir = scratch("classprop");
     let f = |n: &str| dir.join(n).display().to_string();
     std::fs::write(dir.join("a.hex"), "11 22 33 44\n").unwrap();
     std::fs::write(dir.join("b.hex"), "55 66 77 88\n").unwrap();
+    std::fs::write(dir.join("c.hex"), "xx 1z 33 44\n").unwrap();
     let src = r#"
 class C;
   logic [7:0] mem [2][2];
+  bit [7:0] bm [2][2];
   function void ld(string fn);
     $readmemh(fn, mem);
   endfunction
@@ -355,6 +358,7 @@ endclass
 module t;
   logic [7:0] back [2][2];
   logic [7:0] back2 [2][2];
+  logic [7:0] back3 [2][2];
   initial begin
     C c = new;
     $readmemh("@A@", c.mem);
@@ -368,11 +372,18 @@ module t;
     c.wr("@W2@");
     $readmemh("@W2@", back2);
     $display("T|method back %h %h %h %h", back2[0][0], back2[0][1], back2[1][0], back2[1][1]);
+    $readmemh("@C@", c.bm);
+    $display("T|bit %h %h %h %h", c.bm[0][0], c.bm[0][1], c.bm[1][0], c.bm[1][1]);
+    $writememh("@W3@", c.bm);
+    $readmemh("@W3@", back3);
+    $display("T|bit back %h %h %h %h", back3[0][0], back3[0][1], back3[1][0], back3[1][1]);
   end
 endmodule
 "#
     .replace("@A@", &f("a.hex"))
     .replace("@B@", &f("b.hex"))
+    .replace("@C@", &f("c.hex"))
+    .replace("@W3@", &f("w3.hex"))
     .replace("@W@", &f("w.hex"))
     .replace("@W2@", &f("w2.hex"));
     let got = t_lines(&src);
@@ -384,6 +395,8 @@ endmodule
             "T|back 11 22 33 5a",
             "T|method 55 66 77 88",
             "T|method back 55 66 77 88",
+            "T|bit 00 10 33 44",
+            "T|bit back 00 10 33 44",
         ]
     );
 }

@@ -521,6 +521,98 @@ fn check_proc_net_assign(
     warns: &mut Vec<String>,
 ) {
     use std::collections::HashSet;
+    let (nets, untyped) = proc_net_targets(ports, items);
+    if nets.is_empty() {
+        return;
+    }
+    let mut flagged: HashSet<String> = HashSet::new();
+    for_each_proc_stmt(items, &mut |stmt| {
+        for_each_proc_assign_lhs(stmt, &mut |lv| {
+            if let Some(b) = base_ident(lv) {
+                if nets.contains(&b) && flagged.insert(b.clone()) {
+                    if !untyped.contains(&b) {
+                        errs.push(format!(
+                            "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
+                             §6.5 — nets need a continuous assignment)",
+                            b
+                        ));
+                    } else if RELAX_UNTYPED_OUTPUT_PORT.get() {
+                        warns.push(format!(
+                            "[xezim][warning] output port '{b}' of module '{module}' has no data \
+                             type, so it is a net (IEEE 1800-2023 §23.2.2.3), and a procedural \
+                             block assigns it (§6.5); taking it as a variable, as if it were \
+                             declared `output logic` (--relax-untyped-output-port)"
+                        ));
+                    } else {
+                        errs.push(format!(
+                            "output port '{b}' of module '{module}' is the target of a \
+                             procedural assignment, but it is a net: its declaration has no \
+                             data type (IEEE 1800-2023 §23.2.2.3), and a net cannot be assigned \
+                             procedurally (§6.5). Declare it `output logic` rather than \
+                             `output`, or pass --relax-untyped-output-port to take it as a \
+                             variable"
+                        ));
+                    }
+                }
+            }
+        });
+    });
+}
+
+/// The ANSI output ports of a module that `--relax-untyped-output-port`
+/// takes as variables: the ports that are nets only because their
+/// declaration has no data type and no net kind (§23.2.2.3), and that a
+/// procedural block assigns (§6.5). Empty when the relaxation is off. The VPI
+/// object model declares these ports as variables, as the warning says
+/// (`output logic`), so `vpiVariables` lists them and `vpiNet` does not.
+pub fn relaxed_untyped_output_ports(
+    ports: &PortList,
+    items: &[ModuleItem],
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if !RELAX_UNTYPED_OUTPUT_PORT.get() {
+        return out;
+    }
+    let (_, untyped) = proc_net_targets(ports, items);
+    if untyped.is_empty() {
+        return out;
+    }
+    for_each_proc_stmt(items, &mut |stmt| {
+        for_each_proc_assign_lhs(stmt, &mut |lv| {
+            if let Some(b) = base_ident(lv) {
+                if untyped.contains(&b) {
+                    out.insert(b);
+                }
+            }
+        });
+    });
+    out
+}
+
+/// Call `f` on the statement of each `always` and `initial` construct, the
+/// procedural blocks whose assignments `check_proc_net_assign` checks.
+fn for_each_proc_stmt(items: &[ModuleItem], f: &mut dyn FnMut(&Statement)) {
+    for it in items {
+        match it {
+            ModuleItem::AlwaysConstruct(a) => f(&a.stmt),
+            ModuleItem::InitialConstruct(i) => f(&i.stmt),
+            _ => {}
+        }
+    }
+}
+
+/// The nets `check_proc_net_assign` checks, and of those the output ports
+/// that are nets only because they have no data type and no net kind.
+/// Nets are the explicit NetDeclarations and the ANSI output ports that
+/// §23.2.2.3 makes nets, less any name a body data declaration redeclares.
+fn proc_net_targets(
+    ports: &PortList,
+    items: &[ModuleItem],
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    use std::collections::HashSet;
     let mut nets: HashSet<String> = HashSet::new();
     // The output ports that are nets because they have no data type and no
     // net kind.
@@ -568,51 +660,12 @@ fn check_proc_net_assign(
             if let ModuleItem::DataDeclaration(d) = it {
                 for dc in &d.declarators {
                     nets.remove(&dc.name.name);
+                    untyped.remove(&dc.name.name);
                 }
             }
         }
     }
-    if nets.is_empty() {
-        return;
-    }
-    let mut flagged: HashSet<String> = HashSet::new();
-    for it in items {
-        let stmt = match it {
-            ModuleItem::AlwaysConstruct(a) => &a.stmt,
-            ModuleItem::InitialConstruct(i) => &i.stmt,
-            ModuleItem::FinalConstruct(_) => continue,
-            _ => continue,
-        };
-        for_each_proc_assign_lhs(stmt, &mut |lv| {
-            if let Some(b) = base_ident(lv) {
-                if nets.contains(&b) && flagged.insert(b.clone()) {
-                    if !untyped.contains(&b) {
-                        errs.push(format!(
-                            "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
-                             §6.5 — nets need a continuous assignment)",
-                            b
-                        ));
-                    } else if RELAX_UNTYPED_OUTPUT_PORT.get() {
-                        warns.push(format!(
-                            "[xezim][warning] output port '{b}' of module '{module}' has no data \
-                             type, so it is a net (IEEE 1800-2023 §23.2.2.3), and a procedural \
-                             block assigns it (§6.5); taking it as a variable, as if it were \
-                             declared `output logic` (--relax-untyped-output-port)"
-                        ));
-                    } else {
-                        errs.push(format!(
-                            "output port '{b}' of module '{module}' is the target of a \
-                             procedural assignment, but it is a net: its declaration has no \
-                             data type (IEEE 1800-2023 §23.2.2.3), and a net cannot be assigned \
-                             procedurally (§6.5). Declare it `output logic` rather than \
-                             `output`, or pass --relax-untyped-output-port to take it as a \
-                             variable"
-                        ));
-                    }
-                }
-            }
-        });
-    }
+    (nets, untyped)
 }
 
 /// Call `f(lvalue, rvalue)` for each procedural blocking/nonblocking assignment.

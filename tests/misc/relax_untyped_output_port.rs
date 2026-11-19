@@ -212,3 +212,99 @@ fn a_strict_run_does_not_reuse_a_relaxed_design() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A VPI library that lists the variables and nets of `t.dut` and prints the
+/// `vpiType` of two of its ports.
+const VPI_LISTER_C: &str = r###"#include <string.h>
+#include "vpi_user.h"
+static void list(const char *what, PLI_INT32 rel, vpiHandle s) {
+    vpiHandle it = vpi_iterate(rel, s), c;
+    while (it && (c = vpi_scan(it)))
+        vpi_printf("VP|%s %s\n", what, vpi_get_str(vpiName, c));
+}
+static void type_of(const char *n) {
+    vpiHandle h = vpi_handle_by_name((PLI_BYTE8 *)n, NULL);
+    vpi_printf("VP|type %s %d\n", n, h ? (int)vpi_get(vpiType, h) : -1);
+}
+static PLI_INT32 ls(PLI_BYTE8 *u) {
+    (void)u;
+    vpiHandle s = vpi_handle_by_name((PLI_BYTE8 *)"t.dut", NULL);
+    if (!s) { vpi_printf("VP|no t.dut\n"); return 0; }
+    list("var", vpiVariables, s);
+    list("net", vpiNet, s);
+    type_of("t.dut.q");
+    type_of("t.dut.v");
+    return 0;
+}
+static void reg(void) {
+    s_vpi_systf_data d;
+    memset(&d, 0, sizeof d);
+    d.type = vpiSysTask;
+    d.tfname = (PLI_BYTE8 *)"$ls";
+    d.calltf = ls;
+    vpi_register_systf(&d);
+}
+void (*vlog_startup_routines[])(void) = {reg, 0};
+"###;
+
+/// The relaxation takes the port as a variable in the VPI object model too:
+/// `vpiVariables` lists `q`, `r` and `cnt` with `v` and `u` (`output logic`),
+/// `vpiNet` lists only the input ports, and `q` has the `vpiType` of `v`.
+#[test]
+fn vpi_sees_a_relaxed_port_as_a_variable() {
+    let d = scratch("vpi");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("ls.c"), VPI_LISTER_C).unwrap();
+    let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
+    let so = d.join("ls.so");
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
+        .args(["-shared", "-fPIC", "-I"])
+        .arg(&include)
+        .arg(d.join("ls.c"))
+        .arg("-o")
+        .arg(&so)
+        .status()
+        .expect("failed to launch cc")
+        .success();
+    assert!(ok, "cc failed");
+    let src = FLOP.replace("  initial begin\n", "  initial #1 $ls;\n  initial begin\n");
+    let so = so.to_str().unwrap().to_string();
+    let (ok, text) = run_in(
+        &d,
+        &src,
+        &[
+            "--no-cache",
+            "--relax-untyped-output-port",
+            "--vpi-lib",
+            &so,
+        ],
+        &[],
+    );
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(ok, "{text}");
+    assert!(text.contains(FLOP_OUT), "{text}");
+    let mut got: Vec<&str> = text.lines().filter(|l| l.starts_with("VP|")).collect();
+    got.sort_unstable();
+    let ty = |n: &str| {
+        got.iter()
+            .find_map(|l| l.strip_prefix(&format!("VP|type t.dut.{n} ")))
+            .unwrap_or("missing")
+            .to_string()
+    };
+    assert_eq!(ty("q"), ty("v"), "{text}");
+    got.retain(|l| !l.starts_with("VP|type "));
+    assert_eq!(
+        got,
+        [
+            "VP|net clk",
+            "VP|net d",
+            "VP|net rst",
+            "VP|var cnt",
+            "VP|var q",
+            "VP|var r",
+            "VP|var u",
+            "VP|var v",
+        ],
+        "{text}"
+    );
+}

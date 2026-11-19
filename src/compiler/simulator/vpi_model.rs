@@ -1738,7 +1738,13 @@ impl<'a> Builder<'a> {
         for p in params {
             self.param_decl(p, false, &ctx);
         }
-        let mut port_decls = self.ansi_ports(ports, &ctx);
+        // `--relax-untyped-output-port` takes these ports as variables.
+        let relaxed = if matches!(def, DefRef::Module(_)) {
+            crate::should_fail_lint::relaxed_untyped_output_ports(ports, items)
+        } else {
+            Default::default()
+        };
+        let mut port_decls = self.ansi_ports(ports, &relaxed, &ctx);
         self.walk_items(items, &ctx, &mut port_decls);
         // §23.11: instances `bind` adds to this one, connected in its scope.
         let binds: Vec<(&'a BindDirective, u32)> = self
@@ -2670,7 +2676,15 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn ansi_ports(&mut self, ports: &'a PortList, ctx: &Ctx) -> Vec<PortDecl> {
+    /// `relaxed` names the output ports `--relax-untyped-output-port` takes
+    /// as variables (`relaxed_untyped_output_ports`): declared with no data
+    /// type, they would otherwise be nets (§23.2.2.3).
+    fn ansi_ports(
+        &mut self,
+        ports: &'a PortList,
+        relaxed: &std::collections::HashSet<String>,
+        ctx: &Ctx,
+    ) -> Vec<PortDecl> {
         let mut out = Vec::new();
         let PortList::Ansi(list) = ports else {
             return out;
@@ -2725,7 +2739,7 @@ impl<'a> Builder<'a> {
             let explicit_type = !matches!(dt, None | Some(DataType::Implicit { .. }));
             let nt = match net_type {
                 Some(nt) => Self::net_type_code(nt),
-                None if var_kw => 0,
+                None if var_kw || relaxed.contains(&p.name.name) => 0,
                 None if self.port_is_net(dir, &t, explicit_type) => c::WIRE,
                 None => 0,
             };

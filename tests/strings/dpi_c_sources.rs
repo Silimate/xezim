@@ -21,11 +21,16 @@ fn write(dir: &Path, name: &str, text: &str) {
 
 /// Run xezim in `dir` with its DPI cache under `dir/cache`.
 fn run(dir: &Path, args: &[&str]) -> (Output, String) {
+    run_with_cache(dir, &dir.join("cache"), args)
+}
+
+/// Run xezim in `dir` with its DPI cache under `cache`.
+fn run_with_cache(dir: &Path, cache: &Path, args: &[&str]) -> (Output, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args(["--no-cache"])
         .args(args)
         .current_dir(dir)
-        .env("XEZIM_CACHE_DIR", dir.join("cache"))
+        .env("XEZIM_CACHE_DIR", cache)
         .output()
         .expect("failed to run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -47,6 +52,20 @@ fn built_libraries(dir: &Path) -> usize {
 fn cc() -> String {
     std::env::var("CC").unwrap_or_else(|_| "clang".to_string())
 }
+
+/// Build `dir/libmodel.a` holding `int model(int a, int b) { return <body>; }`.
+fn model_archive(dir: &Path, body: &str) {
+    write(dir, "model.c", &format!("int model(int a, int b) {{ return {body}; }}\n"));
+    let ok = |c: &mut Command| c.current_dir(dir).status().is_ok_and(|s| s.success());
+    assert!(ok(Command::new(cc()).args(["-fPIC", "-c", "model.c", "-o", "model.o"])));
+    let _ = std::fs::remove_file(dir.join("libmodel.a"));
+    let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
+    assert!(ok(Command::new(ar).args(["rcs", "libmodel.a", "model.o"])));
+}
+
+/// A C source that calls `model` from an archive named in `-LDFLAGS`.
+const MODEL_ADD_C: &str =
+    "int model(int a, int b);\nint c_add(int a, int b) { return model(a, b); }\n";
 
 const ADD_SV: &str = r#"
 module t;
@@ -164,21 +183,14 @@ endmodule
 }
 
 /// A library named in `-LDFLAGS` is not in the cache key, so the library is
-/// linked again on every run: an edit to that archive reaches the next run.
-/// The C source's object is compiled once.
+/// linked again on every run: an edit to that archive reaches the next run,
+/// in a library of its own. The C source's object is compiled once.
 #[test]
 fn ldflags_archive_edit_reaches_the_next_run() {
     let d = scratch("ldflags");
-    write(&d, "add.c", "int model(int a, int b);\nint c_add(int a, int b) { return model(a, b); }\n");
+    write(&d, "add.c", MODEL_ADD_C);
     write(&d, "t.sv", ADD_SV);
-    let archive = |body: &str| {
-        write(&d, "model.c", &format!("int model(int a, int b) {{ return {body}; }}\n"));
-        let ok = |c: &mut Command| c.current_dir(&d).status().is_ok_and(|s| s.success());
-        assert!(ok(Command::new(cc()).args(["-fPIC", "-c", "model.c", "-o", "model.o"])));
-        let _ = std::fs::remove_file(d.join("libmodel.a"));
-        let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
-        assert!(ok(Command::new(ar).args(["rcs", "libmodel.a", "model.o"])));
-    };
+    let archive = |body: &str| model_archive(&d, body);
     let objects = || -> Vec<(PathBuf, std::time::SystemTime)> {
         let rd = std::fs::read_dir(d.join("cache").join("xezim").join("dpi")).unwrap();
         rd.flatten()
@@ -195,10 +207,55 @@ fn ldflags_archive_edit_reaches_the_next_run() {
     let (out, text) = run(&d, &["-LDFLAGS", "./libmodel.a", "add.c", "t.sv"]);
     assert!(out.status.success(), "{text}");
     assert!(text.contains("sum=105"), "the edited archive was not linked: {text}");
-    assert_eq!(built_libraries(&d), 1, "{text}");
+    assert_eq!(built_libraries(&d), 2, "{text}");
     assert_eq!(first.len(), 1);
     assert_eq!(objects(), first, "the unchanged source was compiled again");
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Two directories with the same C source and `-LDFLAGS` text but their own
+/// `./libmodel.a` have the same cache key. The second run must not replace
+/// the library the first one loads, which a concurrent first run would then
+/// load with the other model in it: each linked library has its own path,
+/// and linking the same bytes again reuses it.
+#[test]
+fn ldflags_builds_of_one_key_keep_their_own_libraries() {
+    let base = scratch("ldflags_dirs");
+    let cache = base.join("cache");
+    let (a, b) = (base.join("a"), base.join("b"));
+    for (dir, body) in [(&a, "a + b"), (&b, "a + b + 100")] {
+        std::fs::create_dir_all(dir).unwrap();
+        write(dir, "add.c", MODEL_ADD_C);
+        write(dir, "t.sv", ADD_SV);
+        model_archive(dir, body);
+    }
+    let libraries = || -> Vec<(String, Vec<u8>)> {
+        let rd = std::fs::read_dir(cache.join("xezim").join("dpi")).unwrap();
+        let mut libs: Vec<(String, Vec<u8>)> = rd
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .filter(|(name, _)| name.ends_with(".so"))
+            .map(|(name, path)| (name, std::fs::read(path).unwrap()))
+            .collect();
+        libs.sort();
+        libs
+    };
+    let args = ["-LDFLAGS", "./libmodel.a", "add.c", "t.sv"];
+    let (out, text) = run_with_cache(&a, &cache, &args);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("sum=5"), "{text}");
+    let first = libraries();
+    assert_eq!(first.len(), 1);
+    let (out, text) = run_with_cache(&b, &cache, &args);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("sum=105"), "{text}");
+    let both = libraries();
+    assert_eq!(both.len(), 2, "the second run replaced the first run's library");
+    assert!(both.contains(&first[0]), "the first run's library changed");
+    let (_, text) = run_with_cache(&a, &cache, &args);
+    assert!(text.contains("sum=5"), "{text}");
+    assert_eq!(libraries(), both, "the same link was not reused");
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// With no cache directory set (`$XEZIM_CACHE_DIR`, `$XDG_CACHE_HOME`,

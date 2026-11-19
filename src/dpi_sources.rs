@@ -19,7 +19,9 @@
 //! files' bytes and the link command. A hit skips the compiler, apart from
 //! the preprocessing pass. `-LDFLAGS` can name files the key does not see
 //! (`./libmodel.a`, a `-l` library on the search path), so with them the
-//! library is linked again on every run, from the cached objects.
+//! library is linked again on every run, from the cached objects, and named
+//! by its own bytes as well as the key: two runs that link different
+//! libraries never share a path.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -291,7 +293,8 @@ fn header_dir(cache: &Path) -> Result<PathBuf, String> {
 /// build. `cflags` go to every compile after xezim's own arguments, so they
 /// can override them (`-O0 -g`); `ldflags` go last on the link. With
 /// `ldflags` the library is linked again every run (they can name files the
-/// key does not cover); the compiled objects are reused either way.
+/// key does not cover) and its path names its bytes too; the compiled
+/// objects are reused either way.
 pub fn build_library(
     inputs: &ForeignInputs,
     cflags: &[String],
@@ -370,6 +373,10 @@ pub fn build_library(
     // library is loaded into xezim, not when it is linked.
     if cfg!(target_os = "macos") {
         link.extend(["-undefined", "dynamic_lookup"].map(OsString::from));
+        // The install name defaults to the output path, which names this
+        // run's build directory; a fixed one keeps the same link's bytes
+        // the same from run to run.
+        link.push("-Wl,-install_name,xezim-dpi.so".into());
     }
     key.text(&display(&link));
     for f in ldflags {
@@ -387,7 +394,7 @@ pub fn build_library(
     let _ = std::fs::remove_dir_all(&build);
     std::fs::create_dir_all(&build)
         .map_err(|e| format!("cannot create {}: {}", build.display(), e))?;
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<PathBuf, String> {
         for (i, (obj, src, lang)) in compiled.iter().enumerate() {
             if obj.is_file() {
                 continue;
@@ -421,11 +428,25 @@ pub fn build_library(
         }
         link.extend(ldflags.iter().map(OsString::from));
         run(&link, "linking the DPI library")?;
+        // With `ldflags`, runs with the same key can link different
+        // libraries (two directories with their own `./libmodel.a`). Each is
+        // named by its bytes as well, so no run replaces the library another
+        // is about to load, and runs that link the same bytes share one.
+        let lib = if ldflags.is_empty() {
+            lib
+        } else {
+            let bytes = std::fs::read(&tmp)
+                .map_err(|e| format!("cannot read the DPI library {}: {}", tmp.display(), e))?;
+            let mut linked = crate::CacheHash::new();
+            linked.bytes(&bytes);
+            cache.join(format!("dpi-{}-{}.so", &key[..24], &linked.finish()[..16]))
+        };
         std::fs::rename(&tmp, &lib)
-            .map_err(|e| format!("cannot move the DPI library to {}: {}", lib.display(), e))
+            .map_err(|e| format!("cannot move the DPI library to {}: {}", lib.display(), e))?;
+        Ok(lib)
     })();
     let _ = std::fs::remove_dir_all(&build);
-    result.map(|()| Some(lib))
+    result.map(Some)
 }
 
 #[cfg(test)]

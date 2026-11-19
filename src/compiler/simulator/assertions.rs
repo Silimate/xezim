@@ -200,13 +200,43 @@ impl Simulator {
         }
     }
 
+    /// §16.8, §16.12, §26.3: the `property_decls` key of the named sequence
+    /// or property a reference names: `name`, or `pkg::name` when it is
+    /// qualified by its package (as written, or as the elaborator spells a
+    /// reference to a name two packages declare), so each package keeps its
+    /// own body.
+    pub(super) fn sva_named_key(&self, e: &Expression) -> Option<String> {
+        let qualified = |pkg: &str, leaf: &str| {
+            let q = format!("{pkg}::{leaf}");
+            self.module.property_decls.contains_key(&q).then_some(q)
+        };
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                match h.path.as_slice() {
+                    [one] => Some(one.name.name.clone()),
+                    [pkg, leaf] => qualified(&pkg.name.name, &leaf.name.name),
+                    _ => None,
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    qualified(&h.path[0].name.name, &member.name)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub(super) fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
         }
         match &e.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                let name = h.path[0].name.name.as_str();
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+                if let Some(key) = self.sva_named_key(e) =>
+            {
+                let name = key.as_str();
                 if self.module.sequences.contains(name)
                     && self
                         .module
@@ -224,12 +254,7 @@ impl Simulator {
             // `s(x, y)`: a named sequence / property with formals — the
             // body with the actuals substituted.
             ExprKind::Call { func, args } => {
-                let name = match &func.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                        Some(h.path[0].name.name.clone())
-                    }
-                    _ => None,
-                };
+                let name = self.sva_named_key(func);
                 if let Some(name) = name {
                     if let Some(body) = self.module.property_decls.get(&name).cloned() {
                         let formals = self
@@ -892,10 +917,12 @@ impl Simulator {
             let node = self.sva_sites[i].node.clone();
             let span_key = self.sva_sites[i].stat_key;
             let attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            let metas = self.sva_take_meta(i, attempts.len());
             let settled = std::mem::take(&mut self.sva_sites[i].settled);
+            let settled_meta = std::mem::take(&mut self.sva_sites[i].settled_meta);
             let prev_active = self.active_sva_site.replace(i);
             // §16.12.14: an abort that settled an attempt after the last tick.
-            self.sva_report_outcomes(i, settled);
+            self.sva_report_outcomes(i, settled, settled_meta);
             if disabled {
                 // Cancelled by the guard, as `sva_cancel_disabled` counts them.
                 let inst = self.sva_sites[i].inst;
@@ -904,12 +931,14 @@ impl Simulator {
                 self.active_sva_site = prev_active;
                 continue;
             }
-            let n_fail = attempts
-                .iter()
-                .filter(|st| Self::sva_fails_at_end(&node, st))
-                .count();
-            for _ in 0..n_fail {
-                self.sva_tally(i, span_key, false);
+            for (st, meta) in attempts.iter().zip(&metas) {
+                if Self::sva_fails_at_end(&node, st) {
+                    if self.vpi_assert_on {
+                        self.vpi_assert_fire(i, vpi_assert::CB_STEP_FAILURE, meta.start_time);
+                        self.vpi_assert_fire(i, vpi_assert::CB_FAILURE, meta.start_time);
+                    }
+                    self.sva_tally(i, span_key, false);
+                }
             }
             self.finished = was_finished;
             self.active_sva_site = prev_active;
@@ -939,7 +968,18 @@ impl Simulator {
         if disabled {
             let inst = self.sva_sites[i].inst;
             self.assert_insts[inst].disabled += self.sva_sites[i].attempts.len() as u64;
+            // IEEE 1800-2017 Clause 39: each attempt `disable iff` discards
+            // is a cbAssertionDisabledEvaluation.
+            if self.vpi_assert_on && !self.sva_sites[i].attempts.is_empty() {
+                let n = self.sva_sites[i].attempts.len();
+                let metas = self.sva_take_meta(i, n);
+                self.sva_sites[i].attempts.clear();
+                for meta in metas {
+                    self.vpi_assert_fire(i, vpi_assert::CB_DISABLED_EVALUATION, meta.start_time);
+                }
+            }
             self.sva_sites[i].attempts.clear();
+            self.sva_sites[i].attempt_meta.clear();
             self.sva_sites[i].matured.clear();
         }
         disabled
@@ -1815,23 +1855,47 @@ impl Simulator {
         let node = self.sva_sites[i].node.clone();
         let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
         let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+        let metas = self.sva_take_meta(i, attempts.len());
         let prev_active = self.active_sva_site.replace(i);
         let prev_scope = self.activation_scope.borrow().clone();
         *self.activation_scope.borrow_mut() = Some(self.sva_sites[i].scope.clone());
         let saved = self.install_preponed(&sampled_ids);
         self.sva_abort_step = true;
         let mut settled = Vec::new();
-        attempts.retain_mut(|st| match self.sva_advance(&node, st) {
-            Some(r) => {
-                settled.push(r);
-                false
+        let mut settled_meta = Vec::new();
+        let mut live_meta = Vec::with_capacity(metas.len());
+        let mut k = 0;
+        attempts.retain_mut(|st| {
+            let meta = metas[k];
+            k += 1;
+            match self.sva_advance(&node, st) {
+                Some(r) => {
+                    settled.push(r);
+                    settled_meta.push(meta);
+                    false
+                }
+                None => {
+                    live_meta.push(meta);
+                    true
+                }
             }
-            None => true,
         });
         self.sva_abort_step = false;
         self.restore_preponed(saved);
         self.sva_sites[i].attempts = attempts;
+        self.sva_sites[i].attempt_meta = live_meta;
+        // The metas of the attempts already settled, in step with them.
+        let n_settled = self.sva_sites[i].settled.len();
+        let now = self.time;
+        self.sva_sites[i].settled_meta.resize(
+            n_settled,
+            SvaAttemptMeta {
+                start_time: now,
+                clock_steps: 0,
+            },
+        );
         self.sva_sites[i].settled.extend(settled);
+        self.sva_sites[i].settled_meta.extend(settled_meta);
         self.sva_sites[i].sampled_ids = sampled_ids;
         self.active_sva_site = prev_active;
         *self.activation_scope.borrow_mut() = prev_scope;
@@ -2094,6 +2158,8 @@ impl Simulator {
             disable,
             fired: false,
             attempts: Vec::new(),
+            attempt_meta: Vec::new(),
+            settled_meta: Vec::new(),
             past_snapshots: HashMap::default(),
             pass_action: a.action.as_deref().cloned(),
             fail_action: a.else_action.as_deref().cloned(),
@@ -2683,7 +2749,7 @@ impl Simulator {
                 self.sva_collect_action_sampled_expr(lvalue, out, sels);
                 self.sva_collect_action_sampled_expr(rvalue, out, sels);
             }
-            SK::VarDecl { declarators, .. } => {
+            SK::VarDecl { declarators, .. } | SK::ParamDecl { declarators, .. } => {
                 for d in declarators {
                     if let Some(init) = &d.init {
                         self.sva_collect_action_sampled_expr(init, out, sels);
@@ -3106,6 +3172,7 @@ impl Simulator {
             // §16.12.14: attempts an abort settled since the last tick come
             // first; a `disable iff` at this tick does not reach them.
             let settled = std::mem::take(&mut self.sva_sites[i].settled);
+            let settled_meta = std::mem::take(&mut self.sva_sites[i].settled_meta);
             // LRM §16.5.1: the referenced-signal ids whose Preponed samples
             // this fire's predicates must read through the sampled-value overlay.
             let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
@@ -3134,27 +3201,58 @@ impl Simulator {
             if self.sva_cancel_disabled(i) {
                 self.assert_insts[inst].disabled += fresh;
                 self.sva_sites[i].sampled_ids = sampled_ids;
-                self.sva_report_outcomes(i, settled);
+                self.sva_report_outcomes(i, settled, settled_meta);
                 self.active_sva_site = prev_active;
                 *self.activation_scope.borrow_mut() = prev_activation_scope;
                 continue;
             }
-            let saved = self.install_preponed(&sampled_ids);
-            let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            let new_meta = SvaAttemptMeta {
+                start_time: self.time,
+                clock_steps: 0,
+            };
+            // Attempts restored from a checkpoint have no meta; pad into
+            // lockstep before pushing the tick's new attempts.
+            let n = self.sva_sites[i].attempts.len();
+            if self.sva_sites[i].attempt_meta.len() != n {
+                let padded = self.sva_take_meta(i, n);
+                self.sva_sites[i].attempt_meta = padded;
+            }
+            let mut started = 0usize;
             if self.sva_sites[i].procedural {
                 // §16.14.6: one attempt per matured instance, none otherwise.
                 for env in std::mem::take(&mut self.sva_sites[i].matured) {
                     if starts {
-                        attempts.push(Self::sva_new_state(&node, &env));
+                        let st = Self::sva_new_state(&node, &env);
+                        self.sva_sites[i].attempts.push(st);
+                        self.sva_sites[i].attempt_meta.push(new_meta);
+                        started += 1;
                     }
                 }
             } else if starts {
-                attempts.push(Self::sva_new_state(&node, &self.sva_sites[i].lv_init));
+                let st = Self::sva_new_state(&node, &self.sva_sites[i].lv_init);
+                self.sva_sites[i].attempts.push(st);
+                self.sva_sites[i].attempt_meta.push(new_meta);
+                started = 1;
             }
+            // IEEE 1800-2017 Clause 39: report Start where a new attempt is
+            // pushed, before advancing it, so Kill/Reset in the callback can
+            // discard even a single-cycle attempt.
+            if self.vpi_assert_on {
+                for _ in 0..started {
+                    self.vpi_assert_fire(i, vpi_assert::CB_START, new_meta.start_time);
+                }
+            }
+            let saved = self.install_preponed(&sampled_ids);
+            let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            let mut metas = self.sva_take_meta(i, attempts.len());
             let mut results: Vec<SvaOutcome> = settled;
+            let mut result_meta: Vec<SvaAttemptMeta> = settled_meta;
+            result_meta.resize(results.len(), new_meta);
             let mut live: Vec<SvaState> = Vec::with_capacity(attempts.len());
+            let mut live_meta: Vec<SvaAttemptMeta> = Vec::with_capacity(attempts.len());
             let all_matches = self.sva_sites[i].all_matches;
-            for mut st in attempts.drain(..) {
+            for (mut st, mut meta) in attempts.drain(..).zip(metas.drain(..)) {
+                meta.clock_steps += 1;
                 if all_matches {
                     let step = match (&*node, &mut st) {
                         (SvaNode::Seq(nfa, _), SvaState::Seq(run)) => {
@@ -3165,36 +3263,87 @@ impl Simulator {
                     if let Some((matched, alive)) = step {
                         if !matched.is_empty() {
                             results.push(SvaOutcome::Pass);
+                            result_meta.push(meta);
                         }
                         if alive {
                             live.push(st);
+                            live_meta.push(meta);
                         }
                         continue;
                     }
                 }
                 match self.sva_advance(&node, &mut st) {
-                    Some(r) => results.push(r),
-                    None => live.push(st),
+                    Some(r) => {
+                        results.push(r);
+                        result_meta.push(meta);
+                    }
+                    None => {
+                        live.push(st);
+                        live_meta.push(meta);
+                    }
                 }
             }
             // §16.7: an attempt with a long legal delay remains live;
             // dropping it at a fixed queue depth changes assertion results.
             self.sva_sites[i].attempts = live;
+            self.sva_sites[i].attempt_meta = live_meta;
             self.restore_preponed(saved);
             self.sva_sites[i].sampled_ids = sampled_ids;
-            self.sva_report_outcomes(i, results);
+            // IEEE 1800-2017 Clause 39: with stepping enabled, report attempts
+            // still in flight after advancing; `sva_report_outcomes` reports
+            // the ones it decided.
+            if self.vpi_assert_on {
+                self.vpi_assert_fire_steps(i);
+            }
+            self.sva_report_outcomes(i, results, result_meta);
             self.active_sva_site = prev_active;
             *self.activation_scope.borrow_mut() = prev_activation_scope;
         }
     }
 
+    /// The assertion API data (IEEE 1800-2017 Clause 39) of the `n` attempts
+    /// in flight at site `i`, taken out of the site. An attempt without any
+    /// (one restored from a checkpoint) starts now.
+    pub(super) fn sva_take_meta(&mut self, i: usize, n: usize) -> Vec<SvaAttemptMeta> {
+        let mut metas = std::mem::take(&mut self.sva_sites[i].attempt_meta);
+        metas.resize(
+            n,
+            SvaAttemptMeta {
+                start_time: self.time,
+                clock_steps: 0,
+            },
+        );
+        metas
+    }
+
     /// Tally the attempts of site `i` that ended, and run their actions.
-    fn sva_report_outcomes(&mut self, i: usize, results: Vec<SvaOutcome>) {
+    /// `metas` holds the attempts' assertion API data (IEEE 1800-2017
+    /// Clause 39), in step with `results`.
+    fn sva_report_outcomes(
+        &mut self,
+        i: usize,
+        results: Vec<SvaOutcome>,
+        metas: Vec<SvaAttemptMeta>,
+    ) {
         let span_key = self.sva_sites[i].stat_key;
         let site_loc = self.sva_sites[i].stat_loc;
         let site_kind = self.sva_sites[i].kind;
         let inst = self.sva_sites[i].inst;
-        for r in results {
+        for (k, r) in results.into_iter().enumerate() {
+            // The callback comes before the action block, which may end the
+            // simulation.
+            if self.vpi_assert_on {
+                let start = metas.get(k).map_or(self.time, |m| m.start_time);
+                let reason = match r {
+                    SvaOutcome::Pass => vpi_assert::CB_SUCCESS,
+                    SvaOutcome::Fail => vpi_assert::CB_FAILURE,
+                    SvaOutcome::Vacuous => vpi_assert::CB_VACUOUS_SUCCESS,
+                };
+                if reason == vpi_assert::CB_FAILURE {
+                    self.vpi_assert_fire(i, vpi_assert::CB_STEP_FAILURE, start);
+                }
+                self.vpi_assert_fire(i, reason, start);
+            }
             match r {
                 SvaOutcome::Pass => self.sva_tally(i, span_key, true),
                 SvaOutcome::Fail => self.sva_tally(i, span_key, false),

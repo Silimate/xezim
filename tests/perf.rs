@@ -64,3 +64,14 @@ mod const_index_array_arming;
 
 #[path = "perf/class_aggregate_resolution.rs"]
 mod class_aggregate_resolution;
+
+#[path = "perf/parked_waiter_index.rs"]
+mod parked_waiter_index;
+#[path = "perf/queue_shift_counters.rs"]
+mod queue_shift_counters;
+#[path = "perf/select_store_counters.rs"]
+mod select_store_counters;
+#[path = "perf/timing_check_conditions.rs"]
+mod timing_check_conditions;
+#[path = "perf/struct_formal_member_calls.rs"]
+mod struct_formal_member_calls;

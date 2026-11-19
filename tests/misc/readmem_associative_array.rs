@@ -258,7 +258,11 @@ fn readmem_writemem_index_wider_than_64_bits() {
     let dir = scratch("wider");
     let f = |n: &str| dir.join(n).display().to_string();
     std::fs::write(dir.join("l.hex"), "@10000000000000000\nab cd\n").unwrap();
-    std::fs::write(dir.join("m.hex"), "@7fffffffffffffffffffffffffffffff\naa bb\n").unwrap();
+    std::fs::write(
+        dir.join("m.hex"),
+        "@7fffffffffffffffffffffffffffffff\naa bb\n",
+    )
+    .unwrap();
     let src = r#"
 module t;
   bit [7:0] mx [bit signed [127:0]];

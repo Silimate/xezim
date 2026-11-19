@@ -454,16 +454,61 @@ impl Simulator {
         // downstream cont-assigns (e.g. cr_iu_decd's ill_expt16 always block
         // → decd_ill_expt → decd_special_sel chain). Without this final
         // settle, those cont-assign dependents stay stale until the next
-        // clock tick — symptom: e902 part6 decoder outputs lag a reference simulator by
-        // one cycle on inst-class transitions. settle alone is sufficient
-        // (no further check_edges); the always-block sens lists read from
-        // signals already captured in the loop's last snapshot, so they
-        // wouldn't re-trigger anyway.
+        // clock tick — symptom: e902 part6 decoder outputs lag a reference
+        // simulator by one cycle on inst-class transitions.
+        //
+        // This settle is NOT always the last word, though: it can itself
+        // change an edge-sensitive signal — e.g. a chained
+        // `always @(n0.f or n0.v) m1=n0.f;` then `always @(n1.f or n1.v) m2=n1.f;`
+        // with n0/n1 continuous assigns, where n1.f settles from 1.25 to 2.75
+        // only in this final propagation and the downstream relay must
+        // re-evaluate (issue #1239). Re-enter the settle→detect→dispatch
+        // cycle below if this settle was non-trivial, so such a relay fires in
+        // the same delta — otherwise n2 would stay stale until the next tick.
+        // Capture the trigger BEFORE the settle: if the cascade exited
+        // (break 1) with an edge-block's blocking-write still unsettled,
+        // `dirty_any` is true here, and the settle below drains it — possibly
+        // changing an edge signal in the process.
+        let dirt_before_final = self.dirty_any;
         if self.dirty_any {
             let t0 = self.profile_timing.then(std::time::Instant::now);
             self.settle_combinatorial();
             if let Some(t) = t0 {
                 t_settle += t.elapsed().as_nanos() as u64;
+            }
+        }
+        // §9.2 tail (see the rationale above): no check_edges runs after the
+        // final settle, so an edge signal it moves would go undelivered until
+        // the next tick. Re-enter settle→detect→dispatch (bounded) so the
+        // downstream relay re-evaluates in this same delta.
+        //
+        // Mode-agnostic: in dirty-edge mode the continuous-assign write also
+        // lands in `changed_edge_pos`; in full-scan mode the re-check
+        // full-scans (already that mode's per-iteration cost).
+        if dirt_before_final {
+            // Re-enter settle→detect→dispatch while the final settle keeps
+            // moving an edge signal. Each round may fire a relay whose
+            // blocking write lands in the next settle, which in turn changes
+            // the NEXT relay's input — so continue until a round produces no
+            // new edge fires and leaves nothing new to settle. Bounded against
+            // a zero-delay livelock.
+            let mut tail_guard = 0u32;
+            loop {
+                let eb = self.prof_edges_fired;
+                self.check_edges();
+                if self.dirty_any {
+                    self.settle_combinatorial();
+                }
+                tail_guard += 1;
+                if tail_guard >= 64 || self.finished {
+                    break;
+                }
+                let progressed = self.prof_edges_fired != eb
+                    || self.dirty_any
+                    || !self.changed_edge_pos.is_empty();
+                if !progressed {
+                    break;
+                }
             }
         }
         (t_snap, t_nba, t_settle, t_edges)
@@ -1369,7 +1414,7 @@ impl Simulator {
         }
         // Blocked on @(...) — if it is also a top spinner, something keeps
         // re-triggering it at this timestamp.
-        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+        if let Some(w) = self.event_waiters.first_of_pid(pid) {
             let sens = w
                 .resolved_sensitivities
                 .iter()
@@ -3075,6 +3120,13 @@ impl Simulator {
             self.cond_waiter_rechecks
         );
         chatter!("[PROF] vm_direct_calls={}", self.vm_direct_calls);
+        chatter!("[PROF] queue_elem_moves={}", self.queue_elem_moves);
+        chatter!(
+            "[PROF] timing_conds compiled={} interpreted={}",
+            self.timing_cond_evals[0],
+            self.timing_cond_evals[1]
+        );
+        chatter!("[PROF] select_store_copies={}", self.select_store_copies);
         chatter!("[PROF] local_meta_reapplies={}", self.local_meta_reapplies);
         chatter!(
             "[PROF] local_meta_swaps={} local_meta_scans={}",
@@ -3086,6 +3138,10 @@ impl Simulator {
             self.prof_edge_waiters as f64 / 1e6,
             self.prof_edge_cg as f64 / 1e6,
             self.prof_waiter_iters
+        );
+        chatter!(
+            "[PROF] implicit_net_scope_steps={}",
+            initialization::IMPLICIT_NET_SCOPE_STEPS.load(std::sync::atomic::Ordering::Relaxed)
         );
         chatter!(
             "[PROF] clocks_only_detect={} nba_elided={} (iters with clocks-only scan / NBAs dropped at eval because value matched signal_table)",

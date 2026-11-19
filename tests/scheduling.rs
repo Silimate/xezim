@@ -520,3 +520,20 @@ mod instance_array_member_reads_1108;
 mod instance_array_member_arrays_1108;
 #[path = "scheduling/struct_array_actual_paths_1110.rs"]
 mod struct_array_actual_paths_1110;
+
+#[path = "scheduling/pattern_nba_1199.rs"]
+mod pattern_nba_1199;
+#[path = "scheduling/event_call_operands_1205.rs"]
+mod event_call_operands_1205;
+
+#[path = "scheduling/array_capture_1217.rs"]
+mod array_capture_1217;
+#[path = "scheduling/intra_delay_pattern_item_width.rs"]
+mod intra_delay_pattern_item_width;
+
+#[path = "scheduling/parked_waiter_signal_index.rs"]
+mod parked_waiter_signal_index;
+#[path = "scheduling/replication_pattern_capture.rs"]
+mod replication_pattern_capture;
+#[path = "scheduling/nettype_relay_chain_1239.rs"]
+mod nettype_relay_chain_1239;

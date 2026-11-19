@@ -329,3 +329,84 @@ endmodule
         ]
     );
 }
+
+/// An unsigned 128-bit index type keeps its keys above `i128::MAX` (§21.4,
+/// §21.5, §7.8). An array holding only key 2^127 dumped nothing, since the
+/// key read back as a negative address outside the default range. Now its
+/// dump holds the key, a dump of the whole array and of a range reads back,
+/// a start address and a file address at or past 2^127 load there, and a
+/// load that reaches the largest key ends there. Verilator 5.046 does not
+/// build `$readmem*`/`$writemem*` on an index type wider than 64 bits, so
+/// the values follow §21.4 and §21.5.
+#[test]
+fn readmem_writemem_unsigned_128_bit_index() {
+    let dir = scratch("u128");
+    let f = |n: &str| dir.join(n).display().to_string();
+    std::fs::write(
+        dir.join("h.hex"),
+        "@ffffffffffffffffffffffffffffffff\naa bb\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("b.hex"), "aa bb\n").unwrap();
+    std::fs::write(dir.join("m.hex"), "@80000000000000000000000000000001\ncc\n").unwrap();
+    let src = r#"
+module t;
+  typedef bit [127:0] k_t;
+  localparam k_t TOP = 128'h8000_0000_0000_0000_0000_0000_0000_0000;
+  localparam k_t MAX = 128'hffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+  bit [7:0] one [k_t];
+  bit [7:0] oner [k_t];
+  bit [7:0] um [k_t];
+  bit [7:0] ur [k_t];
+  bit [7:0] rg [k_t];
+  bit [7:0] uh [k_t];
+  bit [7:0] us [k_t];
+  bit [7:0] uf [k_t];
+  initial begin
+    one[TOP] = 8'h5a;
+    $writememh("@ONE@", one);
+    $readmemh("@ONE@", oner);
+    $display("T|one num=%0d %h", oner.num(), oner[TOP]);
+    um[1] = 8'h11;
+    um[TOP] = 8'h22;
+    um[MAX] = 8'h33;
+    $writememh("@UW@", um);
+    $readmemh("@UW@", ur);
+    $display("T|all num=%0d %h %h %h", ur.num(), ur[1], ur[TOP], ur[MAX]);
+    $writememh("@RG@", um, TOP, MAX);
+    $readmemh("@RG@", rg);
+    $display("T|range num=%0d %h %h", rg.num(), rg[TOP], rg[MAX]);
+    $readmemh("@H@", uh);
+    $display("T|top num=%0d %h", uh.num(), uh[MAX]);
+    $readmemh("@B@", us, TOP - 1);
+    $display("T|start num=%0d %h %h", us.num(), us[TOP - 1], us[TOP]);
+    $readmemh("@M@", uf);
+    $display("T|file num=%0d %h", uf.num(), uf[TOP + 1]);
+  end
+endmodule
+"#
+    .replace("@ONE@", &f("one.hex"))
+    .replace("@UW@", &f("uw.hex"))
+    .replace("@RG@", &f("rg.hex"))
+    .replace("@H@", &f("h.hex"))
+    .replace("@B@", &f("b.hex"))
+    .replace("@M@", &f("m.hex"));
+    let got = t_lines(&src);
+    let one = std::fs::read_to_string(dir.join("one.hex")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        one.contains("@80000000000000000000000000000000") && one.contains("5a"),
+        "{one:?}"
+    );
+    assert_eq!(
+        got,
+        [
+            "T|one num=1 5a",
+            "T|all num=3 11 22 33",
+            "T|range num=2 22 33",
+            "T|top num=1 aa",
+            "T|start num=2 aa bb",
+            "T|file num=1 cc",
+        ]
+    );
+}

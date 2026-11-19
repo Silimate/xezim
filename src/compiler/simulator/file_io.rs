@@ -10,7 +10,7 @@ pub(super) struct MemoryTaskTarget {
     /// An unpacked memory's declared `(left, right)` address bounds; for an
     /// associative array, the least and greatest address its index type
     /// holds. Wide enough for every address of a 64-bit index type, signed
-    /// or unsigned.
+    /// or unsigned; for an unsigned index type of 128 bits, in `bias` order.
     lo: i128,
     hi: i128,
     /// Element width.
@@ -18,9 +18,21 @@ pub(super) struct MemoryTaskTarget {
     /// An associative array with an integral index type, its elements keyed
     /// by address.
     assoc: bool,
-    /// The index type's width (at most 64) and signedness, for an
+    /// The index type's width (at most 128) and signedness, for an
     /// associative array.
     key: (u32, bool),
+    /// 2^127 for an unsigned index type of 128 bits, whose keys run past
+    /// `i128::MAX`, else 0. The bounds and the addresses a load or a dump
+    /// steps through are an address's bits flipped by it ([`key_order`]),
+    /// which puts the keys in `i128` order.
+    bias: u128,
+}
+
+/// An address's bits, as `i128`, to the order of a [`MemoryTaskTarget`]
+/// with `bias`, and back: an unsigned 128-bit key `k` is kept as
+/// `k - 2^127`, so 0 is `i128::MIN` and `u128::MAX` is `i128::MAX`.
+fn key_order(addr: i128, bias: u128) -> i128 {
+    (addr as u128 ^ bias) as i128
 }
 
 impl Simulator {
@@ -1062,6 +1074,7 @@ impl Simulator {
                     width,
                     assoc: false,
                     key: (64, true),
+                    bias: 0,
                 });
             }
         }
@@ -1116,13 +1129,16 @@ impl Simulator {
         let width = self.assoc_elem_width(&name)?;
         // The addresses the index type can hold: all of a `longint` or a
         // `bit [63:0]`, unsigned ones above `i64::MAX` too, and every key of
-        // a wider index type up to 127 bits (128 if signed). A wider one
-        // still is addressed through its low 127 or 128 bits.
-        let kw = kw.clamp(1, if signed { 128 } else { 127 });
-        let (lo, hi) = if signed {
-            (i128::MIN >> (128 - kw), i128::MAX >> (128 - kw))
+        // a wider index type up to 128 bits. A wider one still is addressed
+        // through its low 128 bits. The unsigned 128-bit keys are all of
+        // `u128`, kept in `bias` order.
+        let kw = kw.clamp(1, 128);
+        let (lo, hi, bias) = if signed {
+            (i128::MIN >> (128 - kw), i128::MAX >> (128 - kw), 0)
+        } else if kw == 128 {
+            (i128::MIN, i128::MAX, 1 << 127)
         } else {
-            (0, i128::MAX >> (127 - kw))
+            (0, i128::MAX >> (127 - kw), 0)
         };
         Some(MemoryTaskTarget {
             name,
@@ -1131,6 +1147,7 @@ impl Simulator {
             width,
             assoc: true,
             key: (kw, signed),
+            bias,
         })
     }
 
@@ -1165,7 +1182,8 @@ impl Simulator {
     /// own two's complement (`@ffffffff` for an `int` index) is -1 too. An
     /// index type wider than 64 bits holds `@ffffffffffffffff` as a key of
     /// its own, so there a negative address is its 128-bit two's complement
-    /// or the index type's own.
+    /// or the index type's own. An unsigned 128-bit key above `i128::MAX`
+    /// comes back as its bits, which [`key_order`] puts in order.
     fn memory_file_address(hex: &str, key: (u32, bool)) -> Option<i128> {
         let a = u128::from_str_radix(hex, 16).ok()?;
         let (kw, signed) = key;
@@ -1201,16 +1219,15 @@ impl Simulator {
     fn assoc_memory_store(&mut self, name: &str, addr: i128, mut val: Value) -> bool {
         // Two's complement bits of a negative address, and an unsigned one
         // above `i64::MAX` as it is: the key text takes the index type. An
-        // index type wider than 64 bits takes all 128 bits of the address.
-        let mut key = if self
-            .assoc_index_width_for(name)
-            .is_some_and(|(kw, _)| kw > 64)
-        {
+        // index type wider than 64 bits takes all 128 bits of the address,
+        // which are an unsigned key's own even with the top one set.
+        let (kw, signed) = self.assoc_index_width_for(name).unwrap_or((64, true));
+        let mut key = if kw > 64 {
             Value::from_u128(addr as u128, 128)
         } else {
             Value::from_u64(addr as u64, 64)
         };
-        key.is_signed = addr < 0;
+        key.is_signed = signed && addr < 0;
         let elem = Self::name_with_key(name, &self.assoc_key_str(name, &key));
         if let Some(signed) = self.assoc_elem_signed(name) {
             val.is_signed = signed;
@@ -1368,19 +1385,26 @@ impl Simulator {
             width,
             assoc,
             key,
+            bias,
         }) = self.memory_task_target(task, &args[1])
         else {
             return Value::zero(32);
         };
         // §21.4: with no start address, loading begins at the memory's left
         // bound; an associative array has none and begins at address 0.
-        let first = if assoc { 0 } else { lo };
+        let first = if assoc { key_order(0, bias) } else { lo };
         let mut addr = match args.get(2) {
-            Some(a) => self.memory_task_address(a).unwrap_or(first),
+            Some(a) => self
+                .memory_task_address(a)
+                .map(|a| key_order(a, bias))
+                .unwrap_or(first),
             None => first,
         };
         let end_addr = match args.get(3) {
-            Some(a) => self.memory_task_address(a).unwrap_or(hi),
+            Some(a) => self
+                .memory_task_address(a)
+                .map(|a| key_order(a, bias))
+                .unwrap_or(hi),
             None => hi,
         };
         let step: i128 = if addr <= end_addr { 1 } else { -1 };
@@ -1424,7 +1448,7 @@ impl Simulator {
                 if let Some(rest) = raw_tok.strip_prefix('@') {
                     let addr_hex = rest.trim_start_matches("0x").trim_start_matches("0X");
                     if let Some(a) = Self::memory_file_address(addr_hex, key) {
-                        addr = a;
+                        addr = key_order(a, bias);
                     }
                     continue;
                 }
@@ -1434,7 +1458,8 @@ impl Simulator {
                 if addr >= min_idx && addr <= max_idx {
                     let val = Value::from_str_radix(&digits, radix, width);
                     if assoc {
-                        assoc_changed |= self.assoc_memory_store(&mem_name, addr, val);
+                        assoc_changed |=
+                            self.assoc_memory_store(&mem_name, key_order(addr, bias), val);
                     } else if let Some((first_id, arr_lo, arr_hi)) = dense_array {
                         let (arr_lo, arr_hi) = (i128::from(arr_lo), i128::from(arr_hi));
                         if addr >= arr_lo && addr <= arr_hi {
@@ -1517,17 +1542,24 @@ impl Simulator {
             hi,
             width,
             assoc,
+            bias,
             ..
         }) = self.memory_task_target(tn, &args[1])
         else {
             return Value::zero(32);
         };
         let start = match args.get(2) {
-            Some(a) => self.memory_task_address(a).unwrap_or(lo),
+            Some(a) => self
+                .memory_task_address(a)
+                .map(|a| key_order(a, bias))
+                .unwrap_or(lo),
             None => lo,
         };
         let end = match args.get(3) {
-            Some(a) => self.memory_task_address(a).unwrap_or(hi),
+            Some(a) => self
+                .memory_task_address(a)
+                .map(|a| key_order(a, bias))
+                .unwrap_or(hi),
             None => hi,
         };
         let radix: u32 = if tn.ends_with('b') {
@@ -1550,7 +1582,7 @@ impl Simulator {
             for key in self.assoc_top_level_keys_shared(&mem_name).iter() {
                 // The hex digits of a wide key are its index type's bits.
                 let parsed = match wide_key {
-                    Some(kt) => Self::memory_file_address(key, kt),
+                    Some(kt) => Self::memory_file_address(key, kt).map(|a| key_order(a, bias)),
                     None => key.parse::<i128>().ok(),
                 };
                 let Some(addr) = parsed else {
@@ -1569,8 +1601,10 @@ impl Simulator {
                 words.reverse();
             }
             // A load with no start address begins at address 0.
-            let mut out = MemDump::new(0, if start > end { -1 } else { 1 }, radix);
+            let first = key_order(0, bias);
+            let mut out = MemDump::new(first, if start > end { -1 } else { 1 }, radix);
             out.wide = wide_key.is_some();
+            out.bias = bias;
             for (addr, val) in &words {
                 out.word(*addr, val);
             }
@@ -1952,6 +1986,9 @@ struct MemDump {
     /// An associative array's index type is wider than 64 bits: a negative
     /// address is written as its 128-bit two's complement.
     wide: bool,
+    /// The target's `bias`: the addresses given to [`MemDump::word`] are in
+    /// [`key_order`], and written as the key's own bits.
+    bias: u128,
 }
 
 impl MemDump {
@@ -1965,14 +2002,16 @@ impl MemDump {
             radix,
             every: writemem_every_address(),
             wide: false,
+            bias: 0,
         }
     }
 
     fn word(&mut self, addr: i128, val: &Value) {
         if self.every || self.next != Some(addr) {
             self.text.push('@');
+            let key = key_order(addr, self.bias);
             self.text
-                .push_str(&Simulator::memory_file_address_text(addr, self.wide));
+                .push_str(&Simulator::memory_file_address_text(key, self.wide));
             self.text.push(if self.every { ' ' } else { '\n' });
         }
         self.text.push_str(&match self.radix {

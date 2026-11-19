@@ -29,6 +29,8 @@ mod drive_strength_pull;
 mod dump_formats_agree;
 #[path = "gates/dump_merged_sv.rs"]
 mod dump_merged_sv;
+#[path = "gates/dump_qualified_parameters.rs"]
+mod dump_qualified_parameters;
 #[path = "gates/dumpflush.rs"]
 mod dumpflush;
 #[path = "gates/enum_continuous_delay.rs"]
@@ -56,6 +58,8 @@ mod multi_driver_contention;
 mod nameless_udp_instance;
 #[path = "gates/net_declaration_delay.rs"]
 mod net_declaration_delay;
+#[path = "gates/zero_rise_gate_net_delay.rs"]
+mod zero_rise_gate_net_delay;
 #[path = "gates/opt_pass_equivalence.rs"]
 mod opt_pass_equivalence;
 #[path = "gates/packed_member_nba_compiles.rs"]
@@ -74,6 +78,8 @@ mod streaming_op_compiles;
 mod submodule_gate_net_delays;
 #[path = "gates/timing_checks_kinds.rs"]
 mod timing_checks_kinds;
+#[path = "gates/timing_check_condition_x.rs"]
+mod timing_check_condition_x;
 #[path = "gates/timing_checks_notifier.rs"]
 mod timing_checks_notifier;
 #[path = "gates/tran_and_implicit_nets.rs"]
@@ -113,3 +119,12 @@ mod shared_net_driver_stages;
 mod vector_continuous_delay;
 #[path = "gates/review_select_continuous_delay.rs"]
 mod review_select_continuous_delay;
+
+#[path = "gates/ascending_udp_port_1201.rs"]
+mod ascending_udp_port_1201;
+#[path = "gates/delayed_slice_ownership_1215.rs"]
+mod delayed_slice_ownership_1215;
+#[path = "gates/parameter_wave_scope_1213.rs"]
+mod parameter_wave_scope_1213;
+#[path = "gates/package_param_array_wave_scope_1213.rs"]
+mod package_param_array_wave_scope_1213;

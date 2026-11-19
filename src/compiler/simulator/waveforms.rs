@@ -217,8 +217,14 @@ impl Simulator {
         let top_dot = format!("{}.", top);
         let mut out = Vec::with_capacity(scopes.len());
         for s in scopes {
+            if s.is_empty() {
+                continue;
+            }
             if s == top {
-                return None;
+                // §21.7.1.2: depth applies independently to every scope.
+                // Keep the root alongside descendants instead of dropping them.
+                out.push(String::new());
+                continue;
             }
             out.push(
                 s.strip_prefix(top_dot.as_str())
@@ -321,6 +327,9 @@ impl Simulator {
         match filters {
             None => level_ok(name),
             Some(fs) => fs.iter().any(|f| {
+                if f.is_empty() {
+                    return level_ok(name);
+                }
                 if name == f.as_str() {
                     return true;
                 }
@@ -510,11 +519,67 @@ impl Simulator {
         }
 
         let mut out: Vec<String> = Vec::new();
+        // Imported parameters are lookup aliases, not declarations in this
+        // module (§26.3). Keep local declarations, including their elements.
+        // A package's parameters are registered design-wide under their bare
+        // names too, imported or not: `LIM[0]` of `other::LIM` reached only
+        // as `other::LIM[1]` (#1213). Such a bare name is the package's
+        // unless this module declares it itself (shadowing a wildcard
+        // import, or colliding with a package it never imported).
+        let package_params: HashSet<&str> = self
+            .module
+            .parameters
+            .keys()
+            .chain(self.module.param_decl_types.keys())
+            .filter_map(|k| {
+                let (pkg, rest) = k.split_once("::")?;
+                let leaf = rest.split(['[', '.']).next()?;
+                (self.module.packages.contains(pkg) && !leaf.contains(':')).then_some(leaf)
+            })
+            .collect();
+        let package_param = |base: &str| {
+            package_params.contains(base)
+                && !self.module.wildcard_shadowed.contains(base)
+                && !self.module.foreign_package_names.contains(base)
+        };
+        let parameter_alias = |name: &str| {
+            let mut base = name;
+            let mut alias = false;
+            loop {
+                if self.module.declared_parameters.contains(base) {
+                    return false;
+                }
+                if self.module.parameters.contains_key(base)
+                    || self.module.param_decl_types.contains_key(base)
+                    || package_param(base)
+                {
+                    alias = true;
+                }
+                let Some(end) = base.rfind(['[', '.']) else { return alias; };
+                base = &base[..end];
+            }
+        };
         let keep = |name: &str| -> bool {
             !(name.is_empty()
+                || parameter_alias(name)
                 || enum_lits.contains(name)
                 || scope_names.contains(name)
                 || expanded_bases.contains(name)
+                // Syntax 21-20 (§21.7.2.1) uses reference identifiers (§5.6),
+                // naming the variable in its model scope (§21.7.2.3 d)).
+                // Check the exact parameter key: a same-named variable can
+                // change an alias's dump kind. After the last ::, a dot
+                // keeps members and parameters below escaped scopes
+                // (§5.6.1), and [ keeps array elements on their existing
+                // path (§7.4), including real-valued elements.
+                // Own escaped parameters (§5.6.1) with neither . nor [ after
+                // the last :: (\p::W, \a.b::c) are also left out of VCD, FST
+                // and XTrace; \a::b.c and \a::b[0] are kept.
+                || (name.contains(':')
+                    && name
+                        .rsplit_once("::")
+                        .is_some_and(|(_, leaf)| !leaf.contains(['.', '[']))
+                    && self.module.parameters.contains_key(name))
                 || xezim_core::elaborate::is_delay_stage_net(name)
                 || event_bits::is_edge_alias_net(name))
                 && Self::dump_name_selected(name, filters.as_deref(), depth)

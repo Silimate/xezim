@@ -329,6 +329,31 @@ fn issue_317_clocking_iff_sees_this_edge() {
     assert!(msgs.iter().any(|m| m == "PASS"), "{:#?}", msgs);
 }
 
+/// Issue #1241: a clocking block input bound to an EXPRESSION
+/// (`input sum = a + 1;`) samples X instead of the expression's value
+/// (IEEE 1800-2023 §14.5, §14.13). Arithmetic, concatenation, part-select,
+/// signed arithmetic, conditional and constant defaults must all sample their
+/// values at the clocking edge. Matched byte-for-byte against the reference
+/// simulator.
+#[test]
+fn issue_1241_clocking_input_expression() {
+    let msgs = outputs(
+        include_str!("../issue_cases/clocking_input_expr_1241.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.contains("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "PASS"), "{:#?}", msgs);
+    assert!(
+        msgs.iter().any(|m| m.contains("sum=4")
+            && m.contains("cat=")
+            && m.contains("sx=5")
+            && m.contains("mux=10")
+            && m.contains("ci=42")),
+        "{:#?}",
+        msgs
+    );
+}
+
 /// Issue #312 follow-up (reporter's survey, 41 cases): `foreach` and the
 /// collection methods over typedef'd associative arrays, dynamic arrays and
 /// queues at package, module, class, interface and block scope, every case
@@ -730,4 +755,70 @@ fn modport_qualified_reference_shapes_1050() {
 fn static_packed_member_read_shapes_1050() {
     let (got, want) = nba_shapes_1050(&["s60"]);
     assert_eq!(got, want);
+}
+
+/// Issue #1177: a class property whose width comes from a package or module
+/// parameter (64 bits), read in `%` / `/` / `>>` expressions assigned to a
+/// NARROWER variable. The operands must take the width of the widest (64
+/// bits) BEFORE the operation, and the result cut down only afterwards
+/// (IEEE 1800-2017 §11.6.1, §11.8.2) — not truncated up front. Each compiled
+/// method holds a loop that never runs, and the run drives each call 1100
+/// times to exercise the bytecode tier. Expected values verified
+/// byte-for-byte against the reference simulator.
+#[test]
+fn issue_1177_parameterized_property_width() {
+    let msgs = outputs(
+        include_str!("../issue_cases/width_parameterized_property_1177.sv"),
+        1_000_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST PASSED"), "{:#?}", msgs);
+}
+
+/// Issue #1177 cousin sweep: the same parameter-width-vs-narrower-target
+/// shape across `%` (odd and power-of-two divisors, function and variable
+/// divisors), `/`, `<<`, `>>`, `>>>`, `**`, right-hand-side operands, nested
+/// `%`+`>>`, and module-parameter vs literal-width controls. Expected values
+/// verified byte-for-byte against the reference simulator.
+#[test]
+fn issue_1177_parameterized_property_width_cousins() {
+    let msgs = outputs(
+        include_str!("../issue_cases/width_parameterized_property_1177_cousins.sv"),
+        1_000_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST PASSED"), "{:#?}", msgs);
+}
+
+/// Issue #1178: a package type sized by a parameter IMPORTED from another
+/// package (`import widths::*` and `import widths::AW; import widths::BW;`)
+/// must take the full width, not collapse to 1 bit (IEEE 1800-2017 §26.3).
+/// Covers vectors, packed structs, packed unions, unpacked structs, package
+/// variables, class-body typedefs and their associated arrays, and direct
+/// `widths::AW` scoped references — `$bits` and stored values alike.
+#[test]
+fn issue_1178_package_import_width_typedef() {
+    let msgs = outputs(
+        include_str!("../issue_cases/package_import_width_typedef_1178.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST PASSED"), "{:#?}", msgs);
+}
+
+/// Issue #1178 cousin sweep: the same imported-parameter-typed shapes with
+/// DEEPER nesting — a packed struct that itself contains a packed struct
+/// typedef, package variables of nested type, `$bits` on the nested types —
+/// plus imported-parameter keys referenced through a 3-segment scoped clause
+/// like `$bits(user_mix::holder::key_t)` (the reported break that parses as
+/// a multi-segment HierarchicalIdentifier). Expected values verified
+/// byte-for-byte against the reference simulator.
+#[test]
+fn issue_1178_package_import_width_typedef_cousins() {
+    let msgs = outputs(
+        include_str!("../issue_cases/package_import_width_typedef_1178_cousins.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST PASSED"), "{:#?}", msgs);
 }

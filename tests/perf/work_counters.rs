@@ -257,8 +257,11 @@ module top;
     north_bus[2] = 8'h33;
     north_bus[3] = 8'h44;
 
-    // The first write changes active_slots from four to two. A mutable bound
-    // must remain element-wise so only slots zero and one are written.
+    // silimate: always_comb / always @* blocks wait for the writer to yield too
+    // active_slots is another process's output (§9.2.2.2): it stays four
+    // until this block suspends, although the first write would make it two.
+    // The fill reads a signal as its bound, so it must still stay element-wise;
+    // all four slots are written.
     adaptive_bus = '0;
     for (int slot = 0; slot < active_slots; slot++)
       adaptive_bus[slot] = 8'hff;
@@ -266,7 +269,7 @@ module top;
     #4;
     check = (south_bus === 32'h4433_2211)
          && (ordered_bus === base_bus)
-         && (adaptive_bus === 32'h0000_ffff);
+         && (adaptive_bus === 32'hffff_ffff);
     $display("CHECK=%0d", check);
     $finish;
   end

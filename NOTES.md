@@ -10,13 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* An input port reads with its own declared signedness when it is
-  connected to a concatenation, a select or a net of the other signedness
-  (§23.3.3.7, §11.8.1): `input logic signed [12:0] e_i` connected to
-  `{c[11], c}` reads -27, not 8165, so `a_i - e_i` and `e_i < 0` are
-  signed in the module. A net driven by `assign` from a variable of the
-  other signedness keeps its own too. lowRISC Muntjac's FPU returned 1e-8
-  for `fadd.s pi + 1e-8`. (Silimate/xezim#352)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

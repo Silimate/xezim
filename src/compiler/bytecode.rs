@@ -8698,7 +8698,19 @@ impl<'a> BytecodeCompiler<'a> {
                     condition
                         .as_ref()
                         .is_none_or(|c| expr_ok(c, &inner, me, ext))
-                        && step.iter().all(|e| expr_ok(e, &inner, me, ext))
+                        // silimate: a for-loop step that assigns a local (`i = i + 1`) keeps the function pure
+                        // The step `i = i + 1` / `i += 2` is an `AssignExpr`, which
+                        // the expression walker has no arm for, so every loop over
+                        // a function-level `integer i` branded its function impure.
+                        // Its target is held strict, as for a blocking assignment.
+                        && step.iter().all(|e| match &e.kind {
+                            ExprKind::AssignExpr { lvalue, rvalue } => {
+                                expr_ok(lvalue, &inner, me, false)
+                                    && expr_ok(rvalue, &inner, me, ext)
+                            }
+                            _ => expr_ok(e, &inner, me, ext),
+                        })
+                        // /silimate
                         && stmt_ok(body, &mut inner, me, ext)
                 }
                 // case/casez/casex — the shape of virtually every decode
@@ -21125,9 +21137,16 @@ impl<'a> BytecodeCompiler<'a> {
             (None, Some(ix)) => {
                 // A negative index could still write in-range bits; only an
                 // unsigned one is a plain shift amount.
-                if self.expr_signedness(ix) != Some(false) {
-                    return None;
-                }
+                // silimate: compile a single-bit store at a signed index (an `integer` loop variable)
+                // A single bit at a negative index is out of range and writes
+                // nothing (§11.5.1), so a signed index needs only a sign test
+                // before the shift; a wider field could still reach in-range bits.
+                let signed = match self.expr_signedness(ix) {
+                    Some(false) => false,
+                    Some(true) if fw == 1 => true,
+                    _ => return None,
+                };
+                // /silimate
                 let Some(lo_reg) = self.compile_expr(ix, 0) else {
                     return Some(false);
                 };
@@ -21136,28 +21155,93 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Eq(known, lo_reg, lo_reg));
                 let skip = self.insns.len();
                 self.emit(Insn::BranchIfFalse(known, 0));
-                let mask_reg = self.alloc_reg();
-                self.emit(Insn::LoadConst(mask_reg, Box::new(ones(fw).resize(yw))));
-                let shifted = self.alloc_reg();
-                self.emit(Insn::Shl(shifted, mask_reg, lo_reg));
-                let inv = self.alloc_reg();
-                self.emit(Insn::BitNot(inv, shifted));
-                let cleared = self.alloc_reg();
-                self.emit(Insn::BitAnd(cleared, yreg, inv));
-                let vex = self.alloc_reg();
-                self.emit(Insn::Move(vex, val_reg));
-                self.emit(Insn::Resize(vex, fw));
-                self.emit(Insn::ClearSigned(vex));
-                self.emit(Insn::Resize(vex, yw));
-                let vsh = self.alloc_reg();
-                self.emit(Insn::Shl(vsh, vex, lo_reg));
-                let merged = self.alloc_reg();
-                self.emit(Insn::BitOr(merged, cleared, vsh));
-                self.emit(Insn::Move(yreg, merged));
+                // silimate: compile a single-bit store at a signed index (an `integer` loop variable)
+                // The test is signed whatever flag the index register carries.
+                let below = signed.then(|| {
+                    let t = self.alloc_reg();
+                    self.emit(Insn::Move(t, lo_reg));
+                    self.emit(Insn::SetSigned(t));
+                    let mut z = Value::from_u64(0, 32);
+                    z.is_signed = true;
+                    let zero = self.alloc_reg();
+                    self.emit(Insn::LoadConst(zero, Box::new(z)));
+                    let ok = self.alloc_reg();
+                    self.emit(Insn::Geq(ok, t, zero));
+                    let at = self.insns.len();
+                    self.emit(Insn::BranchIfFalse(ok, 0));
+                    (at, ok)
+                });
+                // /silimate
+                // silimate: a dynamic single-bit store into a local keeps its other bits, z included
+                // A single bit is spliced in by selects, not by masks: `z & 1`
+                // is x, so the mask splice below turned every z of the local
+                // into x (§11.5.1: a select leaves the other bits as they
+                // are). With the local framed as `{0, y, 0}`, the store is
+                // `{e[yw+1 : i+2], v, e[i : 0]}`, whose `[yw:1]` is the new
+                // local; neither part is ever empty for `0 <= i < yw`.
+                let in_range = (fw == 1).then(|| {
+                    let wreg = self.alloc_reg();
+                    self.emit(Insn::LoadConst(wreg, Box::new(Value::from_u64(yw as u64, 32))));
+                    let ok = self.alloc_reg();
+                    self.emit(Insn::Lt(ok, lo_reg, wreg));
+                    let at = self.insns.len();
+                    self.emit(Insn::BranchIfFalse(ok, 0));
+                    (at, ok)
+                });
+                if in_range.is_some() {
+                    let pad = self.alloc_reg();
+                    self.emit(Insn::LoadConst(pad, Box::new(Value::from_u64(0, 1))));
+                    let framed = self.alloc_reg();
+                    self.emit(Insn::Concat(framed, Box::new(vec![pad, yreg, pad])));
+                    let top = self.alloc_reg();
+                    self.emit(Insn::LoadConst(top, Box::new(Value::from_u64(yw as u64 + 1, 32))));
+                    let two = self.alloc_reg();
+                    self.emit(Insn::LoadConst(two, Box::new(Value::from_u64(2, 32))));
+                    let above = self.alloc_reg();
+                    self.emit(Insn::Add(above, lo_reg, two));
+                    let upper = self.alloc_reg();
+                    self.emit(Insn::RangeSelect(upper, framed, top, above));
+                    let zero = self.alloc_reg();
+                    self.emit(Insn::LoadConst(zero, Box::new(Value::from_u64(0, 32))));
+                    let lower = self.alloc_reg();
+                    self.emit(Insn::RangeSelect(lower, framed, lo_reg, zero));
+                    let bit = self.alloc_reg();
+                    self.emit(Insn::Move(bit, val_reg));
+                    self.emit(Insn::Resize(bit, 1));
+                    self.emit(Insn::ClearSigned(bit));
+                    let spliced = self.alloc_reg();
+                    self.emit(Insn::Concat(spliced, Box::new(vec![upper, bit, lower])));
+                    self.emit(Insn::RangeSelectConst(yreg, spliced, yw, 1));
+                } else {
+                    let mask_reg = self.alloc_reg();
+                    self.emit(Insn::LoadConst(mask_reg, Box::new(ones(fw).resize(yw))));
+                    let shifted = self.alloc_reg();
+                    self.emit(Insn::Shl(shifted, mask_reg, lo_reg));
+                    let inv = self.alloc_reg();
+                    self.emit(Insn::BitNot(inv, shifted));
+                    let cleared = self.alloc_reg();
+                    self.emit(Insn::BitAnd(cleared, yreg, inv));
+                    let vex = self.alloc_reg();
+                    self.emit(Insn::Move(vex, val_reg));
+                    self.emit(Insn::Resize(vex, fw));
+                    self.emit(Insn::ClearSigned(vex));
+                    self.emit(Insn::Resize(vex, yw));
+                    let vsh = self.alloc_reg();
+                    self.emit(Insn::Shl(vsh, vex, lo_reg));
+                    let merged = self.alloc_reg();
+                    self.emit(Insn::BitOr(merged, cleared, vsh));
+                    self.emit(Insn::Move(yreg, merged));
+                }
+                // /silimate
                 self.emit(Insn::Resize(yreg, yw));
                 self.emit_local_fit(yreg);
                 let end = self.insns.len() as u32;
                 self.insns[skip] = Insn::BranchIfFalse(known, end);
+                // silimate: compile a single-bit store at a signed index (an `integer` loop variable)
+                for (at, ok) in below.into_iter().chain(in_range) {
+                    self.insns[at] = Insn::BranchIfFalse(ok, end);
+                }
+                // /silimate
                 Some(true)
             }
             (None, None) => None,

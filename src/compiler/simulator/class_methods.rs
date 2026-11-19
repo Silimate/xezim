@@ -355,6 +355,24 @@ impl Simulator {
                         .map(|(n, _)| n.clone()),
                 );
             }
+            // Class typedefs of a virtual interface (`typedef virtual bus_if
+            // vif_t;`), by leaf: the names `class_scope_typedef_target`
+            // looks up through a class scope. A leaf several classes declare
+            // is keyed `<class>::<leaf>`.
+            let mut vif_typedef_leaves: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                vif_typedef_leaves.extend(
+                    cd.typedef_targets
+                        .iter()
+                        .filter(|(_, dt)| {
+                            matches!(
+                                Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types),
+                                DataType::Interface { .. }
+                            )
+                        })
+                        .map(|(n, _)| n.rsplit("::").next().unwrap_or(n).to_string()),
+                );
+            }
             // Names that can prefix `name::member` without being a class
             // key: class parameters and typedef names (module or class
             // scope) — see `class_scope_member_value`.
@@ -399,6 +417,7 @@ impl Simulator {
                 subroutine_suffixes,
                 alias_typedefs,
                 scoped_typedefs,
+                vif_typedef_leaves,
                 scope_prefixes,
                 param_first,
                 params,
@@ -567,12 +586,19 @@ impl Simulator {
 
     /// `dt` followed through bare typedef names in `typedef_types`, by
     /// reference (no resolved-type clone). Stops at the first non-alias.
+    /// A class-scoped virtual-interface typedef (`cfg_t::vif_t`, §8.23) is
+    /// followed too, so its local's initializer binds the interface.
     pub(super) fn typedef_chain_end<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
         let mut cur = dt;
         for _ in 0..16 {
             match cur {
-                DataType::TypeReference { name, .. } if name.scopes.is_empty() => {
-                    match self.module.typedef_types.get(&name.name.name) {
+                DataType::TypeReference { name, .. } => {
+                    let next = if name.scopes.is_empty() {
+                        self.module.typedef_types.get(&name.name.name)
+                    } else {
+                        self.class_scope_vif_typedef(name)
+                    };
+                    match next {
                         Some(next) if !std::ptr::eq(next, cur) => cur = next,
                         _ => break,
                     }
@@ -1428,6 +1454,25 @@ impl Simulator {
                 || cd.array_properties.contains_key(prop)
                 || cd.array_nd_properties.contains_key(prop)
                 || cd.static_properties.contains(prop)
+            {
+                return true;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    pub(super) fn class_declares_nonstatic_collection(&self, class_name: &str, prop: &str) -> bool {
+        let mut cur: Option<&str> = Some(class_name);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if !cd.static_properties.contains(prop)
+                && (cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop)
+                    || cd.array_properties.contains_key(prop)
+                    || cd.array_nd_properties.contains_key(prop))
             {
                 return true;
             }
@@ -2822,8 +2867,14 @@ impl Simulator {
                         let w = match static_dyn_w {
                             Some(w) => w,
                             None => {
-                                let scope = self.instance_param_scope(handle);
-                                resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs))
+                                let values: HashMap<String, Value> =
+                                    self.instance_value_params(handle).into_iter().collect();
+                                let scope = self.instance_param_env(&values);
+                                super::elaborate::resolve_type_width_env(
+                                    rt,
+                                    Some(&scope),
+                                    Some(&self.module.typedefs),
+                                )
                             }
                         };
                         if w > 0 && w != ret.width {

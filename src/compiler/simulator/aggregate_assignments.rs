@@ -155,6 +155,19 @@ impl Simulator {
         lvalue: &Expression,
         items: &[AssignmentPatternItem],
     ) -> bool {
+        // §8.9, §8.23: `Cls::q = '{...}` names the class's static
+        // collection without an object.
+        if let ExprKind::Ident(hi) = &lvalue.kind
+            && hi.path.len() == 2
+            && hi.path.iter().all(|s| s.selects.is_empty())
+            && self.module.classes.contains_key(&hi.path[0].name.name)
+        {
+            let (cls, member) = (&hi.path[0].name.name, &hi.path[1].name.name);
+            return match self.class_scoped_static_coll(cls, member) {
+                Some(key) => self.assign_static_collection_pattern(cls, member, &key, items),
+                None => false,
+            };
+        }
         // The lvalue is either `obj.q`/`this.q` (MemberAccess) or a two-
         // segment `c.q` (flattened Ident). Resolve the object handle + member
         // from both forms.
@@ -200,6 +213,14 @@ impl Simulator {
             return false;
         };
         let member = &member;
+        // §8.9: a STATIC collection reached through the object is the
+        // class's one store, the same one `obj.q[i]` and `Cls::q` use.
+        if self.collection_is_static_in(&cn, member) {
+            return match self.handle_collection_name(handle, member) {
+                Some(key) => self.assign_static_collection_pattern(&cn, member, &key, items),
+                None => false,
+            };
+        }
         let scoped = format!("{}#{}", handle, member);
         if items.is_empty() {
             // `'{}` leaves the queue or dynamic array with no elements.
@@ -236,6 +257,47 @@ impl Simulator {
             return true;
         }
         false
+    }
+
+    /// §8.9, §10.9: assign the pattern to the STATIC associative array,
+    /// queue or dynamic array `member` of `class`'s chain, stored at `key`
+    /// (see `handle_collection_name`). Keyed items replace an associative
+    /// array's contents; positional items are a queue's or dynamic array's
+    /// elements and set its size.
+    fn assign_static_collection_pattern(
+        &mut self,
+        class: &str,
+        member: &str,
+        key: &str,
+        items: &[AssignmentPatternItem],
+    ) -> bool {
+        let mut cur = Some(class);
+        let mut decl = None;
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if let Some(&(_, is_assoc, w)) =
+                cd.static_collections.iter().find(|(n, ..)| n == member)
+            {
+                decl = Some((is_assoc, w));
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        let Some((is_assoc, w)) = decl else {
+            return false;
+        };
+        if is_assoc {
+            self.assign_class_assoc_pattern(key, w, items);
+            return true;
+        }
+        let exprs = self.pattern_ordered(items);
+        for (i, e) in exprs.iter().enumerate() {
+            self.pattern_leaf_at_elem_width(&format!("{}[{}]", key, i), e, w);
+        }
+        self.set_queue_size(key, exprs.len() as u64);
+        true
     }
 
     /// §7.9.11 / §10.9.2: assign the pattern `'{k: v, ..., default: d}` to
@@ -329,10 +391,12 @@ impl Simulator {
     /// `e` is itself an assignment pattern and `dt` an unpacked struct, recurse
     /// member-wise; otherwise evaluate and write the leaf.
     pub(super) fn assign_pattern_or_leaf(&mut self, target: &str, dt: &DataType, e: &Expression) {
+        let capture = self.pattern_nba_leaves.take();
         if let ExprKind::AssignmentPattern(sub) = &self.unpacked_pattern(e).kind {
             if !sub.is_empty() {
                 if let DataType::Struct(su) = self.resolve_dt(dt) {
                     if Self::spreads_member_wise(&su) {
+                        self.pattern_nba_leaves = capture;
                         self.assign_pattern_into_struct(target, &su, sub);
                         return;
                     }
@@ -340,7 +404,8 @@ impl Simulator {
                 // §10.9.2: a pattern for a packed element takes the
                 // element's type.
                 if let Some(v) = self.eval_in_packed_type(e, dt) {
-                    self.write_leaf_by_name(target, v);
+                    self.pattern_nba_leaves = capture;
+                    self.write_pattern_leaf(target, v);
                     return;
                 }
             }
@@ -353,13 +418,27 @@ impl Simulator {
             // everything. Re-enter the spread with a synthetic default item.
             if Self::spreads_member_wise(&su) {
                 let synthetic = [AssignmentPatternItem::Default(e.clone())];
+                self.pattern_nba_leaves = capture;
                 self.assign_pattern_into_struct(target, &su, &synthetic);
                 return;
             }
         }
         let value = self.eval_pattern_leaf_value(dt, e, None);
-        if value.is_real || Self::is_string_data_type(self.resolve_dt_ref(dt)) {
+        self.pattern_nba_leaves = capture;
+        if self.pattern_nba_leaves.is_none()
+            && (value.is_real || Self::is_string_data_type(self.resolve_dt_ref(dt)))
+        {
             self.set_signal_value_by_name(target, value);
+        } else {
+            self.write_pattern_leaf(target, value);
+        }
+    }
+
+    /// §10.4.2: collect target writes only; RHS function side effects remain
+    /// immediate because item evaluation runs outside the capture context.
+    pub(super) fn write_pattern_leaf(&mut self, target: &str, value: Value) {
+        if let Some(leaves) = &mut self.pattern_nba_leaves {
+            leaves.push((target.to_string(), value));
         } else {
             self.write_leaf_by_name(target, value);
         }
@@ -426,12 +505,22 @@ impl Simulator {
         // A `real` leaf keeps its real value even when the element signal was
         // never flagged real (array elements are synthesized without the flag);
         // otherwise `real m[3] = '{1.5, ...}` truncates to integers.
+        // §6.12/§20.5: a SHORTREAL member holds a binary32 value — writing
+        // 16777216.25 rounds to IEEE float 16777216.0, not the f64 double.
         if matches!(self.resolve_dt(dt), DataType::Real { .. }) {
-            return if v.is_real {
-                v
+            let f = v.to_f64();
+            let rlim = if matches!(
+                self.resolve_dt(dt),
+                DataType::Real {
+                    kind: crate::ast::types::RealType::ShortReal,
+                    ..
+                }
+            ) {
+                f as f32 as f64
             } else {
-                Value::from_f64(v.to_f64())
+                f
             };
+            return Value::from_f64(rlim);
         }
         v
     }
@@ -1017,11 +1106,11 @@ impl Simulator {
     /// of `su`, in declaration order. The count is a constant expression
     /// (A.6.7.1), so a parameter or localparam count is evaluated here; an
     /// integer literal needs no evaluation. None for any other pattern, a
-    /// count other than the member count, or a structure with an unpacked
-    /// array member, which keeps the existing binding.
+    /// count other than the member count. Nested member patterns retain
+    /// their own array dimensions during binding.
     pub(super) fn struct_replication_items<'a>(
         &mut self,
-        su: &crate::ast::types::StructUnionType,
+        _su: &crate::ast::types::StructUnionType,
         items: &'a [AssignmentPatternItem],
         members: usize,
     ) -> Option<Vec<&'a Expression>> {
@@ -1037,13 +1126,6 @@ impl Simulator {
             super::elaborate::struct_pattern_replication_with(items, members, &mut |count| {
                 super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
             })?;
-        if super::elaborate::struct_pattern_has_array_member(
-            su,
-            &self.module.typedef_types,
-            &self.module.typedef_unpacked_dims,
-        ) {
-            return None;
-        }
         Some(expanded)
     }
 
@@ -1064,9 +1146,14 @@ impl Simulator {
             if dims.is_empty() {
                 // §10.9.2: the type and default keys reach a packed member
                 // no other key sets.
-                if !explicit && let Some(v) = self.eval_default_in_packed_type(items, &mdt) {
-                    self.write_leaf_by_name(&target, v);
-                    continue;
+                if !explicit {
+                    let capture = self.pattern_nba_leaves.take();
+                    let value = self.eval_default_in_packed_type(items, &mdt);
+                    self.pattern_nba_leaves = capture;
+                    if let Some(v) = value {
+                        self.write_pattern_leaf(&target, v);
+                        continue;
+                    }
                 }
                 self.assign_pattern_or_leaf(&target, &mdt, e);
                 continue;
@@ -1113,6 +1200,8 @@ impl Simulator {
             ExprKind::AssignmentPattern(sub) => {
                 self.assign_pattern_items_over_dims(target, dt, lists, sub);
             }
+            // §10.9.1, §10.10: an unpacked array value supplies the elements.
+            _ if self.assign_array_item(target, lists, dt, e) => {}
             _ => {
                 for idx in first {
                     self.assign_pattern_over_dims(&format!("{}[{}]", target, idx), dt, rest, e);
@@ -1133,6 +1222,20 @@ impl Simulator {
         let Some((first, rest)) = lists.split_first() else {
             return;
         };
+        // IEEE 1800-2023 §10.9.1/§10.10.1: replication supplies a whole
+        // dimension, with each expression converted to its element's type.
+        // This helper checks the replication shape before evaluating counts
+        // or allocating, and leaves mismatched counts on the existing path.
+        if let Some(expanded) =
+            super::elaborate::struct_pattern_replication_with(sub, first.len(), &mut |count| {
+                super::elaborate::struct_pattern_count_value(&self.eval_expr(count))
+            })
+        {
+            for (idx, v) in first.iter().zip(expanded) {
+                self.assign_pattern_over_dims(&format!("{}[{}]", target, idx), dt, rest, v);
+            }
+            return;
+        }
         let mut per_elem: Vec<Option<&Expression>> = vec![None; first.len()];
         let mut dflt: Option<&Expression> = None;
         let mut pos = 0usize;
@@ -1633,7 +1736,7 @@ impl Simulator {
     /// For an array operand that is a whole array or a row of a multi-
     /// dimensional unpacked array (`q`, `q[1]`), the dimensions left below the
     /// selected indices and the leaf-path suffixes in declared order.
-    fn unpacked_row_suffixes(&mut self, expr: &Expression) -> Option<Vec<String>> {
+    pub(super) fn unpacked_row_suffixes(&mut self, expr: &Expression) -> Option<Vec<String>> {
         let mut idx_exprs: Vec<&Expression> = Vec::new();
         let mut cur = expr;
         while let ExprKind::Index { expr: inner, index } = &cur.kind {
@@ -2255,7 +2358,189 @@ impl Simulator {
 
     /// Move queue element `from` to `to` within one queue.
     pub(super) fn queue_move_elem(&mut self, obj_name: &str, from: u64, to: u64) {
+        self.queue_elem_moves += 1;
         self.queue_copy_elem(obj_name, from, obj_name, to);
+    }
+
+    /// The placeholder element cells of queue `obj` — `Some((first id,
+    /// count))`, or `None` when it has none — if every element of `obj` is
+    /// one plain value that a by-name read or write of `obj[i]` finds in
+    /// such a cell (below `count`) or in the name-keyed store (from `count`
+    /// on). `Err` for any other queue: an element spread over several
+    /// entries (an unpacked struct, a fixed array, a collection), or a name
+    /// some other storage could answer for (a call frame, a forced name, a
+    /// packed container, a scope-qualified twin).
+    fn plain_queue_cells(&self, obj: &str) -> Result<Option<(usize, u64)>, ()> {
+        if !self.forced_names.is_empty() || self.module.arrays_2d.contains_key(obj) {
+            return Err(());
+        }
+        if self.has_coll_rows
+            && self
+                .coll_shape_at(obj)
+                .is_some_and(|(shape, depth)| shape.dims.len() > depth + 1)
+        {
+            return Err(());
+        }
+        if self.queue_elem_struct(obj).is_some() {
+            return Err(());
+        }
+        let first_elem = Self::name_with_index(obj, 0);
+        if self.module.associative_arrays.contains_key(&first_elem)
+            || self.module.dynamic_arrays.contains(&first_elem)
+        {
+            return Err(());
+        }
+        if obj.contains('.') {
+            // A name a call frame holds, `<top>.<name>` and a member of a
+            // packed container are each resolved before the element stores.
+            let below = |k: &str| {
+                k.len() > obj.len() && k.as_bytes()[obj.len()] == b'[' && k.starts_with(obj)
+            };
+            if self
+                .local_stack
+                .last()
+                .is_some_and(|l| l.keys().any(|k| below(k)))
+            {
+                return Err(());
+            }
+            let top = self.module.name.as_str();
+            if obj.len() > top.len() && obj.as_bytes()[top.len()] == b'.' && obj.starts_with(top) {
+                return Err(());
+            }
+            if obj
+                .match_indices('.')
+                .any(|(p, _)| self.module.packed_struct_fields.contains_key(&obj[..p]))
+            {
+                return Err(());
+            }
+        } else if let Some(hint) = self.name_resolve_hint.borrow().as_deref() {
+            // An undotted read tries the hinted scope's `<hint>.<name>` first.
+            if self
+                .signal_name_to_id
+                .contains_key(&format!("{}.{}", hint, first_elem))
+            {
+                return Err(());
+            }
+        }
+        let cells = match self.array_first_id.get(obj) {
+            Some(&(first, 0, hi)) if hi >= 0 && !is_packed_id(first) => {
+                Some((first, hi as u64 + 1))
+            }
+            Some(_) => return Err(()),
+            None => None,
+        };
+        // Past the cells no element has a table id of its own.
+        let past = Self::name_with_index(obj, cells.map_or(0, |(_, n)| n as i64));
+        if self.signal_name_to_id.contains_key(past.as_str())
+            || resolve_array_elem_id(&past, &self.array_first_id).is_some()
+        {
+            return Err(());
+        }
+        Ok(cells)
+    }
+
+    /// §7.10.2: shift the elements of queue `obj` (`size` of them) for the
+    /// removal of element `idx` (`open == false`: the elements above it move
+    /// down one index) or for an insertion at `idx` (`open == true`: the
+    /// elements from `idx` on move up one, and `obj[idx]` keeps its value
+    /// until the caller stores the new element). The caller sets the new
+    /// size.
+    ///
+    /// The elements held in the name-keyed store move as one run
+    /// (`SignalMap::run_remove_at` / `run_open_at`), not one by one by name,
+    /// so the cost does not grow with the queue; the placeholder cells of a
+    /// design-scope queue (at most 64) are copied cell to cell. `false`,
+    /// with nothing changed, for a queue `plain_queue_cells` does not vouch
+    /// for or whose stored elements are not exactly one run: the caller then
+    /// moves the elements one by one.
+    pub(super) fn queue_shift_fast(&mut self, obj: &str, idx: u64, size: u64, open: bool) -> bool {
+        if idx >= size || (!open && idx + 1 == size) {
+            // Nothing above `idx` to move: the caller's new size is the
+            // whole change.
+            return true;
+        }
+        let Ok(cells) = self.plain_queue_cells(obj) else {
+            return false;
+        };
+        let n_cells = cells.map_or(0, |(_, n)| n);
+        if size > n_cells && !self.signals.run_covers(obj, n_cells, size) {
+            return false;
+        }
+        // What a by-name element write marks besides the element: the size
+        // proxy of the name before the first `[` (§9.2.2.2).
+        let base = &obj[..obj.find('[').unwrap_or(obj.len())];
+        let touch_id = (!base.is_empty()
+            && (self.module.dynamic_arrays.contains(base)
+                || self.module.associative_arrays.contains_key(base)))
+        .then(|| {
+            self.signal_name_to_id
+                .get(Self::name_with_suffix(base, ".size").as_str())
+                .copied()
+        })
+        .flatten();
+        let touch = |me: &mut Self| {
+            if let Some(id) = touch_id {
+                me.mark_dirty_id(id);
+                me.dirty_any = true;
+            }
+        };
+        let copy_cell = |me: &mut Self, first: usize, from: u64, to: u64| {
+            let (src, dst) = (first + from as usize, first + to as usize);
+            let mut v = me.signal_table[src].clone();
+            if me.signal_signed[src] {
+                v.is_signed = true;
+            }
+            if me.store_named_cell(dst, v) {
+                touch(me);
+            }
+        };
+        // The elements from `n_cells` on, as the run holds them.
+        let tail = size.saturating_sub(n_cells);
+        if open {
+            // Highest element first, as the one-by-one move goes.
+            if tail > 0 {
+                self.signals
+                    .run_open_at(obj, n_cells, idx.max(n_cells), size);
+                touch(self);
+            }
+            if let Some((first, n)) = cells
+                && idx < n
+            {
+                if size >= n {
+                    // The last cell's element moves into the name-keyed store.
+                    let last = Self::name_with_index(obj, n as i64 - 1);
+                    if let Some(v) = self.get_signal_value_by_name(&last) {
+                        self.set_signal_value_by_name(&Self::name_with_index(obj, n as i64), v);
+                    }
+                }
+                for i in (idx..size.min(n - 1)).rev() {
+                    copy_cell(self, first, i, i + 1);
+                }
+            }
+        } else {
+            if let Some((first, n)) = cells
+                && idx < n
+            {
+                for i in idx..(size - 1).min(n - 1) {
+                    copy_cell(self, first, i + 1, i);
+                }
+                if tail > 0 {
+                    // The first name-keyed element moves into the last cell.
+                    let next = Self::name_with_index(obj, n as i64);
+                    if let Some(v) = self.get_signal_value_by_name(&next) {
+                        self.set_signal_value_by_name(&Self::name_with_index(obj, n as i64 - 1), v);
+                    }
+                }
+            }
+            if tail > 0 {
+                let at = idx.max(n_cells);
+                self.signals.run_remove_at(obj, n_cells, at, size);
+                if at + 1 < size {
+                    touch(self);
+                }
+            }
+        }
+        true
     }
 
     /// Copy every element of `src` onto `dst` and set its size (`r = q`).
@@ -3777,22 +4062,29 @@ impl Simulator {
     }
 
     /// Assign `e` to every leaf of the sub-array `base` spanning `dims`
-    /// (`m = '{default:0}` on a multi-dimensional array).
+    /// (`m = '{default:0}` on a multi-dimensional array). An unpacked array
+    /// value supplies the elements of the first sub-array it matches
+    /// (§10.9.1, §10.10); `descending` orders its elements.
     pub(super) fn fill_dims(
         &mut self,
         base: &str,
         dims: &[(i64, i64)],
         dt: &DataType,
         e: &Expression,
+        descending: &[bool],
     ) {
         if dims.is_empty() {
             self.assign_pattern_or_leaf(base, dt, e);
             return;
         }
+        if self.assign_array_item_dims(base, dims, descending, dt, e) {
+            return;
+        }
         let (lo, hi) = dims[0];
+        let inner_desc = descending.get(1..).unwrap_or(&[]);
         for i in lo..=hi {
             let target = format!("{}[{}]", base, i);
-            self.fill_dims(&target, &dims[1..], dt, e);
+            self.fill_dims(&target, &dims[1..], dt, e, inner_desc);
         }
     }
 
@@ -3825,7 +4117,7 @@ impl Simulator {
                     ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
                         self.assign_pattern_array(&target, &dims[1..], dt, sub, inner_desc);
                     }
-                    _ => self.fill_dims(&target, &dims[1..], dt, e),
+                    _ => self.fill_dims(&target, &dims[1..], dt, e, inner_desc),
                 }
             } else {
                 self.assign_pattern_or_leaf(&target, dt, e);
@@ -4175,7 +4467,9 @@ impl Simulator {
         if !Self::spreads_member_wise(&su) {
             return false;
         }
+        let capture = self.pattern_nba_leaves.take();
         let iv = self.eval_expr(index);
+        self.pattern_nba_leaves = capture;
         let key = if self.module.associative_arrays.contains_key(&*bname) {
             self.assoc_key_str(&bname, &iv)
         } else {

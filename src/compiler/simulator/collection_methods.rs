@@ -608,8 +608,29 @@ impl Simulator {
         let ew = self
             .coll_elem_width(&lb)
             .or_else(|| self.coll_elem_width(&rb));
+        // §7.2: an element of an unpacked-struct array compares member by
+        // member.
+        let leaves = self
+            .p_elem_type(&lb)
+            .or_else(|| self.p_elem_type(&rb))
+            .and_then(|dt| self.unpacked_struct_of(&dt))
+            .map(|su| self.struct_leaf_suffixes(&su));
         let mut acc = PatCmp::Equal;
         for (a, b) in ls.iter().zip(rs.iter()) {
+            if let Some(sfx) = &leaves {
+                for s in sfx {
+                    let lv = self.struct_leaf_value(&format!("{lb}{a}.{s}"));
+                    let rv = self.struct_leaf_value(&format!("{rb}{b}.{s}"));
+                    acc = acc.and(match (lv, rv) {
+                        (Some(x), Some(y)) => Self::struct_leaf_cmp(&x, &y, mode),
+                        _ => PatCmp::Unequal,
+                    });
+                }
+                if acc == PatCmp::Unequal {
+                    break;
+                }
+                continue;
+            }
             let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
             let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
             let (Some(lv), Some(rv)) = (lv, rv) else {
@@ -2739,6 +2760,16 @@ impl Simulator {
                 }
                 n.into_owned()
             }
+            // §8.9, §8.23: `Cls::q` names the class's static queue or
+            // dynamic array.
+            ExprKind::Ident(h)
+                if h.path.len() == 2
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && self.module.classes.contains_key(&h.path[0].name.name)
+                    && self.member_is_static_coll(&h.path[0].name.name, &h.path[1].name.name) =>
+            {
+                self.class_scoped_static_coll(&h.path[0].name.name, &h.path[1].name.name)?
+            }
             // §13.5.2: a queue/dynamic-array member of ANOTHER object passed
             // as the actual — `cb.doit(comp.q)` / `cb.doit(this.q)`, or a
             // member chain of any depth (`a.b.c.q`, parsed as a flattened
@@ -3098,6 +3129,21 @@ impl Simulator {
         if bm == BuiltinM::Other {
             return None;
         }
+        let package_store = if !obj_name.contains([':', '.', '#', '['])
+            && self.contested_pkg_vars.contains(obj_name)
+            && !self.frame_scalar_shadows(obj_name)
+            && self.dyn_name_lookup(obj_name).is_none()
+            && self.instance_assoc_member(obj_name).is_none()
+        {
+            if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                self.pkg_qual_collection_key(pkg, obj_name)
+            } else {
+                self.contested_pkg_var_in_scope(obj_name)
+            }
+        } else {
+            None
+        };
+        let obj_name = package_store.as_deref().unwrap_or(obj_name);
         // Per-specialization keying for STATIC collection properties of
         // parameterized classes (e.g. `static T m_q[$]` in `uvmq#(T)`):
         // rewrite the bare member name to the spec-aware storage key so each
@@ -3511,8 +3557,10 @@ impl Simulator {
                         return Some(Value::zero(32));
                     }
                 }
-                for i in (0..cur_size).rev() {
-                    self.queue_move_elem(obj_name, i, i + 1);
+                if !self.queue_shift_fast(obj_name, 0, cur_size, true) {
+                    for i in (0..cur_size).rev() {
+                        self.queue_move_elem(obj_name, i, i + 1);
+                    }
                 }
                 let head = Self::name_with_index(obj_name, 0);
                 self.queue_store_elem(obj_name, &head, arg);
@@ -3524,8 +3572,10 @@ impl Simulator {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self.queue_elem_value(obj_name, 0);
-                for i in 1..cur_size {
-                    self.queue_move_elem(obj_name, i, i - 1);
+                if !self.queue_shift_fast(obj_name, 0, cur_size, false) {
+                    for i in 1..cur_size {
+                        self.queue_move_elem(obj_name, i, i - 1);
+                    }
                 }
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
@@ -3630,8 +3680,10 @@ impl Simulator {
                 };
                 // Move elements member-wise: an unpacked-struct element has no
                 // container signal, so a packed copy shifts nothing at all.
-                for i in (idx..cur_size).rev() {
-                    self.queue_move_elem(obj_name, i, i + 1);
+                if !self.queue_shift_fast(obj_name, idx, cur_size, true) {
+                    for i in (idx..cur_size).rev() {
+                        self.queue_move_elem(obj_name, i, i + 1);
+                    }
                 }
                 let slot = format!("{}[{}]", obj_name, idx);
                 self.queue_store_elem(obj_name, &slot, &args[1]);
@@ -3991,8 +4043,10 @@ impl Simulator {
                     let cur_size = self.get_queue_size(obj_name) as usize;
                     if idx < cur_size {
                         // Member-wise, for the same reason as `insert`.
-                        for i in idx..cur_size - 1 {
-                            self.queue_move_elem(obj_name, (i + 1) as u64, i as u64);
+                        if !self.queue_shift_fast(obj_name, idx as u64, cur_size as u64, false) {
+                            for i in idx..cur_size - 1 {
+                                self.queue_move_elem(obj_name, (i + 1) as u64, i as u64);
+                            }
                         }
                         self.set_queue_size(obj_name, (cur_size - 1) as u64);
                     }

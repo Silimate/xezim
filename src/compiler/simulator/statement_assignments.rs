@@ -31,7 +31,7 @@ impl Simulator {
                     Some(sz) => *sz,
                     None => match cached {
                         Some((_, _, cw)) => cw,
-                        None => Value::unsized_literal_width(value, r_for_w),
+                        None => Value::unsized_integer_width(value, r_for_w, *signed),
                     },
                 };
                 // §5.7.1: an unsized all-x/all-z literal ('bx, 'hz, 'b?) is a
@@ -53,12 +53,6 @@ impl Simulator {
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                // §5.7 (issue #31): a PROCEDURAL-only literal never passes
-                // through elaboration const-eval, so the wrap warning has to
-                // fire here too. Slow path only (the cached-value fast path
-                // above returns first), and the shared dedupe means a literal
-                // already reported at elaboration stays quiet.
-                super::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_literal_text(value, r, w);
                 // Cache inline values (width <= 64)
                 if w <= 64 {
@@ -256,7 +250,9 @@ impl Simulator {
         let saved_auto_len = self.auto_loop_vars.len();
         let mut processes = Vec::with_capacity(stmts.len());
         for s in stmts {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 self.exec_statement(s);
                 for d in declarators {
                     self.auto_loop_vars.push(d.name.name.clone());
@@ -1332,6 +1328,59 @@ impl Simulator {
         true
     }
 
+    /// Whether `flat` names a whole multi-dimensional unpacked array or a
+    /// row of one (`m`, `m[1]` of `m[2][3]`), rather than one element.
+    pub(super) fn names_nd_subarray(&self, flat: &str) -> bool {
+        let mut base = flat;
+        let mut selects = 0;
+        loop {
+            if self.module.arrays_2d.contains_key(base) {
+                return selects < 2;
+            }
+            if let Some((dims, _)) = self.module.arrays_nd.get(base) {
+                return selects < dims.len();
+            }
+            match base.strip_suffix(']').and_then(|b| b.rfind('[')) {
+                Some(open) => {
+                    base = &base[..open];
+                    selects += 1;
+                }
+                None => return false,
+            }
+        }
+    }
+
+    /// §7.2: the unpacked struct an element of the multi-dimensional array
+    /// `flat` names, or a row of, has as its type (`m`, `m[1]`).
+    pub(super) fn nd_elem_struct(&self, flat: &str) -> Option<crate::ast::types::StructUnionType> {
+        let mut base = flat;
+        loop {
+            if self.module.arrays_2d.contains_key(base) || self.module.arrays_nd.contains_key(base)
+            {
+                let dt = self.module.var_decl_types.get(base)?;
+                return self.unpacked_struct_of(dt);
+            }
+            let open = base.strip_suffix(']').and_then(|b| b.rfind('['))?;
+            base = &base[..open];
+        }
+    }
+
+    /// Whether `e` is a multi-dimensional unpacked-struct array, or a select
+    /// of one, named by a plain identifier.
+    fn nd_struct_array_root(&mut self, e: &Expression) -> bool {
+        let mut root = e;
+        while let ExprKind::Index { expr, .. } = &root.kind {
+            root = expr;
+        }
+        match &root.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                let name = self.resolve_hier_name(h).into_owned();
+                self.nd_elem_struct(&name).is_some()
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn exec_stmt_blocking_assign(
         &mut self,
         stmt: &Statement,
@@ -1467,12 +1516,100 @@ impl Simulator {
         true
     }
 
+    /// §10.4.1: whether an item of the pattern `rvalue` reads the variable
+    /// that `lvalue` writes (its root name, as any segment of a name in the
+    /// item). Keys and replication counts are constant expressions and are
+    /// not looked at; a function reading the target is not seen either.
+    fn pattern_reads_target(lvalue: &Expression, rvalue: &Expression) -> bool {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        let mut root = lvalue;
+        while let ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Paren(expr) = &root.kind
+        {
+            root = expr;
+        }
+        // `this.arr = '{this.arr[1], ...}`: any `this` in an item may read it.
+        let var = match &root.kind {
+            ExprKind::Ident(h) => match h.path.first() {
+                Some(s) => s.name.name.as_str(),
+                None => return false,
+            },
+            ExprKind::This => "this",
+            _ => return false,
+        };
+        fn reads(e: &Expression, var: &str) -> bool {
+            match &e.kind {
+                ExprKind::AssignmentPattern(items) => items.iter().any(|item| match item {
+                    Item::Ordered(x)
+                    | Item::Named(_, x)
+                    | Item::Typed(_, x)
+                    | Item::Default(x)
+                    | Item::Keyed(_, x) => reads(x, var),
+                }),
+                ExprKind::Replication { exprs, .. } => exprs.iter().any(|x| reads(x, var)),
+                ExprKind::Paren(x) => reads(x, var),
+                _ => {
+                    let mut hit = false;
+                    super::elaborate::for_each_sub_expr(e, &mut |x| {
+                        hit |= match &x.kind {
+                            ExprKind::Ident(h) => h.path.iter().any(|s| s.name.name == var),
+                            ExprKind::This => var == "this",
+                            // `arr = '{this.arr[1], ...}`
+                            ExprKind::MemberAccess { expr, member } => {
+                                matches!(expr.kind, ExprKind::This) && member.name == var
+                            }
+                            _ => false,
+                        };
+                    });
+                    hit
+                }
+            }
+        }
+        reads(rvalue, var)
+    }
+
     pub(super) fn exec_stmt_blocking_assign_body(
         &mut self,
         stmt: &Statement,
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
+        // is evaluated exactly ONCE. The assign_value machinery
+        // re-evaluates the index in several candidate branches, so
+        // fold side-effecting indices before any aggregate probe. A
+        // compound assign (`x[i++] += 2`) was desugared by the parser
+        // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
+        // on the RHS — point that clone at the same folded index so
+        // the increment still happens once.
+        if Self::lvalue_has_incdec_index(lvalue) {
+            if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
+                let new_rhs: Expression = match &rvalue.kind {
+                    ExprKind::Binary { op, left, right }
+                        if left.span == lvalue.span
+                            && std::mem::discriminant(&left.kind)
+                                == std::mem::discriminant(&lvalue.kind) =>
+                    {
+                        Expression::new(
+                            ExprKind::Binary {
+                                op: *op,
+                                left: Box::new(new_lhs.clone()),
+                                right: right.clone(),
+                            },
+                            rvalue.span,
+                        )
+                    }
+                    _ => (*rvalue).clone(),
+                };
+                // The frozen target can still be an unpacked aggregate.
+                // Keep its member-wise assignment paths instead of forcing
+                // the value-only scalar store.
+                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
+                return;
+            }
+        }
         // #1108: a whole array member of an instance-array element on either
         // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
         // An element select is folded where it is read or written.
@@ -1494,6 +1631,36 @@ impl Simulator {
         }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
+            return;
+        }
+        // §10.4.1, §10.9.1, §10.9.2: the right-hand side is evaluated before
+        // the target is written, but a pattern store reads each item just
+        // before it writes that item's element, so a pattern reading its own
+        // target (`a = '{a[1], a[0]}`) read elements it had already written.
+        // Capture every item first, as an intra-assignment delay does (keys,
+        // nesting and element types kept), then store the captured values.
+        if matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
+            && Self::pattern_reads_target(lvalue, rvalue)
+        {
+            let (saved, release) = self.capture_intra_rhs(lvalue, rvalue, rvalue.span);
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, &saved);
+            if let Some(release) = release
+                && let StatementKind::Expr(e) = &release.kind
+                && let ExprKind::SystemCall { name, args } = &e.kind
+            {
+                self.exec_system_task(name, args);
+            }
+            return;
+        }
+        // §7.6, §7.2: a whole multi-dimensional array of unpacked structs,
+        // or a row of one, copies element by element and member by member.
+        // Ahead of the element and struct paths below, which took a row
+        // (`b[1] = a[0]`) for one element.
+        if (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+            && self.nd_struct_array_root(lvalue)
+            && self.copy_multi_dim_array(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
             return;
         }
         // §7.4.6, §7.6: a slice of an unpacked array on either side pairs
@@ -1558,14 +1725,6 @@ impl Simulator {
         }
         // (A side-effecting lvalue index is folded first, below, and
         // comes back through here.)
-        if self.indexed_colls_live()
-            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
-            && !Self::lvalue_has_incdec_index(lvalue)
-            && self.try_indexed_coll_assign(lvalue, rvalue)
-        {
-            self.settle_after_proc_write();
-            return;
-        }
         if (matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
             || self.lvalue_may_name_struct_coll(lvalue))
             && self.try_struct_aggregate_assign(stmt, lvalue, rvalue)
@@ -1578,39 +1737,19 @@ impl Simulator {
         if self.try_event_handle_assign(lvalue, rvalue) {
             return;
         }
-        // §11.4.1: an lvalue index with a side effect (`x[i++] = v`)
-        // is evaluated exactly ONCE. The assign_value machinery
-        // re-evaluates the index in several candidate branches, so
-        // fold side-effecting indices to literals up front. A
-        // compound assign (`x[i++] += 2`) was desugared by the parser
-        // into `x[i++] = x[i++] + 2` with a CLONED lvalue (same span)
-        // on the RHS — point that clone at the same folded index so
-        // the increment still happens once.
-        if Self::lvalue_has_incdec_index(lvalue) {
-            if let Some(new_lhs) = self.rewrite_lvalue_index_side_effects(lvalue) {
-                let new_rhs: Expression = match &rvalue.kind {
-                    ExprKind::Binary { op, left, right }
-                        if left.span == lvalue.span
-                            && std::mem::discriminant(&left.kind)
-                                == std::mem::discriminant(&lvalue.kind) =>
-                    {
-                        Expression::new(
-                            ExprKind::Binary {
-                                op: *op,
-                                left: Box::new(new_lhs.clone()),
-                                right: right.clone(),
-                            },
-                            rvalue.span,
-                        )
-                    }
-                    _ => (*rvalue).clone(),
-                };
-                // The frozen target can still be an unpacked aggregate.
-                // Keep its member-wise assignment paths instead of forcing
-                // the value-only scalar store.
-                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
-                return;
-            }
+        let sized_new = Self::sized_new_parts(rvalue);
+        let row_sized_new: Option<String> = sized_new
+            .is_some()
+            .then(|| self.sized_new_row_lvalue(lvalue))
+            .flatten();
+        if self.indexed_colls_live()
+            && row_sized_new.is_none()
+            && (self.may_name_indexed_coll(lvalue) || self.may_name_indexed_coll(rvalue))
+            && !Self::lvalue_has_incdec_index(lvalue)
+            && self.try_indexed_coll_assign(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
         }
         // LRM §25.8 virtual-interface binding. When the LHS is a
         // class-property write whose property is declared
@@ -1716,7 +1855,21 @@ impl Simulator {
         // min(n, src.size()) elements and default-initialises the rest.
         // A `d[i] = new[n]` lvalue sizes the ELEMENT of an array of
         // dynamic arrays.
-        if let Some((n_expr, src_expr)) = Self::sized_new_parts(rvalue) {
+        if let Some((n_expr, src_expr)) = sized_new {
+            if let Some(row) = row_sized_new {
+                if !self.ensure_row(&row) {
+                    let _ = self.eval_expr(n_expr);
+                    if let Some(src) = src_expr {
+                        let _ = self.eval_expr(src);
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
+                self.module.dynamic_arrays.insert(row.clone());
+                self.fill_sized_new(&row, n_expr, src_expr);
+                self.settle_after_proc_write();
+                return;
+            }
             let target = match &lvalue.kind {
                 ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
                 // `dq[1] = new[n]` on an array-of-dynamic-arrays
@@ -1853,6 +2006,7 @@ impl Simulator {
                         sim.module.associative_arrays.contains_key(n)
                             || sim.module.dynamic_arrays.contains(n)
                             || sim.module.arrays.contains_key(n)
+                            || sim.names_nd_subarray(n)
                     };
                     let has_dyn = has_dyn && !whole_coll(self, &dst) && !whole_coll(self, &src);
                     if has_dyn && self.struct_storage_exists(&src, &su) {
@@ -2003,8 +2157,12 @@ impl Simulator {
             // identical code at top level worked.
             let (dst, spread_su) = self.struct_copy_target(dst);
             if let Some(su) = spread_su {
+                // §7.4.2: a multi-dimensional array of structs, or a row of
+                // one, is a collection too; it copies element by element
+                // below.
                 let dst_is_collection = self.module.dynamic_arrays.contains(&dst)
                     || self.module.arrays.contains_key(&dst)
+                    || self.names_nd_subarray(&dst)
                     || self.module.associative_arrays.contains_key(&dst);
                 // Freeze only after the destination is known to be a struct;
                 // rejected speculative probes must not execute selectors. The
@@ -2030,6 +2188,7 @@ impl Simulator {
                 if Self::is_struct_elem_ref(rvalue)
                     && !self.module.dynamic_arrays.contains(&dst)
                     && !self.module.arrays.contains_key(&dst)
+                    && !self.names_nd_subarray(&dst)
                     && !self.module.associative_arrays.contains_key(&dst)
                 {
                     self.assign_struct_memberwise(lvalue, rvalue, &su, 0);
@@ -2162,6 +2321,7 @@ impl Simulator {
                             .and_then(|o| o.as_ref())
                             .map(|i| i.class_name.clone());
                         let mut mtn: Option<String> = None;
+                        let mut decl_cn: Option<String> = None;
                         let mut cur = hcn;
                         while let Some(cn) = cur {
                             if let Some(cd) = self.module.classes.get(&cn) {
@@ -2171,6 +2331,7 @@ impl Simulator {
                                     .and_then(|s| s.type_name.clone())
                                 {
                                     mtn = Some(tn);
+                                    decl_cn = Some(cn);
                                     break;
                                 }
                                 cur = cd.extends.clone();
@@ -2186,6 +2347,11 @@ impl Simulator {
                             && let Some(b) = self.prop_class_type(handle, &member_name)
                         {
                             mtn = Some(b);
+                        }
+                        if let Some(t) = mtn.as_deref()
+                            && self.construct_covergroup_into(t, lvalue, rvalue)
+                        {
+                            return;
                         }
                         if let Some(mcls) = mtn.as_deref().and_then(|t| {
                             self.resolve_typedef_spec(t)
@@ -2212,8 +2378,31 @@ impl Simulator {
                                 _ => &[],
                             };
                             let (cn, spec) = mcls;
+                            // §8.8, §8.25: an element of `C #(args) arr[N]`
+                            // takes those args, read where they mean the
+                            // same as in the declaring class: through
+                            // `this`, or for a class without parameters.
+                            let type_args = decl_cn
+                                .as_deref()
+                                .filter(|d| {
+                                    spec.is_none()
+                                        && (this_recv
+                                            || self.this_stack.last().copied().flatten()
+                                                == Some(handle)
+                                            || !self.class_is_parameterized(d))
+                                })
+                                .and_then(|d| self.module.classes.get(d))
+                                .and_then(|d| d.property_type_args.get(&member_name))
+                                .filter(|ta| !ta.is_empty())
+                                .cloned();
                             if let Some(cd) = self.module.classes.get(&cn).cloned() {
-                                let v = if let Some((b, s)) = spec {
+                                let v = if let Some(ta) = type_args {
+                                    self.instantiate_class_with_type_args(
+                                        &cd,
+                                        ctor_args,
+                                        Some(ta.as_slice()),
+                                    )
+                                } else if let Some((b, s)) = spec {
                                     let saved = self.current_spec.take();
                                     self.current_spec = Some((b, s));
                                     let r = self.instantiate_class(&cd, ctor_args);
@@ -2417,6 +2606,11 @@ impl Simulator {
                     } else {
                         None
                     };
+                    if let Some(t) = elem_cls.as_deref()
+                        && self.construct_covergroup_into(t, lvalue, rvalue)
+                    {
+                        return;
+                    }
                     // The element type is often a TYPEDEF alias (e.g.
                     // `typedef elem_pool pool_t;` or a parameterized alias).
                     // The maps above record the TYPEDEF name, which isn't a key in
@@ -3012,7 +3206,16 @@ impl Simulator {
                                 r_prefix.into_owned(),
                                 &mut pairs,
                             );
+                            // §7.2: an element of an unpacked-struct array is
+                            // its member leaves.
+                            let elem_su = self
+                                .nd_elem_struct(&rname)
+                                .or_else(|| self.nd_elem_struct(&lname));
                             for (lp, rp) in pairs {
+                                if let Some(su) = &elem_su {
+                                    self.copy_unpacked_struct(&lp, &rp, &su.clone());
+                                    continue;
+                                }
                                 let v =
                                     self.get_signal_value_by_name(&rp).unwrap_or(Value::zero(1));
                                 self.set_signal_value_by_name(&lp, v);
@@ -3171,8 +3374,8 @@ impl Simulator {
             };
             // Distribute `ordered` MSB-first to each target in source order.
             let total = ordered.width as usize;
-            // Compute fixed-width targets; last target may be dynamic (remainder).
-            let mut fixed_ws: Vec<u32> = Vec::new();
+            // The last target may be a whole dynamic collection, which takes
+            // the remainder of the stream.
             let mut dyn_last: Option<String> = None;
             let mut dyn_last_elem_w: u32 = 8;
             for (i, e) in exprs.iter().enumerate() {
@@ -3195,18 +3398,27 @@ impl Simulator {
                             };
                             dyn_last = Some(n.to_string());
                             dyn_last_elem_w = ew;
-                            continue;
                         }
                     }
                 }
-                fixed_ws.push(self.infer_lhs_width(e));
             }
-            let fixed_total: u32 = fixed_ws.iter().sum();
             let mut msb = total; // bit position just above the MSB
             for (i, e) in exprs.iter().enumerate() {
                 let is_last = i == exprs.len() - 1;
+                // §11.4.14.4: a `with [range]` / slice operand targets a
+                // sub-range of a collection: only the selected elements are
+                // written, the rest of the array is unmodified. Its range
+                // "is evaluated immediately before its corresponding array
+                // is streamed", so it may read a target unpacked to its left
+                // by this same statement (`p.payload with [0 +: p.len]`).
+                let ranged = if Self::stream_operand_has_range(e) {
+                    self.stream_operand_elems(e, true)
+                } else {
+                    None
+                };
                 if is_last && dyn_last.is_some() {
-                    let remaining = (total as u32).saturating_sub(fixed_total);
+                    // Every earlier target took its width off the top.
+                    let remaining = msb as u32;
                     let elem_w = dyn_last_elem_w.max(1);
                     let n_elems = (remaining / elem_w) as usize;
                     let dname = dyn_last.clone().unwrap();
@@ -3236,6 +3448,31 @@ impl Simulator {
                             self.set_signal_value_by_name(&ename, slice_v);
                         }
                     }
+                } else if let Some((names, ew)) = ranged.as_ref() {
+                    // Collection-with-range target: unpack the operand's
+                    // portion of the stream into the selected elements,
+                    // MSB-first, leaving the array's other elements alone.
+                    let w = (names.len() as usize) * (*ew as usize);
+                    if w == 0 {
+                        continue;
+                    }
+                    let hi = msb.saturating_sub(1);
+                    let lo = msb.saturating_sub(w);
+                    let portion = if hi >= lo {
+                        ordered.range_select(hi, lo)
+                    } else {
+                        Value::zero(w as u32)
+                    };
+                    let ew = *ew as usize;
+                    for (k, en) in names.iter().enumerate() {
+                        let piece = if (k + 1) * ew <= w {
+                            portion.range_select(w - k * ew - 1, w - (k + 1) * ew)
+                        } else {
+                            Value::zero(ew as u32)
+                        };
+                        self.set_signal_value_by_name(en, piece.resize(ew as u32));
+                    }
+                    msb = lo;
                 } else {
                     let w = self.infer_lhs_width(e) as usize;
                     if w == 0 {
@@ -3757,9 +3994,12 @@ impl Simulator {
             return;
         }
         // §10.10: `cfg.r = {…}` writes a queue member before the right side runs as a value.
+        // §8.9: so does a static queue reached through the object.
         if let ExprKind::MemberAccess { .. } = &lvalue.kind
             && let ExprKind::Concatenation(_) = &rvalue.kind
-            && let Some(n) = self.expr_assoc_name(lvalue).filter(|n| self.class_queue_prop(n))
+            && let Some(n) = self
+                .expr_assoc_name(lvalue)
+                .filter(|n| self.class_queue_prop(n) || self.module.arrays.contains_key(n))
             && self.assign_whole_coll(&n, None, rvalue)
         {
             self.settle_after_proc_write();
@@ -4333,10 +4573,16 @@ impl Simulator {
             if matches!(rvalue.kind, ExprKind::Concatenation(_))
                 && !self.module.arrays.contains_key(&*lname)
                 && let Some(n) = self.expr_assoc_name(lvalue)
-                && self.class_queue_prop(&n)
             {
-                lname = std::borrow::Cow::Owned(n);
-                class_dyn = true;
+                if self.class_queue_prop(&n) {
+                    lname = std::borrow::Cow::Owned(n);
+                    class_dyn = true;
+                } else if self.module.arrays.contains_key(&n) {
+                    // §8.9: a static queue or dynamic array reached
+                    // through an object (`h.sq = {h.sq, v}`) is the
+                    // class's store.
+                    lname = std::borrow::Cow::Owned(n);
+                }
             }
             if self.module.arrays.contains_key(&*lname) || class_dyn {
                 // Queue/array slice assignment: lq = rq[a:b]. A slice of a

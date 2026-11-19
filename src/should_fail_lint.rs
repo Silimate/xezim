@@ -24,7 +24,7 @@ use xezim_core::ast::stmt::{Statement, StatementKind, VarDeclarator};
 use xezim_core::ast::types::{
     DataType, EnumType, IntegerAtomType, PackedDimension, PortDirection, Signing, UnpackedDimension,
 };
-use xezim_core::elaborate::ElaboratedModule;
+use xezim_core::elaborate::{ElaboratedModule, ParamEnv, ParamLookup};
 
 /// The elaboration's parameter table type (`ElaboratedModule::parameters`).
 type ParamMap = xezim_core::hasher::HashMap<String, Value>;
@@ -186,6 +186,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
         }
     }
     check_class_and_package_undeclared(defs, elab, &pkg_names, &mut errs);
+    check_undeclared_type_names(defs, elab, &pkg_names, &mut errs);
     check_nettype_partial_drivers(defs, elab, &mut errs);
     check_named_block_refs(defs, &mut errs);
     if xezim_core::sv_parser::strict_checks() {
@@ -257,6 +258,7 @@ fn check_items_in_scopes(
     local_types: &std::collections::HashSet<String>,
     errs: &mut Vec<String>,
 ) {
+    let scoped = &views.scoped;
     let views = if scope.top { &[][..] } else { views.of(name) };
     if views.is_empty() {
         for it in items {
@@ -267,7 +269,7 @@ fn check_items_in_scopes(
     let mut seen: HashSet<String> = HashSet::default();
     let mut found = Vec::new();
     for view in views {
-        let scope = ConstScope::instance(scope.elab, view);
+        let scope = ConstScope::instance(scope.elab, view, scoped);
         for it in items {
             check_module_item(it, scope, local_types, true, &mut found);
         }
@@ -698,25 +700,32 @@ impl Drop for ParamLeaves {
 struct ConstScope<'a> {
     elab: &'a ElaboratedModule,
     top: bool,
-    inst: Option<&'a ParamMap>,
+    inst: Option<ParamEnv<'a>>,
 }
 
 /// The parameters of every instance of each non-top definition, keyed by the
 /// definition's name, each with the instance path stripped from its keys
-/// (`u.v.N` of instance `u.v` is `N`) and joined by the package and class
-/// constants (`pkg::N`), which every scope reads by that spelling (§26.3).
+/// (`u.v.N` of instance `u.v` is `N`). An instance's view is its own table
+/// laid over `scoped`, the package and class constants (`pkg::N`), which
+/// every scope reads by that spelling (§26.3); the two never share a key,
+/// since a stripped key holds no `::`. Copying the constants into the table
+/// of every instance instead held instances x constants entries (#721).
 /// A bare top-level key is NOT part of a child's view: the child's own `N`
 /// is registered as `u.N`, and a `$unit` or top-module `N` it could see is
 /// told apart from nothing by the flat table.
 struct InstanceViews {
     by_def: HashMap<String, Vec<ParamMap>>,
+    scoped: ParamMap,
 }
 
 impl InstanceViews {
     fn build(elab: &ElaboratedModule) -> Self {
         let mut by_def: HashMap<String, Vec<ParamMap>> = HashMap::default();
         if elab.instances.is_empty() {
-            return InstanceViews { by_def };
+            return InstanceViews {
+                by_def,
+                scoped: ParamMap::default(),
+            };
         }
         // Instance path -> (definition, index of its view in `by_def`).
         let mut slots: HashMap<&str, (&str, usize)> = HashMap::default();
@@ -728,10 +737,10 @@ impl InstanceViews {
                 (inst.def_name.as_str(), views.len() - 1),
             );
         }
-        let mut scoped: Vec<(&String, &Value)> = Vec::new();
+        let mut scoped = ParamMap::default();
         for (key, value) in &elab.parameters {
             if key.contains("::") {
-                scoped.push((key, value));
+                scoped.insert(key.clone(), value.clone());
                 continue;
             }
             // The longest instance path the key starts with owns it.
@@ -745,19 +754,11 @@ impl InstanceViews {
                 pos = dot;
             }
         }
-        if !scoped.is_empty() {
-            for views in by_def.values_mut() {
-                for view in views.iter_mut() {
-                    for (key, value) in &scoped {
-                        view.insert((*key).clone(), (*value).clone());
-                    }
-                }
-            }
-        }
-        InstanceViews { by_def }
+        InstanceViews { by_def, scoped }
     }
 
-    /// The views of the instances of `def`, empty when it is not instantiated.
+    /// The own tables of the instances of `def`, empty when it is not
+    /// instantiated.
     fn of(&self, def: &str) -> &[ParamMap] {
         self.by_def.get(def).map_or(&[], Vec::as_slice)
     }
@@ -791,7 +792,7 @@ impl<'a> GenerateSelection<'a> {
         self.views
             .of(def)
             .iter()
-            .map(|v| ConstScope::instance(self.elab, v))
+            .map(|v| ConstScope::instance(self.elab, v, &self.views.scoped))
             .collect()
     }
 
@@ -915,27 +916,34 @@ impl<'a> ConstScope<'a> {
         }
     }
 
-    /// The scope of one instance of a non-top definition (#893).
-    fn instance(elab: &'a ElaboratedModule, view: &'a ParamMap) -> Self {
+    /// The scope of one instance of a non-top definition (#893): its own
+    /// table `view` over the constants every scope reads (`scoped`).
+    fn instance(elab: &'a ElaboratedModule, view: &'a ParamMap, scoped: &'a ParamMap) -> Self {
         ConstScope {
             elab,
             top: false,
-            inst: Some(view),
+            inst: Some(ParamEnv::Overlay {
+                base: scoped,
+                top: view,
+            }),
         }
     }
 
     /// The table a constant of this scope folds against.
-    fn params(&self) -> &'a ParamMap {
+    fn params(&self) -> ParamEnv<'a> {
         match self.inst {
             Some(view) if !self.top => view,
-            _ => &self.elab.parameters,
+            _ => ParamEnv::Single(&self.elab.parameters),
         }
     }
 
     /// The parameter `name` of this scope, when the scope knows it.
     fn param(&self, name: &str) -> Option<&'a Value> {
         if self.top || self.inst.is_some() {
-            self.params().get(name)
+            match self.params() {
+                ParamEnv::Single(table) => table.get(name),
+                ParamEnv::Overlay { base, top } => top.get(name).or_else(|| base.get(name)),
+            }
         } else {
             None
         }
@@ -951,7 +959,7 @@ impl<'a> ConstScope<'a> {
                 return Folded::Hidden;
             }
         }
-        match xezim_core::elaborate::const_eval_i64_with_params(e, Some(self.params())) {
+        match xezim_core::elaborate::const_eval_i64_with_params_env(e, Some(&self.params())) {
             Some(v) => Folded::Value(v),
             None => Folded::NotConstant,
         }
@@ -983,9 +991,9 @@ impl<'a> ConstScope<'a> {
         if !known {
             return 0;
         }
-        xezim_core::elaborate::resolve_type_width(
+        xezim_core::elaborate::resolve_type_width_env(
             dt,
-            Some(self.params()),
+            Some(&self.params()),
             Some(&self.elab.typedefs),
         )
     }
@@ -1315,6 +1323,11 @@ fn check_stmt_stream(
         data_type,
         declarators,
         ..
+    }
+    | StatementKind::ParamDecl {
+        data_type,
+        declarators,
+        ..
     } = &s.kind
     {
         for decl in declarators {
@@ -1436,7 +1449,7 @@ fn stream_width(exprs: &[Expression], vw: &std::collections::HashMap<String, u32
 /// measured 1 bit and §6.19 REJECTED a perfectly legal design. A lint must not
 /// fire on a width it could not determine.
 fn dim_names_resolve(dt: &DataType, scope: ConstScope) -> bool {
-    fn expr_known(e: &Expression, params: &ParamMap) -> bool {
+    fn expr_known(e: &Expression, params: ParamEnv) -> bool {
         match &e.kind {
             ExprKind::Number(_) => true,
             ExprKind::Paren(x) => expr_known(x, params),
@@ -1838,6 +1851,7 @@ fn is_leading_nonexec(s: &Statement) -> bool {
     matches!(
         s.kind,
         StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. }
             | StatementKind::Typedef(_)
             | StatementKind::Null
             | StatementKind::ScopePop
@@ -2261,7 +2275,8 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     fn block_members(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
             for_each_stmt(st, &mut |s| match &s.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     out.extend(declarators.iter().map(|d| d.name.name.clone()));
                 }
                 StatementKind::SeqBlock { name: Some(n), .. }
@@ -2379,7 +2394,9 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     for st in &stmts {
         note_stmt(st, &mut blocks);
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 data.extend(declarators.iter().map(|d| d.name.name.clone()));
             }
         });
@@ -3147,7 +3164,9 @@ fn check_subroutine_range_idents(
     let check = |sub: &str, dts: Vec<&DataType>, body: &[Statement], errs: &mut Vec<String>| {
         let mut locals = HashSet::new();
         for st in body {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 locals.extend(declarators.iter().map(|d| d.name.name.as_str()));
             }
         }
@@ -3362,7 +3381,8 @@ fn check_foreach_dims(items: &[ModuleItem], errs: &mut Vec<String>) {
     let mut loops: Vec<(String, usize)> = Vec::new();
     for st in &stmts {
         for_each_stmt(st, &mut |s| match &s.kind {
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
                 locals.extend(declarators.iter().map(|d| d.name.name.clone()))
             }
             StatementKind::Foreach { array, vars, .. } => {
@@ -3474,7 +3494,9 @@ fn check_select_depth(items: &[ModuleItem], errs: &mut Vec<String>) {
     }
     for st in &stmts {
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 for d in declarators {
                     dims.remove(d.name.name.as_str());
                 }
@@ -4152,7 +4174,9 @@ fn note_function_names(f: &xezim_core::ast::decl::FunctionDeclaration, out: &mut
     }
     note_data_type_names(&f.return_type, out);
     for st in f.items.iter() {
-        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             note_declarator_names(declarators, out);
         }
     }
@@ -4165,7 +4189,9 @@ fn note_task_names(t: &xezim_core::ast::decl::TaskDeclaration, out: &mut HashSet
         note_data_type_names(&p.data_type, out);
     }
     for st in t.items.iter() {
-        if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+        if let StatementKind::VarDecl { declarators, .. }
+        | StatementKind::ParamDecl { declarators, .. } = &st.kind
+        {
             note_declarator_names(declarators, out);
         }
     }
@@ -4886,7 +4912,9 @@ fn check_wildcard_import_conflicts(
             _ => continue,
         };
         for_each_stmt(st, &mut |s| {
-            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &s.kind
+            {
                 locals.extend(declarators.iter().map(|d| d.name.name.clone()));
             }
         });
@@ -5104,7 +5132,9 @@ fn check_inherited_local_access(
             let mut locals: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
             for st in body {
                 for_each_stmt(st, &mut |s| {
-                    if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                    if let StatementKind::VarDecl { declarators, .. }
+                    | StatementKind::ParamDecl { declarators, .. } = &s.kind
+                    {
                         locals.extend(declarators.iter().map(|d| d.name.name.clone()));
                     }
                 });
@@ -5269,7 +5299,8 @@ fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
         let mut names: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
         for st in body {
             for_each_stmt(st, &mut |s| match &s.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     names.extend(declarators.iter().map(|d| d.name.name.clone()))
                 }
                 StatementKind::SeqBlock { name: Some(n), .. }
@@ -5294,7 +5325,9 @@ fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
         };
         for st in stmts {
             for_each_stmt(st, &mut |s| {
-                if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                if let StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } = &s.kind
+                {
                     locals.extend(declarators.iter().map(|d| d.name.name.clone()));
                 }
             });
@@ -5658,6 +5691,13 @@ fn monitor_stmt(
                 }
             }
         }
+        StatementKind::ParamDecl { declarators, .. } => {
+            if let Some(top) = scopes.last_mut() {
+                for d in declarators {
+                    top.push((d.name.name.clone(), false));
+                }
+            }
+        }
         StatementKind::Expr(e) => {
             if let ExprKind::SystemCall { name, args } = &e.kind
                 && matches!(
@@ -5785,7 +5825,9 @@ fn check_unpacked_pattern_counts(items: &[ModuleItem], errs: &mut Vec<String>) {
         .collect();
     for s in &procs {
         for_each_stmt(s, &mut |st| {
-            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &st.kind
+            {
                 for d in declarators {
                     shadowed.insert(d.name.name.clone());
                 }
@@ -5920,4 +5962,386 @@ fn monitor_idents(e: &Expression, out: &mut Vec<String>) {
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// §6.18, §8.3, §8.13 — a declaration or `extends` clause naming a type that
+// is declared nowhere.
+// ---------------------------------------------------------------------------
+//
+// `addr_constrained_txn txn = new();` with no such class in the compilation
+// elaborated as an untyped handle: `randomize()` did nothing, every member
+// read `x`, and the run exited 0. An undefined base class was dropped the same
+// way. A type identifier shall be declared before it is used (§6.18), and a
+// class handle or base class shall name a class (§8.3, §8.13).
+//
+// As with the #888 finder above, the pass does not resolve scopes: a name is
+// reported only when NOTHING in the design declares it (no class, typedef,
+// type parameter, covergroup, nettype, interface, package member, ...). A
+// type that exists but is not visible from the use is left to elaboration.
+// Scoped names (`pkg::T`, `C::T`) are left alone too.
+
+/// Walks every definition twice: once harvesting the type-like names the #888
+/// harvest does not reach (`collecting`), once checking the type positions.
+struct UndeclaredTypeFinder<'a> {
+    elab: &'a ElaboratedModule,
+    pkg_names: &'a HashSet<String>,
+    declared: HashSet<String>,
+    collecting: bool,
+    /// The definition being walked, to locate a span in the right file.
+    owner: String,
+    seen: HashSet<String>,
+    errs: Vec<String>,
+}
+
+impl<'a> UndeclaredTypeFinder<'a> {
+    fn known(&self, n: &str) -> bool {
+        !is_plain_ident(n)
+            || is_builtin_type(n)
+            || reserved_type_arg_name(n)
+            || self.pkg_names.contains(n)
+            || self.declared.contains(n)
+            || top_declares(n, self.elab)
+            || self.elab.covergroups.contains_key(n)
+            || self.elab.checker_decls.contains_key(n)
+            || self.elab.nettype_resolvers.contains_key(n)
+            || self.elab.forward_typedef_names.contains(n)
+    }
+
+    fn report(&mut self, n: &str, span: xezim_core::ast::Span, message: String) {
+        if self.collecting || self.known(n) || !self.seen.insert(message.clone()) {
+            return;
+        }
+        self.errs.push(xezim_core::elaborate::span_error_of(
+            self.elab,
+            span,
+            &self.owner,
+            &message,
+        ));
+    }
+
+    /// The type of the declaration of `declared_name`.
+    fn data_type(&mut self, dt: &DataType, declared_name: &str) {
+        match dt {
+            DataType::TypeReference { name, .. } if !name.has_scope() => {
+                let n = name.name.name.clone();
+                let message = format!(
+                    "'{n}' is not a declared type or class: it is used as the type of \
+                     '{declared_name}' but nothing in the design declares it \
+                     (IEEE 1800-2017 §6.18, §8.3)"
+                );
+                self.report(&n, name.span, message);
+            }
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    let member = m
+                        .declarators
+                        .first()
+                        .map(|d| d.name.name.clone())
+                        .unwrap_or_default();
+                    self.data_type(&m.data_type, &member);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn declarators(&mut self, dt: &DataType, ds: &[VarDeclarator]) {
+        let first = ds.first().map(|d| d.name.name.clone()).unwrap_or_default();
+        self.data_type(dt, &first);
+    }
+
+    fn typedef_name(&mut self, td: &TypedefDeclaration) {
+        if self.collecting {
+            self.declared.insert(td.name.name.clone());
+        }
+    }
+
+    fn stmt(&mut self, s: &Statement) {
+        use xezim_core::ast::stmt::ForInit;
+        match &s.kind {
+            StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } => self.declarators(data_type, declarators),
+            StatementKind::Typedef(td) => self.typedef_name(td),
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt(then_stmt);
+                if let Some(e) = else_stmt {
+                    self.stmt(e);
+                }
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items {
+                    self.stmt(&it.stmt);
+                }
+            }
+            StatementKind::For { init, body, .. } => {
+                for i in init {
+                    if let ForInit::VarDecl {
+                        data_type, name, ..
+                    } = i
+                    {
+                        self.data_type(data_type, &name.name);
+                    }
+                }
+                self.stmt(body);
+            }
+            StatementKind::Foreach { body, .. }
+            | StatementKind::ForeachTail { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::ForeverTail { body }
+            | StatementKind::RsAction { body }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => self.stmt(body),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for st in stmts {
+                    self.stmt(st);
+                }
+            }
+            StatementKind::RandCase { items } => {
+                for (_, st) in items {
+                    self.stmt(st);
+                }
+            }
+            StatementKind::WaitOrder { pass, fail, .. } => {
+                for st in [pass, fail].into_iter().flatten() {
+                    self.stmt(st);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ports(&mut self, ports: &[xezim_core::ast::decl::FunctionPort]) {
+        for p in ports {
+            self.data_type(&p.data_type, &p.name.name);
+        }
+    }
+
+    fn function(&mut self, f: &xezim_core::ast::decl::FunctionDeclaration) {
+        self.data_type(&f.return_type, &f.name.name.name);
+        self.ports(&f.ports);
+        for st in f.items.iter() {
+            self.stmt(st);
+        }
+    }
+
+    fn task(&mut self, t: &xezim_core::ast::decl::TaskDeclaration) {
+        self.ports(&t.ports);
+        for st in t.items.iter() {
+            self.stmt(st);
+        }
+    }
+
+    fn covergroup(&mut self, cg: &xezim_core::ast::decl::CovergroupDeclaration) {
+        if self.collecting {
+            self.declared.insert(cg.name.name.clone());
+        }
+    }
+
+    fn class(&mut self, c: &ClassDeclaration) {
+        if self.collecting {
+            self.declared.insert(c.name.name.clone());
+        }
+        if let Some(x) = &c.extends {
+            if x.scopes.is_empty() {
+                let n = x.name.name.clone();
+                let message = format!(
+                    "class '{}' extends '{n}', but nothing in the design declares a class \
+                     '{n}' (IEEE 1800-2017 §8.13)",
+                    c.name.name
+                );
+                self.report(&n, x.span, message);
+            }
+        }
+        for it in &c.items {
+            match it {
+                ClassItem::Property(pr) => self.declarators(&pr.data_type, &pr.declarators),
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => self.function(f),
+                    ClassMethodKind::Task(t) => self.task(t),
+                },
+                ClassItem::Typedef(td) => self.typedef_name(td),
+                ClassItem::Class(inner) => self.class(inner),
+                ClassItem::Covergroup(cg) => self.covergroup(cg),
+                _ => {}
+            }
+        }
+    }
+
+    fn items(&mut self, items: &[ModuleItem]) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) => self.declarators(&d.data_type, &d.declarators),
+                ModuleItem::TypedefDeclaration(td) => self.typedef_name(td),
+                ModuleItem::FunctionDeclaration(f) => self.function(f),
+                ModuleItem::TaskDeclaration(t) => self.task(t),
+                ModuleItem::ClassDeclaration(c) => self.class(c),
+                ModuleItem::InitialConstruct(p) => self.stmt(&p.stmt),
+                ModuleItem::AlwaysConstruct(p) => self.stmt(&p.stmt),
+                ModuleItem::FinalConstruct(p) => self.stmt(&p.stmt),
+                ModuleItem::CovergroupDeclaration(cg) => self.covergroup(cg),
+                ModuleItem::NettypeDeclaration(nt) => {
+                    if self.collecting {
+                        self.declared.insert(nt.name.name.clone());
+                    }
+                }
+                ModuleItem::CheckerDeclaration(ck) => {
+                    if self.collecting {
+                        self.declared.insert(ck.name.name.clone());
+                    }
+                    self.items(&ck.items);
+                }
+                ModuleItem::GenerateRegion(g) => self.items(&g.items),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, its) in &g.branches {
+                        self.items(its);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => self.items(&g.items),
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &g.arms {
+                        if self.collecting {
+                            note_items_names(&arm.items, &mut self.declared);
+                        }
+                        self.items(&arm.items);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn definitions(&mut self, defs: &[&SourceDefinition]) {
+        use xezim_core::ast::decl::PackageItem;
+        for d in defs {
+            self.owner = d.name();
+            if self.collecting {
+                self.declared.insert(d.name());
+            }
+            match d {
+                SourceDefinition::Module(m) => self.items(&m.items),
+                SourceDefinition::Interface(m) => self.items(&m.items),
+                SourceDefinition::Program(m) => self.items(&m.items),
+                SourceDefinition::Package(p) => {
+                    for it in &p.items {
+                        match it {
+                            PackageItem::Data(dd) => {
+                                self.declarators(&dd.data_type, &dd.declarators)
+                            }
+                            PackageItem::Typedef(td) => self.typedef_name(td),
+                            PackageItem::Function(f) => self.function(f),
+                            PackageItem::Task(t) => self.task(t),
+                            PackageItem::Class(c) => self.class(c),
+                            PackageItem::Nettype(nt) if self.collecting => {
+                                self.declared.insert(nt.name.name.clone());
+                            }
+                            PackageItem::Checker(ck) if self.collecting => {
+                                self.declared.insert(ck.name.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                SourceDefinition::Class(c) => self.class(c),
+                SourceDefinition::Typedef(_) | SourceDefinition::Udp(_) => {}
+            }
+        }
+    }
+}
+
+/// §6.18, §8.3, §8.13: report every unscoped type name, in a variable,
+/// property, subroutine-port or return-type declaration or in an `extends`
+/// clause, that nothing in the design declares.
+fn check_undeclared_type_names(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    pkg_names: &HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    let mut f = UndeclaredTypeFinder {
+        elab,
+        pkg_names,
+        declared: design_declared_names(defs),
+        collecting: true,
+        owner: String::new(),
+        seen: HashSet::new(),
+        errs: Vec::new(),
+    };
+    f.definitions(defs);
+    f.collecting = false;
+    f.definitions(defs);
+    // `defs` iterates a hash map; keep the report order stable.
+    f.errs.sort();
+    errs.extend(f.errs);
+}
+
+#[cfg(test)]
+mod instance_view_tests {
+    use super::*;
+
+    /// §26.3 (#721): the package constants are held once for the whole lint
+    /// run, not once per instance. Each instance's table holds its own
+    /// parameters; the scope it folds in reads both.
+    #[test]
+    fn instances_share_one_table_of_package_constants() {
+        let mut src = String::from("package cfg;\n");
+        for i in 0..40 {
+            src.push_str(&format!("  parameter int K{i} = {i};\n"));
+        }
+        src.push_str(
+            "endpackage\n\
+             module leaf #(parameter int N = 1) (); localparam int M = N + cfg::K7; endmodule\n\
+             module top;\n",
+        );
+        for i in 0..25 {
+            src.push_str(&format!("  leaf #(.N({i})) u{i} ();\n"));
+        }
+        src.push_str("endmodule\n");
+        let (_, elab) = xezim_core::parse_and_elaborate_multi(
+            &[src],
+            Some("top"),
+            &[],
+            &["views.sv".to_string()],
+            &[],
+        )
+        .expect("elaborate");
+        let views = InstanceViews::build(&elab);
+        assert_eq!(views.scoped.len(), 40);
+        assert!(views.scoped.keys().all(|k| k.starts_with("cfg::K")));
+        let leaves = views.of("leaf");
+        assert_eq!(leaves.len(), 25);
+        // 25 instances x 40 constants were 1,000 copied entries.
+        let own: usize = leaves.iter().map(|view| view.len()).sum();
+        assert_eq!(own, 25 * 2, "N and M of each instance");
+        assert!(
+            leaves
+                .iter()
+                .all(|view| view.keys().all(|k| !k.contains("::")))
+        );
+        // A scope reads its own parameter and the shared constant alike.
+        let mut seen = Vec::new();
+        for view in leaves {
+            let scope = ConstScope::instance(&elab, view, &views.scoped);
+            let n = scope.param("N").and_then(|v| v.to_i64()).expect("own N");
+            let m = scope.param("M").and_then(|v| v.to_i64()).expect("own M");
+            assert_eq!(m, n + 7);
+            let k = scope.param("cfg::K7").expect("shared constant");
+            assert!(std::ptr::eq(k, &views.scoped["cfg::K7"]));
+            seen.push(n);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..25).collect::<Vec<i64>>());
+    }
 }

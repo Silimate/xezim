@@ -663,3 +663,13 @@ mod urandom_seed_input_1058;
 mod oom_trace;
 #[path = "misc/scope_randomize_without_std.rs"]
 mod scope_randomize_without_std;
+#[path = "misc/interconnect_array_drivers_1098.rs"]
+mod interconnect_array_drivers_1098;
+#[path = "misc/replication_signedness_1095.rs"]
+mod replication_signedness_1095;
+#[path = "misc/localparam_self_determined_1143.rs"]
+mod localparam_self_determined_1143;
+#[path = "misc/comb_timescale.rs"]
+mod comb_timescale;
+#[path = "misc/comb_batch_branches_1284.rs"]
+mod comb_batch_branches_1284;

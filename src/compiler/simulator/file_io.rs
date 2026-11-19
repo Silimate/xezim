@@ -1943,8 +1943,9 @@ impl NdMemory {
 /// `@<address> <word>`, the form xezim used to write.
 struct MemDump {
     text: String,
-    /// The address the next word lands at without an `@` line.
-    next: i128,
+    /// The address the next word lands at without an `@` line; `None`
+    /// after the last address in the direction of the dump.
+    next: Option<i128>,
     /// +1 or -1: the direction from the start address to the finish one.
     step: i128,
     radix: u32,
@@ -1960,7 +1961,7 @@ impl MemDump {
     fn new(first: i128, step: i128, radix: u32) -> Self {
         MemDump {
             text: String::new(),
-            next: first,
+            next: Some(first),
             step,
             radix,
             every: writemem_every_address(),
@@ -1969,7 +1970,7 @@ impl MemDump {
     }
 
     fn word(&mut self, addr: i128, val: &Value) {
-        if self.every || addr != self.next {
+        if self.every || self.next != Some(addr) {
             self.text.push('@');
             self.text
                 .push_str(&Simulator::memory_file_address_text(addr, self.wide));
@@ -1981,7 +1982,7 @@ impl MemDump {
             _ => val.to_dec_string(),
         });
         self.text.push('\n');
-        self.next = addr + self.step;
+        self.next = addr.checked_add(self.step);
     }
 }
 

@@ -293,3 +293,45 @@ endmodule
         ]
     );
 }
+
+/// A dump that reaches the largest or the smallest key of a signed 128-bit
+/// index type ends there instead of overflowing the next address: an
+/// ascending and a descending dump of both endpoint keys are written and
+/// read back.
+#[test]
+fn writemem_associative_endpoint_keys_of_a_128_bit_index() {
+    let dir = scratch("endkeys");
+    let f = |n: &str| dir.join(n);
+    let src = r#"
+module t;
+  bit [7:0] em [bit signed [127:0]];
+  bit [7:0] ea [bit signed [127:0]];
+  bit [7:0] ed [bit signed [127:0]];
+  bit signed [127:0] mx = 128'sh7fff_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+  bit signed [127:0] mn = 128'sh8000_0000_0000_0000_0000_0000_0000_0000;
+  initial begin
+    em[mx] = 8'h11;
+    em[mn] = 8'h22;
+    $writememh("@A@", em);
+    $writememh("@D@", em, mx, mn);
+    $readmemh("@A@", ea);
+    $readmemh("@D@", ed, mx, mn);
+    $display("T|ascending num=%0d %h %h", ea.num(), ea[mx], ea[mn]);
+    $display("T|descending num=%0d %h %h", ed.num(), ed[mx], ed[mn]);
+  end
+endmodule
+"#
+    .replace("@A@", &f("a.hex").display().to_string())
+    .replace("@D@", &f("d.hex").display().to_string());
+    let got = t_lines(&src);
+    let files: Vec<String> = ["a.hex", "d.hex"].iter().map(|n| read(&f(n))).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        files,
+        [
+            "@80000000000000000000000000000000\n22\n@7fffffffffffffffffffffffffffffff\n11\n",
+            "@7fffffffffffffffffffffffffffffff\n11\n@80000000000000000000000000000000\n22\n",
+        ]
+    );
+    assert_eq!(got, ["T|ascending num=2 11 22", "T|descending num=2 11 22"]);
+}

@@ -15,6 +15,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   process resumed in the same time slot, or because its `always_comb` ran
   again, ran no action and now counts as no attempt (§16.4.2); it counted as
   a failure, so an assertion that never reported one read as failing.
+* The `always_comb` copies of a generate loop keep their own deferred
+  reports. A report replaced the pending report of another copy with the
+  same assertion statement, so that copy's action did not run, and a
+  failure there printed nothing.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

@@ -245,3 +245,76 @@ endmodule
         ]
     );
 }
+
+/// An index type wider than 64 bits keeps every key (§21.4, §21.5, §7.8):
+/// the default range of a dump covers the whole index type, and an address
+/// line or a start or finish argument above 64 bits keeps its value. A
+/// signed wide index type writes a negative key as its 128-bit two's
+/// complement, and a positive key of 64 one bits stays positive; both read
+/// back.
+#[test]
+fn readmem_writemem_index_wider_than_64_bits() {
+    let dir = scratch("wider");
+    let f = |n: &str| dir.join(n).display().to_string();
+    std::fs::write(dir.join("l.hex"), "@10000000000000000\nab cd\n").unwrap();
+    let src = r#"
+module t;
+  bit [7:0] wm [bit [79:0]];
+  bit [7:0] wr [bit [79:0]];
+  bit [7:0] lm [bit [79:0]];
+  bit [7:0] rg [bit [79:0]];
+  bit [7:0] sm [bit signed [79:0]];
+  bit [7:0] sr [bit signed [79:0]];
+  bit signed [79:0] big = 80'sh1_0000_0000_0000_0000;
+  initial begin
+    wm[5] = 8'h11;
+    wm[80'h1_0000_0000_0000_0000] = 8'h22;
+    wm[80'hffff_0000_0000_0000_0000] = 8'h33;
+    $writememh("@WW@", wm);
+    $readmemh("@WW@", wr);
+    $display("T|wide num=%0d %h %h %h", wr.num(), wr[5], wr[80'h1_0000_0000_0000_0000],
+             wr[80'hffff_0000_0000_0000_0000]);
+    $readmemh("@L@", lm);
+    $display("T|load num=%0d %h %h", lm.num(), lm[80'h1_0000_0000_0000_0000],
+             lm[80'h1_0000_0000_0000_0001]);
+    $writememh("@RG@", wm, 80'h1_0000_0000_0000_0000, 80'hffff_ffff_ffff_ffff_ffff);
+    $readmemh("@RG@", rg);
+    $display("T|range num=%0d %h %h", rg.num(), rg[80'h1_0000_0000_0000_0000],
+             rg[80'hffff_0000_0000_0000_0000]);
+    sm[-1] = 8'h44;
+    sm[-big] = 8'h55;
+    sm[80'shffff_ffff_ffff_ffff] = 8'h66;
+    $writememh("@SW@", sm);
+    $readmemh("@SW@", sr);
+    $display("T|signed num=%0d %h %h %h", sr.num(), sr[-1], sr[-big], sr[80'shffff_ffff_ffff_ffff]);
+  end
+endmodule
+"#
+    .replace("@WW@", &f("ww.hex"))
+    .replace("@L@", &f("l.hex"))
+    .replace("@RG@", &f("rg.hex"))
+    .replace("@SW@", &f("sw.hex"));
+    let got = t_lines(&src);
+    let files: Vec<String> = ["ww.hex", "sw.hex"]
+        .iter()
+        .map(|n| std::fs::read_to_string(dir.join(n)).unwrap_or_default())
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        files,
+        [
+            "@5 11\n@10000000000000000 22\n@ffff0000000000000000 33\n",
+            "@ffffffffffffffff0000000000000000 55\n@ffffffffffffffffffffffffffffffff 44\n\
+             @ffffffffffffffff 66\n",
+        ]
+    );
+    assert_eq!(
+        got,
+        [
+            "T|wide num=3 11 22 33",
+            "T|load num=2 ab cd",
+            "T|range num=2 22 33",
+            "T|signed num=3 44 55 66",
+        ]
+    );
+}

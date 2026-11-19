@@ -15,24 +15,35 @@ impl Simulator {
     pub(super) fn register_dyn_member_shape(
         &mut self,
         cdef: &crate::compiler::elaborate::ElaboratedClass,
-        params: &HashMap<String, Value>,
+        overrides: &HashMap<String, Value>,
         prop: &str,
         scoped: &str,
         width: u32,
     ) {
+        let params = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: overrides,
+        };
         let fixed_tail: Option<Vec<(i64, i64)>> =
             cdef.dynamic_tail_properties.get(prop).and_then(|tail| {
                 tail.iter()
                     .map(|d| match d {
                         crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
-                            let l =
-                                super::elaborate::const_eval_i64_with_params(left, Some(params))?;
-                            let r =
-                                super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+                            let l = super::elaborate::const_eval_i64_with_params_env(
+                                left,
+                                Some(&params),
+                            )?;
+                            let r = super::elaborate::const_eval_i64_with_params_env(
+                                right,
+                                Some(&params),
+                            )?;
                             Some((l.min(r), l.max(r)))
                         }
                         crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
-                            match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
+                            match super::elaborate::const_eval_i64_with_params_env(
+                                expr,
+                                Some(&params),
+                            ) {
                                 Some(n) if n > 0 => Some((0, n - 1)),
                                 _ => None,
                             }
@@ -486,7 +497,27 @@ impl Simulator {
             .map(|(_, d)| d.clone())
     }
 
-    pub(super) fn params_with_class_spec(&mut self) -> Option<HashMap<String, Value>> {
+    /// The design parameters with `spec` (`class_spec_value_params`) laid
+    /// over them, borrowed: copying the design's whole parameter table on
+    /// every evaluation inside a class method cost time linear in the
+    /// design's parameter count (#1276).
+    pub(super) fn spec_param_env<'a>(
+        &'a self,
+        spec: &'a Option<HashMap<String, Value>>,
+    ) -> super::elaborate::ParamEnv<'a> {
+        match spec {
+            Some(top) => super::elaborate::ParamEnv::Overlay {
+                base: &self.module.parameters,
+                top,
+            },
+            None => super::elaborate::ParamEnv::Single(&self.module.parameters),
+        }
+    }
+
+    /// Just the active specialization's value parameters, which
+    /// `spec_param_env` lays over `module.parameters` instead of copying
+    /// every design parameter.
+    pub(super) fn class_spec_value_params(&mut self) -> Option<HashMap<String, Value>> {
         let (base, _) = self.current_spec.clone()?;
         let names: Vec<String> = {
             let cd = self.module.classes.get(&base)?;
@@ -499,7 +530,7 @@ impl Simulator {
         if names.is_empty() {
             return None;
         }
-        let mut m = self.module.parameters.clone();
+        let mut m = HashMap::default();
         for n in names {
             if let Some(v) = self.resolve_value_param_from_spec(&n) {
                 m.insert(n, v);
@@ -1865,12 +1896,76 @@ impl Simulator {
                 return Some(ta.clone());
             }
         }
+        if let Some(ta) = self.member_target_type_args(lvalue) {
+            return Some(ta);
+        }
         if let ExprKind::Ident(lh) = &lvalue.kind {
             if let Some(leaf) = lh.path.last() {
                 if let Some(ta) = self.this_property_type_args(&leaf.name.name) {
                     return Some(ta);
                 }
             }
+        }
+        None
+    }
+
+    /// §8.8, §8.25: `obj.m = new` (or `this.m = new`) where the class of
+    /// `obj` declares `C #(args) m;` constructs that specialization, as a
+    /// bare `m = new` in a method of `obj` would. Only where `args` mean the
+    /// same in the running scope: `obj` is `this`, or the declaring class
+    /// has no parameters (a parameterized owner's member specialization is
+    /// `receiver_member_spec`'s).
+    fn member_target_type_args(&self, lvalue: &Expression) -> Option<Vec<Expression>> {
+        let (owner, cn, prop) = self.member_target_decl(lvalue)?;
+        let cd = self.module.classes.get(&cn)?;
+        let is_this = self.this_stack.last().copied().flatten() == Some(owner);
+        if !is_this && self.class_is_parameterized(&cn) {
+            return None;
+        }
+        cd.property_type_args
+            .get(&prop)
+            .filter(|ta| !ta.is_empty())
+            .cloned()
+    }
+
+    /// For a `new` target naming a member through an object (`obj.m`,
+    /// `this.m`): the object, the class in its chain that declares the
+    /// member, and the member's name. `None` for any other target, a null
+    /// object, or a collection member (an element of one is constructed on
+    /// the element path of `exec_stmt_blocking_assign_body`).
+    fn member_target_decl(&self, lvalue: &Expression) -> Option<(usize, String, String)> {
+        let (owner, prop) = match &lvalue.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_handle_expr(expr)?, member.name.as_str())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    self.eval_ident_handle(&h.path[0].name.name)?,
+                    h.path[1].name.name.as_str(),
+                )
+            }
+            _ => return None,
+        };
+        if owner == 0 {
+            return None;
+        }
+        let mut cur = Some(self.heap.get(owner)?.as_ref()?.class_name.clone());
+        for _ in 0..64 {
+            let cn = cur?;
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(prop) {
+                let coll = cd.array_properties.contains_key(prop)
+                    || cd.array_nd_properties.contains_key(prop)
+                    || cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop);
+                if coll {
+                    return None;
+                }
+                return Some((owner, cn, prop.to_string()));
+            }
+            cur = cd.extends.clone();
         }
         None
     }
@@ -1891,6 +1986,15 @@ impl Simulator {
     /// `this`-instance inheritance chain so a base-class property (e.g.
     /// `uvm_component.event_pool`) resolves from a derived component.
     pub(super) fn this_member_typedef_spec(&self, lvalue: &Expression) -> Option<(String, String)> {
+        // §8.8: `obj.m = new` through another object (or an element of its
+        // member array) declares `m` in `obj`'s class, not in `this`'s.
+        if let Some((owner, cn, prop)) = self.member_target_decl(lvalue)
+            && self.this_stack.last().copied().flatten() != Some(owner)
+            && !self.class_is_parameterized(&cn)
+        {
+            let raw = self.module.classes.get(&cn)?.properties.get(&prop)?.type_name.as_ref()?;
+            return self.resolve_typedef_spec(raw);
+        }
         let leaf = match &lvalue.kind {
             ExprKind::Ident(h) => h.path.last()?.name.name.clone(),
             ExprKind::MemberAccess { member, .. } => member.name.clone(),
@@ -2833,13 +2937,13 @@ impl Simulator {
                 self.module.dynamic_arrays.insert(scoped.clone());
                 // The object is not on the heap yet: its value parameters
                 // are read from the instance being built.
-                let mut params = self.module.parameters.clone();
+                let mut overrides: HashMap<String, Value> = HashMap::default();
                 for (pn, _) in &cdef.param_defaults {
                     if let Some(v) = instance.properties.get(pn) {
-                        params.insert(pn.clone(), v.clone());
+                        overrides.insert(pn.clone(), v.clone());
                     }
                 }
-                self.register_dyn_member_shape(cdef, &params, prop, &scoped, width);
+                self.register_dyn_member_shape(cdef, &overrides, prop, &scoped, width);
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(scoped.clone(), m);
                 }

@@ -1453,6 +1453,11 @@ impl Simulator {
                     data_type,
                     declarators,
                     ..
+                }
+                | SK::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
                 } => {
                     if is_class_data_type(data_type, sim) {
                         for d in declarators {
@@ -2084,97 +2089,112 @@ impl Simulator {
             // delegation pattern under test) are still dispatched here.
             // The `uvm_` prefix is the well-defined boundary between user
             // code and the pre-supported library classes.
+            let frag_of = |e: &Expression| -> Option<String> {
+                // Check for `this_type` BEFORE expr_to_spec_fragment
+                // resolves it to just the base class name (without the
+                // specialization suffix).
+                if let ExprKind::Ident(h) = &e.kind {
+                    if h.path.len() == 1 {
+                        let nm = &h.path[0].name.name;
+                        if nm == "this_type" || nm == "this" {
+                            if let Some((b, s)) = &self.current_spec {
+                                return Some(format!("{}#({})", b, s));
+                            }
+                        }
+                        // A type arg that is a TYPEDEF of a parameterized
+                        // class (`cb_type cb_q[$]` where `typedef
+                        // uvm_event_callback#(T) cb_type;`): expand it via
+                        // `resolve_typedef_spec` so the base's own type
+                        // args are carried (and their bare params resolved
+                        // through `current_spec`). `expr_to_spec_fragment`
+                        // on the raw typedef ident otherwise returns ONLY
+                        // the base class name — dropping the `#(T)`, so
+                        // the missing param is afterwards filled with its
+                        // DECLARED DEFAULT (`uvm_object`) instead of the
+                        // enclosing `T` (`string`). That made the string /
+                        // `uvm_object` event callbacks key differently and
+                        // the string event's `get_all` missed its callback.
+                        if self.module.typedef_types.contains_key(nm.as_str())
+                            || self.lookup_typedef_target(nm.as_str()).is_some()
+                        {
+                            if let Some((tb, ts)) = self.resolve_typedef_spec(&nm) {
+                                return Some(format!("{}#({})", tb, ts));
+                            }
+                        }
+                    }
+                }
+                let frag = match self.expr_to_spec_fragment(e) {
+                    Some(f) => f,
+                    None => self.fold_enclosing_param_expr(e)?,
+                };
+                // §8.25: a bare SELF-REFERENCE — the argument names the
+                // class whose specialization context we are resolving in
+                // (`uvm_object_registry#(C,"C") type_id`, written by
+                // `uvm_object_utils(C)`) — denotes the CURRENT
+                // specialization `C#(sig)`, not the default. Without
+                // this, a static method entered through a specialization
+                // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
+                // declared `C#(T2)`) keyed the registry on the default
+                // `C`, so the factory created default-specialized objects
+                // and the `$cast` in `uvm_create_on` correctly rejected
+                // them.
+                //
+                // Only inside that class's own declaration (or a derived
+                // one): elsewhere the bare name IS the default
+                // specialization — a non-parameterized class whose typedef
+                // names `C` must not read `C#(sig)` just because its method
+                // happens to run under an active `C#(sig)` context.
+                if let Some((b, s)) = &self.current_spec {
+                    if frag == *b && self.inside_class_decl_of(b) {
+                        return Some(format!("{}#({})", b, s));
+                    }
+                }
+                // Resolve bare type-param names (e.g. `T`, `this_type`)
+                // through the active specialization so the typedef's
+                // specialization carries concrete values.
+                if frag == "this_type" || frag == "this" {
+                    if let Some((b, s)) = &self.current_spec {
+                        return Some(format!("{}#({})", b, s));
+                    }
+                }
+                let frag = self.substitute_spec_params(&frag);
+                // Check if frag is a type/value param of the spec base
+                if let Some((b, s)) = &self.current_spec {
+                    if let Some(cd) = self.get_class_def(b) {
+                        if cd.type_param_names.iter().any(|t| t == &frag)
+                            || cd.param_order.iter().any(|t| t == &frag)
+                        {
+                            if let Some(resolved) =
+                                self.resolve_type_param_with(&frag, &self.current_spec)
+                            {
+                                return Some(resolved);
+                            }
+                            // Try value param resolution
+                            let idx = cd.param_order.iter().position(|t| t == &frag);
+                            if let Some(idx) = idx {
+                                let sig_frags = Self::split_spec_args(s);
+                                if let Some(v) = sig_frags.get(idx) {
+                                    return Some(v.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(frag)
+            };
+            // §8.25, §23.10.2.2: a named assignment `.W(W)` names a parameter
+            // of the class being specialized, so only its value resolves in
+            // the enclosing specialization. Substituted as one fragment, the
+            // name was replaced too (`.16(16)` in `outer #(16)`), matched no
+            // parameter, and the default specialization was used.
             let frags: Vec<String> = type_args
                 .iter()
-                .filter_map(|e| {
-                    // Check for `this_type` BEFORE expr_to_spec_fragment
-                    // resolves it to just the base class name (without the
-                    // specialization suffix).
-                    if let ExprKind::Ident(h) = &e.kind {
-                        if h.path.len() == 1 {
-                            let nm = &h.path[0].name.name;
-                            if nm == "this_type" || nm == "this" {
-                                if let Some((b, s)) = &self.current_spec {
-                                    return Some(format!("{}#({})", b, s));
-                                }
-                            }
-                            // A type arg that is a TYPEDEF of a parameterized
-                            // class (`cb_type cb_q[$]` where `typedef
-                            // uvm_event_callback#(T) cb_type;`): expand it via
-                            // `resolve_typedef_spec` so the base's own type
-                            // args are carried (and their bare params resolved
-                            // through `current_spec`). `expr_to_spec_fragment`
-                            // on the raw typedef ident otherwise returns ONLY
-                            // the base class name — dropping the `#(T)`, so
-                            // the missing param is afterwards filled with its
-                            // DECLARED DEFAULT (`uvm_object`) instead of the
-                            // enclosing `T` (`string`). That made the string /
-                            // `uvm_object` event callbacks key differently and
-                            // the string event's `get_all` missed its callback.
-                            if self.module.typedef_types.contains_key(nm.as_str())
-                                || self.lookup_typedef_target(nm.as_str()).is_some()
-                            {
-                                if let Some((tb, ts)) = self.resolve_typedef_spec(&nm) {
-                                    return Some(format!("{}#({})", tb, ts));
-                                }
-                            }
-                        }
-                    }
-                    let frag = self.expr_to_spec_fragment(e)?;
-                    // §8.25: a bare SELF-REFERENCE — the argument names the
-                    // class whose specialization context we are resolving in
-                    // (`uvm_object_registry#(C,"C") type_id`, written by
-                    // `uvm_object_utils(C)`) — denotes the CURRENT
-                    // specialization `C#(sig)`, not the default. Without
-                    // this, a static method entered through a specialization
-                    // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
-                    // declared `C#(T2)`) keyed the registry on the default
-                    // `C`, so the factory created default-specialized objects
-                    // and the `$cast` in `uvm_create_on` correctly rejected
-                    // them.
-                    //
-                    // Only inside that class's own declaration (or a derived
-                    // one): elsewhere the bare name IS the default
-                    // specialization — a non-parameterized class whose typedef
-                    // names `C` must not read `C#(sig)` just because its method
-                    // happens to run under an active `C#(sig)` context.
-                    if let Some((b, s)) = &self.current_spec {
-                        if frag == *b && self.inside_class_decl_of(b) {
-                            return Some(format!("{}#({})", b, s));
-                        }
-                    }
-                    // Resolve bare type-param names (e.g. `T`, `this_type`)
-                    // through the active specialization so the typedef's
-                    // specialization carries concrete values.
-                    if frag == "this_type" || frag == "this" {
-                        if let Some((b, s)) = &self.current_spec {
-                            return Some(format!("{}#({})", b, s));
-                        }
-                    }
-                    let frag = self.substitute_spec_params(&frag);
-                    // Check if frag is a type/value param of the spec base
-                    if let Some((b, s)) = &self.current_spec {
-                        if let Some(cd) = self.get_class_def(b) {
-                            if cd.type_param_names.iter().any(|t| t == &frag)
-                                || cd.param_order.iter().any(|t| t == &frag)
-                            {
-                                if let Some(resolved) =
-                                    self.resolve_type_param_with(&frag, &self.current_spec)
-                                {
-                                    return Some(resolved);
-                                }
-                                // Try value param resolution
-                                let idx = cd.param_order.iter().position(|t| t == &frag);
-                                if let Some(idx) = idx {
-                                    let sig_frags = Self::split_spec_args(s);
-                                    if let Some(v) = sig_frags.get(idx) {
-                                        return Some(v.trim().to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(frag)
+                .filter_map(|e| match &e.kind {
+                    ExprKind::NamedArg {
+                        name,
+                        expr: Some(x),
+                    } => Some(format!(".{}({})", name.name, frag_of(x)?)),
+                    _ => frag_of(e),
                 })
                 .collect();
             let sig = frags.join(",");
@@ -2744,7 +2764,7 @@ impl Simulator {
         let mut keys: Vec<String> = self
             .signals
             .elem_keys_with_prefix(&prefix)
-            .chain(static_keys.iter().map(|k| &**k))
+            .chain(static_keys.iter().map(|k| std::borrow::Cow::Borrowed(&**k)))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
                 Self::assoc_first_key_seg(rest).map(|s| s.to_string())
@@ -3077,7 +3097,23 @@ impl Simulator {
                     && name.as_bytes()[top.len()] == b'.'
                     && name.starts_with(top)
                 {
-                    if let Some(v) = self.get_signal_value_by_name(&name[top.len() + 1..]) {
+                    let bare = &name[top.len() + 1..];
+                    // `<top>.<sig>` is an ABSOLUTE reference to the top
+                    // module's own variable — never re-scope it under the
+                    // resolve hint (that would bind top's `sig` to a
+                    // same-named net inside the hinted instance: `$root.top.n`
+                    // read a leaf's `l.n` when a hint named `l` was active,
+                    // forwarding x for a 0). Read the stripped key directly;
+                    // array elements and packed leaves fall back to the
+                    // recursion below.
+                    if let Some(&id) = self.signal_name_to_id.get(bare) {
+                        let mut v = self.signal_table[id].clone();
+                        if self.signal_signed[id] {
+                            v.is_signed = true;
+                        }
+                        return Some(v);
+                    }
+                    if let Some(v) = self.get_signal_value_by_name(bare) {
                         return Some(v);
                     }
                 }
@@ -3246,48 +3282,14 @@ impl Simulator {
             }
         }
         if let Some(&id) = self.signal_name_to_id.get(name) {
-            let w = self.signal_widths[id];
-            // A width-0 signal (e.g. an untracked module-scope class handle)
-            // would truncate to nothing; keep the value's natural width so a
-            // class handle (`c = factory.create_...()`) is preserved. §6.16: a
-            // string (or an element of a string collection) has no declared
-            // length either — the table width is a placeholder, and resizing to
-            // it chops the text. This is the path `push_back` takes, so without
-            // it a `string q[$]` element was still clamped to 128 characters
-            // after scalar strings had been fixed.
-            let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-            let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
-            // §6.11.1: a 2-state destination drops x/z.
-            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
-                resized = resized.to_two_state();
-            }
-            // §6.11.1: storage keeps the SIGNAL'S declared signedness, not the
-            // rvalue's. An unsized decimal literal is signed (§5.7.1), so
-            // `barr[i] = 9` stamped is_signed onto a `bit [3:0]` element and
-            // every later read sign-extended it (-7). Strings/handles (w==0)
-            // and reals keep their value untouched.
-            if w != 0 && !is_str && !resized.is_real {
-                resized.is_signed = self.signal_signed[id];
-            }
-            if self.signal_table[id] != resized {
-                self.mark_dirty_id(id);
-                write_sig!(self, id, resized);
-                self.table_modified = true;
+            if self.store_named_cell(id, val) {
                 // §9.2.2.2: a queue / dynamic / associative ELEMENT that
                 // happens to own a table id still isn't what comb readers
                 // depend on — a variable-index read (`q[i]`) registers the
                 // collection's `.size` proxy instead. Marking only the
                 // element's own id left such a block permanently stale after
                 // `q[0] = v`, while `push_back` (which resizes) woke it fine.
-                if let Some(base) = name.find('[').map(|i| &name[..i]) {
-                    if !base.is_empty()
-                        && (self.module.dynamic_arrays.contains(base)
-                            || self.module.associative_arrays.contains_key(base))
-                    {
-                        let base = base.to_string();
-                        self.touch_queue(&base);
-                    }
-                }
+                self.touch_elem_base(name);
             }
             return;
         }
@@ -3387,6 +3389,149 @@ impl Simulator {
             }
         }
         self.signals.insert(name.to_string(), val);
+    }
+
+    /// §9.2.2.2: a changed table signal named `name` that is an element of a
+    /// queue, dynamic or associative array (`q[i]`) also marks the
+    /// collection's size proxy, which is what a variable-index reader of the
+    /// collection depends on.
+    pub(super) fn touch_elem_base(&mut self, name: &str) {
+        if let Some(base) = name.find('[').map(|i| &name[..i]) {
+            if !base.is_empty()
+                && (self.module.dynamic_arrays.contains(base)
+                    || self.module.associative_arrays.contains_key(base))
+            {
+                let base = base.to_string();
+                self.touch_queue(&base);
+            }
+        }
+    }
+
+    /// Store `val` in table cell `id` as a by-name write of the cell's name
+    /// does: fitted to the cell's width, value set and signedness, and marked
+    /// dirty when it changed. Returns whether it changed.
+    pub(super) fn store_named_cell(&mut self, id: usize, val: Value) -> bool {
+        let w = self.signal_widths[id];
+        // A width-0 signal (e.g. an untracked module-scope class handle)
+        // would truncate to nothing; keep the value's natural width so a
+        // class handle (`c = factory.create_...()`) is preserved. §6.16: a
+        // string (or an element of a string collection) has no declared
+        // length either — the table width is a placeholder, and resizing to
+        // it chops the text. This is the path `push_back` takes, so without
+        // it a `string q[$]` element was still clamped to 128 characters
+        // after scalar strings had been fixed.
+        let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
+        let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
+        // §6.11.1: a 2-state destination drops x/z.
+        if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
+            resized = resized.to_two_state();
+        }
+        // §6.11.1: storage keeps the SIGNAL'S declared signedness, not the
+        // rvalue's. An unsized decimal literal is signed (§5.7.1), so
+        // `barr[i] = 9` stamped is_signed onto a `bit [3:0]` element and
+        // every later read sign-extended it (-7). Strings/handles (w==0)
+        // and reals keep their value untouched.
+        if w != 0 && !is_str && !resized.is_real {
+            resized.is_signed = self.signal_signed[id];
+        }
+        if self.signal_table[id] != resized {
+            self.mark_dirty_id(id);
+            write_sig!(self, id, resized);
+            self.table_modified = true;
+            return true;
+        }
+        false
+    }
+
+    /// Where the variable `name` is stored, when a by-name read
+    /// (`get_local_or_signal`) and a by-name write (`set_local_or_signal`)
+    /// of it both address that one place: the innermost call frame, or a
+    /// table signal. `None` for every other name (a name-keyed entry, a
+    /// packed member, a scope-qualified twin a read would prefer): the
+    /// caller then reads and writes the whole value by name.
+    pub(super) fn whole_var_store(&self, name: &str) -> Option<VarStore> {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(name))
+        {
+            return Some(VarStore::Frame);
+        }
+        let id = *self.signal_name_to_id.get(name)?;
+        if !name.contains('.')
+            && let Some(hint) = self.name_resolve_hint.borrow().as_deref()
+        {
+            // An undotted read tries the hinted scope's `<hint>.<name>`
+            // first; a write does not.
+            let mut k = self.hint_key_scratch.borrow_mut();
+            k.clear();
+            k.push_str(hint);
+            k.push('.');
+            k.push_str(name);
+            if self
+                .signal_name_to_id
+                .get(k.as_str())
+                .is_some_and(|&h| h != id)
+            {
+                return None;
+            }
+        }
+        (!is_packed_id(id)).then_some(VarStore::Table(id))
+    }
+
+    /// §11.5.1/§7.4.1: replace bits `[lo, lo + piece.width)` of table signal
+    /// `id` by `piece`, editing the stored value in place: no copy of the
+    /// whole vector, and only the written bits are compared. The marks a
+    /// changed store leaves are those of a whole-value store of the same
+    /// result (`store_named_cell`). Returns whether a bit changed.
+    ///
+    /// `None`, with nothing done, when a whole-value store does more than
+    /// set bits and has to run instead: a forced or traced signal, a string,
+    /// a real, a value the table does not hold at the signal's declared
+    /// width and signedness, x/z bits headed into a 2-state signal, or a
+    /// range outside the vector.
+    pub(super) fn splice_signal_bits(
+        &mut self,
+        id: usize,
+        lo: usize,
+        piece: &Value,
+    ) -> Option<bool> {
+        if is_packed_id(id)
+            || self.warn_x
+            || self.value_trace_ids.is_some()
+            || (!self.forced_signals.is_empty() && self.forced_signals.contains_key(&id))
+            || self.signal_is_string.get(id).copied().unwrap_or(false)
+            || piece.is_real
+            || piece.is_fill
+        {
+            return None;
+        }
+        let w = self.signal_widths[id];
+        let cur = &self.signal_table[id];
+        if w == 0
+            || cur.width != w
+            || cur.is_real
+            || cur.is_fill
+            || cur.is_signed != self.signal_signed[id]
+            || lo.checked_add(piece.width as usize)? > w as usize
+            || (self.signal_two_state.get(id).copied().unwrap_or(false) && piece.has_xz())
+        {
+            return None;
+        }
+        if !self.signal_table[id].copy_bits_from(lo, piece, 0, piece.width as usize) {
+            return Some(false);
+        }
+        self.mark_dirty_id(id);
+        let (v, x) = self.signal_table[id].raw_bits();
+        if id < self.signal_has_xz.len() {
+            self.signal_has_xz[id] = u8::from(x != 0);
+        }
+        if id < self.signal_inline_bits.len() {
+            self.signal_inline_bits[id] = [v, x];
+        }
+        write_sig_done!(self, id, true);
+        self.table_modified = true;
+        Some(true)
     }
 
     pub(super) fn get_queue_size(&self, obj_name: &str) -> u64 {
@@ -3750,12 +3895,20 @@ impl Simulator {
     /// would otherwise read an empty string and silently produce wrong
     /// output (e.g. table printers emitting columns with no padding).
     pub(super) fn get_local_signal_or_static(&mut self, name: &str) -> Option<Value> {
-        if let Some(v) = self.get_local_or_signal(name) {
-            return Some(v);
-        }
-        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
-            if let Some(v) = self.class_static_get(&ctx, name) {
-                return Some(v);
+        // §23.9 / §8.11: lexical scope precedence inside an active routine:
+        // local/formal frame -> `this` instance property -> class static ->
+        // enclosing module signal. Checking module signals first caused a
+        // same-named outer variable (e.g. `int value` or `S value`) to hide
+        // a class property `string value`.
+        if let Some(&base) = self.method_local_base.last() {
+            for m in self.local_stack.get(base..).unwrap_or(&[]).iter().rev() {
+                if let Some(v) = m.get(name) {
+                    return Some(v.clone());
+                }
+            }
+        } else if let Some(m) = self.local_stack.last() {
+            if let Some(v) = m.get(name) {
+                return Some(v.clone());
             }
         }
         // §8.10/§6.16: an INSTANCE property as a built-in method receiver —
@@ -3777,7 +3930,12 @@ impl Simulator {
                 return Some(v.clone());
             }
         }
-        None
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            if let Some(v) = self.class_static_get(&ctx, name) {
+                return Some(v);
+            }
+        }
+        self.get_signal_value_by_name(name)
     }
 
     /// Set a loop index/iteration variable. Writes to the current call frame's
@@ -4810,6 +4968,77 @@ impl Simulator {
         key.push_str(name);
         self.queue_frame_saves.last_mut().unwrap().push((key, save));
         true
+    }
+
+    /// A fresh local declaration shadows any prior global-scoped collection
+    /// registration left over from another frame's same-named local
+    /// (subroutine locals use bare names). Reset the array/queue/assoc
+    /// bookkeeping so e.g. a scalar `string str` after a previous
+    /// `string str[$]` isn't still treated as a queue.
+    pub(super) fn clear_shadowed_collection_meta(
+        &mut self,
+        name: &str,
+        data_type: &crate::ast::types::DataType,
+    ) {
+        if !self.decl_shadow_log.is_empty() {
+            self.note_decl_shadow(name, data_type);
+        }
+        // If this local shares its bare name with a caller-frame queue,
+        // preserve the caller's queue storage so it is restored when this
+        // subroutine returns (queue locals are global-by-bare-name; see
+        // `queue_frame_saves`).
+        if !self.save_queue_local(name, true) {
+            self.module.dynamic_arrays.remove(name);
+            self.module.arrays.remove(name);
+            self.module.descending_arrays.remove(name);
+            self.module.queue_max_sizes.remove(name);
+        }
+        self.module.associative_arrays.remove(name);
+        self.module.packed_signal_elem_widths.remove(name);
+        let mut size_key = std::mem::take(&mut self.queue_key_scratch);
+        size_key.clear();
+        size_key.push_str(name);
+        size_key.push_str(".size");
+        self.signals.remove(&size_key);
+        self.queue_key_scratch = size_key;
+    }
+
+    /// Route a declaration initializer through a synthetic `BlockingAssign`,
+    /// so the pattern-spread / queue / associative-array population applies
+    /// through the same path as a standalone assignment. This is the
+    /// boilerplate shared by a local array/queue/assoc declaration whose
+    /// initializer would otherwise be dropped.
+    pub(super) fn route_decl_init_via_assign(
+        &mut self,
+        target: &str,
+        init: &crate::ast::expr::Expression,
+        span: crate::ast::Span,
+    ) {
+        let lvalue = crate::ast::expr::Expression::new(
+            crate::ast::expr::ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: target.to_owned(),
+                        span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            }),
+            span,
+        );
+        let assign = crate::ast::stmt::Statement::new(
+            crate::ast::stmt::StatementKind::BlockingAssign {
+                lvalue,
+                rvalue: init.clone(),
+            },
+            span,
+        );
+        self.exec_statement(&assign);
     }
 
     /// Pop the top queue-local save frame and restore every snapshotted name:

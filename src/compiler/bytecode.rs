@@ -1825,6 +1825,9 @@ pub struct BytecodeCompiler<'a> {
     /// absent means "assume possibly-real", which only costs missed
     /// `Resize` elisions, never correctness.
     signal_real: Option<&'a [bool]>,
+    /// The runtime's per-signal 2-state marks (`Simulator::signal_two_state`),
+    /// which its writes use to drop x/z (§6.11.2). `None` until set.
+    signal_two_state: Option<&'a [bool]>,
     arrays: &'a HashMap<String, (i64, i64, u32)>,
     array_first_id: Option<&'a HashMap<Arc<str>, (usize, i64, i64)>>,
     widths: &'a HashMap<String, u32>,
@@ -2409,6 +2412,7 @@ impl<'a> BytecodeCompiler<'a> {
             signal_signed,
             signal_widths,
             signal_real: None,
+            signal_two_state: None,
             arrays,
             array_first_id: None,
             widths,
@@ -2603,6 +2607,120 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         None
+    }
+
+    /// §7.2, §7.4.2: a member select through constant element selects of a
+    /// packed struct (`s.e[1].dw[0].value`). Elaboration flattens a member that
+    /// is a packed array of structs into one entry per element (`e[1]`,
+    /// `e[1].dw[0].value`, ...), so with constant indices the whole select is
+    /// one static bit range of the container signal. Returns
+    /// `(container_signal_id, layout key, member path, lsb_offset, width)`, or
+    /// `None` for anything else (a dynamic or x/z index, an index outside the
+    /// declared range, an unpacked root), which keeps its existing path.
+    fn packed_const_member_path_target(
+        &self,
+        lhs: &Expression,
+    ) -> Option<(usize, String, String, u32, u32)> {
+        let fields_map = self.packed_struct_fields?;
+        // A local of the frame (a function's own struct) shadows a module
+        // signal of the same name; it is not this signal's layout.
+        if self.frame_bound_target(lhs) {
+            return None;
+        }
+        // The selects below the root, innermost (leaf) first.
+        let mut tail: Vec<String> = Vec::new();
+        let mut has_index = false;
+        let mut cur = lhs;
+        let hier = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    tail.push(format!(".{}", member.name));
+                    cur = expr;
+                }
+                ExprKind::Index { expr, index } => {
+                    if self.is_xz_literal(index) {
+                        return None;
+                    }
+                    tail.push(format!("[{}]", self.plain_const_index(index)?));
+                    has_index = true;
+                    cur = expr;
+                }
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        if !has_index {
+            return None;
+        }
+        if hier.root.is_some() || hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        if self.lookup_array_name(hier).is_some() || self.is_multi_dim_array(hier) {
+            return None;
+        }
+        tail.reverse();
+        let suffix: String = tail.concat();
+        let seg = |i: usize| hier.path[i].name.name.as_str();
+        // As `packed_struct_member_target`: the longest base that is a
+        // container signal with a layout wins. Elaboration may already have
+        // folded the leading members into the identifier (`s.e` then `[1]`).
+        // The container must be entered through a member (`s.e[1]`), not an
+        // element (`a[1].f`, an array of structs, which has its own stores).
+        for k in (1..=hier.path.len()).rev() {
+            let base: String = (0..k).map(seg).collect::<Vec<_>>().join(".");
+            let mut member: String = (k..hier.path.len()).map(seg).collect::<Vec<_>>().join(".");
+            if !member.is_empty() {
+                member.push_str(&suffix);
+            } else if let Some(rest) = suffix.strip_prefix('.') {
+                member = rest.to_string();
+            } else {
+                continue;
+            }
+            // The instance's own variable first, as `compile_packed_member_read`
+            // resolves a base: a bare key may belong to the top module or to
+            // another instance.
+            let scoped = self
+                .scope_hint
+                .as_ref()
+                .filter(|sc| !sc.is_empty() && !base.contains('.'))
+                .map(|sc| format!("{}.{}", sc, base));
+            let Some((base_id, key)) = scoped
+                .and_then(|s| Some((self.lookup_signal_id_by_name(&s)?, s)))
+                .or_else(|| Some((self.lookup_signal_id_by_name(&base)?, base.clone())))
+            else {
+                continue;
+            };
+            let Some(fields) = fields_map.get(key.as_str()) else {
+                continue;
+            };
+            if let Some(&(_, off, w)) = fields.iter().find(|(m, _, _)| *m == member)
+                && w > 0
+            {
+                return Some((base_id, key, member, off, w));
+            }
+        }
+        None
+    }
+
+    /// §11.6.1: an index whose value does not depend on expression width: a
+    /// literal, a parameter or a bound constant, optionally negated or in
+    /// parentheses. An expression such as `1'b1 + 1'b1` is self-determined
+    /// (it wraps to 0) and `eval_const_bound` does not model that, so it is
+    /// left to the interpreter.
+    fn plain_const_index(&self, e: &Expression) -> Option<i64> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.plain_const_index(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand,
+            } if matches!(operand.kind, ExprKind::Number(_)) => self.eval_const_bound(e),
+            ExprKind::Number(_) => self.eval_const_bound(e),
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                self.eval_const_bound(e)
+            }
+            _ => None,
+        }
     }
 
     /// Resolve a packed-struct container and clone its flattened field layout.
@@ -3267,6 +3385,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// survives — measured at ~337K of the ~553K resizes still executing.
     pub fn set_signal_real(&mut self, r: &'a [bool]) {
         self.signal_real = Some(r);
+    }
+
+    /// The runtime's 2-state marks, by signal id. A compiled range store
+    /// into a container declines when its signal may be 2-state.
+    pub fn set_signal_two_state(&mut self, t: &'a [bool]) {
+        self.signal_two_state = Some(t);
     }
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
@@ -10261,6 +10385,28 @@ impl<'a> BytecodeCompiler<'a> {
         depth == Some(selects)
     }
 
+    /// §6.11.2: can a range store into the packed container `var` (signal
+    /// `id`) skip the 2-state conversion? A 2-state variable stores x/z as 0
+    /// across its whole value on the interpreter's path, which a range store
+    /// does not do, so the compiled store is taken only when neither the
+    /// runtime's mark for the signal nor its declared type is 2-state. Without
+    /// the runtime table the answer is no, which keeps the interpreter.
+    fn packed_container_four_state(&self, id: usize, var: &str) -> bool {
+        let Some(marks) = self.signal_two_state else {
+            return false;
+        };
+        if marks.get(id).copied().unwrap_or(true) {
+            return false;
+        }
+        let (Some(decls), Some(types)) = (self.var_decl_types, self.typedef_types) else {
+            return true;
+        };
+        let leaf = var.rsplit_once('.').map_or(var, |(_, leaf)| leaf);
+        decls.get(var).or_else(|| decls.get(leaf)).is_none_or(|dt| {
+            !crate::compiler::elaborate::is_type_two_state_resolved(dt, types)
+        })
+    }
+
     /// §7.2.1, §6.11.3: the signedness of `member` (a dotted path) of the
     /// packed structure or union variable `var` holds, from its declared
     /// type. None when the declaration or the member cannot be resolved.
@@ -11234,7 +11380,14 @@ impl<'a> BytecodeCompiler<'a> {
                     _ => return None,
                 }
             }
-            ExprKind::MemberAccess { expr, member } => self.const_param_member(expr, &member.name)?,
+            ExprKind::MemberAccess { expr, member } => {
+                self.const_param_member(expr, &member.name)?
+            }
+            // §20.8.1: as the interpreter computes it, a 32-bit unsigned result.
+            ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
+                let v = self.fold_const(&args[0])?.to_u64()?;
+                Value::from_u64(u64::from(clog2_u64(v)), 32)
+            }
             _ => return None,
         };
         (!v.has_xz() && !v.is_real).then_some(v)
@@ -18190,8 +18343,45 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return Some(dest);
                     }
-                    let l = self.compile_expr(left, 0)?;
-                    let r = self.compile_expr(right, 0)?;
+                    // §7.4.1, §11.5.1: bounds the compiler cannot fold are
+                    // still labels of the declared range. A descending range
+                    // that does not start at 0 (`input [11:2] a`) shifts them
+                    // to physical bits; an ascending one also mirrors their
+                    // order, which only the interpreter's select does.
+                    // Only for a plain vector: on a packed multi-D base the
+                    // bounds select elements, which this path never scaled.
+                    let plain = match &expr.kind {
+                        ExprKind::Ident(h) => {
+                            self.packed_elem_width_of(h).filter(|&w| w > 1).is_none()
+                        }
+                        ExprKind::Index { .. } => true,
+                        _ => false,
+                    };
+                    let dim = self.sel_base_dim(expr).filter(|_| plain);
+                    if dim.is_some_and(|(l, r)| l < r) {
+                        self.truncate_insns(base_start);
+                        self.next_reg = base_reg;
+                        if let Some(r) =
+                            self.emit_expr_fallback(whole, ctx_width, "range_sel_dyn_ascending")
+                        {
+                            return Some(r);
+                        }
+                        self.bail("range_sel_dyn_ascending");
+                        return None;
+                    }
+                    let mut l = self.compile_expr(left, 0)?;
+                    let mut r = self.compile_expr(right, 0)?;
+                    if let Some((_, lo)) = dim.filter(|&(_, lo)| lo != 0) {
+                        let off = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            off,
+                            Box::new(Value::from_u64(lo as u64, 32)),
+                        ));
+                        let (pl, pr) = (self.alloc_reg(), self.alloc_reg());
+                        self.emit(Insn::Sub(pl, l, off));
+                        self.emit(Insn::Sub(pr, r, off));
+                        (l, r) = (pl, pr);
+                    }
                     let dest = self.alloc_reg();
                     self.emit(Insn::RangeSelect(dest, base, l, r));
                     Some(dest)
@@ -18516,6 +18706,14 @@ impl<'a> BytecodeCompiler<'a> {
                     None
                 }
                 crate::compiler::simulator::COV_COND_FN => self.compile_cov_cond(args),
+                // §20.8.1: `$clog2` of a constant (a parameter, a literal) is
+                // that constant; anything else keeps the interpreter call.
+                "$clog2" if args.len() == 1 && self.fold_const(expr).is_some() => {
+                    let v = self.fold_const(expr)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadConst(dest, Box::new(v)));
+                    Some(dest)
+                }
                 // A condition or expression coverage item: the interpreter
                 // evaluates it term by term (see `simulator::code_cov`).
                 crate::compiler::simulator::COV_EXPR_FN => {
@@ -19081,6 +19279,32 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return Some(r);
                     }
+                }
+                // §7.2, §7.4.2: `s.e[1].dw[0].value` with constant indices
+                // is one static range of `s`, as `compile_packed_member_read`
+                // reads a plain member path.
+                // §7.2.1: the member keeps its declared type's sign (the
+                // element selects on the way only pick the element), so the
+                // read compiles only when that type is known.
+                if let Some((base_id, key, path, off, w)) =
+                    self.packed_const_member_path_target(expr)
+                    && let Some(signed) = self.packed_member_signed(
+                        &key,
+                        &path
+                            .split('.')
+                            .map(|seg| seg.split('[').next().unwrap_or(seg))
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    )
+                {
+                    let root = self.alloc_reg();
+                    self.emit(Insn::LoadSignal(root, as_sig_id(base_id)));
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::RangeSelectConst(dest, root, off + w - 1, off));
+                    if signed {
+                        self.emit(Insn::SetSigned(dest));
+                    }
+                    return Some(dest);
                 }
                 if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_MemberAccess") {
                     return Some(r);
@@ -20718,6 +20942,21 @@ impl<'a> BytecodeCompiler<'a> {
                 if self.try_packed_path_nba(lhs, val_reg) {
                     return true;
                 }
+                // `s.e[1].dw[0].value <= v`: one static range of `s`.
+                if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
+                    && self.packed_container_four_state(base_id, &key)
+                {
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::NbaAssignRange(
+                        as_sig_id(base_id),
+                        off + mw - 1,
+                        off,
+                        resized,
+                    ));
+                    return true;
+                }
                 self.bail("nba_member_access");
                 false
             }
@@ -21456,6 +21695,21 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     self.emit(Insn::BlockingAssignArrayRange(
                         array, idx_reg, hi_reg, lo_reg, resized,
+                    ));
+                    return true;
+                }
+                // `s.e[1].dw[0].value = v`: one static range of `s`.
+                if let Some((base_id, key, _, off, mw)) = self.packed_const_member_path_target(lhs)
+                    && self.packed_container_four_state(base_id, &key)
+                {
+                    let resized = self.alloc_reg();
+                    self.emit(Insn::Move(resized, val_reg));
+                    self.emit(Insn::Resize(resized, mw));
+                    self.emit(Insn::BlockingAssignRange(
+                        as_sig_id(base_id),
+                        off + mw - 1,
+                        off,
+                        resized,
                     ));
                     return true;
                 }
@@ -22270,6 +22524,12 @@ impl<'a> BytecodeCompiler<'a> {
                     32
                 }
             }
+            // §7.2, §7.4.2: a member select through constant element selects
+            // (`s.e[1].dw[0].value`) is as wide as its layout entry, which
+            // sizes the right-hand side before the compiled store.
+            ExprKind::MemberAccess { .. } => self
+                .packed_const_member_path_target(lhs)
+                .map_or(32, |(_, _, _, _, w)| w),
             _ => 32,
         }
     }
@@ -22311,7 +22571,22 @@ impl<'a> BytecodeCompiler<'a> {
                     pv.to_u64().map(|u| u as i64)
                 }
             }
+            // §20.8.1: `$clog2` of a constant is a constant (`a[$clog2(N)-1:3]`).
+            ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
+                Some(i64::from(clog2_u64(self.const_u64_operand(&args[0])?)))
+            }
             _ => self.eval_const_expr(e).map(|v| v as i64),
+        }
+    }
+
+    /// A constant operand at its full value up to 64 bits: a literal keeps
+    /// every bit (`64'h1_0000_0000`), where `eval_const_expr` would narrow it
+    /// to 32. `None` for anything wider, x/z or negative.
+    fn const_u64_operand(&self, e: &Expression) -> Option<u64> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.const_u64_operand(inner),
+            ExprKind::Number(n) => self.eval_number_static(n)?.to_u64(),
+            _ => u64::try_from(self.eval_const_bound(e)?).ok(),
         }
     }
 
@@ -27026,5 +27301,15 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
             return hit;
         }
         None
+    }
+}
+
+/// §20.8.1: the ceiling of the base-2 logarithm, with `$clog2(0)` and
+/// `$clog2(1)` both 0 (the interpreter's `$clog2`).
+fn clog2_u64(v: u64) -> u32 {
+    if v <= 1 {
+        0
+    } else {
+        64 - (v - 1).leading_zeros()
     }
 }

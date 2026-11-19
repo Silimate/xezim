@@ -10,15 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* `$readmemh` and `$readmemb` load a multidimensional unpacked array, or a
-  partially indexed one (`ram[1]`), and `$writememh` and `$writememb` write
-  one (§21.4.3, §21.5). The words are in row-major order, the rightmost
-  dimension fastest and each dimension from its low index to its high one.
-  The start and finish addresses and the file's `@` entries count elements
-  in that order, as in Verilator, Icarus and the reference simulator. Both
-  reported that the array names no unpacked memory and did nothing, so
-  Caliptra's testbench loaded no firmware into its byte-wide
-  `caliptra_sram`. (Silimate/xezim#328)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick
@@ -45,15 +36,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§21.6, §38.17). The seed line the run prints (`[xezim] seed: <n>`, or
   `[xezim] random seed: <n> (replay with -sv_seed <n>)` for `random`) names
   the option the seed came from. (Silimate/xezim#2)
-* `$writememh` and `$writememb` write one word per line, with an
-  `@<address>` line only before a word that `$readmem*` would not otherwise
-  load at its address: the first word of a range that does not start at the
-  memory's first address, and the word after a gap, such as an associative
-  array's missing keys (§21.5). A whole memory is then data only, as
-  Verilator writes it. Every line was `@<address> <word>`, so tools that
-  compare a dump with a golden file failed: NVDLA's sanity3 checktest
-  failed with identical data. `--writemem-every-address` keeps the old
-  layout. (Silimate/xezim#335)
 * Code coverage leaves out what a constant condition rules out in an
   instance, as the reference simulator does: a `case` whose selector and
   items are constants, an `if` chain or `?:` on parameters, genvars or ports
@@ -99,14 +81,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
-* `$readmemh` and `$readmemb` load an associative array whose index type is
-  integral, each address a key (§21.4): from the file's addresses, from
-  address 0 when the file gives none, or between the start and finish
-  addresses given, through a local or a hierarchical name (`lmem.mem`).
-  `$writememh` and `$writememb` write the elements that exist, in index
-  order (§21.5). Both reported that the array names no unpacked memory and
-  did nothing, so the VeeR EH1, EH2 and EL2 testbenches loaded no program.
-  (Silimate/xezim#301)
 
 **Usability**
 

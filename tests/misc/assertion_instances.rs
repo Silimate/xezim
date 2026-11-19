@@ -666,3 +666,62 @@ fn attempts_disabled_at_the_end_count_as_disabled() {
     assert_eq!(counts(&json, "top", "a_live"), [1, 0, 0, 0, 0], "{json}");
     assert_eq!(counts(&json, "top", "a_now"), [1, 1, 0, 0, 0], "{json}");
 }
+
+const DEFERRED_FLUSH: &str = r#"module add(input logic [3:0] a, b, output logic [4:0] s);
+  assign s = a + b;
+  always_comb c_zero : assert #0 (s == a + b) else $error("c_zero failed");
+  always_comb c_final : assert final (s == a + b) else $error("c_final failed");
+endmodule
+
+module top;
+  logic [3:0] a, b;
+  logic [4:0] s;
+  int x, y;
+  add u (.a, .b, .s);
+  always @(x) p_zero : assert #0 (x == y) else $error("p_zero failed");
+  always @(x) p_final : assert final (x == y) else $error("p_final failed");
+  initial begin
+    for (int i = 0; i < 20; i++) begin
+      a = i;
+      b = 3 * i;
+      #1;
+    end
+    for (int i = 1; i <= 5; i++) begin
+      y = i;
+      x = -i;  // both `always @(x)` wake and queue a failing report
+      #0 x = i;  // they resume in the same time slot: a flush point
+      #1;
+    end
+    $finish;
+  end
+endmodule
+"#;
+
+// silimate: count a deferred assertion when its report matures, not when it is queued
+/// §16.4.2: a deferred assertion's report is flushed when its process
+/// resumes in the same time slot, and an `always_comb` that re-executes
+/// supersedes its earlier report. A flushed report runs no action and is no
+/// attempt: only the report that matures counts. Each `always @(x)` queues
+/// a failing report, resumes on the second write and matures a passing one;
+/// each `always_comb` matures one passing report per time slot it ran in,
+/// however often it ran before the continuous assignment settled.
+#[test]
+fn flushed_deferred_reports_are_no_attempts() {
+    let (json, out) = run("deferred_flush", &[("d.sv", DEFERRED_FLUSH)]);
+    assert!(!out.contains("failed"), "{out}");
+    for (inst, name) in [("top.u", "c_zero"), ("top.u", "c_final")] {
+        assert_eq!(counts(&json, inst, name), [20, 20, 0, 0, 0], "{inst} {name}:\n{json}");
+    }
+    for (inst, name) in [("top", "p_zero"), ("top", "p_final")] {
+        assert_eq!(counts(&json, inst, name), [5, 5, 0, 0, 0], "{inst} {name}:\n{json}");
+    }
+    // The summed entries count only the matured reports too.
+    for line in [3, 4, 12, 13] {
+        let at = format!("\"line\": {line}, ");
+        let e = json
+            .lines()
+            .find(|l| l.contains(&at) && l.contains("\"pass\": ") && !l.contains("\"instance\""))
+            .unwrap_or_else(|| panic!("no summed entry for line {line}:\n{json}"));
+        assert!(e.contains("\"fail\": 0}"), "line {line}: {e}");
+    }
+}

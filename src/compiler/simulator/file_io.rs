@@ -1115,13 +1115,14 @@ impl Simulator {
         let (kw, signed) = self.assoc_index_width_for(&name)?;
         let width = self.assoc_elem_width(&name)?;
         // The addresses the index type can hold: all of a `longint` or a
-        // `bit [63:0]`, unsigned ones above `i64::MAX` too. A wider index
-        // type is addressed through its low 64 bits.
-        let kw = kw.clamp(1, 64);
+        // `bit [63:0]`, unsigned ones above `i64::MAX` too, and every key of
+        // a wider index type up to 127 bits (128 if signed). A wider one
+        // still is addressed through its low 127 or 128 bits.
+        let kw = kw.clamp(1, if signed { 128 } else { 127 });
         let (lo, hi) = if signed {
-            (-(1i128 << (kw - 1)), (1i128 << (kw - 1)) - 1)
+            (i128::MIN >> (128 - kw), i128::MAX >> (128 - kw))
         } else {
-            (0, (1i128 << kw) - 1)
+            (0, i128::MAX >> (127 - kw))
         };
         Some(MemoryTaskTarget {
             name,
@@ -1135,9 +1136,22 @@ impl Simulator {
 
     /// The address a `$readmem*` start or finish argument names: its value
     /// as written, signed or unsigned, so an unsigned 64-bit address above
-    /// `i64::MAX` keeps its value.
+    /// `i64::MAX` keeps its value, and a wider one (for an associative
+    /// array's wide index type) keeps up to 128 bits.
     fn memory_task_address(&mut self, e: &Expression) -> Option<i128> {
         let v = self.eval_expr(e);
+        if v.width > 64 {
+            if v.has_xz() {
+                return None;
+            }
+            let a = v.to_u128();
+            let s = 128 - v.width.min(128);
+            return Some(if v.is_signed {
+                ((a << s) as i128) >> s
+            } else {
+                a as i128
+            });
+        }
         if v.is_signed {
             v.to_i64().map(i128::from)
         } else {
@@ -1148,14 +1162,19 @@ impl Simulator {
     /// The address an `@<hex>` entry of a memory file names (§21.4). A
     /// negative address is written as its 64-bit two's complement, so
     /// `@ffffffffffffffff` is -1; for a signed index type the index type's
-    /// own two's complement (`@ffffffff` for an `int` index) is -1 too.
+    /// own two's complement (`@ffffffff` for an `int` index) is -1 too. An
+    /// index type wider than 64 bits holds `@ffffffffffffffff` as a key of
+    /// its own, so there a negative address is its 128-bit two's complement
+    /// or the index type's own.
     fn memory_file_address(hex: &str, key: (u32, bool)) -> Option<i128> {
         let a = u128::from_str_radix(hex, 16).ok()?;
         let (kw, signed) = key;
+        let kw = kw.clamp(1, 128);
         Some(
-            if signed && kw < 64 && a < (1u128 << kw) && a >> (kw - 1) == 1 {
-                a as i128 - (1i128 << kw)
-            } else if a >> 63 == 1 && a >> 64 == 0 && (signed || kw < 64) {
+            if signed && kw != 64 && (kw == 128 || a >> kw == 0) && (a >> (kw - 1)) & 1 == 1 {
+                let s = 128 - kw;
+                ((a << s) as i128) >> s
+            } else if a >> 63 == 1 && a >> 64 == 0 && (kw < 64 || (signed && kw == 64)) {
                 a as u64 as i64 as i128
             } else {
                 a as i128
@@ -1164,10 +1183,11 @@ impl Simulator {
     }
 
     /// `addr` as `$writemem*` writes it after `@`: hexadecimal, a negative
-    /// address as its 64-bit two's complement ([`memory_file_address`]
-    /// reads both back).
-    fn memory_file_address_text(addr: i128) -> String {
-        if addr < 0 {
+    /// address as its 64-bit two's complement, or its 128-bit one for an
+    /// index type wider than 64 bits (`wide`) ([`memory_file_address`]
+    /// reads each back).
+    fn memory_file_address_text(addr: i128, wide: bool) -> String {
+        if addr < 0 && !wide {
             format!("{:x}", addr as i64)
         } else {
             format!("{:x}", addr)
@@ -1180,8 +1200,16 @@ impl Simulator {
     /// whether the element changed.
     fn assoc_memory_store(&mut self, name: &str, addr: i128, mut val: Value) -> bool {
         // Two's complement bits of a negative address, and an unsigned one
-        // above `i64::MAX` as it is: the key text takes the index type.
-        let mut key = Value::from_u64(addr as u64, 64);
+        // above `i64::MAX` as it is: the key text takes the index type. An
+        // index type wider than 64 bits takes all 128 bits of the address.
+        let mut key = if self
+            .assoc_index_width_for(name)
+            .is_some_and(|(kw, _)| kw > 64)
+        {
+            Value::from_u128(addr as u128, 128)
+        } else {
+            Value::from_u64(addr as u64, 64)
+        };
         key.is_signed = addr < 0;
         let elem = Self::name_with_key(name, &self.assoc_key_str(name, &key));
         if let Some(signed) = self.assoc_elem_signed(name) {
@@ -1507,17 +1535,17 @@ impl Simulator {
             let (from, to) = (start.min(end), start.max(end));
             // A key's text is its decimal value (hex digits for an index
             // wider than 64 bits), the full value of an unsigned 64-bit key.
-            let hex_keys = self
+            let wide_key = self
                 .assoc_index_width_for(&mem_name)
-                .is_some_and(|(kw, _)| kw > 64);
+                .filter(|&(kw, _)| kw > 64);
             let mut words: Vec<(i128, Value)> = Vec::new();
             for key in self.assoc_top_level_keys_shared(&mem_name).iter() {
-                let parsed = if hex_keys {
-                    i128::from_str_radix(key, 16)
-                } else {
-                    key.parse::<i128>()
+                // The hex digits of a wide key are its index type's bits.
+                let parsed = match wide_key {
+                    Some(kt) => Self::memory_file_address(key, kt),
+                    None => key.parse::<i128>().ok(),
                 };
-                let Ok(addr) = parsed else {
+                let Some(addr) = parsed else {
                     continue;
                 };
                 if addr < from || addr > to {
@@ -1527,11 +1555,14 @@ impl Simulator {
                     words.push((addr, val));
                 }
             }
+            // Index order: a signed wide key's text sorts as its unsigned bits.
+            words.sort_by_key(|(addr, _)| *addr);
             if start > end {
                 words.reverse();
             }
             // A load with no start address begins at address 0.
             let mut out = MemDump::new(0, if start > end { -1 } else { 1 }, radix);
+            out.wide = wide_key.is_some();
             for (addr, val) in &words {
                 out.word(*addr, val);
             }
@@ -1910,6 +1941,9 @@ struct MemDump {
     step: i128,
     radix: u32,
     every: bool,
+    /// An associative array's index type is wider than 64 bits: a negative
+    /// address is written as its 128-bit two's complement.
+    wide: bool,
 }
 
 impl MemDump {
@@ -1922,6 +1956,7 @@ impl MemDump {
             step,
             radix,
             every: writemem_every_address(),
+            wide: false,
         }
     }
 
@@ -1929,7 +1964,7 @@ impl MemDump {
         if self.every || addr != self.next {
             self.text.push('@');
             self.text
-                .push_str(&Simulator::memory_file_address_text(addr));
+                .push_str(&Simulator::memory_file_address_text(addr, self.wide));
             self.text.push(if self.every { ' ' } else { '\n' });
         }
         self.text.push_str(&match self.radix {

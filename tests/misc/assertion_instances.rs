@@ -725,3 +725,50 @@ fn flushed_deferred_reports_are_no_attempts() {
         assert!(e.contains("\"fail\": 0}"), "line {line}: {e}");
     }
 }
+
+const DEFERRED_FINISH: &str = r#"module top;
+  initial begin
+    a_end : assert #0 (1) $finish;
+    a_bad : assert #0 (0) else $display("a_bad failed");
+    c_none : cover #0 (0);
+    a_late : assert final (1);
+  end
+endmodule
+"#;
+
+// silimate: count a deferred assertion when its report matures, not when it is queued
+/// §16.4: the slot's `#0` reports mature together in the Observed region,
+/// before their actions run, so `a_end`'s `$finish` leaves `a_bad` counted
+/// as a failure although its action no longer runs. The Postponed region,
+/// where `a_late` would mature, is never reached. Only `a_bad` had a
+/// failure action left, so only it is noted: the cover that did not match
+/// is no failure (§16.14.3).
+#[test]
+fn finish_in_a_deferred_action_leaves_its_region_counted() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("assertion_instances_deferred_finish");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("f.sv");
+    std::fs::write(&src, DEFERRED_FINISH).unwrap();
+    let db = dir.join("cov.json");
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .env("XEZIM_COV_DB", &db)
+        .current_dir(&dir)
+        .args(["--no-cache"])
+        .arg(&src)
+        .output()
+        .expect("run xezim");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    let json = std::fs::read_to_string(&db).expect("results file");
+    assert_eq!(counts(&json, "top", "a_end"), [1, 1, 0, 0, 0], "{json}");
+    assert_eq!(counts(&json, "top", "a_bad"), [1, 0, 0, 1, 0], "{json}");
+    assert_eq!(counts(&json, "top", "a_late"), [0, 0, 0, 0, 0], "{json}");
+    assert!(!stdout.contains("a_bad failed"), "{stdout}");
+    let notes: Vec<&str> = stderr.lines().filter(|l| l.contains("did not run before $finish")).collect();
+    assert_eq!(notes.len(), 1, "{stderr}");
+    assert!(notes[0].contains(":4"), "{stderr}");
+}

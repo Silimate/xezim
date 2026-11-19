@@ -1031,16 +1031,38 @@ impl Simulator {
     pub(super) fn mature_deferred_asserts(&mut self) {
         let mut pending = std::mem::take(&mut self.deferred_asserts);
         pending.sort_by_key(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final);
-        for d in pending {
-            // silimate: count a deferred assertion when its report matures, not when it is queued
-            // A slot `$finish` ended never reaches its Observed or Postponed
-            // region, so its reports do not mature there either.
+        // silimate: count a deferred assertion when its report matures, not when it is queued
+        // The `#0` reports mature together in the Observed region and the
+        // `final` ones in the Postponed region, before any of their actions
+        // run (§16.4): each group is counted on reaching its region, so a
+        // `$finish` in one report's action leaves the others counted. A
+        // region `$finish` kept the slot from reaching matures nothing.
+        let at = pending
+            .iter()
+            .position(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final)
+            .unwrap_or(pending.len());
+        let finals = pending.split_off(at);
+        for group in [pending, finals] {
             if !self.finished {
-                self.imm_assert_count(d.inst, d.tag, d.passed);
+                for d in &group {
+                    self.imm_assert_count(d.inst, d.tag, d.passed);
+                }
             }
-            // /silimate
+            self.run_deferred_actions(group);
+        }
+        // /silimate
+    }
+
+    /// The actions of matured deferred reports (see `mature_deferred_asserts`).
+    fn run_deferred_actions(&mut self, group: Vec<DeferredReport>) {
+        for d in group {
             if self.finished {
-                if !d.passed {
+                // silimate: count a deferred assertion when its report matures, not when it is queued
+                // Only a report with a failure action left to run is noted:
+                // a cover that did not match has none (§16.14.3).
+                let unrun = !d.passed && (d.action.is_some() || d.default_error_scope.is_some());
+                // /silimate
+                if unrun {
                     let loc = self
                         .span_file_line_in(d.span, None)
                         .unwrap_or_else(|| "?".to_string());

@@ -81,11 +81,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
-* A struct passed through a type parameter keeps its member types when the
-  struct and its member typedefs are declared in a module below the top:
-  `a[i].id` on a `T [N-1:0] a` port read the member as a 32-bit `int` once the
-  struct was 32 bits or wider, and a child typedef of the same name took the
-  member's place (§6.20.3, §23.10).
 
 **Usability**
 

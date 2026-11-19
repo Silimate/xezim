@@ -10,13 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* An event control on a member of a packed struct waits on that member:
-  `@(posedge a.clk)` on the member's least significant bit and `@(a.valid)`
-  on a change of its bits (§9.4.2, §7.2.1). The whole struct vector was
-  watched, so an edge was judged on another member's bit and any member's
-  change woke the block. A clock forwarded through a struct member to a
-  module's clock port (`.clk(b.clk)`) fired the child's flops on the wrong
-  edges; Caliptra-SS `otp_ctrl`'s OTP macro missed its Init command.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

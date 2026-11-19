@@ -3733,6 +3733,20 @@ impl<'a> BytecodeCompiler<'a> {
         out
     }
 
+    /// §11.5.1: the run-time base `base` (compiled from `left`) of a
+    /// part-select of packed elements, widened to the 32 bits of the slot
+    /// arithmetic it feeds. `Resize` sign-extends a signed register, so
+    /// `bit signed [7:0] j = -1` stays label -1, as an `int` -1 is; added to
+    /// 32-bit constants as 8 bits it read as 255.
+    fn widen_part_select_base(&mut self, left: &Expression, base: RegId) -> RegId {
+        if self.lrm_self_width(left) >= 32 {
+            return base;
+        }
+        let wide = self.alloc_reg();
+        self.emit(Insn::MoveResize(wide, base, 32));
+        wide
+    }
+
     pub fn set_ast_fallback(&mut self, allow: bool) {
         self.allow_ast_fallback = allow;
     }
@@ -18407,6 +18421,10 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     let idx = self.compile_expr(left, 0)?;
+                    let idx = match elem {
+                        Some(_) => self.widen_part_select_base(left, idx),
+                        None => idx,
+                    };
                     // §7.4.6/§11.5.1: the base index is a DECLARED index, but
                     // `RangeSelect` takes physical bit offsets — rebase it for a
                     // non-zero-based vector exactly as the plain bit select
@@ -20300,6 +20318,7 @@ impl<'a> BytecodeCompiler<'a> {
                         // of the dimension; only the slots inside it are
                         // written (see `emit_slot_run_store`).
                         let base = self.compile_expr(left, 0)?;
+                        let base = self.widen_part_select_base(left, base);
                         let slot = self.emit_packed_slot_index(Some(dim), base);
                         let low = if up {
                             slot

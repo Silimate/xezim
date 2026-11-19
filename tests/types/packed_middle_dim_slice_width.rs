@@ -191,3 +191,82 @@ fn part_select_of_middle_packed_dimension_selects_whole_elements() {
     .collect();
     assert_eq!(got, expected);
 }
+
+/// §11.5.1: a signed base narrower than 32 bits keeps its value. With
+/// `bit signed [7:0] j = -1`, `a[0][j +: 2]` selects labels -1 and 0, as an
+/// `int` base of -1 does, so its high byte lands in `a[0][0]`. The compiled
+/// path added the 8-bit pattern 255 to 32-bit constants instead: slot 256,
+/// so the store wrote nothing and the read returned all x. An unsigned 255
+/// is still label 255. Verilator does not follow §11.5.1 once a select
+/// leaves its dimension, whatever the base's type, but it gives the `int`
+/// base the same results as the 8-bit one.
+const SIGNED_BASE_SRC: &str = r#"
+module tb;
+  logic clk = 0;
+  bit signed [7:0] j = -8'sd1;
+  logic signed [3:0] jn = -4'sd1;
+  bit [7:0] ju = 8'hff;
+  int k = -1;
+  bit [1:0][5:0][7:0] a, ai, u;
+  always_comb begin
+    a = '0;
+    a[0][j +: 2] = 16'hbbaa;
+  end
+  always_comb begin
+    ai = '0;
+    ai[0][k +: 2] = 16'hbbaa;
+  end
+  always_comb begin
+    u = '0;
+    u[0][ju +: 2] = 16'hbbaa;
+  end
+  logic [1:0][5:0][7:0] n;
+  always_ff @(posedge clk) begin
+    n <= '0;
+    n[1][jn +: 3] <= 24'h332211;
+  end
+  logic [1:0][5:0][7:0] s;
+  initial for (int i = 0; i < 12; i++) s[i / 6][i % 6] = 8'(8'h10 + i);
+  logic [15:0] r1, r2, r3;
+  always_comb r1 = s[1][j +: 2];
+  always_comb r2 = s[1][k +: 2];
+  always_comb r3 = s[1][ju +: 2];
+
+  task automatic chk(string name, logic [95:0] got, logic [95:0] exp);
+    if (got === exp) $display("PASS %s", name);
+    else $display("FAIL %s got=%h exp=%h", name, got, exp);
+  endtask
+
+  initial begin
+    #1 clk = 1;
+    #1 clk = 0;
+    #1;
+    chk("signed base", a, {48'h0, 48'h0000000000bb});
+    chk("int base", ai, {48'h0, 48'h0000000000bb});
+    chk("unsigned base", u, 96'h0);
+    chk("signed base, nba", n, {48'h000000003322, 48'h0});
+    chk("signed base, read", r1, 16'h16xx);
+    chk("int base, read", r2, 16'h16xx);
+    chk("unsigned base, read", r3, 16'hxxxx);
+    $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn narrow_signed_base_of_a_middle_dimension_keeps_its_sign() {
+    let got = lines(SIGNED_BASE_SRC);
+    let expected: Vec<String> = [
+        "signed base",
+        "int base",
+        "unsigned base",
+        "signed base, nba",
+        "signed base, read",
+        "int base, read",
+        "unsigned base, read",
+    ]
+    .iter()
+    .map(|n| format!("PASS {n}"))
+    .collect();
+    assert_eq!(got, expected);
+}

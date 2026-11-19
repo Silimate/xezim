@@ -772,3 +772,41 @@ fn finish_in_a_deferred_action_leaves_its_region_counted() {
     assert_eq!(notes.len(), 1, "{stderr}");
     assert!(notes[0].contains(":4"), "{stderr}");
 }
+
+const DEFERRED_COPIES: &str = r#"module top;
+  logic [3:0] x = 4'b1101;
+  for (genvar i = 0; i < 4; i++) begin : g
+    always_comb begin : chk
+      logic b;
+      b = x[i];
+      a_zero : assert #0 (b) else $display("g[%0d] a_zero failed at %0t", i, $time);
+      a_final : assert final (b) else $display("g[%0d] a_final failed at %0t", i, $time);
+    end
+  end
+  initial begin
+    #1 x = 4'b1111;
+    #1 $finish;
+  end
+endmodule
+"#;
+
+// silimate: supersede by assertion instance, not by span and name hint
+/// §16.4.2: only a re-execution of the same `always_comb` supersedes its
+/// pending report. The four generate copies share their assertion
+/// statements; at time 0 they run in one settle, so each copy's report must
+/// survive the other copies: `g[1]` fails there, prints its failure once and
+/// counts it. Each copy runs once at time 0 and once at time 1.
+#[test]
+fn generate_copies_keep_their_own_deferred_reports() {
+    let (json, out) = run("deferred_copies", &[("c.sv", DEFERRED_COPIES)]);
+    for i in 0..4 {
+        for name in ["a_zero", "a_final"] {
+            let want = if i == 1 { [2, 1, 0, 1, 0] } else { [2, 2, 0, 0, 0] };
+            assert_eq!(counts(&json, "top", &format!("g[{i}].chk.{name}")), want, "g[{i}] {name}:\n{json}");
+        }
+    }
+    for name in ["a_zero", "a_final"] {
+        assert_eq!(out.matches(&format!("g[1] {name} failed at 0")).count(), 1, "{out}");
+    }
+    assert_eq!(out.matches("failed").count(), 2, "{out}");
+}

@@ -2109,8 +2109,8 @@ impl Simulator {
                 // #35 §5.5/§10.3: while a PROCESS's post-write settle runs,
                 // cont-assign re-evaluation is a SEPARATE active-region event
                 // the process must not observe before yielding — defer these
-                // entries to the next full settle. UDP/gate/always entries
-                // (a synthesized netlist's cells) stay eager, which is the
+                // entries to the next full settle. UDP/gate entries (a
+                // synthesized netlist's cells) stay eager, which is the
                 // reference-measured split (c1b lazy vs dep eager).
                 // #t0-comb-defer: the optimizer lowers `assign p = a` (and
                 // port connects) to gate-shaped entries, which the variant
@@ -2120,6 +2120,15 @@ impl Simulator {
                 // `gate_entry_is_assign_origin` recovers the assign origin
                 // from `signal_gate_driven` so those entries defer too while
                 // true gate primitives stay eager.
+                // silimate: always_comb / always @* blocks wait for the writer to yield too
+                // §4.5, §9.2.2.2: a level-sensitive `always` (always_comb,
+                // always @*, always @(a or b)) is a process of its own, not a
+                // cell: the writer's change only schedules it, and it runs
+                // once the writer suspends, after the continuous assignments
+                // it reads have been updated (the settle walks entries in
+                // dependency order). Run inline, it saw each blocking write
+                // separately and before the assignments, so an immediate
+                // assertion in it failed on values that never coexist.
                 if self.proc_settle_defer
                     && (matches!(
                         entries[eidx].item,
@@ -2130,6 +2139,8 @@ impl Simulator {
                             | CombItem::FastDirectFanout { .. }
                             | CombItem::FusedBufFanout { .. }
                             | CombItem::FusedAndFanout { .. }
+                            | CombItem::AlwaysBlock { .. }
+                            | CombItem::CompiledAlwaysBlock { .. }
                     ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                 {
                     // An entry with no resolvable read (one reading only

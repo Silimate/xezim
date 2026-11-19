@@ -42,7 +42,8 @@ module bp import cfg_pkg::*; #(parameter cfg_t pt = '{DEPTH: 256, W: 5, HI: 9, L
     input  logic [1:0]           en,
     input  logic [pt.HI:pt.LO]   addr,
     output logic [pt.DEPTH-1:0]  bank0,
-    output logic [pt.DEPTH-1:0]  bank1
+    output logic [pt.DEPTH-1:0]  bank1,
+    output logic [pt.DEPTH-1:0]  ibank
 );
   // The VeeR branch-predictor shape: a one-hot write enable per bank.
   for (genvar i = 0; i < 2; i++) begin : BANKS
@@ -54,6 +55,8 @@ module bp import cfg_pkg::*; #(parameter cfg_t pt = '{DEPTH: 256, W: 5, HI: 9, L
       always_ff @(posedge clk) bank1 <= pt.DEPTH'(en[i] << addr);
     end
   end
+  // A procedural cast in the instance's own scope.
+  initial #1 ibank = pt.DEPTH'(en[0] << addr);
 endmodule
 
 module tb;
@@ -67,14 +70,14 @@ module tb;
   logic [255:0] c_assign, c_comb, c_init, c_paren;
   logic [7:0] c_ctx, c_narrow, c_type;
   logic [11:0] c_typed;
-  logic [255:0] bank0, bank1;
+  logic [255:0] bank0, bank1, ibank;
   assign c_assign = pt.DEPTH'(en[0] << addr);
   always_comb c_comb = pt.DEPTH'(en[0] << addr);
   assign c_paren = (pt.DEPTH)'(en[0] << addr);
   assign c_ctx = 8'(pt.W'(a4 + b4));
   assign c_narrow = 8'(pt.W'(8'hff));
   assign c_typed = word_t'(a4 + b4);
-  bp #(.pt(pt)) u (.clk(clk), .en(en), .addr(addr), .bank0(bank0), .bank1(bank1));
+  bp #(.pt(pt)) u (.clk(clk), .en(en), .addr(addr), .bank0(bank0), .bank1(bank1), .ibank(ibank));
 
   task automatic chk(string name, logic [255:0] got, logic [255:0] exp);
     if (got === exp) $display("PASS %s", name);
@@ -95,6 +98,7 @@ module tb;
     chk("typedef cast", c_typed, 12'h010);
     chk("generate bank", bank0, 256'(1) << 14);
     chk("generate nba", bank1, 256'(1) << 14);
+    chk("instance initial", ibank, 256'(1) << 14);
     $finish;
   end
 endmodule
@@ -113,6 +117,7 @@ fn size_cast_by_struct_parameter_field_sets_operand_context() {
         "typedef cast",
         "generate bank",
         "generate nba",
+        "instance initial",
     ]
     .iter()
     .map(|n| format!("PASS {n}"))

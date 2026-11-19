@@ -520,10 +520,17 @@ impl Simulator {
                 _ => return None,
             }
         };
-        if (!field && h.path.len() < 2)
-            || h.root.is_some()
-            || self.scoped_param_value(&h.path[0].name.name).is_none()
-        {
+        // An instance's names arrive rewritten to their full path and rooted
+        // (`$root.u.pt.DEPTH`); that path is the parameter's own key.
+        let is_param = match h.root.as_deref() {
+            None => self.scoped_param_value(&h.path[0].name.name).is_some(),
+            Some("$root") => self
+                .module
+                .parameters
+                .contains_key(h.path[0].name.name.as_str()),
+            Some(_) => false,
+        };
+        if (!field && h.path.len() < 2) || !is_param {
             return None;
         }
         let v = self.eval_expr(target);

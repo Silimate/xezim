@@ -890,6 +890,14 @@ impl Simulator {
         let i = self.imm_assert_inst(a, kind);
         let key = self.assert_insts[i].key;
         self.note_assert_label(key, label);
+        self.imm_assert_count(i, kind, passed);
+    }
+
+    // silimate: count a deferred assertion when its report matures, not when it is queued
+    /// Count one outcome of `assert_insts[i]`, an immediate or deferred
+    /// assertion of kind tag `kind`, there and in its statement's
+    /// `assertion_stats` entry.
+    pub(super) fn imm_assert_count(&mut self, i: usize, kind: u8, passed: bool) {
         let ai = &mut self.assert_insts[i];
         let entry = self.assertion_stats.entry(ai.key).or_insert(AssertionStat {
             kind,
@@ -909,10 +917,14 @@ impl Simulator {
             ai.fail += 1;
         }
     }
+    // /silimate
 
     /// §16.4: record a deferred assertion's outcome; its action block runs
     /// when the report matures. Arguments of a subroutine-call action are
-    /// evaluated now, as §16.4 requires.
+    /// evaluated now, as §16.4 requires. The outcome is counted only when
+    /// the report matures: a report flushed because its process resumed in
+    /// the same time slot (§16.4.2), superseded by a re-execution of its
+    /// `always_comb`, or killed (§20.12) is no attempt.
     pub(super) fn queue_deferred_assert(
         &mut self,
         a: &crate::ast::stmt::AssertionStatement,
@@ -925,7 +937,11 @@ impl Simulator {
             crate::ast::stmt::AssertionKind::Assume => 1,
             crate::ast::stmt::AssertionKind::Cover => 2,
         };
-        self.imm_assert_tally(a, kind_tag, passed, label);
+        // silimate: count a deferred assertion when its report matures, not when it is queued
+        let inst = self.imm_assert_inst(a, kind_tag);
+        let key = self.assert_insts[inst].key;
+        self.note_assert_label(key, label);
+        // /silimate
         // An `always_comb` / `always @*` the settle runs as a comb entry is
         // not the process that happens to be current (whose resumption, a
         // §16.4.2 flush point, would drop the report): its reports belong to
@@ -945,9 +961,7 @@ impl Simulator {
         // has no failure action).
         let default_error_scope =
             (action.is_none() && !passed && kind_tag != 2).then(|| self.m_path());
-        if action.is_none() && default_error_scope.is_none() {
-            return;
-        }
+        // silimate: a report with no action still matures, to be counted then
         let ctl = self.imm_assert_ident(a);
         self.deferred_asserts.push(DeferredReport {
             pid,
@@ -960,6 +974,8 @@ impl Simulator {
             this_handle: self.this_stack.last().copied().flatten(),
             class_context: self.class_context_stack.last().cloned().flatten(),
             ctl,
+            inst,
+            tag: kind_tag,
         });
     }
 
@@ -1016,6 +1032,13 @@ impl Simulator {
         let mut pending = std::mem::take(&mut self.deferred_asserts);
         pending.sort_by_key(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final);
         for d in pending {
+            // silimate: count a deferred assertion when its report matures, not when it is queued
+            // A slot `$finish` ended never reaches its Observed or Postponed
+            // region, so its reports do not mature there either.
+            if !self.finished {
+                self.imm_assert_count(d.inst, d.tag, d.passed);
+            }
+            // /silimate
             if self.finished {
                 if !d.passed {
                     let loc = self

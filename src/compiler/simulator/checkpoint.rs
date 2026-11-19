@@ -39,7 +39,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §8.23 / §25.9: ClassMemberNames::vif_typedef_leaves.
 // §13.5.1: MethodAdmission::coll_formal_positions.
 // §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x10";
+// silimate: §16.4.2: DeferredReport::inst and ::tag, tallied when the report matures.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x11";
 
 #[derive(Default)]
 struct Session {

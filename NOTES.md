@@ -10,6 +10,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A deferred assertion (`assert #0`, `assert final`) counts its outcome in
+  the results file when its report matures. A report flushed because its
+  process resumed in the same time slot, or because its `always_comb` ran
+  again, ran no action and now counts as no attempt (§16.4.2); it counted as
+  a failure, so an assertion that never reported one read as failing.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

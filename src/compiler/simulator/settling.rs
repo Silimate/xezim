@@ -1583,6 +1583,20 @@ impl Simulator {
                 }
             };
         }
+        // silimate: always_comb / always @* blocks wait for the writer to yield too
+        // A deferring settle notes its seeds (the signals the process wrote)
+        // before seeding consumes their dirty marks.
+        if self.proc_settle_defer {
+            self.defer_seeds.clear();
+            for &id in &self.dirty_list[..seed_dirty_len] {
+                if self.dirty_signals.get(id).copied().unwrap_or(false) {
+                    self.defer_seeds.push(id);
+                }
+            }
+            self.defer_seeds_listed = false;
+        }
+        let seeded_from = next_list.len();
+        // /silimate
         if self.ctl_sig.is_empty() {
             seed_dirty!(|_id: usize| false);
         } else {
@@ -1590,6 +1604,25 @@ impl Simulator {
             seed_dirty!(|id: usize| ctl_sig.get(id).copied().unwrap_or(false));
             self.ctl_sig = ctl_sig;
         }
+        // silimate: always_comb / always @* blocks wait for the writer to yield too
+        // Stamp the entries the seeds woke, so the deferral below can tell
+        // them from entries a gate's output or an unresolved read woke.
+        if self.proc_settle_defer {
+            self.defer_seed_gen = self.defer_seed_gen.wrapping_add(1);
+            if self.defer_seed_gen == 0 {
+                self.defer_seed_mark.fill(0);
+                self.defer_seed_gen = 1;
+            }
+        }
+        if self.proc_settle_defer && next_list.len() > seeded_from {
+            if self.defer_seed_mark.len() < num_entries {
+                self.defer_seed_mark.resize(num_entries, 0);
+            }
+            for &e in &next_list[seeded_from..] {
+                self.defer_seed_mark[e] = self.defer_seed_gen;
+            }
+        }
+        // /silimate
         self.dirty_list.clear();
         self.dirty_any = false;
 
@@ -2143,6 +2176,25 @@ impl Simulator {
                             | CombItem::CompiledAlwaysBlock { .. }
                     ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                 {
+                    // silimate: always_comb / always @* blocks wait for the writer to yield too
+                    // An `always` entry the process's writes woke lists those
+                    // writes: they wake at the yield exactly the blocks they
+                    // woke here. Its other reads did not change, and listing
+                    // them would also wake blocks sensitive to them alone.
+                    if matches!(
+                        entries[eidx].item,
+                        CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+                    ) && self.defer_seed_mark.get(eidx) == Some(&self.defer_seed_gen)
+                    {
+                        if !self.defer_seeds_listed {
+                            self.defer_seeds_listed = true;
+                            let seeds = std::mem::take(&mut self.defer_seeds);
+                            self.defer_proc_reads(&seeds, false);
+                            self.defer_seeds = seeds;
+                        }
+                        continue;
+                    }
+                    // /silimate
                     // An entry with no resolvable read (one reading only
                     // memory cells without element names) has no id to
                     // re-dirty: an out-of-range marker still makes the next

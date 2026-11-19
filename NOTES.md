@@ -27,11 +27,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
-* The port width check (§23.3.3) measures a connection through an index
-  and a range of the next dimension, `.o(a[2][4:2])` on
-  `logic [3:0][5:0][7:0] a`, as the 24 bits it selects (§7.4.3). It counted
-  the labels and warned that the connection was 3 bits; the same width also
-  decided input port substitution and inout z-fill. (Silimate/xezim#316)
 * `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
   adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
   `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so

@@ -76,11 +76,49 @@ impl Simulator {
         self.module.covergroups.get(tname).cloned()
     }
 
+    /// §19.3, §19.4: `cg[i] = new(args)` whose element type `tname` is a
+    /// covergroup builds an instance of that covergroup into the element.
+    /// The target's type says what `new` builds (§8.7): left to the plain
+    /// assignment, `new(args)` was taken for the enclosing class's
+    /// constructor, which a constructor re-entered until the stack
+    /// overflowed. False when `tname` names no covergroup.
+    pub(super) fn construct_covergroup_into(
+        &mut self,
+        tname: &str,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> bool {
+        if self.module.covergroups.is_empty() || self.module.classes.contains_key(tname) {
+            return false;
+        }
+        let Some(cg_def) = self.covergroup_def_for(tname) else {
+            return false;
+        };
+        let args: &[Expression] = match &rvalue.kind {
+            ExprKind::Call { args, .. } => args,
+            _ => &[],
+        };
+        let handle = self.instantiate_covergroup(&cg_def, args);
+        self.assign_value(lvalue, &handle);
+        true
+    }
+
     pub(super) fn instantiate_covergroup(
         &mut self,
         cg_def: &CovergroupDeclaration,
-        _args: &[Expression],
+        args: &[Expression],
     ) -> Value {
+        // §13.5.3, §13.5.4: the actuals bind like any subroutine call's,
+        // `.name(expr)` to the named formal and an omitted one from its
+        // default; they were taken by position only.
+        let named;
+        let args: &[Expression] = match Self::normalize_call_args(&cg_def.ports, args) {
+            Some(v) => {
+                named = v;
+                &named
+            }
+            None => args,
+        };
         let handle = self.cg_heap.len();
         let owner = self
             .this_stack
@@ -93,7 +131,15 @@ impl Simulator {
         // constructor's `cg = new` after the base constructor's — leaves the
         // older instance unreachable. Drop it so it no longer counts in type
         // coverage (§19.11; the reference simulator does not count it).
-        if owner.is_some() {
+        // Only an embedded covergroup (`Class::cg`): an object may hold any
+        // number of instances of a covergroup type declared outside it
+        // (`cg_t a, b;`, `cg_t arr[4];`), and building one dropped the rest.
+        let embedded = cg_def
+            .name
+            .name
+            .rsplit_once("::")
+            .is_some_and(|(c, _)| self.module.classes.contains_key(c));
+        if owner.is_some() && embedded {
             for slot in self.cg_heap.iter_mut() {
                 if slot
                     .as_ref()
@@ -109,10 +155,16 @@ impl Simulator {
             ctor_args: {
                 let mut bound = Vec::new();
                 for (i, port) in cg_def.ports.iter().enumerate() {
-                    let v = if let Some(a) = _args.get(i) {
-                        self.eval_expr(a)
+                    // §13.5, §11.6.1: an input actual (or default) is
+                    // context-determined by its formal, so `new(x + y)` over
+                    // 8-bit operands into an `int` formal keeps the carry.
+                    let v = if let Some(a) = args.get(i) {
+                        match self.actual_context_width(port) {
+                            Some(w) => self.eval_expr_ctx(a, w),
+                            None => self.eval_expr(a),
+                        }
                     } else if let Some(d) = &port.default {
-                        self.eval_expr(d)
+                        self.eval_formal_default(port, d)
                     } else {
                         Value::zero(32)
                     };
@@ -125,7 +177,7 @@ impl Simulator {
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| matches!(p.direction, crate::ast::types::PortDirection::Ref))
-                .filter_map(|(i, p)| _args.get(i).map(|a| (p.name.name.clone(), a.clone())))
+                .filter_map(|(i, p)| args.get(i).map(|a| (p.name.name.clone(), a.clone())))
                 .collect(),
             class_params: owner
                 .map(|h| {
@@ -686,9 +738,11 @@ impl Simulator {
         {
             return Some(v);
         }
-        let mut all = self.module.parameters.clone();
-        all.extend(params);
-        super::elaborate::const_eval_i64_with_params(e, Some(&all))
+        let all = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &params,
+        };
+        super::elaborate::const_eval_i64_with_params_env(e, Some(&all))
     }
 
     /// The names a bin bound or option of covergroup instance `inst` sees

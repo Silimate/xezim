@@ -251,14 +251,17 @@ endmodule
 /// line or a start or finish argument above 64 bits keeps its value. A
 /// signed wide index type writes a negative key as its 128-bit two's
 /// complement, and a positive key of 64 one bits stays positive; both read
-/// back.
+/// back. A load that reaches the largest key of a 128-bit index type ends
+/// there instead of wrapping to the most negative key.
 #[test]
 fn readmem_writemem_index_wider_than_64_bits() {
     let dir = scratch("wider");
     let f = |n: &str| dir.join(n).display().to_string();
     std::fs::write(dir.join("l.hex"), "@10000000000000000\nab cd\n").unwrap();
+    std::fs::write(dir.join("m.hex"), "@7fffffffffffffffffffffffffffffff\naa bb\n").unwrap();
     let src = r#"
 module t;
+  bit [7:0] mx [bit signed [127:0]];
   bit [7:0] wm [bit [79:0]];
   bit [7:0] wr [bit [79:0]];
   bit [7:0] lm [bit [79:0]];
@@ -287,13 +290,16 @@ module t;
     $writememh("@SW@", sm);
     $readmemh("@SW@", sr);
     $display("T|signed num=%0d %h %h %h", sr.num(), sr[-1], sr[-big], sr[80'shffff_ffff_ffff_ffff]);
+    $readmemh("@M@", mx);
+    $display("T|max num=%0d %h", mx.num(), mx[128'sh7fff_ffff_ffff_ffff_ffff_ffff_ffff_ffff]);
   end
 endmodule
 "#
     .replace("@WW@", &f("ww.hex"))
     .replace("@L@", &f("l.hex"))
     .replace("@RG@", &f("rg.hex"))
-    .replace("@SW@", &f("sw.hex"));
+    .replace("@SW@", &f("sw.hex"))
+    .replace("@M@", &f("m.hex"));
     let got = t_lines(&src);
     let files: Vec<String> = ["ww.hex", "sw.hex"]
         .iter()
@@ -315,6 +321,7 @@ endmodule
             "T|load num=2 ab cd",
             "T|range num=2 22 33",
             "T|signed num=3 44 55 66",
+            "T|max num=1 aa",
         ]
     );
 }

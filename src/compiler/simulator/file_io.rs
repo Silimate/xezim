@@ -1442,7 +1442,10 @@ impl Simulator {
                             if is_packed_id(id) {
                                 self.cell_write(id, &val);
                                 loaded += 1;
-                                addr += step;
+                                let Some(next) = addr.checked_add(step) else {
+                                    break 'lines;
+                                };
+                                addr = next;
                                 continue;
                             }
                             let width = self.signal_widths[id];
@@ -1470,7 +1473,12 @@ impl Simulator {
                     }
                     loaded += 1;
                 }
-                addr += step;
+                // The last address a wide index type holds ends the load
+                // rather than wrap to the other end of the range.
+                let Some(next) = addr.checked_add(step) else {
+                    break 'lines;
+                };
+                addr = next;
             }
         }
         if assoc_changed {

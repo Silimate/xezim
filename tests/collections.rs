@@ -350,6 +350,8 @@ mod package_array_operand_in_method;
 
 #[path = "collections/unpacked_struct_concat_1035.rs"]
 mod unpacked_struct_concat_1035;
+#[path = "collections/struct_concat_registered.rs"]
+mod struct_concat_registered;
 
 #[path = "collections/call_returned_array_whole_value_1036.rs"]
 mod call_returned_array_whole_value_1036;
@@ -373,3 +375,21 @@ mod review_queue_of_queues_push_1086;
 mod assoc_struct_delete_1124;
 #[path = "collections/review_typedef_row_class_properties_216.rs"]
 mod review_typedef_row_class_properties_216;
+
+#[path = "collections/dyn_array_of_dyn_array_rows.rs"]
+mod dyn_array_of_dyn_array_rows;
+
+#[path = "collections/pattern_array_items.rs"]
+mod pattern_array_items;
+#[path = "collections/struct_concat_forms.rs"]
+mod struct_concat_forms;
+#[path = "collections/queue_front_shift.rs"]
+mod queue_front_shift;
+#[path = "collections/stream_with_range_1197.rs"]
+mod stream_with_range_1197;
+#[path = "collections/stream_with_range_unpack.rs"]
+mod stream_with_range_unpack;
+#[path = "collections/pattern_self_read.rs"]
+mod pattern_self_read;
+#[path = "collections/pattern_self_read_scopes.rs"]
+mod pattern_self_read_scopes;

@@ -81,12 +81,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
-* An unpacked-array parameter works in the generate conditions of a module
-  below the top (`if (Info[k].variant == ...)`, `if (V[k] == 1)`), whether it
-  is a `localparam` of that module (also when its struct typedef is declared
-  there) or a package parameter (`import p::*`, `import p::V`, `p::V[k]`);
-  every branch took `else` and the assignments in the others were lost
-  (§6.20.2, §26.3, §27.5). (#342)
 
 **Usability**
 

@@ -387,8 +387,9 @@ fn method_boost_enabled() -> bool {
 // §23.9: a frame local that hides a parameter is not a constant element select.
 // §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §7.2: reads of nested packed-struct members (`s.inner.f`) compile to a range select.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3091;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3093;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1823,10 +1824,11 @@ struct CombEntryCold {
 // §20.8.1, §7.4.1: `$clog2` of a constant folds, and a select bound that does
 // not fold still maps its label to a physical bit.
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
 // §7.2: a read of a nested packed-struct member (`s.inner.f`) compiles to a range select.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB052";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB055";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

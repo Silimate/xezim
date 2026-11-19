@@ -177,3 +177,33 @@ endmodule
         &["c3s: lt=111 q0=0000000000000000 q1=0000000176543210 q2=0000000376543210 m=7 mf=7"],
     );
 }
+
+/// §7.4.1: on a packed multidimensional base, a part-select's bounds name
+/// whole elements. Bounds that do not fold (a constant function, `$clog2` of
+/// an operator expression) leave the select to the interpreter, which scales
+/// them; the compiled bit-range select read `a[1:0]` as two bits.
+#[test]
+fn unfolded_bounds_on_a_packed_array_select_elements() {
+    assert_has(
+        r#"
+// bounds that do not fold on a packed multi-dimensional base select whole elements
+module pmd;
+  logic clk = 0;
+  logic [3:0][7:0] a = 32'h1234567b;
+  logic [31:0] q0, q1, i0, i1;
+  function automatic int f(int x); return x + 1; endfunction
+  always @(posedge clk) begin
+    q0 <= a[$clog2(2+2)-1:0];
+    q1 <= a[f(2):f(0)];
+  end
+  initial begin
+    i0 = a[$clog2(2+2)-1:0];
+    i1 = a[f(2):f(0)];
+    #1 clk = 1;
+    #1 $display("pmd: q0=%h q1=%h i0=%h i1=%h", q0, q1, i0, i1);
+  end
+endmodule
+"#,
+        &["pmd: q0=0000567b q1=00123456 i0=0000567b i1=00123456"],
+    );
+}

@@ -10,16 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* A text macro defined in a `-y`/`-v` library file, itself or through an
-  `` `include `` of the design's headers, is defined for the library files
-  read after it, as for source files (§22.5.1, §3.12.1). A library module
-  that included the headers did not share them with the library modules it
-  instantiates, which then failed to parse. Library files are now read in a
-  fixed order, the order their modules are resolved in. (Silimate/xezim#310)
-* A `-v`/`-y` library file with a byte that is not UTF-8 (a Latin-1 `®` in a
-  comment) is decoded as source files are, the byte becoming U+FFFD. The
-  whole file was dropped ("stream did not contain valid UTF-8") and its
-  modules were not found.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

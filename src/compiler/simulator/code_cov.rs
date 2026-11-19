@@ -2395,6 +2395,7 @@ impl Instr<'_> {
             // Not statements of their own: the markers and bodies the
             // executor and other constructs own.
             kind @ (StatementKind::Null
+            | StatementKind::ParamDecl { .. }
             | StatementKind::Typedef(_)
             | StatementKind::Coverpoint { .. }
             | StatementKind::Cross { .. }

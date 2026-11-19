@@ -233,6 +233,17 @@ impl Simulator {
                 } else {
                     skip
                 };
+                if skip == 1
+                    && h.path.len() >= 2
+                    && let Some(mut key) =
+                        self.pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                {
+                    for seg in &h.path[2..] {
+                        key.push('.');
+                        key.push_str(&seg.name.name);
+                    }
+                    return Some(key);
+                }
                 let segs = &h.path[skip..];
                 // The overwhelmingly common shape is a single segment; the
                 // Vec + join below allocates twice for it. This is the
@@ -2130,6 +2141,29 @@ impl Simulator {
         Some(changed)
     }
 
+    /// Whether storing `val`'s bits (bit 0 up) over `cur[lsb..=msb]`, clipped
+    /// to `cur`'s width, changes a bit.
+    fn range_store_differs(cur: &Value, lsb: usize, msb: usize, val: &Value) -> bool {
+        let top = msb.min((cur.width as usize).saturating_sub(1));
+        (lsb..=top).any(|i| cur.get_bit(i) != val.get_bit(i - lsb))
+    }
+
+    /// Store `val`'s bits (bit 0 up) over `cur[lsb..=msb]`, clipped to
+    /// `cur`'s width, in the stored value itself. Returns whether a bit
+    /// changed.
+    fn range_store(cur: &mut Value, lsb: usize, msb: usize, val: &Value) -> bool {
+        let top = msb.min((cur.width as usize).saturating_sub(1));
+        let mut changed = false;
+        for i in lsb..=top {
+            let nb = val.get_bit(i - lsb);
+            if cur.get_bit(i) != nb {
+                cur.set_bit(i, nb);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Outlined from `assign_value_inner` (see `exec_stmt_blocking_assign`): keeps
     /// the dispatcher's stack frame small.
     #[inline(never)]
@@ -2268,6 +2302,54 @@ impl Simulator {
                         return false; // §11.5.1: x/z index selects nothing
                     }
                     let idx = idx_v.to_i64().unwrap_or(i64::MIN);
+                    // A variable stored whole in one known place — the call
+                    // frame or a table signal — takes the element in place.
+                    // Reading the vector out, setting the element's bits and
+                    // storing it back copied and compared the whole vector
+                    // several times for each element written: a loop filling
+                    // a 1-Mibit buffer spent its time there.
+                    if let Some(store) = self.whole_var_store(&base) {
+                        let width = match store {
+                            VarStore::Frame => self.frame_get(&base).map_or(0, |v| v.width),
+                            VarStore::Table(id) => self.signal_table[id].width,
+                        };
+                        if width > elem_w {
+                            if let Some(lo) = self
+                                .packed_elem_lsb(&pkey, idx, elem_w)
+                                .filter(|lo| lo + (elem_w as usize) <= width as usize)
+                            {
+                                let piece = val.resize(elem_w);
+                                match store {
+                                    VarStore::Frame => {
+                                        if let Some(cur) = self
+                                            .local_stack
+                                            .last_mut()
+                                            .and_then(|l| l.get_mut(&*base))
+                                        {
+                                            return cur.copy_bits_from(
+                                                lo,
+                                                &piece,
+                                                0,
+                                                elem_w as usize,
+                                            );
+                                        }
+                                    }
+                                    VarStore::Table(id) => {
+                                        if let Some(changed) =
+                                            self.splice_signal_bits(id, lo, &piece)
+                                        {
+                                            if changed {
+                                                self.touch_elem_base(&base);
+                                            }
+                                            return changed;
+                                        }
+                                    }
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                    }
                     // Frame-aware storage: subroutine locals live in
                     // the call frame, module vars in the signal maps —
                     // get/set_local_or_signal covers both.
@@ -2281,6 +2363,7 @@ impl Simulator {
                     if let Some(key) = storage_key {
                         if let Some(mut cur) = self.get_local_or_signal(&key) {
                             if cur.width > elem_w {
+                                self.select_store_copies += u64::from(cur.width > 64);
                                 let piece = val.resize(elem_w);
                                 let Some(lo) = self.packed_elem_lsb(&pkey, idx, elem_w) else {
                                     return false;
@@ -2389,6 +2472,100 @@ impl Simulator {
                 }
                 return changed;
             }
+        }
+
+        // §7.4.2: `m[i][j] = v` on a class-property dynamic array of dynamic
+        // arrays writes element `j` of row `<h>#m[i]`, the key reads use. The
+        // arms below took `[j]` for a bit-select of the row's own cell.
+        if matches!(expr.kind, ExprKind::Index { .. })
+            && !self.no_class_objects()
+            && let Some(row) = self.coll_elem_expr_key(expr)
+            && row.contains('#')
+            && self.module.dynamic_arrays.contains(&row)
+            && self.coll_shape_at(&row).is_some_and(|(shape, depth)| {
+                matches!(shape.dims.get(depth), Some(Dim::Dyn))
+            })
+        {
+            let Some(j) = self.eval_expr(index).to_i64() else {
+                return false;
+            };
+            if j < 0 || j as u64 >= self.get_queue_size(&row) {
+                return false;
+            }
+            let key = format!("{}[{}]", row, j);
+            let elem_is_string = self.is_string_collection(&row)
+                || self.is_string_collection(&key)
+                || self
+                    .p_elem_type_ref(&row)
+                    .is_some_and(|dt| Self::is_string_data_type(&dt));
+            let prev = self.signals.get(&key);
+            let elem_dt = || {
+                self.p_elem_type_ref(&row)
+                    .or_else(|| self.class_member_coll_type(&row).map(std::borrow::Cow::Borrowed))
+            };
+            let declared_slot = || -> Option<Value> {
+                let w = self
+                    .module
+                    .arrays
+                    .get(&row)
+                    .map(|&(_, _, w)| w)
+                    .or_else(|| self.assoc_store_ctx_width(&row))?;
+                let signed = self
+                    .p_elem_type_ref(&row)
+                    .or_else(|| self.class_member_coll_type(&row).map(std::borrow::Cow::Borrowed))
+                    .is_some_and(|dt| {
+                        super::elaborate::is_type_signed_resolved(&dt, &self.module.typedef_types)
+                    });
+                let mut p = Value::zero(w.max(1));
+                p.is_signed = signed;
+                Some(p)
+            };
+            let mut v = if elem_is_string {
+                val.clone()
+            } else if val.is_real {
+                if let Some(p) = prev {
+                    if p.is_real {
+                        Value::from_f64(val.to_f64())
+                    } else {
+                        Self::real_into_slot(p, val.to_f64())
+                    }
+                } else if elem_dt().is_some_and(|dt| super::elaborate::is_type_real(&dt)) {
+                    Value::from_f64(val.to_f64())
+                } else if let Some(p) = declared_slot() {
+                    Self::real_into_slot(&p, val.to_f64())
+                } else {
+                    val.clone()
+                }
+            } else if let Some(p) = prev {
+                if !p.is_real && p.width > 0 {
+                    val.resize(p.width)
+                } else if p.is_real {
+                    Value::from_f64(val.to_f64())
+                } else {
+                    val.clone()
+                }
+            } else if let Some(w) = self
+                .module
+                .arrays
+                .get(&row)
+                .map(|&(_, _, w)| w)
+                .or_else(|| self.assoc_store_ctx_width(&row))
+            {
+                val.resize(w.max(1))
+            } else {
+                val.clone()
+            };
+            if let Some(dt) = elem_dt() {
+                if super::elaborate::is_type_two_state_resolved(&dt, &self.module.typedef_types) {
+                    v = v.to_two_state();
+                }
+            }
+            let changed = self.signals.get(&key) != Some(&v);
+            if changed {
+                self.write_coll_elem(&key, v);
+                self.touch_queue(&row);
+            }
+            return changed;
         }
         // Element write into an ARRAY-OF-COLLECTIONS class property
         // (`expected[1][0][k] = v`, `dq[1][2] = v`, `aa[0][key] = v`):
@@ -2579,24 +2756,26 @@ impl Simulator {
                     // not itself a leaf and the phantom-element path below
                     // still applies.
                     if i >= 0
-                        && let Some(cur) = self
+                        && self
                             .local_stack
                             .last()
-                            .and_then(|f| f.get(base.as_ref()))
-                            .cloned()
+                            .is_some_and(|f| f.contains_key(base.as_ref()))
                         && !self.frame_name_is_string(&base)
                     {
+                        // The frame's value takes the bit in place: a copy
+                        // of the whole local for each bit written made a
+                        // bit loop over a wide local quadratic.
                         let bit = i as usize;
-                        if bit < cur.width as usize {
+                        if let Some(cur) = self
+                            .local_stack
+                            .last_mut()
+                            .and_then(|f| f.get_mut(base.as_ref()))
+                            && bit < cur.width as usize
+                        {
                             let nb = val.bits_first();
-                            let old = cur.get_bit(bit);
-                            let changed = old != nb;
+                            let changed = cur.get_bit(bit) != nb;
                             if changed {
-                                let mut nv = cur;
-                                nv.set_bit(bit, nb);
-                                if let Some(frame) = self.local_stack.last_mut() {
-                                    frame.insert(base.to_string(), nv);
-                                }
+                                cur.set_bit(bit, nb);
                             }
                             return changed;
                         }
@@ -2737,7 +2916,10 @@ impl Simulator {
             // (`for i in 0..sz VAR[i] = …`); without this growth the
             // unpacked `.size()` stayed 0 and every later field read
             // desynced (PCKSZ errors / X compare).
-            if !self.is_associative_array(&an) {
+            let is_fixed_array = self.module.arrays.contains_key(&an)
+                && !self.module.dynamic_arrays.contains(&an)
+                && !self.module.queue_vars.contains(&an);
+            if !self.is_associative_array(&an) && !is_fixed_array {
                 let kval = idx_val.to_i64().unwrap_or(0);
                 if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
                     self.set_queue_size(&an, kval as u64 + 1);
@@ -5172,7 +5354,49 @@ impl Simulator {
                 // excluded here. Bit-selects are already correct in both
                 // directions; this closes the part-select WRITE gap.
                 let mut elem_ascending_dim: Option<(i64, i64)> = None;
-                let class_dim = self.class_prop_select_dim(expr);
+                // §7.4.1: a multidimensional packed class property, or an
+                // associative-array element of such a type, selects elements
+                // of its first dimension; neither has the signal tables the
+                // branches below read its geometry from.
+                let extra_dims = (!self.no_class_objects())
+                    .then(|| self.class_prop_receiver(expr))
+                    .flatten()
+                    .and_then(|(h, p)| self.class_prop_packed_dims(h, &p))
+                    .or_else(|| {
+                        let ExprKind::Index { expr: root, .. } = &expr.kind else {
+                            return None;
+                        };
+                        let ExprKind::Ident(h) = &root.kind else {
+                            return None;
+                        };
+                        let name = self.resolve_hier_name(h);
+                        self.is_associative_array(&name)
+                            .then(|| self.module.packed_full_dims.get(&*name).cloned())
+                            .flatten()
+                    })
+                    .filter(|d| d.len() > 1);
+                let physical = extra_dims.as_ref().map(|dims| {
+                    let (dl, dr) = dims[0];
+                    let stride: i64 = dims[1..].iter().map(|(l, r)| (l - r).abs() + 1).product();
+                    let (a, b) = match kind {
+                        RangeKind::Constant => (li, ri),
+                        RangeKind::IndexedUp => (li, li + ri - 1),
+                        RangeKind::IndexedDown => (li, li - ri + 1),
+                    };
+                    let bit = |i: i64| {
+                        if dl >= dr {
+                            (i - dr) * stride
+                        } else {
+                            (dr - i) * stride
+                        }
+                    };
+                    (bit(a).min(bit(b)), bit(a).max(bit(b)) + stride - 1)
+                });
+                let class_dim = if physical.is_none() {
+                    self.class_prop_select_dim(expr)
+                } else {
+                    None
+                };
                 if let Some((dl, dr)) = class_dim {
                     if dl < dr {
                         li = match kind {
@@ -5253,8 +5477,6 @@ impl Simulator {
                 // select. Kept for the partial-OOB case where the physical
                 // range is clamped: the loop needs the UNCLAMPED high end.
                 let mut asc_phys_hi: Option<i64> = None;
-                let l = li.max(0) as usize;
-                let r = ri.max(0) as usize;
                 let (mut msb, mut lsb) = (msb_i.max(0) as usize, lsb_i.max(0) as usize);
                 // §7.4.1 element-range WRITE on a packed multi-D base:
                 // `wv[2:1] = 16'hBEEF` / `wv[1 +: 2] = …` targets whole
@@ -5271,9 +5493,9 @@ impl Simulator {
                         .filter(|&&w| w > 1)
                     {
                         let (lab_a, lab_b): (i64, i64) = match kind {
-                            RangeKind::Constant => (l as i64, r as i64),
-                            RangeKind::IndexedUp => (l as i64, l as i64 + r as i64 - 1),
-                            RangeKind::IndexedDown => (l as i64, l as i64 - (r as i64 - 1)),
+                            RangeKind::Constant => (li, ri),
+                            RangeKind::IndexedUp => (li, li + ri - 1),
+                            RangeKind::IndexedDown => (li, li - (ri - 1)),
                         };
                         let dim = self
                             .module
@@ -5295,10 +5517,21 @@ impl Simulator {
                         };
                         let la = lsb_of(lab_a);
                         let lb = lsb_of(lab_b);
-                        lsb = la.min(lb).max(0) as usize;
-                        msb = (la.max(lb) + elem_w as i64 - 1).max(0) as usize;
+                        // §11.5.1: map signed labels before clipping, retaining
+                        // the source offset for partially out-of-range writes.
+                        src_base = la.min(lb);
+                        msb_i = la.max(lb) + elem_w as i64 - 1;
+                        lsb = src_base.max(0) as usize;
+                        msb = msb_i.max(0) as usize;
                         elem_scaled = true;
                     }
+                }
+                if let Some((lo, hi)) = physical {
+                    src_base = lo;
+                    msb_i = hi;
+                    lsb = lo.max(0) as usize;
+                    msb = hi.max(0) as usize;
+                    elem_scaled = true;
                 }
                 // Ascending packed vector part-write (`logic [0:7] pa; pa[0:3]=v`):
                 // labels index from the MSB end → internal [(W-1)-lsb : (W-1)-msb]
@@ -5721,28 +5954,39 @@ impl Simulator {
                             // property landed correctly. Resolved before the
                             // mutable borrow below.
                             let (msb, lsb) = match self.class_prop_packed_shape(handle, &fname) {
+                                // A multidimensional property's select was
+                                // mapped to physical bits above already.
                                 Some((_, total, left, right))
-                                    if class_dim.is_none() && left < right && total > 0 =>
+                                    if class_dim.is_none()
+                                        && physical.is_none()
+                                        && left < right
+                                        && total > 0 =>
                                 {
                                     let top = total as usize - 1;
                                     (top.saturating_sub(lsb), top.saturating_sub(msb))
                                 }
                                 _ => (msb, lsb),
                             };
+                            // §11.5.1: elements below bit 0 are dropped with
+                            // the value bits they would have taken.
+                            let shifted;
+                            let val = if physical.is_some() && src_base < 0 {
+                                if msb_i < 0 {
+                                    return false;
+                                }
+                                shifted =
+                                    val.shift_right(&Value::from_u64(src_base.unsigned_abs(), 32));
+                                &shifted
+                            } else {
+                                val
+                            };
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                if let Some(cur) = inst.properties.get(&fname).cloned() {
-                                    let width = cur.width as usize;
-                                    let mut nv = cur.clone();
-                                    let mut changed = false;
-                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                        let nb = val.get_bit(i - lsb);
-                                        if nv.get_bit(i) != nb {
-                                            nv.set_bit(i, nb);
-                                            changed = true;
-                                        }
-                                    }
-                                    if changed {
-                                        inst.properties.insert(fname, nv);
+                                // The property takes the bits in place (§11.5.1); it is
+                                // noted as written only when one changes.
+                                if let Some(cur) = inst.properties.get(&fname) {
+                                    let changed = Self::range_store_differs(cur, lsb, msb, val);
+                                    if changed && let Some(cur) = inst.properties.get_mut(&fname) {
+                                        Self::range_store(cur, lsb, msb, val);
                                     }
                                     return changed;
                                 }
@@ -5754,39 +5998,20 @@ impl Simulator {
                         // local_stack frame
                         if !self.local_stack.is_empty() {
                             let last_idx = self.local_stack.len() - 1;
-                            if let Some(cur) = self.local_stack[last_idx].get(&bare).cloned() {
-                                let width = cur.width as usize;
-                                let mut nv = cur.clone();
-                                let mut changed = false;
-                                for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                    let nb = val.get_bit(i - lsb);
-                                    if nv.get_bit(i) != nb {
-                                        nv.set_bit(i, nb);
-                                        changed = true;
-                                    }
-                                }
-                                if changed {
-                                    self.local_stack[last_idx].insert(bare.clone(), nv);
-                                }
-                                return changed;
+                            if let Some(cur) = self.local_stack[last_idx].get_mut(&bare) {
+                                // The local takes the bits in place.
+                                return Self::range_store(cur, lsb, msb, val);
                             }
                         }
                         // this.<prop>
                         if let Some(Some(handle)) = self.this_stack.last().copied() {
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                if let Some(cur) = inst.properties.get(&bare).cloned() {
-                                    let width = cur.width as usize;
-                                    let mut nv = cur.clone();
-                                    let mut changed = false;
-                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                        let nb = val.get_bit(i - lsb);
-                                        if nv.get_bit(i) != nb {
-                                            nv.set_bit(i, nb);
-                                            changed = true;
-                                        }
-                                    }
-                                    if changed {
-                                        inst.properties.insert(bare, nv);
+                                // The property takes the bits in place (§11.5.1); it is
+                                // noted as written only when one changes.
+                                if let Some(cur) = inst.properties.get(&bare) {
+                                    let changed = Self::range_store_differs(cur, lsb, msb, val);
+                                    if changed && let Some(cur) = inst.properties.get_mut(&bare) {
+                                        Self::range_store(cur, lsb, msb, val);
                                     }
                                     return changed;
                                 }
@@ -5795,19 +6020,12 @@ impl Simulator {
                     }
                     // signals slow-path
                     let name = self.resolve_hier_name(hier);
-                    if let Some(cur) = self.signals.get(&*name).cloned() {
-                        let width = cur.width as usize;
-                        let mut nv = cur.clone();
-                        let mut changed = false;
-                        for i in lsb..=msb.min(width.saturating_sub(1)) {
-                            let nb = val.get_bit(i - lsb);
-                            if nv.get_bit(i) != nb {
-                                nv.set_bit(i, nb);
-                                changed = true;
-                            }
-                        }
+                    if let Some(cur) = self.signals.get(&*name) {
+                        let changed = Self::range_store_differs(cur, lsb, msb, val);
                         if changed {
-                            self.signals.insert(name.to_string(), nv);
+                            if let Some(cur) = self.signals.get_mut(&*name) {
+                                Self::range_store(cur, lsb, msb, val);
+                            }
                             self.mark_dirty(&name);
                         }
                         return changed;
@@ -5840,19 +6058,12 @@ impl Simulator {
                         if self.receiver_may_be_handle(base) {
                             let pname = member.name.clone();
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                if let Some(cur) = inst.properties.get(&pname).cloned() {
-                                    let width = cur.width as usize;
-                                    let mut nv = cur.clone();
-                                    let mut changed = false;
-                                    for i in lsb..=msb.min(width.saturating_sub(1)) {
-                                        let nb = val.get_bit(i - lsb);
-                                        if nv.get_bit(i) != nb {
-                                            nv.set_bit(i, nb);
-                                            changed = true;
-                                        }
-                                    }
-                                    if changed {
-                                        inst.properties.insert(pname, nv);
+                                // The property takes the bits in place (§11.5.1); it is
+                                // noted as written only when one changes.
+                                if let Some(cur) = inst.properties.get(&pname) {
+                                    let changed = Self::range_store_differs(cur, lsb, msb, val);
+                                    if changed && let Some(cur) = inst.properties.get_mut(&pname) {
+                                        Self::range_store(cur, lsb, msb, val);
                                     }
                                     return changed;
                                 }

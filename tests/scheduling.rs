@@ -537,3 +537,5 @@ mod parked_waiter_signal_index;
 mod replication_pattern_capture;
 #[path = "scheduling/nettype_relay_chain_1239.rs"]
 mod nettype_relay_chain_1239;
+#[path = "scheduling/level_always_waits_for_writer.rs"]
+mod level_always_waits_for_writer;

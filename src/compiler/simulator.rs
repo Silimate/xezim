@@ -364,7 +364,26 @@ fn method_boost_enabled() -> bool {
 // §10.9.1, §11.8.1, §7.2.1, §7.4.1, §11.4.14: typed pattern keys, operand signs, packed elements, stream widths.
 // §23.3.2, §7.4: an element of a multidimensional array member of an instance-array element.
 // §6.19.5: enumeration methods take the receiver's declared enumeration.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_307a;
+// §6.20: procedural parameters retain their own type and declaration kind.
+// Scope-specific combinational dependency resolution (§23.6).
+// Absolute packed references retain declaration geometry (§23.6, §7.4.1).
+// Class aggregate ownership and struct-field constructor typing (§8.8/§8.11).
+// Scoped memory destinations, dynamic rows, combinational time scope, and string-member local shadowing.
+// Explicit event expressions retain function-call operands and result guards.
+// Net typedef metadata and virtual-interface specialization identities.
+// Class-local shadowing keeps numeric comparisons out of string-member admission.
+// §7.4.1, §6.20: elements of packed-array members of struct formals and nested
+// callees reading module parameters inline.
+// §13.5, §11.6.1: compiled import calls and calls handed to the interpreter size
+// integral input actuals by their formals; a method with a vif local declines (§25.9).
+// §6.18, §6.16, §13.5.1, §8.9: typedef write-back receivers, string-collection members, unpacked-formal actuals, static collections.
+// §5.7.1, §11.8.2, §11.4.13, §12.5.4: fill operands of real operators fold at one bit; real,
+// fill and negative-member `inside` and non-constant `case inside` items run interpreted.
+// §8.9, §23.9, §6.18, §8.25: bare stores to class-scope shadow names decline; class typedef chains size formals.
+// §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional packed range NBAs decline.
+// §26.3: package code reads its own package's parameters, variables and imports, and an
+// inlined package callee its own, ahead of the design's same-named declarations.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3089;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -1010,6 +1029,96 @@ macro_rules! vcd_mark {
     }};
 }
 
+/// The bookkeeping of a completed store into `signal_table[id]` (`changed`:
+/// whether the stored value differs from the one it replaced): what
+/// `write_sig!` does once the new value is in the table. A store that edits
+/// the table value in place ends with this, so it leaves the same marks as a
+/// whole-value `write_sig!`.
+macro_rules! write_sig_done {
+    ($self:ident, $id:expr_2021, $changed:expr_2021) => {{
+        let __wsig_id = $id;
+        let __wsig_changed = $changed;
+        // Expression-backed procedural assignments use per-signal
+        // generations as their sensitivity set. Keep the usual no-active-
+        // assignment path to one branch; only real value changes advance
+        // the generation.
+        if __wsig_changed
+            && !$self.active_force_exprs.is_empty()
+            && __wsig_id < $self.active_force_signal_epochs.len()
+        {
+            $self.active_force_signal_epochs[__wsig_id] =
+                $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
+            $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
+        }
+        // Incremental VCD: mark this write dirty (no-op when the dump is off
+        // or the full scan is forced). Superset-safe — the flush re-checks
+        // prev vs cur, so marking an unchanged write costs only a skip.
+        vcd_mark!($self, __wsig_id);
+        // O1 measurement: stamp the signal's last-change phase.
+        if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
+            $self.sig_last_change[__wsig_id] = $self.event_phase;
+        }
+        // Arm only gateable edge blocks that actually read this signal.
+        // The dense bitmap keeps unrelated writes a single cheap branch;
+        // positive hits use the sparse CSR fanout built after compile.
+        if $self.armed_edge
+            && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
+            && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
+        {
+            let (lo, hi) = $self.armed_input_ranges[__wsig_id];
+            for __k in lo as usize..hi as usize {
+                let __bi = $self.armed_input_blocks[__k] as usize;
+                $self.edge_block_armed[__bi] |= EDGE_ARMED;
+            }
+        }
+        // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
+        // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
+        // the borrow stays a direct field access in macro-expanded contexts.
+        if ($self.dirty_edge || $self.dirty_edge_shadow)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
+                $self.edge_pos_seen[__ep as usize] = true;
+                $self.changed_edge_pos.push(__ep as usize);
+            }
+        }
+        // Parked-waiter index: queue a watched signal that changed, for
+        // the next waiter drain and the next snapshot. One length
+        // compare while no waiter is indexed.
+        if __wsig_changed
+            && __wsig_id < $self.event_waiters.watch.len()
+            && $self.event_waiters.watch[__wsig_id] & event_waiters::WATCH_ANY != 0
+        {
+            $self.event_waiters.note_write(__wsig_id);
+        }
+        // §9.2 re-trigger: a blocking write to an edge-sensitive signal
+        // made WHILE an edge block executes must re-run edge detection
+        // for that signal (drain_edge_exec_rescan) — record its position.
+        // One bool load when not inside an edge block.
+        if ($self.in_edge_block || $self.in_edge_cont)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
+                $self.edge_exec_seen[__ep as usize] = true;
+                $self.edge_exec_wrote.push(__ep as usize);
+            }
+        }
+        // §38.36.1 cbValueChange: report the change right away, in the
+        // region of the write. One emptiness check while nothing is
+        // watched. Writes that bypass this macro are caught by the poll
+        // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
+        // The dispatcher takes the raw self-pointer: this macro expands
+        // under live borrows of other fields.
+        if !$self.dpi_value_change_cbs.is_empty()
+            && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
+        {
+            vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
+        }
+    }};
+}
+
 macro_rules! write_sig {
     ($self:ident, $id:expr_2021, $val:expr_2021) => {{
         let __wsig_id = $id;
@@ -1022,6 +1131,18 @@ macro_rules! write_sig {
         // strings never reach a sized table slot with it consulted.
         if !__wsig_val.is_real && __wsig_id < $self.signal_signed.len() {
             __wsig_val.is_signed = $self.signal_signed[__wsig_id];
+        }
+        // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
+        // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
+        // keeps every bit. Only a REAL write pays the type-name lookup.
+        if __wsig_val.is_real
+            && $self
+                .signal_type_names
+                .get(&__wsig_id)
+                .is_some_and(|tn| tn == "shortreal")
+        {
+            let __wsig_f = __wsig_val.to_f64() as f32 as f64;
+            __wsig_val = Value::from_f64(__wsig_f);
         }
         // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
         // keeps the common no-force case to one branch — `contains_key`
@@ -1093,75 +1214,7 @@ macro_rules! write_sig {
                 }
             }
             $self.signal_table[__wsig_id] = __wsig_val;
-            // Expression-backed procedural assignments use per-signal
-            // generations as their sensitivity set. Keep the usual no-active-
-            // assignment path to one branch; only real value changes advance
-            // the generation.
-            if __wsig_changed
-                && !$self.active_force_exprs.is_empty()
-                && __wsig_id < $self.active_force_signal_epochs.len()
-            {
-                $self.active_force_signal_epochs[__wsig_id] =
-                    $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
-                $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
-            }
-            // Incremental VCD: mark this write dirty (no-op when the dump is off
-            // or the full scan is forced). Superset-safe — the flush re-checks
-            // prev vs cur, so marking an unchanged write costs only a skip.
-            vcd_mark!($self, __wsig_id);
-            // O1 measurement: stamp the signal's last-change phase.
-            if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
-                $self.sig_last_change[__wsig_id] = $self.event_phase;
-            }
-            // Arm only gateable edge blocks that actually read this signal.
-            // The dense bitmap keeps unrelated writes a single cheap branch;
-            // positive hits use the sparse CSR fanout built after compile.
-            if $self.armed_edge
-                && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
-                && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
-            {
-                let (lo, hi) = $self.armed_input_ranges[__wsig_id];
-                for __k in lo as usize..hi as usize {
-                    let __bi = $self.armed_input_blocks[__k] as usize;
-                    $self.edge_block_armed[__bi] |= EDGE_ARMED;
-                }
-            }
-            // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
-            // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
-            // the borrow stays a direct field access in macro-expanded contexts.
-            if ($self.dirty_edge || $self.dirty_edge_shadow)
-                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-            {
-                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-                if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
-                    $self.edge_pos_seen[__ep as usize] = true;
-                    $self.changed_edge_pos.push(__ep as usize);
-                }
-            }
-            // §9.2 re-trigger: a blocking write to an edge-sensitive signal
-            // made WHILE an edge block executes must re-run edge detection
-            // for that signal (drain_edge_exec_rescan) — record its position.
-            // One bool load when not inside an edge block.
-            if ($self.in_edge_block || $self.in_edge_cont)
-                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-            {
-                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-                if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
-                    $self.edge_exec_seen[__ep as usize] = true;
-                    $self.edge_exec_wrote.push(__ep as usize);
-                }
-            }
-            // §38.36.1 cbValueChange: report the change right away, in the
-            // region of the write. One emptiness check while nothing is
-            // watched. Writes that bypass this macro are caught by the poll
-            // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
-            // The dispatcher takes the raw self-pointer: this macro expands
-            // under live borrows of other fields.
-            if !$self.dpi_value_change_cbs.is_empty()
-                && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
-            {
-                vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
-            }
+            write_sig_done!($self, __wsig_id, __wsig_changed);
         }
     }};
 }
@@ -1750,7 +1803,16 @@ struct CombEntryCold {
 // §10.9.1, §11.8.1, §7.2.1, §7.4.1, §11.4.14: typed pattern keys, operand signs, packed elements, stream widths.
 // §23.3.2, §7.4: elements of a multidimensional array member of an instance-array
 // element are read and written by the interpreter and depend on their own signals.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB038";
+// §7.4.1, §6.20: elements of packed-array members of struct formals and nested
+// callees reading module parameters inline.
+// §12.5.4, §11.4.13: `case inside` with a wildcard, range or real item and `inside` with a
+// real operand, a fill or a negative member run on the interpreter's matcher.
+// §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional
+// packed range nonblocking writes are left to the interpreter.
+// §10.3.2, §9.2.2.1: shared-read batches leave out members with fused branches or jump
+// tables, chain fusion relocates branches within one process class, and an instance's
+// read of an unnamed memory cell stays unresolved.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB042";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -1796,6 +1858,8 @@ pub struct SimOutput {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct NbaEntry {
+    /// §10.10: captured elements of a whole unpacked-array assignment.
+    elements: Option<Vec<Value>>,
     lhs: Option<Expression>,
     value: Value,
     resolved_id: Option<usize>,
@@ -2249,7 +2313,7 @@ pub(super) struct LocalMeta {
     class: Option<String>,
     container: Option<String>,
     type_args: Option<Vec<Expression>>,
-    decl_types: Vec<(String, DataType)>,
+    decl_types: Vec<(String, Rc<DataType>)>,
     struct_members: Vec<(String, Vec<String>)>,
     packed_fields: Vec<(String, Vec<(String, u32, u32)>)>,
     elem_widths: Vec<(String, u32)>,
@@ -2448,6 +2512,10 @@ const WHEEL_SIZE: usize = 4096;
 /// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
 /// Not expressible in SV source, so it can never collide with a user name.
 const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
+/// §14.5: the hidden clocking names of the operand samples of a clockvar
+/// bound to an expression (`__xz_cbop.sum.0`), and the unresolvable net name
+/// the clockvar itself is registered under. Unreachable from SV source.
+const CB_OPERAND_PREFIX: &str = "__xz_cbop.";
 
 /// IEEE 1800-2023 §14.4: `#1step` in the clocking skew maps. An input with no
 /// declared skew samples with 1step too (§14.3 default), so the default-input
@@ -3053,6 +3121,8 @@ impl NbaFastIndex {
 }
 
 mod aggregate_assignments;
+mod pattern_array_items;
+mod intra_pattern_shape;
 mod annex_n;
 mod aggregate_expressions;
 mod aggregate_members;
@@ -3085,6 +3155,7 @@ mod coverage;
 mod dpi_imports;
 mod edges;
 mod enum_receivers;
+mod event_waiters;
 mod event_loop;
 mod stall_progress;
 mod expression_types;
@@ -3142,6 +3213,7 @@ mod ts_x;
 mod typename;
 mod uvm_dpi;
 mod vpi_api;
+mod vpi_assert;
 mod vpi_cb;
 mod vpi_model;
 use assert_ctl::{AssertCtl, CtlIdent, CtlSite};
@@ -3880,12 +3952,6 @@ fn signal_key_bits(k: &str) -> u64 {
     if bits == 0 { u64::MAX } else { bits }
 }
 
-/// A write to the string-keyed stores that does not name its target.
-#[inline]
-fn bump_store_gen() {
-    note_store_write(u64::MAX);
-}
-
 /// The names written since the last call.
 fn take_store_writes() -> u64 {
     STORE_WRITE_MASK.with(|m| m.replace(0))
@@ -4022,6 +4088,8 @@ struct ClassMemberNames {
     /// Typedef names (module or class scope) whose target is a class-scoped
     /// type (`typedef R::elem_t et_t;`).
     scoped_typedefs: HashSet<String>,
+    /// Class typedef names whose target is a virtual interface (§25.9).
+    vif_typedef_leaves: HashSet<String>,
     /// Names that may prefix a class-scope reference without being a
     /// class: class parameters and typedef names.
     scope_prefixes: HashSet<String>,
@@ -4221,6 +4289,15 @@ struct SvaClockedSite {
     fired: bool,
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
+    /// IEEE 1800-2017 Clause 39 (assertion API): what the VPI reports of
+    /// each attempt in `attempts`, in the same order (`sva_take_meta` pads
+    /// it, so the engine never depends on it). Not saved: an attempt
+    /// restored from a checkpoint reports the restore time as its start.
+    #[serde(skip)]
+    attempt_meta: Vec<SvaAttemptMeta>,
+    /// The same for the attempts in `settled`.
+    #[serde(skip)]
+    settled_meta: Vec<SvaAttemptMeta>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
     /// Each entry is `signal_name → ring of sampled values (index 0 =
     /// this cycle, index N = N cycles ago)`. Refreshed at every clock fire
@@ -4457,6 +4534,16 @@ enum SvaNode {
         sync: bool,
         body: Box<SvaNode>,
     },
+}
+
+/// IEEE 1800-2017 Clause 39: the per-attempt data of the assertion API
+/// (`s_vpi_attempt_info`), kept beside the attempt's evaluation state.
+#[derive(Debug, Clone, Copy, Default)]
+struct SvaAttemptMeta {
+    /// Simulation time (ticks) of the clock tick that started the attempt.
+    start_time: u64,
+    /// Clock ticks the attempt has been evaluated at.
+    clock_steps: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4996,6 +5083,9 @@ enum FsmWait {
 
 type ClockingOutputDrive = (String, String, Value, Option<Expression>);
 type ClockingCycleDrive = (u64, String, String, Value, Option<Expression>);
+/// §14.5: an expression a clockvar is bound to and its operand nets, each
+/// with the hidden clocking name of its sample.
+type ClockingBoundExpr = (Expression, Vec<(String, String)>);
 type ClockingEdgeDrive = (String, Value, EdgeKind, u64, Option<Expression>);
 
 /// One clocking block's per-tick poll state: its clock resolved to a
@@ -5108,7 +5198,7 @@ struct FormalMetadataSnapshot {
 /// `snapshot_formal_parts`).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct FormalMetaParts {
-    declared_type: Option<DataType>,
+    declared_type: Option<Rc<DataType>>,
     packed_fields: Option<Vec<(String, u32, u32)>>,
     packed_element_widths: Vec<(String, u32)>,
     packed_dimensions: Option<Vec<(i64, i64)>>,
@@ -6753,101 +6843,532 @@ impl VcdVarKind {
 /// without scanning the whole map. The `starts_with` full-map scans in the
 /// queue-frame save/restore were 25%+ of a UVM AVIP run.
 ///
-/// Reads go through `Deref<Target = HashMap<..>>`; every mutation that can
-/// add or drop a KEY must go through the inherent `insert`/`remove` below
-/// (inherent methods shadow the deref'd HashMap ones), keeping the index
-/// exact. `get_mut`-style value edits need no index work.
+/// The elements `name[i]` of a queue or dynamic array (a name with a
+/// `name.size` entry) are held in one dense run per name (`ElemRun`) instead
+/// of one map entry each, so removing or inserting an element at the front
+/// moves no other element (§7.10.2). The run is an implementation detail of
+/// the map: every accessor below serves `name[i]` from it exactly as if the
+/// key were a map entry.
+///
+/// There is no `Deref` to the inner map: every read and every mutation goes
+/// through the inherent methods below, which keep the index and the runs
+/// exact.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SignalMap {
     map: HashMap<String, Value>,
+    /// The map-held keys containing `[`, by base name. Run-held elements are
+    /// not listed here.
     elems: HashMap<String, std::collections::HashSet<String>>,
     /// Per base name, a stamp that changes whenever an element key is added
-    /// to or removed from `elems[base]` (absent = no element keys), so a
-    /// derived view of a base's key set can be cached until it changes.
+    /// to or removed from the base (absent = no element keys), so a derived
+    /// view of a base's key set can be cached until it changes.
     elem_gens: HashMap<String, u64>,
     elem_gen_counter: u64,
+    /// The dense element runs, by collection name (`q`, `12#m_q`, `@q#3`,
+    /// `u.q`, a row `aq[3]`).
+    runs: HashMap<String, ElemRun>,
+    /// Elements held in `runs`, so `len()` counts them as keys.
+    run_keys: usize,
+    /// The names in `runs` that contain `[` themselves, by base name: the
+    /// runs whose keys the element index files under another name.
+    nested_runs: HashMap<String, Vec<String>>,
+}
+
+/// The elements `name[start]`, `name[start + 1]`, ... of one collection.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ElemRun {
+    /// Index of `items[0]` (meaningless while `items` is empty).
+    start: u64,
+    items: VecDeque<Value>,
+    /// `name.size` is stored: the name is a queue or dynamic array, and the
+    /// run is kept while empty.
+    sized: bool,
+    /// Map-held keys `name[<index>]` outside the run.
+    strays: u32,
+}
+
+impl ElemRun {
+    #[inline]
+    fn end(&self) -> u64 {
+        self.start + self.items.len() as u64
+    }
+
+    #[inline]
+    fn slot(&self, i: u64) -> Option<usize> {
+        (i >= self.start && i < self.end()).then(|| (i - self.start) as usize)
+    }
+}
+
+/// `name[<n>]` with `<n>` a canonical decimal index: the collection name and
+/// the index. Any other spelling (`a[01]`, `a[-1]`, `a["k"]`, `a[1].f`) is
+/// not an element of a run.
+#[inline]
+fn split_elem_key(k: &str) -> Option<(&str, u64)> {
+    let b = k.as_bytes();
+    let n = b.len();
+    if n < 4 || b[n - 1] != b']' {
+        return None;
+    }
+    let mut i = n - 1;
+    while i > 0 && b[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    let digits = n - 1 - i;
+    if digits == 0 || digits > 9 || i < 2 || b[i - 1] != b'[' {
+        return None;
+    }
+    if digits > 1 && b[i] == b'0' {
+        return None;
+    }
+    let mut v = 0u64;
+    for &d in &b[i..n - 1] {
+        v = v * 10 + (d - b'0') as u64;
+    }
+    Some((&k[..i - 1], v))
 }
 
 impl SignalMap {
+    pub fn new() -> Self {
+        SignalMap {
+            map: HashMap::default(),
+            elems: HashMap::default(),
+            elem_gens: HashMap::default(),
+            elem_gen_counter: 0,
+            runs: HashMap::default(),
+            run_keys: 0,
+            nested_runs: HashMap::default(),
+        }
+    }
+
     fn base_of(k: &str) -> Option<&str> {
         k.find('[').map(|i| &k[..i])
     }
 
+    /// The base name the element index files `name`'s elements under.
+    #[inline]
+    fn outer_of(name: &str) -> &str {
+        Self::base_of(name).unwrap_or(name)
+    }
+
+    #[inline]
+    pub fn get(&self, k: &str) -> Option<&Value> {
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get(name)
+            && let Some(s) = run.slot(i)
+        {
+            return Some(&run.items[s]);
+        }
+        self.map.get(k)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, k: &str) -> bool {
+        self.get(k).is_some()
+    }
+
+    /// Stored keys, run-held elements included.
+    pub fn len(&self) -> usize {
+        self.map.len() + self.run_keys
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every stored key with its value, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, str>, &Value)> + '_ {
+        self.map
+            .iter()
+            .map(|(k, v)| (std::borrow::Cow::Borrowed(k.as_str()), v))
+            .chain(self.runs.iter().flat_map(|(name, run)| {
+                run.items.iter().enumerate().map(move |(s, v)| {
+                    (
+                        std::borrow::Cow::Owned(format!("{}[{}]", name, run.start + s as u64)),
+                        v,
+                    )
+                })
+            }))
+    }
+
+    /// The entries the map itself holds: every key but a run's elements
+    /// (`elem_runs`).
+    pub fn map_entries(&self) -> impl Iterator<Item = (&String, &Value)> + '_ {
+        self.map.iter()
+    }
+
+    /// The element runs: a collection name, the index of its first held
+    /// element and the elements `name[first]`, `name[first + 1]`, ...
+    pub fn elem_runs(&self) -> impl Iterator<Item = (&str, u64, &VecDeque<Value>)> + '_ {
+        self.runs
+            .iter()
+            .filter(|(_, run)| !run.items.is_empty())
+            .map(|(name, run)| (name.as_str(), run.start, &run.items))
+    }
+
+    /// Every stored key, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// A key was added under or removed from base `outer`: move its stamp,
+    /// or drop it with the base's last key.
+    fn stamp_base(&mut self, outer: &str) {
+        if self.elems.contains_key(outer) || self.base_has_run_keys(outer) {
+            self.elem_gen_counter += 1;
+            match self.elem_gens.get_mut(outer) {
+                Some(g) => *g = self.elem_gen_counter,
+                None => {
+                    self.elem_gens
+                        .insert(outer.to_string(), self.elem_gen_counter);
+                }
+            }
+        } else {
+            self.elem_gens.remove(outer);
+        }
+    }
+
+    fn base_has_run_keys(&self, outer: &str) -> bool {
+        self.runs.get(outer).is_some_and(|r| !r.items.is_empty())
+            || self.nested_runs.get(outer).is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|n| self.runs.get(n).is_some_and(|r| !r.items.is_empty()))
+            })
+    }
+
+    /// File map-held key `k` in the element index.
+    fn index_key(&mut self, k: &str) {
+        if let Some(b) = Self::base_of(k) {
+            match self.elems.get_mut(b) {
+                Some(set) => {
+                    set.insert(k.to_string());
+                }
+                None => {
+                    self.elems
+                        .entry(b.to_string())
+                        .or_default()
+                        .insert(k.to_string());
+                }
+            }
+            self.stamp_base(b);
+        }
+    }
+
+    /// Drop map-held key `k` from the element index.
+    fn unindex_key(&mut self, k: &str) {
+        if let Some(b) = Self::base_of(k) {
+            self.unlist_key(k, b);
+            self.stamp_base(b);
+        }
+    }
+
+    /// Take map-held key `k` off base `b`'s list, leaving the stamp alone.
+    fn unlist_key(&mut self, k: &str, b: &str) {
+        if let Some(set) = self.elems.get_mut(b) {
+            set.remove(k);
+            if set.is_empty() {
+                self.elems.remove(b);
+            }
+        }
+    }
+
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
         note_store_write(signal_key_bits(&k));
-        if let Some(b) = Self::base_of(&k) {
-            if !self.map.contains_key(&k) {
-                self.elems
-                    .entry(b.to_string())
-                    .or_default()
-                    .insert(k.clone());
-                self.elem_gen_counter += 1;
-                self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(&k)
+            && let Some(run) = self.runs.get_mut(name)
+        {
+            if let Some(s) = run.slot(i) {
+                return Some(std::mem::replace(&mut run.items[s], v));
+            }
+            // A key the map already holds stays there.
+            if run.strays == 0 || !self.map.contains_key(&k) {
+                let adopted = if run.items.is_empty() {
+                    run.start = i;
+                    run.items.push_back(v);
+                    None
+                } else if i == run.end() {
+                    run.items.push_back(v);
+                    None
+                } else if i + 1 == run.start {
+                    run.start = i;
+                    run.items.push_front(v);
+                    None
+                } else {
+                    Some(v)
+                };
+                match adopted {
+                    None => {
+                        let absorb = run.strays > 0;
+                        self.run_keys += 1;
+                        let name = name.to_string();
+                        if absorb {
+                            self.absorb_strays(&name);
+                        }
+                        self.stamp_base(Self::outer_of(&name));
+                        return None;
+                    }
+                    Some(v) => {
+                        run.strays += 1;
+                        self.index_key(&k);
+                        return self.map.insert(k, v);
+                    }
+                }
+            }
+            return self.map.insert(k, v);
+        }
+        if !self.map.contains_key(&k) {
+            self.index_key(&k);
+            if let Some(name) = k.strip_suffix(".size") {
+                let name = name.to_string();
+                let prev = self.map.insert(k, v);
+                self.note_sized(&name);
+                return prev;
             }
         }
         self.map.insert(k, v)
     }
 
+    /// `name.size` was stored: `name` is a queue or dynamic array, so its
+    /// elements are kept in a run from now on. Elements the map already
+    /// holds move into it (the contiguous ones, from the lowest index).
+    fn note_sized(&mut self, name: &str) {
+        if let Some(run) = self.runs.get_mut(name) {
+            run.sized = true;
+            return;
+        }
+        let outer = Self::outer_of(name);
+        let mut held: Vec<u64> = match self.elems.get(outer) {
+            Some(set) => set
+                .iter()
+                .filter_map(|k| {
+                    split_elem_key(k)
+                        .filter(|(n, _)| *n == name)
+                        .map(|(_, i)| i)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        held.sort_unstable();
+        let mut run = ElemRun {
+            sized: true,
+            strays: held.len() as u32,
+            ..ElemRun::default()
+        };
+        if let Some(&first) = held.first() {
+            run.start = first;
+        }
+        if outer.len() != name.len() {
+            self.nested_runs
+                .entry(outer.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+        self.runs.insert(name.to_string(), run);
+        if !held.is_empty() {
+            self.absorb_strays(name);
+        }
+    }
+
+    /// Move the map-held keys adjacent to `name`'s run into it.
+    fn absorb_strays(&mut self, name: &str) {
+        loop {
+            let Some(run) = self.runs.get(name) else {
+                return;
+            };
+            if run.strays == 0 {
+                return;
+            }
+            // An empty run restarts at the index it last began at.
+            let empty = run.items.is_empty();
+            let above = if empty { run.start } else { run.end() };
+            let below = if empty {
+                None
+            } else {
+                run.start.checked_sub(1)
+            };
+            let mut took = false;
+            for (back, i) in [(true, Some(above)), (false, below)] {
+                let Some(i) = i else { continue };
+                let key = format!("{}[{}]", name, i);
+                if let Some(v) = self.map.remove(&key) {
+                    // The key stays stored: the base's stamp does not move.
+                    self.unlist_key(&key, Self::outer_of(name));
+                    let run = self.runs.get_mut(name).unwrap();
+                    if back {
+                        if run.items.is_empty() {
+                            run.start = i;
+                        }
+                        run.items.push_back(v);
+                    } else {
+                        run.start = i;
+                        run.items.push_front(v);
+                    }
+                    run.strays -= 1;
+                    self.run_keys += 1;
+                    took = true;
+                }
+            }
+            if !took {
+                return;
+            }
+        }
+    }
+
+    /// Forget `name`'s run once it holds nothing and `name.size` is gone.
+    fn drop_idle_run(&mut self, name: &str) {
+        if self
+            .runs
+            .get(name)
+            .is_some_and(|r| r.items.is_empty() && !r.sized && r.strays == 0)
+        {
+            self.runs.remove(name);
+            let outer = Self::outer_of(name);
+            if outer.len() != name.len()
+                && let Some(names) = self.nested_runs.get_mut(outer)
+            {
+                names.retain(|n| n != name);
+                if names.is_empty() {
+                    self.nested_runs.remove(outer);
+                }
+            }
+        }
+    }
+
     pub fn remove(&mut self, k: &str) -> Option<Value> {
         note_store_write(signal_key_bits(k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get_mut(name)
+        {
+            if let Some(s) = run.slot(i) {
+                let last = run.items.len() - 1;
+                let v = if s == last {
+                    run.items.pop_back()
+                } else if s == 0 {
+                    run.start += 1;
+                    run.items.pop_front()
+                } else {
+                    // A hole: the shorter side leaves the run for the map.
+                    let v = run.items.remove(s);
+                    let (lo, moved): (u64, Vec<Value>) = if s <= last / 2 {
+                        let lo = run.start;
+                        run.start = i + 1;
+                        (lo, run.items.drain(..s).collect())
+                    } else {
+                        (i + 1, run.items.drain(s..).collect())
+                    };
+                    run.strays += moved.len() as u32;
+                    self.run_keys -= moved.len();
+                    for (j, mv) in moved.into_iter().enumerate() {
+                        let key = format!("{}[{}]", name, lo + j as u64);
+                        self.index_key(&key);
+                        self.map.insert(key, mv);
+                    }
+                    v
+                };
+                self.run_keys -= 1;
+                self.drop_idle_run(name);
+                self.stamp_base(Self::outer_of(name));
+                return v;
+            }
+            let r = self.map.remove(k);
+            if r.is_some() {
+                run.strays -= 1;
+                self.unindex_key(k);
+                self.drop_idle_run(name);
+            }
+            return r;
+        }
         let r = self.map.remove(k);
         if r.is_some() {
-            if let Some(b) = Self::base_of(k) {
-                if let Some(set) = self.elems.get_mut(b) {
-                    set.remove(k);
-                    if set.is_empty() {
-                        self.elems.remove(b);
-                        self.elem_gens.remove(b);
-                    } else {
-                        self.elem_gen_counter += 1;
-                        self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
-                    }
-                }
+            self.unindex_key(k);
+            if let Some(name) = k.strip_suffix(".size")
+                && let Some(run) = self.runs.get_mut(name)
+            {
+                run.sized = false;
+                self.drop_idle_run(name);
             }
         }
         r
     }
 
-    /// An in-place edit of one stored value, noted under its key's names
-    /// (other `&mut` access through `DerefMut` notes every name).
+    /// An in-place edit of one stored value, noted under its key's names.
     pub fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
         note_store_write(signal_key_bits(k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get_mut(name)
+            && let Some(s) = run.slot(i)
+        {
+            return Some(&mut run.items[s]);
+        }
         self.map.get_mut(k)
+    }
+
+    /// The runs whose keys the element index files under `outer`.
+    fn runs_under<'a>(&'a self, outer: &'a str) -> impl Iterator<Item = (&'a str, &'a ElemRun)> {
+        self.runs
+            .get(outer)
+            .map(|r| (outer, r))
+            .into_iter()
+            .chain(
+                self.nested_runs
+                    .get(outer)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| self.runs.get(n).map(|r| (n.as_str(), r))),
+            )
+            .filter(|(_, r)| !r.items.is_empty())
+    }
+
+    /// Whether every key `name[i]` begins with `prefix`, which ends in `[`.
+    #[inline]
+    fn run_under_prefix(name: &str, prefix: &str) -> bool {
+        name.starts_with(prefix) || (prefix.len() == name.len() + 1 && prefix.starts_with(name))
     }
 
     /// All stored keys beginning with `prefix`, which must end with `[`.
     /// Served from the element index: only the owning base name's keys are
     /// touched, never the whole map. Handles nested-bracket prefixes
     /// (`q[0].f[`) by indexing on the OUTERMOST base and filtering.
+    /// A run's keys come highest index first, so a caller removing them in
+    /// this order shrinks the run from its end.
     pub fn keys_with_elem_prefix(&self, prefix: &str) -> Vec<String> {
         debug_assert!(prefix.ends_with('['));
-        let base = &prefix[..prefix.len() - 1];
-        let outer = Self::base_of(base).unwrap_or(base);
-        self.elems
-            .get(outer)
-            .map(|set| {
-                set.iter()
-                    .filter(|k| k.starts_with(prefix))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.elem_keys_with_prefix(prefix)
+            .map(|k| k.into_owned())
+            .collect()
     }
 
-    /// Keys of every `base[...]` element currently stored, unordered.
+    /// Keys of every `base[...]` element currently stored, unordered (a
+    /// run's keys highest index first, see `keys_with_elem_prefix`).
     pub fn elem_keys(&self, base: &str) -> Vec<String> {
-        self.elems
+        let mut keys: Vec<String> = self
+            .elems
             .get(base)
             .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The index files nothing under a name with a bracket in it.
+        if !base.contains('[') {
+            for (name, run) in self.runs_under(base) {
+                keys.extend(
+                    (run.start..run.end())
+                        .rev()
+                        .map(|i| format!("{}[{}]", name, i)),
+                );
+            }
+        }
+        keys
     }
 
     /// Borrowing form of `keys_with_elem_prefix`: the element keys under
-    /// `prefix` (which must end in `[`) without cloning them.
+    /// `prefix` (which must end in `[`), cloning none of the map-held ones.
     pub fn elem_keys_with_prefix<'a>(
         &'a self,
         prefix: &'a str,
-    ) -> impl Iterator<Item = &'a str> + 'a {
+    ) -> impl Iterator<Item = std::borrow::Cow<'a, str>> + 'a {
         let base = &prefix[..prefix.len().saturating_sub(1)];
         let outer = Self::base_of(base).unwrap_or(base);
         self.elems
@@ -6855,6 +7376,16 @@ impl SignalMap {
             .into_iter()
             .flat_map(|set| set.iter().map(|k| k.as_str()))
             .filter(move |k| k.starts_with(prefix))
+            .map(std::borrow::Cow::Borrowed)
+            .chain(
+                self.runs_under(outer)
+                    .filter(move |(name, _)| Self::run_under_prefix(name, prefix))
+                    .flat_map(|(name, run)| {
+                        (run.start..run.end())
+                            .rev()
+                            .map(move |i| std::borrow::Cow::Owned(format!("{}[{}]", name, i)))
+                    }),
+            )
     }
 
     /// The element-key stamp of the outermost base of `prefix` (which ends
@@ -6871,26 +7402,124 @@ impl SignalMap {
     /// `obj`; this replaces a scan of the whole map.
     pub fn any_key_with_prefix(&self, prefix: &str) -> bool {
         let Some(outer) = Self::base_of(prefix) else {
-            return self.map.keys().any(|k| k.starts_with(prefix));
+            return self.map.keys().any(|k| k.starts_with(prefix))
+                || self
+                    .runs
+                    .iter()
+                    .any(|(name, run)| !run.items.is_empty() && name.starts_with(prefix));
         };
         self.elems
             .get(outer)
             .is_some_and(|set| set.iter().any(|k| k.starts_with(prefix)))
+            || self
+                .runs_under(outer)
+                .any(|(name, run)| Self::run_has_key_with_prefix(name, run, prefix))
+    }
+
+    /// Whether a key `name[i]` of the non-empty `run` begins with `prefix`.
+    fn run_has_key_with_prefix(name: &str, run: &ElemRun, prefix: &str) -> bool {
+        if prefix.len() <= name.len() {
+            return name.starts_with(prefix);
+        }
+        let Some(rest) = prefix.strip_prefix(name).and_then(|r| r.strip_prefix('[')) else {
+            return false;
+        };
+        // `rest` has to begin `<index>]`, the whole remainder of a key.
+        let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        match &rest[digits..] {
+            "" => (run.start..run.end()).any(|i| i.to_string().starts_with(rest)),
+            "]" => split_elem_key(prefix).is_some_and(|(_, i)| run.slot(i).is_some()),
+            _ => false,
+        }
+    }
+
+    /// Whether `name`'s run holds every element `name[lo]` .. `name[hi - 1]`
+    /// and nothing else is stored under `name[`: no element outside the run,
+    /// and no member, row or size of an element (`name[i].f`, `name[i][j]`,
+    /// `name[i].size`). Then the collection's elements from `lo` on are
+    /// exactly the run's items, in order.
+    pub fn run_covers(&self, name: &str, lo: u64, hi: u64) -> bool {
+        let Some(run) = self.runs.get(name) else {
+            return false;
+        };
+        if run.strays != 0 || run.items.is_empty() || run.start != lo || run.end() < hi {
+            return false;
+        }
+        let outer = Self::outer_of(name);
+        let below = |k: &str| {
+            k.len() > name.len() && k.as_bytes()[name.len()] == b'[' && k.starts_with(name)
+        };
+        !self
+            .elems
+            .get(outer)
+            .is_some_and(|set| set.iter().any(|k| below(k)))
+            && !self
+                .nested_runs
+                .get(outer)
+                .is_some_and(|names| names.iter().any(|n| below(n)))
+    }
+
+    /// Remove element `name[idx]` of a collection of `size` elements whose
+    /// run starts at `lo` (`run_covers(name, lo, size)` holds): the elements
+    /// above it move down one index. Elements a shrink left behind at or past
+    /// `size` are dropped.
+    pub fn run_remove_at(&mut self, name: &str, lo: u64, idx: u64, size: u64) -> Option<Value> {
+        note_store_write(signal_key_bits(name));
+        let run = self.runs.get_mut(name)?;
+        debug_assert!(run.start == lo && lo <= idx && idx < size && run.end() >= size);
+        let live = (size - lo) as usize;
+        let before = run.items.len();
+        run.items.truncate(live);
+        let v = if idx == lo {
+            run.items.pop_front()
+        } else {
+            run.items.remove((idx - lo) as usize)
+        };
+        self.run_keys -= before - run.items.len();
+        self.stamp_base(Self::outer_of(name));
+        v
+    }
+
+    /// Open a slot at `name[idx]` in a collection of `size` elements whose
+    /// run starts at `lo` (`run_covers(name, lo, size)` holds): the elements
+    /// from `idx` on move up one index, and `name[idx]` keeps its value until
+    /// it is stored. Elements a shrink left behind at or past `size` are
+    /// dropped.
+    pub fn run_open_at(&mut self, name: &str, lo: u64, idx: u64, size: u64) -> bool {
+        note_store_write(signal_key_bits(name));
+        let Some(run) = self.runs.get_mut(name) else {
+            return false;
+        };
+        debug_assert!(run.start == lo && lo <= idx && idx < size && run.end() >= size);
+        let live = (size - lo) as usize;
+        let before = run.items.len();
+        run.items.truncate(live);
+        let s = (idx - lo) as usize;
+        let keep = run.items[s].clone();
+        if s == 0 {
+            run.items.push_front(keep);
+        } else {
+            run.items.insert(s, keep);
+        }
+        self.run_keys = self.run_keys + run.items.len() - before;
+        self.stamp_base(Self::outer_of(name));
+        true
     }
 }
 
-impl std::ops::Deref for SignalMap {
-    type Target = HashMap<String, Value>;
-    fn deref(&self) -> &Self::Target {
-        &self.map
+impl Default for SignalMap {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl std::ops::DerefMut for SignalMap {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        bump_store_gen();
-        &mut self.map
-    }
+/// The single place a whole variable is stored (`Simulator::whole_var_store`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarStore {
+    /// The innermost call frame.
+    Frame,
+    /// The table signal with this id.
+    Table(usize),
 }
 
 /// Mid-exec ts aborts tolerated per block before demotion.
@@ -7527,6 +8156,19 @@ pub struct Simulator {
     /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
     clocking_cycle_pending: HashMap<String, Vec<ClockingCycleDrive>>,
+    /// §14.16.2: clocking select drives waiting for their maturity as
+    /// nonblocking updates: (maturity time, signal). A whole drive of the
+    /// same signal maturing with one queues behind it, so the drives take
+    /// effect in the order they were issued.
+    clocking_select_due: Vec<(u64, usize)>,
+    /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
+    /// resolved net). The snapshot/meta store the NET; reads and drives use
+    /// the clocking name, so they translate through this first.
+    /// §14.16: a clocking OUTPUT clockvar drives a stage of its own when
+    /// the net it is bound to has another driver: (block name, net) →
+    /// stage signal. The clockvar drives the stage, and the stage joins the
+    /// net's other drivers in the resolution fold.
+    clocking_output_stages: HashMap<(String, String), String>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
@@ -7536,6 +8178,13 @@ pub struct Simulator {
     /// BASE net; a sample applies the select to the base's sample, a drive
     /// writes through it (#823).
     clocking_sig_bound_sel: HashMap<String, HashMap<String, Expression>>,
+    /// §14.5 a clockvar bound to an expression (`input sum = a + 1;`,
+    /// `input i = {op, ra, rb[3:1]};`): cb → (clocking name → (the bound
+    /// expression, each operand net with the hidden clocking name of its
+    /// sample)). Each operand is sampled as a clocking input of its own, with
+    /// the clockvar's skew; the clockvar's sample is the expression evaluated
+    /// over those samples.
+    clocking_sig_bound_expr: HashMap<String, HashMap<String, ClockingBoundExpr>>,
     /// §14.4 per-cb default OUTPUT skew in ticks (absent = #0).
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
@@ -7743,7 +8392,8 @@ pub struct Simulator {
     /// Per-signal delay in sim ticks (0 = no delay). Indexed by signal_id.
     sdf_delays: Vec<u64>,
     /// Pending delayed signal updates: (time, signal_id, value)
-    delayed_updates: Vec<(u64, usize, Value)>,
+    // A mask limits a delayed update to the bits its driver owns (§10.3.3).
+    delayed_updates: Vec<(u64, usize, Value, Option<Value>)>,
     /// §10.3.3 / §28.16: some net may hold more than one pending update in
     /// `delayed_updates` (select drivers due at different times, see
     /// `schedule_delayed_slice_chain`). Cleared when no update is pending.
@@ -7773,6 +8423,18 @@ pub struct Simulator {
     /// by `CombItem::TimingCheck{idx}`).
     timing_checks: Vec<timing_checks::TimingCheckRt>,
     timing_watches: Vec<timing_checks::TcWatch>,
+    /// The conditions of the timing checks, compiled on first use
+    /// (`timing_checks::TcCond`): check `i`'s start at `timing_cond_base[i]`,
+    /// one per condition it has. They depend on the design only, so a
+    /// checkpoint neither holds nor resets them.
+    #[serde(skip)]
+    timing_cond_base: Vec<u32>,
+    #[serde(skip)]
+    timing_conds: Vec<timing_checks::TcCond>,
+    /// Condition evaluations of the timing checks: compiled, interpreted
+    /// (`[PROF] timing_conds`).
+    #[serde(skip)]
+    timing_cond_evals: [u64; 2],
     /// Like `has_udp`: timing checks keep per-check state, so their comb
     /// entries force the serial settle.
     has_timing_checks: bool,
@@ -8107,6 +8769,24 @@ pub struct Simulator {
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
+    /// §18.5.9: the objects of the randomize() call being solved, outermost
+    /// first: the object `randomize()` was called on, then each rand
+    /// sub-object whose own solve is running under it. A sub-object's
+    /// constraint that reads a rand variable of an object earlier in the
+    /// chain through a handle member (`item.addr`, `item` the handle back
+    /// to the enclosing object) belongs to that object's solve.
+    rand_solve_chain: Vec<usize>,
+    /// Set by `randomize_nested_with` for the solve it starts, which then
+    /// extends `rand_solve_chain` instead of starting a chain of its own.
+    rand_solve_nested: bool,
+    /// §18.6.2: the sub-objects of the running call whose `post_randomize`
+    /// waits for the whole call to succeed. A sub-object with an item left
+    /// to an enclosing solve (see `rand_solve_chain`) is done before the
+    /// variables that item constrains have their final values, which its
+    /// `post_randomize` may read (`hist.push_back(item.addr)`).
+    rand_post_deferred: Vec<usize>,
+    /// The solve in progress left an item to an enclosing solve.
+    rand_post_defer_self: bool,
     /// Failed randomize() calls reported so far, per class or
     /// `std::randomize` call site (`rand_fail_warn`).
     rand_fail_reports: HashMap<String, u32>,
@@ -8773,6 +9453,10 @@ pub struct Simulator {
     class_event_prop_names: Option<std::rc::Rc<HashSet<String>>>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
+    /// Pattern target writes collected before scheduling their NBA updates.
+    /// Empty at scheduling boundaries; never part of a checkpoint.
+    #[serde(skip)]
+    pattern_nba_leaves: Option<Vec<(String, Value)>>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that
     /// signal during the *current* NBA accumulation window. Used by the
     /// partial-range/bit NBA Insns (NbaAssignRange, NbaAssignRangeDyn,
@@ -8911,6 +9595,14 @@ pub struct Simulator {
     /// The cursor is a `u32` (never `usize::MAX`-sentinel — the executor
     /// compares against `keys.len()`).
     foreach_arena: Vec<(Vec<Value>, u32)>,
+    /// Spare register files for the combinational and continuous-assignment
+    /// bytecode a settle evaluates (`enter_private_regs`). A compiled method
+    /// or process loop waiting in an interpreted call keeps its live
+    /// registers in `vm_regs`; a settle that call starts runs on a file of
+    /// its own (§13.4, §8.11). A stack, so evaluations may nest; the files
+    /// hold stale scratch only.
+    #[serde(skip)]
+    vm_regs_pool: Vec<Vec<Value>>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
     clock_generators: Vec<ClockGen>,
     /// Source position of every clock generator, for its time-0 rank:
@@ -9473,7 +10165,7 @@ pub struct Simulator {
     /// `#0` visible after it, so entries parked here are promoted back into
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
-    inactive_queue: Vec<(usize, ProcCont)>,
+    inactive_queue: PidVec<ProcCont>,
     /// Processes waiting for the NBA region to commit (e.g.
     /// `uvm_wait_for_nba_region`: `nba <= next_nba; @(nba)` where `nba` is a
     /// procedural variable). Resumed in `run_one_tick` after all active +
@@ -9489,6 +10181,14 @@ pub struct Simulator {
     /// Compiled-to-compiled calls dispatched directly (`vm_try_direct_call_from`),
     /// without the interpreter's binding (`[PROF] vm_direct_calls`).
     vm_direct_calls: u64,
+    /// Queue elements a `pop_front`, `push_front`, `insert` or `delete`
+    /// moved one at a time by name, because the queue's elements are not a
+    /// single run of plain values (`[PROF] queue_elem_moves`).
+    queue_elem_moves: u64,
+    /// Stores to an element or member of a packed vector wider than 64 bits
+    /// that read the whole vector out and stored it back instead of editing
+    /// it in place (`[PROF] select_store_copies`).
+    select_store_copies: u64,
     /// Checks of the running process's claims for displaced local metadata
     /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`), the displaced
     /// declarations installed again (`[PROF] local_meta_swaps`), and the
@@ -9553,8 +10253,16 @@ pub struct Simulator {
     /// (i.e. the event has been triggered in the same time slot as the
     /// query). EventTrigger handler stamps this.
     event_triggered_time: EventStampStore,
-    /// Processes waiting for signal edge events (@(posedge clk), etc.)
-    event_waiters: Vec<EventWaiter>,
+    /// Processes waiting for signal edge events (@(posedge clk), etc.),
+    /// with the per-signal index a drain picks the ones to examine by.
+    event_waiters: event_waiters::EventWaiters,
+    /// `XEZIM_WAITER_INDEX` (default on, and only with the dirty-driven
+    /// edge scan, whose write notes it shares): a drain examines the
+    /// waiters whose signals were written, not every parked waiter.
+    waiter_index_on: bool,
+    /// `XEZIM_WAITER_INDEX_SHADOW=1`: examine every waiter anyway and stop
+    /// on one the index would have skipped although its signal moved.
+    waiter_index_shadow: bool,
     /// Processes parked on a class-field named event (`@m_event` inside a
     /// method on `this`). Woken directly by `fire_instance_event` when the
     /// matching `->m_event` runs; see `InstanceEventWaiter`.
@@ -10621,6 +11329,15 @@ pub struct Simulator {
     /// client registers callbacks.
     #[serde(skip)]
     vpi_cb: Box<vpi_cb::VpiCbState>,
+    /// Assertion callback registry (IEEE 1800-2017 Clause 39,
+    /// `vpi_assert.rs`). Untouched unless a VPI client registers assertion
+    /// callbacks.
+    #[serde(skip)]
+    vpi_assert: Box<vpi_assert::VpiAssertState>,
+    /// An assertion callback is registered: the gate every assertion hook
+    /// tests first, so a run without them pays one load and branch.
+    #[serde(skip)]
+    vpi_assert_on: bool,
     /// Bit `r` set while a callback of reason `r` is registered (plus
     /// `vpi_cb::MASK_PENDING`): the gate every callback hook tests first, so
     /// a run without VPI callbacks pays one load and branch per hook site.
@@ -14045,6 +14762,8 @@ impl RandColl {
 enum SizeCon {
     /// `a.size() == E` — E already evaluated.
     Eq(u64),
+    /// `a.size() == E` with a negative signed target or one above the trial cap.
+    Impossible,
     /// `a.size() inside {…}` — the ranges already evaluated.
     In(Vec<(u64, u64)>),
     /// `a.size() < E`, `>= E`, … — E already evaluated.
@@ -14946,6 +15665,9 @@ mod finished_process_lifetime_tests;
 
 #[cfg(test)]
 mod class_heap_lifetime_tests;
+
+#[cfg(test)]
+mod signal_map_tests;
 
 mod heap_trace;
 

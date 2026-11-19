@@ -285,8 +285,8 @@ fn print_usage() {
     eprintln!("                   with a && or ||, a term covered once it was 0 and 1");
     eprintln!("                   (logical). XEZIM_CODE_COVERAGE_EXPRESSIONS too.");
     eprintln!("  --code-coverage-granularity=<statement|block>  Count statements (the");
-    eprintln!("                   default) or straight-line blocks, implicit else and default");
-    eprintln!("                   arms included and continuous assignments not.");
+    eprintln!("                   default) or straight-line blocks, without continuous");
+    eprintln!("                   assignments and implicit else and default arms.");
     eprintln!("                   XEZIM_CODE_COVERAGE_GRANULARITY too.");
     eprintln!("  --no-fsm-reset-transitions  Leave out the FSM transitions only a reset makes.");
     eprintln!("                   XEZIM_FSM_RESET_TRANSITIONS=0 too.");

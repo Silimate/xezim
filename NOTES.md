@@ -126,21 +126,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
   to be read as source files or top names, and `-licqueue` as `-l icqueue`,
   which sent the transcript to a file named `icqueue`.
-* Code coverage counting rules, each its own option and off by default.
-  Five follow the code coverage defaults the reference simulator documents:
-  `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
-  signals declared in generate blocks out of toggle coverage;
-  `--code-coverage-expressions=logical` scores only the conditions with a
-  `&&` or `||`, a term covered once it has been 0 and 1;
-  `--code-coverage-granularity=block` counts straight-line blocks, implicit
-  `else` and `default` arms included and continuous assignments not; and
-  `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
-  makes, an asynchronous reset's included. FSM coverage skips the code a
-  constant condition rules out, as statement and branch coverage do, also
-  where the rest of the condition can't change it (`if (EN && go)` with `EN`
-  0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of bits whose
-  only drivers are constants (`{4'b0, x}`, a port tied to `1'b0` and the
-  ports wired to it). Each has an `XEZIM_*` variable. See
+* Code coverage counting rules, each its own option and off by default,
+  inferred from CVDP's coverage targets. On its target-100 designs, enum
+  toggles, generate-block toggles and a constant expression term were bins
+  no stimulus can reach: `--no-toggle-enums` and `--no-toggle-generate`
+  leave enum variables and the signals declared in generate blocks out of
+  toggle coverage, and `--code-coverage-expressions=logical` scores only the
+  conditions with a `&&` or `||`, a term covered once it has been 0 and 1.
+  `--code-coverage-granularity=block` counts straight-line blocks, not
+  continuous assignments, and not the implicit arm of an `if` without an
+  `else` or a `case` without a `default`, where no statement runs (Verilator
+  5.038's line coverage has no line for one either; the arm stays in branch
+  coverage). `--no-fsm-reset-transitions` leaves out the FSM transitions
+  only a reset makes, an asynchronous reset's included. FSM coverage skips
+  the code a constant condition rules out, as statement and branch coverage
+  do, also where the rest of the condition can't change it (`if (EN && go)`
+  with `EN` 0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of
+  bits whose only drivers are constants (`{4'b0, x}`, a port tied to `1'b0`
+  and the ports wired to it). Each has an `XEZIM_*` variable. See
   docs/coverage-guide.md, "Counting rules".
 * `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
   an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of

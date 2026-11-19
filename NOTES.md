@@ -81,14 +81,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
-* `$readmemh` and `$readmemb` load an associative array whose index type is
-  integral, each address a key (§21.4): from the file's addresses, from
-  address 0 when the file gives none, or between the start and finish
-  addresses given, through a local or a hierarchical name (`lmem.mem`).
-  `$writememh` and `$writememb` write the elements that exist, in index
-  order (§21.5). Both reported that the array names no unpacked memory and
-  did nothing, so the VeeR EH1, EH2 and EL2 testbenches loaded no program.
-  (Silimate/xezim#301)
 
 **Usability**
 

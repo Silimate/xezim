@@ -857,12 +857,12 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Preprocess: read a NUL byte as white space (1 enables)",
     ),
     (
-        "XEZIM_RELAX_STATIC_CONST",
-        "Parse: read `static const` as `const static` (1 enables)",
-    ),
-    (
         "XEZIM_RELAX_UNTYPED_OUTPUT_PORT",
         "Lint: take an output port declared with no data type, which a procedural block assigns, as a variable, with a warning (§23.2.2.3, §6.5; 1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_STATIC_CONST",
+        "Parse: read `static const` as `const static` (1 enables)",
     ),
     (
         "XEZIM_RELAX_USE_BEFORE_DECL",

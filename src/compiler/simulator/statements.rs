@@ -142,8 +142,9 @@ impl Simulator {
     /// and read (§11.3.2: an operand is evaluated once). A call that returns
     /// the object a member is read from (`get_obj().data`) is made now too,
     /// and replaced by a literal of the handle it returns. `None` when a side
-    /// effect sits anywhere else (another call, an increment of its own) or
-    /// an index value is real.
+    /// effect sits anywhere else (another call, an increment of its own), an
+    /// index value is real, or an index names `$` of a collection whose last
+    /// index is not known here.
     pub(super) fn freeze_side_effect_indices(&mut self, e: &Expression) -> Option<Expression> {
         if Self::cond_expr_is_effect_free(e, false) {
             return Some(e.clone());
@@ -153,8 +154,7 @@ impl Simulator {
             ExprKind::Index { expr, index } => {
                 **expr = self.freeze_side_effect_indices(expr)?;
                 if !Self::cond_expr_is_effect_free(index, false) {
-                    let v = self.eval_expr(index);
-                    **index = Self::value_literal(&v, index.span)?;
+                    **index = self.freeze_index_literal(index, expr)?;
                 }
             }
             ExprKind::MemberAccess { expr, .. } => {
@@ -180,12 +180,30 @@ impl Simulator {
                 **expr = self.freeze_side_effect_indices(expr)?;
             }
             ExprKind::Ident(h) => {
-                for seg in h.path.iter_mut() {
-                    for sel in seg.selects.iter_mut() {
-                        if !Self::cond_expr_is_effect_free(sel, false) {
-                            let v = self.eval_expr(sel);
-                            *sel = Self::value_literal(&v, sel.span)?;
+                for si in 0..h.path.len() {
+                    for k in 0..h.path[si].selects.len() {
+                        let sel = &h.path[si].selects[k];
+                        if Self::cond_expr_is_effect_free(sel, false) {
+                            continue;
                         }
+                        // The collection this select indexes: the path up to
+                        // its segment, with the segment's earlier selects
+                        // (`objs[$].v` indexes `objs`).
+                        let mut path = h.path[..=si].to_vec();
+                        path[si].selects.truncate(k);
+                        let base = Expression::new(
+                            ExprKind::Ident(HierarchicalIdentifier {
+                                root: h.root.clone(),
+                                path,
+                                span: h.span,
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
+                            }),
+                            h.span,
+                        );
+                        let sel = sel.clone();
+                        h.path[si].selects[k] = self.freeze_index_literal(&sel, &base)?;
                     }
                 }
                 h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
@@ -194,6 +212,27 @@ impl Simulator {
             _ => return None,
         }
         Some(out)
+    }
+
+    /// A literal of the index `index` of `base`, evaluated now. A `$` in it
+    /// is the last index of the collection `base` names (§7.10.1, §7.4.6),
+    /// as `capture_index_literal` binds it. `None` when that collection's
+    /// last index is not known here, which leaves the operand to its readers,
+    /// or when the value is real.
+    fn freeze_index_literal(&mut self, index: &Expression, base: &Expression) -> Option<Expression> {
+        let bound = if Self::expr_contains_dollar(index) {
+            Some(self.dollar_bound_for_base(base)?)
+        } else {
+            None
+        };
+        if let Some(b) = bound {
+            self.dollar_bound.push(b);
+        }
+        let v = self.eval_expr(index);
+        if bound.is_some() {
+            self.dollar_bound.pop();
+        }
+        Self::value_literal(&v, index.span)
     }
 
     /// The receiver `e` of a member access when it is a call whose declared

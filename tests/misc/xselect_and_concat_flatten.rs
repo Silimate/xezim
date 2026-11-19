@@ -269,6 +269,102 @@ endmodule
     );
 }
 
+/// §7.10.1: `$` in an operand's index is the last index of the queue that
+/// index selects from, also when the index has a side effect and is
+/// evaluated once, first (`src[$ - next_off()]`). Covers an index of the
+/// operand itself (`src[$]`, `rows[1][$]`, `qq[$-1][$]`, `objs[$].v`) and a
+/// select inside a hierarchical path (`$root.tb.qq[$][1]`), assigned to a
+/// queue, a fixed array and a selected queue, and passed to a queue formal.
+/// Expected values are Verilator 5.046's.
+#[test]
+fn dollar_index_in_operand_is_the_selected_queue_last_index() {
+    const SRC: &str = r#"
+module tb;
+  class C;
+    int v;
+    function new(int x);
+      v = x;
+    endfunction
+  endclass
+  int src[$];
+  int dst[$];
+  int fx[2];
+  int rows[2][$];
+  int qq[$][$];
+  C objs[$];
+  C c;
+  int calls;
+  bit pass_a, pass_b, pass_c, pass_d, pass_e, pass_f, pass_g, pass_h, pass_i, pass_j, pass_k,
+      pass_l;
+  function automatic int next_off();
+    calls++;
+    return 1;
+  endfunction
+  function automatic int sum(int a[$]);
+    int s = 0;
+    foreach (a[k]) s += a[k];
+    return s;
+  endfunction
+  initial begin
+    src = {10, 20};
+    dst = {src[$]};
+    pass_a = (dst.size() == 1) && (dst[0] == 20);
+    dst = {src[$-1], src[$]};
+    pass_b = (dst.size() == 2) && (dst[0] == 10) && (dst[1] == 20);
+    calls = 0;
+    dst = {src[$ - next_off()]};
+    pass_c = (calls == 1) && (dst.size() == 1) && (dst[0] == 10);
+    fx = {src[$], src[0]};
+    pass_d = (fx[0] == 20) && (fx[1] == 10);
+    rows[1] = {7, 8, 9};
+    dst = {rows[1][$]};
+    pass_e = (dst.size() == 1) && (dst[0] == 9);
+    rows[0] = {rows[0], src[$]};
+    pass_f = (rows[0].size() == 1) && (rows[0][0] == 20);
+    pass_g = (sum({src[$], src[$-1]}) == 30);
+    c = new(5);
+    objs.push_back(c);
+    c = new(7);
+    objs.push_back(c);
+    dst = {objs[$].v};
+    pass_h = (dst.size() == 1) && (dst[0] == 7);
+    calls = 0;
+    dst = {objs[$ - next_off()].v};
+    pass_i = (calls == 1) && (dst.size() == 1) && (dst[0] == 5);
+    qq.push_back(src);
+    qq.push_back(rows[1]);
+    dst = {qq[$][1], qq[$-1][$]};
+    pass_j = (dst.size() == 2) && (dst[0] == 8) && (dst[1] == 20);
+    dst = {$root.tb.qq[$][2], $root.tb.qq[$-1][0]};
+    pass_k = (dst.size() == 2) && (dst[0] == 9) && (dst[1] == 10);
+    calls = 0;
+    dst = {$root.tb.qq[$ - next_off()][1]};
+    pass_l = (calls == 1) && (dst.size() == 1) && (dst[0] == 20);
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let wrong: Vec<&str> = [
+        ("pass_a", "{src[$]} is '{20}"),
+        ("pass_b", "{src[$-1], src[$]} is '{10, 20}"),
+        ("pass_c", "{src[$ - next_off()]} is '{10}, with one call"),
+        ("pass_d", "a fixed array gets {src[$], src[0]} = '{20, 10}"),
+        ("pass_e", "{rows[1][$]} reads the last element of rows[1]"),
+        ("pass_f", "the selected queue rows[0] gets src[$]"),
+        ("pass_g", "a queue formal gets {src[$], src[$-1]}"),
+        ("pass_h", "{objs[$].v} reads the last object's member"),
+        ("pass_i", "{objs[$ - next_off()].v} reads objs[0].v, with one call"),
+        ("pass_j", "{qq[$][1], qq[$-1][$]} is '{8, 20}"),
+        ("pass_k", "{$root.tb.qq[$][2], $root.tb.qq[$-1][0]} is '{9, 10}"),
+        ("pass_l", "{$root.tb.qq[$ - next_off()][1]} is '{20}, with one call"),
+    ]
+    .into_iter()
+    .filter(|(name, _)| flag(&sim, name) != 1)
+    .map(|(_, what)| what)
+    .collect();
+    assert!(wrong.is_empty(), "wrong: {wrong:#?}");
+}
+
 /// §11.3.2: an operand whose object comes from a call (`get_obj().data`)
 /// makes the call once, whether the member turns out to be a scalar or a
 /// queue. `data` is a queue in another class, so the operand is looked up

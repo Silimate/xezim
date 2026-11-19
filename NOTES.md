@@ -10,16 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* A conditional generate branch that no instance selects is not checked
-  for struct members that do not exist: it is not elaborated, so its names
-  are never resolved (§27.5). Caliptra's `kmac.sv` with `EnFullKmac = 0` and
-  `entropy_src.sv` with `Stub = 0` were rejected with "not a member of the
-  struct or union". A branch some instance selects is still checked.
-  (Silimate/xezim#339)
-* With `-s`, a top-level module that was not selected (and what only it
-  instantiates) is not checked for connections to ports its targets do not
-  declare: it is never elaborated (§23.3.2). A connection there stopped the
-  run; Verilator runs it. An elaborated top is still checked.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

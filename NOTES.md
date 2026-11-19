@@ -136,13 +136,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
 
-**Performance**
-
-* The interpreter reads a struct typedef in place when it walks a dotted
-  name's declared type to see whether the name is a class handle, instead of
-  copying the whole typedef for every segment. Register blocks whose field
-  structs have hundreds of members spent much of a run copying them. (#356)
-
 **Maintenance**
 
 * Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned

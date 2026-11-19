@@ -27,11 +27,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
-* An unpacked-array port connected to a slice whose bounds are parameter
-  expressions, `.p(arr[0:N-1])`, inside an instantiated module takes the
-  slice's elements in order (§7.4.6, §23.3.3). Port element `t` took bit `t`
-  of the first element, and an output port drove nothing, so the Intel FPGA
-  NPU's vector register files got garbage. (Silimate/xezim#364)
 * `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
   adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
   `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so

@@ -42,11 +42,34 @@ impl Simulator {
                     .any(|m| m.contains_key(&*name))
             });
         if in_any_frame {
+            if let Some(flag) = self.task_frame_string_flag(name.as_ref()) {
+                return flag;
+            }
             if let Some(t) = self.var_class_types.get(&*name) {
                 return t == "string";
             }
             if let Some(t) = self.var_typedef_types.get(&*name) {
                 return t == "string";
+            }
+            if !self.method_local_base.is_empty() {
+                return self.string_signals.contains(name.as_ref());
+            }
+        } else {
+            let active_cls = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                .map(|i| i.class_name.as_str())
+                .or_else(|| self.class_context_stack.last().and_then(|c| c.as_deref()));
+            if let Some(cls) = active_cls {
+                if self.class_declares_property(cls, name.as_ref()) {
+                    return self
+                        .class_string_props_of(cls)
+                        .iter()
+                        .any(|p| p == name.as_ref());
+                }
             }
         }
         if let Some(t) = self
@@ -435,6 +458,24 @@ impl Simulator {
                             if let Some(mt) = self.class_prop_type_named(&tn, &member.name) {
                                 return Some(mt);
                             }
+                        }
+                    }
+                }
+                // §7.2.2/§8.8: an anonymous struct-array element has no
+                // typedef name, but its field still supplies the constructor
+                // type. Query the declaration without evaluating selectors.
+                if matches!(base.kind, ExprKind::Index { .. }) {
+                    let mut root = base.as_ref();
+                    while let ExprKind::Index { expr, .. } = &root.kind {
+                        root = expr;
+                    }
+                    if let ExprKind::Ident(h) = &root.kind {
+                        let key = self.resolve_hier_name(h);
+                        if let Some(dt) = self.module.var_decl_types.get(key.as_ref())
+                            && let Some((field_type, _)) = self.member_decl_type(dt, &member.name)
+                            && let Some(name) = self.declared_typeref_name(&field_type)
+                        {
+                            return Some(name);
                         }
                     }
                 }

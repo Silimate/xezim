@@ -24,16 +24,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   succeeds vacuously while `c` is false, so it runs no pass action and a
   `cover` of it does not match, and `p or q` with a sequence operand is never
   vacuous.
-* Braces nested in an unpacked array concatenation are a vector or string
-  concatenation, one element of the target (§10.10.3): `q = {q, {pc, insn}}`
-  on a queue of 64-bit elements appends one element, as on the reference
-  simulator. xezim spliced the braced operands as separate elements, which
-  gave CHERIoT Ibex's testbench spurious `dii_if` errors. Braces around a
-  queue or unpacked array operand, which no vector concatenation can hold,
-  still splice. A selected queue (`rows[0] = {rows[0], {pc, insn}}`) follows
-  the same rule, and each operand of an unpacked array concatenation
-  assigned to a queue or array is evaluated once: `q = {q, f()}` called `f`
-  twice, and `q = {m[i++]}` advanced `i` more than once. (Silimate/xezim#336)
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.

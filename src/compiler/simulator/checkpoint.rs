@@ -986,10 +986,10 @@ impl Simulator {
             Ok(())
         })?;
         self.reopen_files(file.files)?;
-        // Caches keyed by an address in the run that wrote the checkpoint.
-        self.recv_call_memo.clear();
         // §10.6.2: the writers index is built from the restored entry table.
         self.comb_writer_index = None;
+        // Caches keyed by an address in the run that wrote the checkpoint.
+        self.recv_call_memo.clear();
         // A checkpoint is taken at the end of a time slot, so every initial
         // block of the saving run had started; the bodies this build queued
         // for its own time 0 belong to no restored process.

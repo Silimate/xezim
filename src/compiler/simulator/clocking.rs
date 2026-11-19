@@ -953,8 +953,13 @@ impl Simulator {
         };
         // A re-executed assertion of the same activation (an always_comb
         // evaluated twice in one slot) supersedes its earlier report.
-        self.deferred_asserts
-            .retain(|d| !(d.pid == pid && d.span == a.span && d.comb_scope == comb_scope));
+        // silimate: supersede by assertion instance, not by span and name hint
+        // The copies of a generate loop share the span, and the name hint
+        // can be just the block's label in all of them, so only the instance
+        // tells them apart. The hint can also differ between two executions
+        // of one copy, which must still supersede.
+        self.deferred_asserts.retain(|d| !(d.pid == pid && d.inst == inst));
+        // /silimate
         let action = if passed { &a.action } else { &a.else_action };
         let action = action.as_deref().map(|st| self.capture_deferred_action(st));
         // §16.3: a failure without an `else` clause calls `$error` (a cover

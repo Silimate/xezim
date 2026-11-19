@@ -29,10 +29,32 @@ fn assert_all_pass(o: &[String], checks: usize) {
     );
 }
 
+/// A scratch directory this test creates itself, readable by its owner only.
+/// `create` (not `create_dir_all`) fails on a path that already exists, so a
+/// directory or link someone else made in the shared temporary directory is
+/// never used.
+fn private_scratch_dir() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    loop {
+        let dir = std::env::temp_dir().join(format!(
+            "xezim_scanf_xz_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        match builder.create(&dir) {
+            Ok(()) => return dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create {}: {e}", dir.display()),
+        }
+    }
+}
+
 #[test]
 fn scanf_integer_conversions_read_x_and_z_digits() {
-    let dir = std::env::temp_dir().join(format!("xezim_scanf_xz_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = private_scratch_dir();
     let path = dir.join("vec.txt").to_string_lossy().replace('\\', "/");
     let src = format!(
         r#"

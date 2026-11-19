@@ -18358,24 +18358,29 @@ impl<'a> BytecodeCompiler<'a> {
                     // to physical bits; an ascending one also mirrors their
                     // order, which only the interpreter's select does.
                     // Only for a plain vector: on a packed multi-D base the
-                    // bounds select elements, which this path never scaled.
-                    let plain = match &expr.kind {
-                        ExprKind::Ident(h) => {
-                            self.packed_elem_width_of(h).filter(|&w| w > 1).is_none()
-                        }
-                        ExprKind::Index { .. } => true,
-                        _ => false,
-                    };
+                    // bounds select whole elements (`a[$clog2(2+2)-1:0]` on
+                    // `logic [3:0][7:0] a` is two bytes), which the bit-range
+                    // `RangeSelect` below does not scale, so that select is
+                    // the interpreter's too.
+                    let elems = matches!(&expr.kind, ExprKind::Ident(h)
+                        if self.packed_elem_width_of(h).is_some_and(|w| w > 1));
+                    let plain =
+                        !elems && matches!(&expr.kind, ExprKind::Ident(_) | ExprKind::Index { .. });
                     let dim = self.sel_base_dim(expr).filter(|_| plain);
-                    if dim.is_some_and(|(l, r)| l < r) {
+                    let interpreted = if elems {
+                        Some("range_sel_dyn_elements")
+                    } else if dim.is_some_and(|(l, r)| l < r) {
+                        Some("range_sel_dyn_ascending")
+                    } else {
+                        None
+                    };
+                    if let Some(site) = interpreted {
                         self.truncate_insns(base_start);
                         self.next_reg = base_reg;
-                        if let Some(r) =
-                            self.emit_expr_fallback(whole, ctx_width, "range_sel_dyn_ascending")
-                        {
+                        if let Some(r) = self.emit_expr_fallback(whole, ctx_width, site) {
                             return Some(r);
                         }
-                        self.bail("range_sel_dyn_ascending");
+                        self.bail(site);
                         return None;
                     }
                     let mut l = self.compile_expr(left, 0)?;

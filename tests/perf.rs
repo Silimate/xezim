@@ -73,3 +73,5 @@ mod select_store_counters;
 mod timing_check_conditions;
 #[path = "perf/struct_formal_member_calls.rs"]
 mod struct_formal_member_calls;
+#[path = "perf/packed_member_path_read.rs"]
+mod packed_member_path_read;

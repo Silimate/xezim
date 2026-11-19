@@ -10,14 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* An equality, relational, logical, reduction or `inside` operator is 1 bit
-  wide in the interpreter too, so it no longer widens the operator around
-  it (§11.6.1, Table 11-21). In a self-determined condition,
-  `if ((~a) | (m == 5'd12))` over a 1-bit `a` and a 5-bit `m` read `~a` as
-  5'b11110 and took the branch; so did `?:`, loop and `case` conditions,
-  `wait`, an event's `iff` and assertions, and `$display` printed such an
-  expression 5 bits wide. An assignment to a 1-bit target hid it by
-  truncating. (Silimate/xezim#337)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

@@ -10,10 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* A generate-if condition or generate-case selector may read a package
-  parameter by its package-scoped name, such as `p::Info[k].variant` with
-  `k` a genvar, without the module importing the package (§27.5, §11.2.1,
-  §26.3). It was rejected as not a constant expression.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

@@ -113,6 +113,8 @@ mod divide_operand_width;
 mod division_operand_width;
 #[path = "types/dollar_lvalue_and_assoc_width.rs"]
 mod dollar_lvalue_and_assoc_width;
+#[path = "types/duplicate_typedef.rs"]
+mod duplicate_typedef;
 #[path = "types/enum_base_and_packed_members.rs"]
 mod enum_base_and_packed_members;
 #[path = "types/enum_cross_cast_assignment.rs"]
@@ -237,6 +239,8 @@ mod packed_struct_array_local;
 mod packed_struct_array_param_pattern_in_instance;
 #[path = "types/packed_struct_formal_member.rs"]
 mod packed_struct_formal_member;
+#[path = "types/packed_struct_formal_member_elements.rs"]
+mod packed_struct_formal_member_elements;
 #[path = "types/packed_struct_member_width.rs"]
 mod packed_struct_member_width;
 #[path = "types/param_cb_isolation.rs"]
@@ -269,6 +273,8 @@ mod range_select_param_arith;
 mod real_conversion_of_integral_operands;
 #[path = "types/real_literal_comb_eval.rs"]
 mod real_literal_comb_eval;
+#[path = "types/real_fill_literals.rs"]
+mod real_fill_literals;
 #[path = "types/real_valued_delay.rs"]
 mod real_valued_delay;
 #[path = "types/scoped_type_cast.rs"]
@@ -482,6 +488,8 @@ mod real_to_int_wide;
 mod real_to_integral_local;
 #[path = "types/real_to_integral_stores_889.rs"]
 mod real_to_integral_stores_889;
+#[path = "types/real_inside_equality.rs"]
+mod real_inside_equality;
 #[path = "types/rtoi_out_of_range.rs"]
 mod rtoi_out_of_range;
 #[path = "types/ref_formal_element_write.rs"]
@@ -717,6 +725,8 @@ mod struct_array_member_elem_select;
 
 #[path = "types/packed_select_geometry_1002.rs"]
 mod packed_select_geometry_1002;
+#[path = "types/array_member_pattern_replication.rs"]
+mod array_member_pattern_replication;
 #[path = "types/struct_pattern_replication.rs"]
 mod struct_pattern_replication;
 #[path = "types/struct_pattern_replication_constant_counts.rs"]
@@ -761,3 +771,29 @@ mod review_struct_pattern_return;
 mod enum_receiver_types_1132;
 #[path = "types/signed_named_packed_props_ports_1107.rs"]
 mod signed_named_packed_props_ports_1107;
+
+#[path = "types/owned_aggregate_storage_1132_1147.rs"]
+mod owned_aggregate_storage_1132_1147;
+
+#[path = "types/net_typedef_metadata_1212.rs"]
+mod net_typedef_metadata_1212;
+
+#[path = "types/real_relational_unknown_bits.rs"]
+mod real_relational_unknown_bits;
+
+#[path = "types/struct_param_localparam_type.rs"]
+mod struct_param_localparam_type;
+#[path = "types/wide_packed_select_store.rs"]
+mod wide_packed_select_store;
+#[path = "types/nd_struct_array_members_1240.rs"]
+mod nd_struct_array_members_1240;
+#[path = "types/nettype_driver_delays_1204.rs"]
+mod nettype_driver_delays_1204;
+#[path = "types/inside_compiled_forms.rs"]
+mod inside_compiled_forms;
+#[path = "types/nettype_declaration_initializer_drivers.rs"]
+mod nettype_declaration_initializer_drivers;
+#[path = "types/unsized_decimal_width_1120.rs"]
+mod unsized_decimal_width_1120;
+#[path = "types/negative_bound_packed_slice_write_1193.rs"]
+mod negative_bound_packed_slice_write_1193;

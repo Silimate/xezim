@@ -1354,6 +1354,16 @@ impl Simulator {
                         return Some(access);
                     }
                 }
+                // §8.11: a current-object property precedes a same-named
+                // module declaration. Its packed layout belongs to the class.
+                if (h.path.len() == 1 && self.this_prop_hides(&h.path[0].name.name))
+                    || (h.path.len() > 1
+                        && (matches!(h.path[0].name.name.as_str(), "this" | "super")
+                            || self.bare_name_is_class_channel(&h.path[0].name.name)
+                            || self.hier_parent_handle(h).is_some()))
+                {
+                    return None;
+                }
                 let name = self
                     .frame_bound_bare_name(h)
                     .map(str::to_owned)
@@ -1401,8 +1411,18 @@ impl Simulator {
                 } else {
                     0
                 };
+                // §23.6: keep an absolute top-level access absolute after
+                // resolving its declaration; a later scope hint must not
+                // redirect the storage lookup to a same-named child variable.
+                let storage = if !name.contains('.')
+                    && (h.root.is_some() || h.path.len() > 1)
+                {
+                    format!("{}.{}", self.module.name, name)
+                } else {
+                    name
+                };
                 Some(DeclaredPackedAccess {
-                    storage: name,
+                    storage,
                     params: scope,
                     is_signed: super::elaborate::is_type_signed_resolved(
                         dt,
@@ -3065,13 +3085,13 @@ impl Simulator {
                         // resolve a bare TYPE-PARAMETER name through its
                         // declared default AST (`parameter type T = logic
                         // [W-1:0]`), which likewise sizes from W.
-                        let spec = self.params_with_class_spec();
-                        let params = spec.as_ref().unwrap_or(&self.module.parameters);
                         let resolved_dt = self.class_type_param_default(dt);
                         let target = resolved_dt.as_ref().unwrap_or(dt);
-                        let w = super::elaborate::resolve_type_width(
+                        let spec = self.class_spec_value_params();
+                        let params = self.spec_param_env(&spec);
+                        let w = super::elaborate::resolve_type_width_env(
                             target,
-                            Some(params),
+                            Some(&params),
                             Some(&self.module.typedefs),
                         )
                         .max(1);
@@ -3116,11 +3136,11 @@ impl Simulator {
                                 span: arg.span,
                             };
                             if let Some(dflt) = self.class_type_param_default(&as_ty) {
-                                let spec = self.params_with_class_spec();
-                                let params = spec.as_ref().unwrap_or(&self.module.parameters);
-                                let w = super::elaborate::resolve_type_width(
+                                let spec = self.class_spec_value_params();
+                                let params = self.spec_param_env(&spec);
+                                let w = super::elaborate::resolve_type_width_env(
                                     &dflt,
-                                    Some(params),
+                                    Some(&params),
                                     Some(&self.module.typedefs),
                                 )
                                 .max(1);
@@ -3219,8 +3239,10 @@ impl Simulator {
                             && !self.module.typedef_unpacked_dims.contains_key(&*name)
                             && let Some(dt) = self.module.typedef_types.get(&*name).cloned()
                         {
-                            let params = self.instance_param_scope(this_h);
-                            let w = super::elaborate::resolve_type_width(
+                            let values: HashMap<String, Value> =
+                                self.instance_value_params(this_h).into_iter().collect();
+                            let params = self.instance_param_env(&values);
+                            let w = super::elaborate::resolve_type_width_env(
                                 &dt,
                                 Some(&params),
                                 Some(&self.module.typedefs),
@@ -3235,7 +3257,7 @@ impl Simulator {
                         // parameterized instances don't collide. Resolve
                         // through the process's scope hint, outermost
                         // scope walked inward (ivtest sv_enum1).
-                        let typedef_w = self.module.typedefs.get(&*name).copied().or_else(|| {
+                        let scope_typedef_w = (|| {
                             let mut h = self.name_resolve_hint.borrow().clone()?;
                             loop {
                                 if let Some(&w) =
@@ -3248,7 +3270,36 @@ impl Simulator {
                                     None => return None,
                                 }
                             }
-                        });
+                        })();
+                        // §8.23: a `::`-chained scoped TYPE name
+                        // (`$bits(pkg::cls::td)`) may parse as a multi-
+                        // segment HierarchicalIdentifier whose package first
+                        // segment `resolve_hier_name` strips, joining the
+                        // rest with `.` (`pkg::cls::td` -> `cls.td`). That
+                        // does not match the typedef table's `::`-qualified
+                        // key, so reconstruct the `::`-joined candidates
+                        // (longest first) and consult the type tables.
+                        let scoped_typedef_w = if name.contains('.') && hier.path.len() >= 2 {
+                            let segs: Vec<&str> = hier
+                                .path
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect();
+                            let mut cands = Vec::new();
+                            for start in 0..segs.len() {
+                                cands.push(segs[start..].join("::"));
+                            }
+                            cands.into_iter().find_map(|k| self.module.typedefs.get(&k).copied())
+                        } else {
+                            None
+                        };
+                        let typedef_w = self
+                            .module
+                            .typedefs
+                            .get(&*name)
+                            .copied()
+                            .or(scope_typedef_w)
+                            .or(scoped_typedef_w);
                         if let Some(w) = typedef_w {
                             // §20.6.2: a typedef carrying UNPACKED dims is
                             // element_bits × the dimension sizes —

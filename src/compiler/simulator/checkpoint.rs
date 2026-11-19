@@ -33,7 +33,13 @@ use serde::ser::{SerializeSeq, Serializer};
 // §16.12.14: abort properties in SvaNode/SvaState, settled attempts per site.
 // §16.12.8: SvaNode::Implies.
 // §13.5.2: TaskCleanup::struct_formal_meta, Simulator::ref_park_flags.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x0b";
+// §10.3.3: delayed updates retain the mask of bits owned by their driver.
+// Whole-array NBA entries carry captured element values.
+// §7.10: SignalMap holds queue and dynamic-array elements in runs; two profile counters.
+// §8.23 / §25.9: ClassMemberNames::vif_typedef_leaves.
+// §13.5.1: MethodAdmission::coll_formal_positions.
+// §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x10";
 
 #[derive(Default)]
 struct Session {
@@ -1232,6 +1238,7 @@ checkpoint_state!(
     clocking_array_leaves,
     clocking_output_pending,
     clocking_cycle_pending,
+    clocking_select_due,
     clocking_edge_out_pending,
     clocking_edge_drive_dirty,
     clocking_prev_clock,
@@ -1282,6 +1289,7 @@ checkpoint_state!(
     deferred_comb_pool,
     deferred_proc_entries,
     delayed_nba,
+    delayed_nba_queue,
     delayed_slice_chains,
     delayed_updates,
     dirty_any,
@@ -1450,6 +1458,7 @@ checkpoint_state!(
     name_resolve_hint,
     nba_fast,
     nba_fast_index,
+    nba_queue,
     nba_touched_edge_non_clock,
     nested_run_epoch,
     next_dpi_task,
@@ -1529,6 +1538,7 @@ checkpoint_state!(
     program_pids,
     prop_raw_ty_cache,
     prop_width_memo,
+    queue_elem_moves,
     queue_frame_saves,
     queue_key_scratch,
     queue_name_pool,
@@ -1566,6 +1576,7 @@ checkpoint_state!(
     sampled_watches,
     saw_fatal,
     sdf_delays,
+    select_store_copies,
     semaphore_get_waiters,
     semaphores,
     sensitivity_trigger_count,

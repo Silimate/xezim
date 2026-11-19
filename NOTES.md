@@ -140,9 +140,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 * A packed declaration inside an instance is sized against that instance's
   parameters overlaid on the design-wide table (§23.10). The parameters under
-  each scope are now collected once, and one shared copy of the table moves
-  between instances by taking off and putting on only the scopes the two do
-  not share, instead of the whole table being copied whenever a select or an
+  each scope are now collected once, and up to four shared copies of the
+  table, kept for the outermost scopes in use, move between instances by
+  taking off and putting on only the scopes the two do not share, instead of the whole table being copied whenever a select or an
   assignment pattern moved to another instance. On a large design whose
   continuous assignments assign patterns to instance-sized structs, each such
   evaluation took about 1 ms. (#356)

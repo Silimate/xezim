@@ -57,3 +57,32 @@ fn level_always_runs_after_the_writer_and_the_assignments() {
         }
     }
 }
+
+const GATE_WOKEN: &str = r#"
+module tb;
+  logic a = 0, x = 0, g, y;
+  buf (g, a);
+  always_comb y = g ^ x;
+  always @(x) $display("observer ran at %0t", $time);
+  initial begin
+    #1 a = 1;
+    #0 $display("y=%b at %0t", y, $time);
+    #1 a = 0;
+    #0 $display("y=%b at %0t", y, $time);
+    #1 $finish;
+  end
+endmodule
+"#;
+
+/// §9.4.2: an `always @(x)` runs only when `x` changes. The `always_comb`
+/// that the gate's output `g` wakes (the writer changed only `a`) waits for
+/// the writer, and at the yield only the signals that changed wake blocks
+/// again: listing every read of the `always_comb` re-dirtied `x` too and ran
+/// the observer.
+#[test]
+fn deferred_block_wakes_nothing_on_its_unchanged_reads() {
+    let out = lines(GATE_WOKEN);
+    assert!(!out.iter().any(|l| l.contains("observer ran")), "{out:#?}");
+    assert!(out.iter().any(|l| l == "y=1 at 1"), "{out:#?}");
+    assert!(out.iter().any(|l| l == "y=0 at 2"), "{out:#?}");
+}

@@ -511,7 +511,7 @@ mod generate_real_struct_members_1099;
 
 #[path = "hierarchy/rooted_packed_scope.rs"]
 mod rooted_packed_scope;
-#[path = "hierarchy/nettype_input_port_actuals_1280.rs"]
-mod nettype_input_port_actuals_1280;
 #[path = "hierarchy/clog2_port_connection_select.rs"]
 mod clog2_port_connection_select;
+#[path = "hierarchy/nettype_input_port_actuals_1280.rs"]
+mod nettype_input_port_actuals_1280;

@@ -136,6 +136,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
 
+**Performance**
+
+* The interface-alias name cache no longer keeps the answers for a
+  subroutine call's own storage keys (`@q#17`), which are new on every call:
+  on a design with interface ports it grew by an entry per call and element
+  for the whole run, to gigabytes over a long run. (#356)
+
 **Maintenance**
 
 * Binary releases for x86_64 Linux: a `vVERSION` tag builds xezim in a pinned

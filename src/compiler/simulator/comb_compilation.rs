@@ -978,7 +978,20 @@ impl Simulator {
             let direct_copy = if let Some((dst_id, src_id)) = ident_copy_ids {
                 let width = self.signal_widths[dst_id];
                 let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
-                if width == self.signal_widths[src_id] {
+                // A raw-bit copy cannot carry a REAL across a type change:
+                // `assign r = n;` where `r` is a real variable and `n` a net
+                // whose value is held as an integer would copy the integer
+                // bit pattern into the real's float storage. The typed path
+                // (compiled / AST cont-assign) does the conversion the LRM
+                // asks for, so a copy BETWEEN a real and a non-real keeps
+                // that path. A copy between two reals (or two non-reals)
+                // carries the same representation on both sides and stays
+                // on the fast path.
+                let dst_real = self.signal_real.get(dst_id).copied().unwrap_or(false);
+                let src_real = self.signal_real.get(src_id).copied().unwrap_or(false);
+                if dst_real != src_real {
+                    None
+                } else if width == self.signal_widths[src_id] {
                     if width <= 64 && delay == 0 {
                         Some(CombItem::FastDirectCopy { dst_id, src_id })
                     } else if self
@@ -1544,6 +1557,25 @@ impl Simulator {
                 // first value. An array of the packed arena has no per-cell
                 // ids: the read stays unresolved.
                 let mut packed_array_read = false;
+                // #1284, §10.3.2: an element read of an array stored without
+                // element names (`u.mem[5]`, one of the reads a dynamic index
+                // `u.mem[idx]` stands for) changes at run time, but no
+                // dependency edge can name its cell: the entry re-evaluates
+                // at every settle, as an always block reading one does and
+                // as a top-level read already did. The member-strip fallback
+                // below took it for a member of the instance `u` and
+                // depended on `u`, which no write dirties, so the
+                // assignment kept its first value.
+                if !found
+                    && self.read_names_unnamed_cell(
+                        r,
+                        scope_hint.as_deref(),
+                        ca_lhs_scope.unwrap_or_default(),
+                    )
+                {
+                    unresolved_count += 1;
+                    continue;
+                }
                 if !found && r.contains('.') {
                     let scopes = if read_is_rooted {
                         [None, None]
@@ -2024,9 +2056,7 @@ impl Simulator {
                             bound: crate::ast::binding::Bound::UNSET,
                         };
                         let saved = self.name_resolve_hint.borrow().clone();
-                        if !ab.scope.is_empty() {
-                            *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
-                        }
+                        *self.name_resolve_hint.borrow_mut() = (!ab.scope.is_empty()).then(|| ab.scope.clone());
                         let resolved = self.resolve_hier_name(&ident);
                         *self.name_resolve_hint.borrow_mut() = saved;
                         if resolved != *r {
@@ -2870,19 +2900,19 @@ impl Simulator {
                     continue;
                 }
                 // Straight-line only: no branch targets to rebase, and no AST
-                // fallbacks (those would need per-member scope hints).
+                // fallbacks (those would need per-member scope hints). Every
+                // branch form counts, the fused compare-and-branch and the
+                // jump tables included: a member's targets are relative to
+                // its own first instruction, so a later member's branch would
+                // land in the first member's body (#1284: four inlined
+                // `if (k > N) k = N;` taps looped there for ever).
                 use super::bytecode::Insn as I;
                 if compiled.instructions.iter().any(|i| {
-                    matches!(
-                        i,
-                        I::Jump(..)
-                            | I::BranchIfFalse(..)
-                            | I::BranchUnlessZero(..)
-                            | I::BranchIfSignalFalse(..)
-                            | I::StmtFallback(..)
-                            | I::EvalExprFallback(..)
-                            | I::LoadDynElem(..)
-                    )
+                    i.is_branch()
+                        || matches!(
+                            i,
+                            I::StmtFallback(..) | I::EvalExprFallback(..) | I::LoadDynElem(..)
+                        )
                 }) {
                     continue;
                 }
@@ -2966,15 +2996,29 @@ impl Simulator {
         // pass-through chains.
         if matches!(std::env::var("XEZIM_FUSE_CHAINS").as_deref(), Ok("1")) {
             let n = entries.len();
+            // An entry with unresolved reads re-runs every settle pass; the
+            // merged entry would drop that flag for its absorbed members.
             let mergeable = |e: &CombEntry| {
-                matches!(
-                    e.item,
-                    CombItem::CompiledContAssign { .. } | CombItem::CompiledAlwaysBlock { .. }
-                ) && !match &e.item {
-                    CombItem::CompiledContAssign { compiled }
-                    | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.has_fallback,
-                    _ => false,
+                !e.has_unresolved_reads
+                    && matches!(
+                        e.item,
+                        CombItem::CompiledContAssign { .. } | CombItem::CompiledAlwaysBlock { .. }
+                    )
+                    && !match &e.item {
+                        CombItem::CompiledContAssign { compiled }
+                        | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.has_fallback,
+                        _ => false,
+                    }
+            };
+            // Classes never mix, as in region fusion below: a continuous
+            // assign runs at time 0 while a plain `always @(...)` waits for
+            // its first event (§9.2.2.1, §10.3.2), and the merged entry keeps
+            // only the head's kind and `defer_at_time0`.
+            let class = |e: &CombEntry| match &e.item {
+                CombItem::CompiledAlwaysBlock { is_always_comb, .. } => {
+                    (1u8 + u8::from(!*is_always_comb), e.defer_at_time0)
                 }
+                _ => (0u8, e.defer_at_time0),
             };
             // writer/reader maps over COMB entries only.
             let mut writer: HashMap<usize, Option<usize>> = HashMap::default();
@@ -3010,6 +3054,7 @@ impl Simulator {
                         let b = uniq[0];
                         if writer.get(&sw) == Some(&Some(i))
                             && mergeable(&entries[b])
+                            && class(&entries[b]) == class(e)
                             && !entries[b].cold.write_signal_ids.contains(&sw)
                         {
                             match link {
@@ -3126,8 +3171,17 @@ impl Simulator {
                             | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled,
                             _ => unreachable!(),
                         };
+                        // B's branch targets are relative to its own first
+                        // instruction: relocate them past the head's body,
+                        // or a guard or loop in B jumps back into the head
+                        // (wrong values, or a loop that never ends: #1284).
+                        let off = hc.instructions.len() as u32;
                         hc.instructions
-                            .extend(b_compiled.instructions.iter().cloned());
+                            .extend(b_compiled.instructions.iter().map(|i| {
+                                let mut i = i.clone();
+                                i.offset_branch_targets(off);
+                                i
+                            }));
                         hc.num_regs = hc.num_regs.max(b_compiled.num_regs);
                         hc.has_fallback |= b_compiled.has_fallback;
                         for r in b_reads {

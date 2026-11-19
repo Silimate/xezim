@@ -153,9 +153,22 @@ impl Simulator {
         )
     }
 
+    /// §11.4.13 / §11.4.5: real operands use numeric equality, including
+    /// conversion of an integral operand to real; a NaN must not match itself.
+    /// Integral pairs retain wildcard equality.
+    #[inline]
+    pub(super) fn inside_values_equal(val: &Value, item: &Value) -> Value {
+        if val.is_real || item.is_real {
+            val.is_equal(item)
+        } else {
+            val.wildcard_eq(item)
+        }
+    }
+
     /// IEEE 1800-2017 §12.5.4 `case (e) inside`: an item is a range, a value or
     /// an array, matched with the same rules as the `inside` OPERATOR — ranges
-    /// are inclusive and x/z in an item are wildcards. `CaseInside` fell through
+    /// are inclusive and x/z in an item are wildcards for integral operands.
+    /// `CaseInside` fell through
     /// to exact `case_eq`, so a range item compared against a garbage value and
     /// a wildcard item never matched: both silently took `default`.
     pub(super) fn case_inside_match(&mut self, val: &Value, pat: &Expression) -> bool {
@@ -175,7 +188,7 @@ impl Simulator {
         if let Some(keys) = self.inside_operand_keys(pat) {
             for key in keys {
                 if let Some(ev) = self.get_signal_value_by_name(&key) {
-                    if val.wildcard_eq(&ev).is_true() {
+                    if Self::inside_values_equal(val, &ev).is_true() {
                         return true;
                     }
                 }
@@ -183,7 +196,7 @@ impl Simulator {
             return false;
         }
         let pv = self.eval_expr(pat);
-        val.wildcard_eq(&pv).is_true()
+        Self::inside_values_equal(val, &pv).is_true()
     }
 
     /// IEEE 1800-2017 §6.12.2: converting a real to an integral type ROUNDS to
@@ -786,20 +799,24 @@ impl Simulator {
         &self,
         port: &crate::ast::decl::FunctionPort,
     ) -> Option<u32> {
-        if !Self::actual_ctx_shape(port) {
-            return None;
-        }
-        let dt = &port.data_type;
-        let fixed = matches!(dt, DataType::IntegerAtom { .. }) || Self::packed_dims_are_constant(dt);
-        fixed
+        Self::actual_ctx_fixed(port)
             .then(|| {
                 super::elaborate::resolve_type_width(
-                    dt,
+                    &port.data_type,
                     Some(&self.module.parameters),
                     Some(&self.module.typedefs),
                 )
             })
             .filter(|w| *w > 0)
+    }
+
+    /// The formals `actual_context_width` answers for: an integral input
+    /// whose width is fixed by its declaration. The compiled call lowerings
+    /// ask the same question so compiled and interpreted calls agree.
+    pub(crate) fn actual_ctx_fixed(port: &crate::ast::decl::FunctionPort) -> bool {
+        Self::actual_ctx_shape(port)
+            && (matches!(port.data_type, DataType::IntegerAtom { .. })
+                || Self::packed_dims_are_constant(&port.data_type))
     }
 
     /// Parameter-free arithmetic bounds (including macro-expanded `[64-1:0]`)
@@ -2022,6 +2039,14 @@ impl Simulator {
                     .or_else(|| Some(n.into_owned()))
             }
         } else if h.path.iter().all(|s| s.selects.is_empty()) {
+            // §8.9, §8.23: `Cls::member` names the class's static collection.
+            if h.path.len() == 2
+                && self.module.classes.contains_key(&h.path[0].name.name)
+                && let Some(key) =
+                    self.class_scoped_static_coll(&h.path[0].name.name, &h.path[1].name.name)
+            {
+                return Some(key);
+            }
             // A flattened member chain `a.b.member` naming an unpacked-array
             // property. HEAD is the base object; middle segments are
             // handle-valued properties; the LAST names the collection, stored
@@ -2129,6 +2154,8 @@ impl Simulator {
             return Some((caller.clone(), caller, prior));
         }
         let key = self.formal_dyn_key(&param, &port.data_type);
+        // §13.5.1: copied associative elements retain their packed fields.
+        self.register_packed_leaf_layout(&key, &port.data_type);
         self.register_formal_shape(&key, &port.dimensions);
         if !matches!(port.direction, PortDirection::Output) {
             // §13.5.1: copy every element in, including unpacked-struct
@@ -2501,7 +2528,27 @@ impl Simulator {
                     None => self.module.arrays_nd.get(&param).map_or(32, |t| t.1),
                 };
                 let out_default = self.output_formal_elem_default(port, w);
+                // §7.2, §13.5.1: an element of an unpacked-struct array is
+                // its member leaves, as in the one-dimensional case below.
+                let elem_su = self
+                    .p_elem_type(&caller)
+                    .or_else(|| self.p_elem_type(&param))
+                    .and_then(|dt| self.unpacked_struct_of(&dt));
                 for sfx in &suffixes {
+                    if let Some(su) = &elem_su {
+                        let d = format!("{}{}", param, sfx);
+                        if out_default.is_some() {
+                            let mut leaves = Vec::new();
+                            self.unpacked_struct_leaf_defaults(&d, su, 0, &mut leaves);
+                            for (k, dv, _) in leaves {
+                                self.signals.insert(k, dv);
+                            }
+                        } else {
+                            let s = format!("{}{}", caller, sfx);
+                            self.copy_unpacked_struct(&d, &s, &su.clone());
+                        }
+                        continue;
+                    }
                     let v = match &out_default {
                         Some(d) => Some(d.clone()),
                         None => self.get_signal_value_by_name(&format!("{}{}", caller, sfx)),
@@ -2770,7 +2817,20 @@ impl Simulator {
         if !(l_nd || r_nd) || (lbase == rbase && lsfx == rsfx) {
             return false;
         }
+        // §7.2: an element of an unpacked-struct array is its member leaves.
+        let elem_su = self
+            .nd_elem_struct(&rbase)
+            .or_else(|| self.nd_elem_struct(&lbase))
+            .or_else(|| {
+                self.p_elem_type(&rbase)
+                    .and_then(|dt| self.unpacked_struct_of(&dt))
+            });
         for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
+            if let Some(su) = &elem_su {
+                let (d, s) = (format!("{}{}", lbase, ls), format!("{}{}", rbase, rs));
+                self.copy_unpacked_struct(&d, &s, &su.clone());
+                continue;
+            }
             let v = self
                 .get_signal_value_by_name(&format!("{}{}", rbase, rs))
                 .unwrap_or_else(|| Value::zero(32));
@@ -2833,7 +2893,17 @@ impl Simulator {
             }
             if let Some(sfxs) = self.nd_formal_suffixes(param) {
                 if param != caller {
+                    let elem_su = self
+                        .p_elem_type(param)
+                        .or_else(|| self.p_elem_type(caller))
+                        .and_then(|dt| self.unpacked_struct_of(&dt));
                     for sfx in sfxs {
+                        if let Some(su) = &elem_su {
+                            let (d, s) =
+                                (format!("{}{}", caller, sfx), format!("{}{}", param, sfx));
+                            self.copy_unpacked_struct(&d, &s, &su.clone());
+                            continue;
+                        }
                         if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", param, sfx))
                         {
                             self.set_signal_value_by_name(&format!("{}{}", caller, sfx), v);
@@ -3376,7 +3446,8 @@ impl Simulator {
     pub(super) fn collect_decl_names(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
             match &st.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     for d in declarators {
                         out.insert(d.name.name.clone());
                     }
@@ -3420,7 +3491,9 @@ impl Simulator {
                 lifetime: Some(crate::ast::types::Lifetime::Static),
                 ..
             } => false,
-            StatementKind::Null | StatementKind::VarDecl { .. } => true,
+            StatementKind::Null
+            | StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. } => true,
             StatementKind::Break | StatementKind::Continue => true,
             StatementKind::Return(e) => e.as_ref().is_none_or(|e| self.expr_is_pure(e, locals)),
             StatementKind::BlockingAssign { lvalue, rvalue } => {

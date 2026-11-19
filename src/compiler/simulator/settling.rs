@@ -5,6 +5,26 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Install a register file of the evaluation's own for the bytecode of
+    /// the combinational logic a settle evaluates, and return the caller's.
+    /// A compiled method or process loop that waits in an interpreted call
+    /// keeps `this`, its formals, locals and held operands in `vm_regs`; the
+    /// logic a write in that call triggers is a separate evaluation (§4.5,
+    /// §9.2.2.2, §10.3) and must not change what the subroutine owns (§13.4,
+    /// §13.5, §8.11). A pointer swap and a pool pop in steady state.
+    #[inline]
+    pub(super) fn enter_private_regs(&mut self) -> Vec<Value> {
+        let own = self.vm_regs_pool.pop().unwrap_or_default();
+        std::mem::replace(&mut self.vm_regs, own)
+    }
+
+    /// Put the caller's register file back (see `enter_private_regs`).
+    #[inline]
+    pub(super) fn leave_private_regs(&mut self, caller: Vec<Value>) {
+        let own = std::mem::replace(&mut self.vm_regs, caller);
+        self.vm_regs_pool.push(own);
+    }
+
     pub(super) fn settle_combinatorial(&mut self) {
         if self.finished {
             return;
@@ -264,6 +284,7 @@ impl Simulator {
         let mut next_seed = std::mem::take(&mut self.bsp_next_seed);
         next_seed.clear();
         let mut view = std::mem::take(&mut self.signal_table);
+        let caller_regs = self.enter_private_regs();
         let mut vm_regs = std::mem::take(&mut self.vm_regs);
         let mut dirtied: Vec<u32> = Vec::new();
         let mut par_scratch: Vec<usize> = Vec::new();
@@ -561,6 +582,7 @@ impl Simulator {
 
         self.signal_table = view;
         self.vm_regs = vm_regs;
+        self.leave_private_regs(caller_regs);
         // Restore reusable buffers (retain capacity for the next call).
         seed_list.clear();
         self.settle_triggered_list = seed_list;
@@ -669,9 +691,8 @@ impl Simulator {
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(hint) = &scope_hint {
-                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                }
+                // §23.6: top-scope work must clear the caller's instance hint.
+                *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 let mut lhs_id = self.get_lhs_signal_id(lhs);
                 if scope_hint.is_none() {
                     // The bare-lhs resolve above can itself need the hint
@@ -827,17 +848,18 @@ impl Simulator {
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(hint) = &scope_hint {
-                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                }
+                // §23.6: top-scope work must clear the caller's instance hint.
+                *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 self.settle_prev_values.clear();
                 for &id in &entry.cold.write_signal_ids {
                     self.settle_prev_values
                         .push((id, self.signal_table[id].clone()));
                 }
-                // $time/%t in the body scales to the BLOCK's module timescale.
+                // §20.3.1, §20.3.3: time calls use the block's module.
+                // An absent name hint still needs an explicit top override;
+                // None would inherit the last scheduled process's timescale.
                 let saved_ts = self.timescale_scope_override.take();
-                self.timescale_scope_override = scope_hint.clone();
+                self.timescale_scope_override = Some(scope_hint.clone().unwrap_or_default());
                 self.exec_statement(stmt);
                 self.timescale_scope_override = saved_ts;
                 *self.name_resolve_hint.borrow_mut() = saved_hint;
@@ -871,6 +893,10 @@ impl Simulator {
             }
             CombItem::CompiledContAssign { compiled, .. }
             | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                // Inside a settle the file is already the settle's own; a
+                // `release`, a force refresh or a time-0 replay outside one
+                // can run while a compiled caller waits (§13.4).
+                let caller_regs = (!self.settling).then(|| self.enter_private_regs());
                 if self.vm_regs.len() < compiled.num_regs as usize {
                     self.vm_regs
                         .resize(compiled.num_regs as usize, Value::zero(1));
@@ -881,7 +907,22 @@ impl Simulator {
                         compiled.instructions.len(),
                     )
                 };
+                // §20.3.1, §20.3.3: statement fallbacks in top blocks need the top unit.
+                let saved_ts = if compiled.has_fallback
+                    && entry.cold.scope_hint.is_none()
+                    && matches!(entry.item, CombItem::CompiledAlwaysBlock { .. })
+                {
+                    Some(self.timescale_scope_override.replace(String::new()))
+                } else {
+                    None
+                };
                 self.exec_insns(insns);
+                if let Some(saved_ts) = saved_ts {
+                    self.timescale_scope_override = saved_ts;
+                }
+                if let Some(caller_regs) = caller_regs {
+                    self.leave_private_regs(caller_regs);
+                }
             }
             CombItem::FusedGate { op } => {
                 self.exec_fused_gate(op);
@@ -966,7 +1007,8 @@ impl Simulator {
         self.quiet_bits.resize(n.div_ceil(64), 0);
         for id in 0..n {
             let armed = self.armed_input_set(id);
-            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            // An edge signal, or one a parked waiter is indexed under.
+            let edge = self.waiter_signal_hooked(id);
             if !armed && !edge {
                 self.quiet_bits[id >> 6] |= 1u64 << (id & 63);
             }
@@ -1311,7 +1353,7 @@ impl Simulator {
             self.gate_lane[eidx] = self.gate_ops.len() as u32;
             self.gate_ops.push(*op);
             let armed = self.armed_input_set(id);
-            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            let edge = self.waiter_signal_hooked(id);
             let wide = self.signal_widths.get(id).copied().unwrap_or(65) > 64;
             self.gate_obs
                 .push((armed as u8) | ((edge as u8) << 1) | ((wide as u8) << 2));
@@ -1644,6 +1686,7 @@ impl Simulator {
             self.settling = false;
             return;
         }
+        let caller_regs = self.enter_private_regs();
 
         // Chaotic-iteration loop: drain a sorted worklist of triggered
         // entries each pass. New triggers added during a pass (via worklist
@@ -2500,9 +2543,7 @@ impl Simulator {
                                         let prev_ts = self.timescale_scope_override.take();
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
-                                        if sc.is_some() {
-                                            *self.name_resolve_hint.borrow_mut() = sc.clone();
-                                        }
+                                        *self.name_resolve_hint.borrow_mut() = sc.clone();
                                         self.timescale_scope_override = sc;
                                         Some((prev_hint, prev_ts))
                                     } else {
@@ -2552,9 +2593,15 @@ impl Simulator {
                             }
                         }
                         CombItem::CompiledAlwaysBlock { compiled, .. } => {
-                            // P5: X-free evaluations run on u64 words (a lowered
-                            // block has no fallbacks, so none of the scope /
-                            // timescale bookkeeping below applies to it).
+                            // §20.3.1, §20.3.3: native statements can also fall
+                            // back to the interpreter. Only top needs an override
+                            // before native dispatch; the VM and two-state hooks
+                            // install theirs when reached. Non-native builds do
+                            // no time-scope work on the plan's hot path.
+                            #[cfg(feature = "jit")]
+                            let saved_ts = (compiled.has_fallback
+                                && entries[eidx].cold.scope_hint.is_none())
+                            .then(|| self.timescale_scope_override.replace(String::new()));
                             if self.dispatch_comb_plan(eidx, compiled) {
                                 n_ab += 1;
                                 if self.proc_depth > 0 {
@@ -2596,11 +2643,6 @@ impl Simulator {
                                             compiled.instructions.len(),
                                         )
                                     };
-                                    // $time/%t in a fallback stmt scales to the BLOCK's
-                                    // module timescale (mirrors the edge-block dispatch).
-                                    let saved_ts = self.timescale_scope_override.take();
-                                    self.timescale_scope_override =
-                                        entries[eidx].cold.scope_hint.clone();
                                     // …and `%m` in that fallback names the BLOCK's instance.
                                     self.set_m_block_scope(
                                         entries[eidx].cold.scope_hint.as_deref(),
@@ -2611,28 +2653,45 @@ impl Simulator {
                                     // resolved the bare array name, found nothing, and
                                     // dropped every write. Pure-bytecode blocks pre-resolve
                                     // their ids, so this costs them one bool test.
+                                    // has_fallback counts statement fallbacks only. Comb blocks
+                                    // have no expression fallbacks (only edge blocks enable
+                                    // them), so without statement fallbacks this block never
+                                    // re-enters the interpreter here.
                                     // (A fallback's blocking write clears this
                                     // settle's deferral, as in the AST arm.)
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
-                                        if let Some(sc) = entries[eidx].cold.scope_hint.as_ref() {
-                                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
-                                        }
+                                        *self.name_resolve_hint.borrow_mut() = entries[eidx].cold.scope_hint.clone();
                                         Some((prev, self.proc_settle_defer))
                                     } else {
                                         None
                                     };
+                                    let saved_vm_ts = compiled.has_fallback.then(|| {
+                                        self.timescale_scope_override.replace(
+                                            entries[eidx]
+                                                .cold
+                                                .scope_hint
+                                                .clone()
+                                                .unwrap_or_default(),
+                                        )
+                                    });
                                     self.exec_insns(insns);
+                                    if let Some(prev) = saved_vm_ts {
+                                        self.timescale_scope_override = prev;
+                                    }
                                     if let Some((prev, defer)) = saved_hint {
                                         *self.name_resolve_hint.borrow_mut() = prev;
                                         self.proc_settle_defer = defer;
                                     }
-                                    self.timescale_scope_override = saved_ts;
                                     n_ab += 1;
                                     if self.proc_depth > 0 {
                                         self.note_comb_ran_in_process(eidx, &entries[eidx]);
                                     }
                                 }
+                            }
+                            #[cfg(feature = "jit")]
+                            if let Some(saved_ts) = saved_ts {
+                                self.timescale_scope_override = saved_ts;
                             }
                         }
                         // The three fused arms are the settle loop's highest-volume
@@ -2952,6 +3011,7 @@ impl Simulator {
         if total_iters > self.max_settle_iters {
             self.max_settle_iters = total_iters;
         }
+        self.leave_private_regs(caller_regs);
         self.settling = false;
     }
 

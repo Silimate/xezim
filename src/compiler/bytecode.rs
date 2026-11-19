@@ -2707,7 +2707,9 @@ impl<'a> BytecodeCompiler<'a> {
     /// literal, a parameter or a bound constant, optionally negated or in
     /// parentheses. An expression such as `1'b1 + 1'b1` is self-determined
     /// (it wraps to 0) and `eval_const_bound` does not model that, so it is
-    /// left to the interpreter.
+    /// left to the interpreter. So is a local of the running frame (§23.9: a
+    /// function's `int I` hides a module's `parameter I`), unless it is an
+    /// unrolled loop's index, bound to a constant for this iteration.
     fn plain_const_index(&self, e: &Expression) -> Option<i64> {
         match &e.kind {
             ExprKind::Paren(inner) => self.plain_const_index(inner),
@@ -2717,6 +2719,10 @@ impl<'a> BytecodeCompiler<'a> {
             } if matches!(operand.kind, ExprKind::Number(_)) => self.eval_const_bound(e),
             ExprKind::Number(_) => self.eval_const_bound(e),
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let name = h.path[0].name.name.as_str();
+                if !self.const_var_binds.contains_key(name) && self.frame_bound_target(e) {
+                    return None;
+                }
                 self.eval_const_bound(e)
             }
             _ => None,

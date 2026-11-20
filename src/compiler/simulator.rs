@@ -390,12 +390,17 @@ fn method_boost_enabled() -> bool {
 // declared with an ascending or offset range does not inline.
 // §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
 // site, and boxed optional delays, initializers and case item patterns (#721).
+// silimate: bump the method-cache salt past upstream's for the local-collection element width fix
+// §11.6.1, §7.10: an element read of a method-local queue or dynamic array has its element's
+// width, so a compare of two of them no longer resizes both to one bit. On an upstream bump,
+// take upstream's value and bump it once more.
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
 // §23.9: a frame local that hides a parameter is not a constant element select.
 // §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3092;
+// /silimate
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never

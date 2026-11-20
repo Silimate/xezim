@@ -1369,42 +1369,38 @@ impl Simulator {
         }
     }
 
-    /// §23.6: `$root.top.a[i].m`, a name that selects a member after an
-    /// element select, in the shape its relative spelling `top.a[i].m` has
-    /// after elaboration: the dotted names up to the first select as one
-    /// identifier (`top.a`), then the selects and the later members
-    /// (`MemberAccess { Index { Ident, i }, m }`). The member and select arms
-    /// read a class property through a queue or array element (§7.10, §8.4)
-    /// and a field of a packed-struct element (§7.2.1) from that shape only;
-    /// as one identifier its flat key named no storage and the read was 0.
-    /// `None` for any other name, and when the flat key does name storage: a
-    /// generate block or instance-array element (`$root.top.g[1].x`) is a
-    /// scope whose constant index is part of the key.
-    ///
-    /// The chain's readers may look its selects up more than once. For a
-    /// `read`, a select with a side effect (`objs[i++]`, `objs[next()]`) is
-    /// made a literal of its value, evaluated here once, left to right
-    /// (§11.4.2, §13.4.1). For sizing such a name, no select is evaluated:
-    /// the chain is a literal as wide as the member's declared type (see
-    /// `root_member_declared_width`), or, when that is not known, the chain
-    /// with each such select made a fixed index (`root_member_probe_index`),
-    /// since every element has the same declared type.
-    #[cold]
-    #[inline(never)]
-    pub(super) fn root_member_select_chain(
-        &mut self,
+    /// §23.6: whether `h` is `$root.top.a[i].m`, a name that selects a member
+    /// after an element select, whose flat key names no storage. A generate
+    /// block or instance-array element (`$root.top.g[1].x`) is a scope whose
+    /// constant index is part of that key, and keeps the name resolver's path.
+    /// Nothing is evaluated or built.
+    pub(super) fn root_member_select_shape(&self, h: &HierarchicalIdentifier) -> bool {
+        h.path.len() >= 3
+            && h.path[0].name.name == "$root"
+            && h.path[..h.path.len() - 1]
+                .iter()
+                .any(|s| !s.selects.is_empty())
+            && !self.unit_scope_decl_exists(&self.resolve_hier_name(h))
+    }
+
+    /// Whether any select of `h` has a side effect (`i++`, a call).
+    fn hier_has_effect_select(h: &HierarchicalIdentifier) -> bool {
+        h.path.iter().any(|s| {
+            s.selects
+                .iter()
+                .any(|e| !Self::cond_expr_is_effect_free(e, false))
+        })
+    }
+
+    /// The dotted names of `h` (without `$root`) up to its first select as
+    /// one identifier, that segment's selects, and the segments after it.
+    fn root_member_parts(
         h: &HierarchicalIdentifier,
-        span: crate::ast::Span,
-        read: bool,
-    ) -> Option<Expression> {
-        let (_, inner) = h.path.split_last()?;
-        if h.path.len() < 3
-            || h.path[0].name.name != "$root"
-            || inner.iter().all(|s| s.selects.is_empty())
-            || self.unit_scope_decl_exists(&self.resolve_hier_name(h))
-        {
-            return None;
-        }
+    ) -> Option<(
+        HierarchicalIdentifier,
+        Vec<Expression>,
+        Vec<crate::ast::expr::HierPathSegment>,
+    )> {
         let first = h.path.iter().position(|s| !s.selects.is_empty())?;
         let mut base = h.clone();
         let rest = base.path.split_off(first + 1);
@@ -1413,36 +1409,36 @@ impl Simulator {
         base.cached_signal_id = crate::ast::cache::SignalCache::new(None);
         base.cached_resolved_name = crate::ast::cache::NameCache::new();
         base.bound = crate::ast::binding::Bound::UNSET;
-        if !read
-            && h.path.iter().any(|s| {
-                s.selects
-                    .iter()
-                    .any(|e| !Self::cond_expr_is_effect_free(e, false))
-            })
-            && let Some(w) = self.root_member_declared_width(&base, &rest)
-        {
-            return Some(Expression::new(
-                ExprKind::Number(NumberLiteral::Integer {
-                    size: Some(w),
-                    signed: false,
-                    base: NumberBase::Decimal,
-                    value: "0".to_string(),
-                    cached_val: crate::ast::cache::LiteralCache::new(None),
-                }),
-                span,
-            ));
+        Some((base, selects, rest))
+    }
+
+    /// A name of `root_member_select_shape` in the shape its relative
+    /// spelling `top.a[i].m` has after elaboration: the dotted names up to
+    /// the first select as one identifier (`top.a`), then the selects and the
+    /// later members (`MemberAccess { Index { Ident, i }, m }`). The member
+    /// and select arms read a class property through a queue or array element
+    /// (§7.10, §8.4) and a field of a packed-struct element (§7.2.1) from
+    /// that shape only; as one identifier its flat key named no storage and
+    /// the read was 0.
+    ///
+    /// The chain's readers may look its selects up more than once. For a
+    /// `read`, a select with a side effect (`objs[i++]`, `objs[next()]`) is
+    /// made a literal of its value, evaluated here once, left to right
+    /// (§11.4.2, §13.4.1). For sizing it is not evaluated: the first select
+    /// of the collection becomes `probe`, any other 0.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn root_member_select_chain(
+        &mut self,
+        h: &HierarchicalIdentifier,
+        span: crate::ast::Span,
+        read: bool,
+        probe: i64,
+    ) -> Option<Expression> {
+        if !self.root_member_select_shape(h) {
+            return None;
         }
-        // Sizing without the declared width: a side-effect select of the
-        // collection itself probes its first element that holds an object.
-        let probe = if read
-            || selects
-                .first()
-                .is_none_or(|e| Self::cond_expr_is_effect_free(e, false))
-        {
-            0
-        } else {
-            self.root_member_probe_index(&base)
-        };
+        let (base, selects, rest) = Self::root_member_parts(h)?;
         let mut chain = Expression::new(ExprKind::Ident(base), span);
         let index = |me: &mut Self, chain: Expression, sel: &Expression, probe: i64| {
             let sel = if Self::cond_expr_is_effect_free(sel, false) {
@@ -1487,10 +1483,53 @@ impl Simulator {
         Some(chain)
     }
 
+    /// What the width probes size a name of `root_member_select_shape` by,
+    /// and whether that width holds for every evaluation of the name, so it
+    /// may be kept on the node. A name whose selects are free of side effects
+    /// is sized as its chain reads, from the element it selects. For one with
+    /// a side-effect select nothing is evaluated: the expression is a literal
+    /// as wide as the member's declared type (`root_member_declared_width`),
+    /// which holds; else the chain through the collection's first element
+    /// that holds an object (`root_member_probe_index`), whose width holds
+    /// too, since every element has the declared type, once such an element
+    /// is found.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn root_member_size(
+        &mut self,
+        h: &HierarchicalIdentifier,
+        span: crate::ast::Span,
+    ) -> Option<(Expression, bool)> {
+        if !self.root_member_select_shape(h) {
+            return None;
+        }
+        if !Self::hier_has_effect_select(h) {
+            return Some((self.root_member_select_chain(h, span, false, 0)?, false));
+        }
+        let (base, _, rest) = Self::root_member_parts(h)?;
+        if let Some(w) = self.root_member_declared_width(&base, &rest) {
+            let lit = Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(w),
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: "0".to_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            );
+            return Some((lit, true));
+        }
+        let probe = self.root_member_probe_index(&base);
+        let chain = self.root_member_select_chain(h, span, false, probe.unwrap_or(0))?;
+        Some((chain, probe.is_some()))
+    }
+
     /// The first index of the collection `base` names whose element is a
-    /// live object when its elements are class handles, else 0: the element
-    /// the width probes read for a select they must not evaluate.
-    fn root_member_probe_index(&self, base: &HierarchicalIdentifier) -> i64 {
+    /// live object, when its elements are class handles: the element the
+    /// width probes read for a select they must not evaluate. `None` when
+    /// there is none, or the elements are not handles.
+    fn root_member_probe_index(&self, base: &HierarchicalIdentifier) -> Option<i64> {
         let name = self.resolve_hier_name(base);
         let name = name.as_ref();
         let holds_objects = self.module.var_decl_types.get(name).is_some_and(|dt| {
@@ -1498,22 +1537,20 @@ impl Simulator {
                 DataType::TypeReference { name: t, .. } if self.module.classes.contains_key(&t.name.name))
         });
         if !holds_objects {
-            return 0;
+            return None;
         }
         let (lo, n) = if self.module.dynamic_arrays.contains(name) {
             (0, self.get_queue_size(name) as i64)
         } else if let Some(&(l, r, _)) = self.module.arrays.get(name) {
             (l.min(r), l.abs_diff(r) as i64 + 1)
         } else {
-            return 0;
+            return None;
         };
-        (lo..lo + n)
-            .find(|k| {
-                self.get_signal_value_by_name(&format!("{name}[{k}]"))
-                    .and_then(|v| v.to_u64())
-                    .is_some_and(|h| h != 0)
-            })
-            .unwrap_or(0)
+        (lo..lo + n).find(|k| {
+            self.get_signal_value_by_name(&format!("{name}[{k}]"))
+                .and_then(|v| v.to_u64())
+                .is_some_and(|h| h != 0)
+        })
     }
 
     /// The declared width of the member `rest` names below an element of the
@@ -2676,7 +2713,7 @@ impl Simulator {
                 // relative name's select chain.
                 if h.path.len() >= 3
                     && h.path[0].name.name == "$root"
-                    && let Some(chain) = self.root_member_select_chain(h, expr.span, true)
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span, true, 0)
                 {
                     return self.eval_expr_ctx_inner(&chain, ctx_width, unsigned_context);
                 }

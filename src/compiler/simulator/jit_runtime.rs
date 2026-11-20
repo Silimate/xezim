@@ -603,11 +603,17 @@ impl Simulator {
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 // §23.6: sized as the select chain it reads as.
-                if h.path.len() >= 3
-                    && h.path[0].name.name == "$root"
-                    && let Some(chain) = self.root_member_select_chain(h, expr.span, false)
-                {
-                    return self.lrm_self_width(&chain);
+                if h.path.len() >= 3 && h.path[0].name.name == "$root" {
+                    if let Some(w) = expr.cached_width.get() {
+                        return Some(w);
+                    }
+                    if let Some((by, holds)) = self.root_member_size(h, expr.span) {
+                        let w = self.lrm_self_width(&by);
+                        if holds && let Some(w) = w {
+                            expr.cached_width.set(Some(w));
+                        }
+                        return w;
+                    }
                 }
                 let n = self.resolve_hier_name(h);
                 if let Some(w) = self
@@ -1554,7 +1560,7 @@ impl Simulator {
             // §23.6: a `$root` name that reads as a select chain is sized by
             // reading it, once, as the chain's member read is.
             ExprKind::Ident(h) if h.path.len() >= 3 && h.path[0].name.name == "$root" => {
-                self.root_member_select_chain(h, expr.span, false).is_some()
+                self.root_member_select_shape(h)
             }
             ExprKind::Ident(_)
             | ExprKind::Number(NumberLiteral::Integer { .. })
@@ -1612,9 +1618,9 @@ impl Simulator {
                 // §23.6: sized as the select chain it reads as.
                 if h.path.len() >= 3
                     && h.path[0].name.name == "$root"
-                    && let Some(chain) = self.root_member_select_chain(h, expr.span, false)
+                    && let Some((by, holds)) = self.root_member_size(h, expr.span)
                 {
-                    return (self.infer_width_walk(&chain).0, false);
+                    return (self.infer_width_walk(&by).0, holds);
                 }
                 let n = self.resolve_hier_name(h);
                 // The resolution is node-stable only once the resolver has

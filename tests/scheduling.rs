@@ -500,6 +500,9 @@ mod hierarchical_subroutine_static;
 mod review_loop_jumps_and_block_disables;
 #[path = "scheduling/nba_partial_commit_order.rs"]
 mod nba_partial_commit_order;
+// silimate: a wait's statement that suspends runs as the process's next statement
+#[path = "scheduling/wait_then_event_control.rs"]
+mod wait_then_event_control;
 #[path = "scheduling/finished_process_metadata.rs"]
 mod finished_process_metadata;
 #[path = "scheduling/review_intra_delay_capture_1162.rs"]
@@ -545,6 +548,3 @@ mod intra_delay_array_items;
 mod review_intra_delay_array_items;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
-// silimate: a wait's statement that suspends runs as the process's next statement
-#[path = "scheduling/wait_then_event_control.rs"]
-mod wait_then_event_control;

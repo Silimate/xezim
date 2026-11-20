@@ -4,6 +4,10 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+// Synchronous fork sources belong to callable syntax, which is rebuilt
+// independently after a checkpoint. Keep their derived frame cache cold.
+pub(super) const SYNCHRONOUS_FORK_FRAME_KIND: u8 = 9;
+
 impl Simulator {
     /// §9.6.2: identity of a statement frame (its address).
     pub(super) fn frame_key(f: &Arc<[Statement]>) -> usize {
@@ -616,6 +620,7 @@ impl Simulator {
                                     )
                                         && super::bytecode::BytecodeCompiler::static_local_carries(
                                             &d.name.name,
+                                            Some(&*data_type),
                                             rest,
                                         )))
                         })
@@ -1259,7 +1264,7 @@ impl Simulator {
                         name: routine.to_string(),
                         span,
                     }),
-                    stmts: std::mem::take(items).into_vec(),
+                    stmts: std::mem::take(items),
                 },
                 span,
             );
@@ -1399,7 +1404,7 @@ impl Simulator {
         if !allocate.is_empty() {
             let block = |stmts: Vec<Statement>| super::elaborate::InitialBlock {
                 stmt: Statement::new(
-                    StatementKind::SeqBlock { name: None, stmts },
+                    StatementKind::SeqBlock { name: None, stmts: stmts.into() },
                     crate::ast::Span::dummy(),
                 ),
                 scope: String::new(),
@@ -1610,7 +1615,7 @@ impl Simulator {
                 stmt: Statement::new(
                     StatementKind::SeqBlock {
                         name: None,
-                        stmts: decls,
+                        stmts: decls.into(),
                     },
                     span,
                 ),
@@ -1810,7 +1815,7 @@ impl Simulator {
     pub(super) fn spliced_body(body: &Statement) -> Vec<Statement> {
         match &body.kind {
             StatementKind::SeqBlock { stmts, name: None } if !Self::stmts_declare_vars(stmts) => {
-                stmts.clone()
+                stmts.to_vec()
             }
             _ => vec![body.clone()],
         }
@@ -1911,7 +1916,11 @@ impl Simulator {
             for d in declarators {
                 let nm = d.name.name.as_str();
                 sv.declared_names.push(nm.to_string());
-                if d.dimensions.is_empty() && self.is_virtual_iface_type(data_type) {
+                // §13.5 / §25.9: a variable of any type hides a key left under
+                // its name by an enclosing or a caller's binding too.
+                if (d.dimensions.is_empty() && self.is_virtual_iface_type(data_type))
+                    || self.vif_local_names.contains(nm)
+                {
                     // §6.21 / §25.9: hiding a variable also hides its binding.
                     // Values alone cannot restore the enclosing vif after a
                     // nested block has rebound or cleared the same bare name.
@@ -2800,16 +2809,30 @@ impl Simulator {
         f
     }
 
-    pub(super) fn fork_child_frame(&mut self, s: &Statement) -> Arc<[Statement]> {
-        let key = (s as *const Statement as usize, 5u8);
+    pub(super) fn fork_child_frame(
+        &mut self,
+        s: &Statement,
+        source: &crate::ast::shared_vec::SharedVec<Statement>,
+    ) -> Arc<[Statement]> {
+        debug_assert!(source.iter().any(|node| std::ptr::eq(node, s)));
+        let key = (s as *const Statement as usize, SYNCHRONOUS_FORK_FRAME_KIND);
         if let Some((_, f)) = self.blocking_cont_cache.get(&key)
             && f.first().is_some_and(|st| st.span == s.span)
         {
             return f.clone();
         }
         let f: Arc<[Statement]> = Arc::from(std::slice::from_ref(s));
-        self.blocking_cont_cache
-            .insert(key, (Arc::clone(&f), f.clone()));
+        // §9.3.2: the key addresses the original child, not its frame copy.
+        // Retain its exact backing allocation, including in explicit clone
+        // modes; this owner is a lifetime anchor and is never executed.
+        let owner = Arc::from(vec![Statement::new(
+            StatementKind::SeqBlock {
+                name: None,
+                stmts: Arc::clone(source.as_arc()).into(),
+            },
+            s.span,
+        )]);
+        self.blocking_cont_cache.insert(key, (owner, f.clone()));
         f
     }
 
@@ -2907,7 +2930,9 @@ impl Simulator {
             return None;
         }
         let mut cont: Vec<Statement> = Vec::with_capacity(td.items.len() + 1);
-        cont.extend_from_slice(&td.items);
+        // §13.3/§23.6: continuation caches key nested statement addresses.
+        // Own this site's tree and contextual caches before executing it.
+        crate::ast::cache::with_fresh_scope_caches(|| cont.extend_from_slice(&td.items));
         cont.push(Statement::new(StatementKind::ScopePop, call_span));
         let frame: Arc<[Statement]> = Arc::from(cont);
         self.task_frame_cache
@@ -2931,7 +2956,8 @@ impl Simulator {
             unreachable!("class_task_body_frame takes tasks only")
         };
         let mut cont: Vec<Statement> = Vec::with_capacity(td.items.len() + 1);
-        cont.extend_from_slice(&td.items);
+        // Each method call site owns its nested continuation/cache identity.
+        crate::ast::cache::with_fresh_scope_caches(|| cont.extend_from_slice(&td.items));
         cont.push(Statement::new(StatementKind::ScopePop, call_span));
         let f: Arc<[Statement]> = Arc::from(cont);
         self.class_task_frame_cache
@@ -5238,6 +5264,32 @@ impl Simulator {
         }
     }
 
+    pub(super) fn snapshot_wide(
+        previous: &mut HashMap<usize, Value>,
+        id: usize,
+        current: &Value,
+    ) {
+        match previous.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                slot.get_mut().copy_from(current);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(current.clone());
+            }
+        }
+    }
+
+    pub(super) fn wide_edge_baseline(
+        previous: &HashMap<usize, Value>,
+        id: usize,
+        width: u32,
+    ) -> std::borrow::Cow<'_, Value> {
+        match previous.get(&id) {
+            Some(value) => std::borrow::Cow::Borrowed(value),
+            None => std::borrow::Cow::Owned(Value::new(width)),
+        }
+    }
+
     /// Snapshot only edge-sensitive signals + event_waiter signals into
     /// the prev_val/prev_xz parallel arrays (A3 from the compression
     /// analysis). Wide signals (> 64 bits) also update `prev_wide`.
@@ -5273,9 +5325,7 @@ impl Simulator {
             prev_val[id] = v;
             prev_xz[id] = x;
             if signal_widths[id] > 64 {
-                if let Some(p) = prev_wide.get_mut(&id) {
-                    p.copy_from(&signal_table[id]);
-                }
+                Simulator::snapshot_wide(prev_wide, id, &signal_table[id]);
             }
         }
         // Hot loop: this runs over the WHOLE edge-signal set on every snapshot
@@ -5311,9 +5361,7 @@ impl Simulator {
                     pv[id] = v;
                     px[id] = x;
                     if widths[id] > 64 {
-                        if let Some(p) = pw.get_mut(&id) {
-                            p.copy_from(&st[id]);
-                        }
+                        Self::snapshot_wide(pw, id, &st[id]);
                     }
                     continue;
                 }
@@ -5325,9 +5373,7 @@ impl Simulator {
                     *px.get_unchecked_mut(id) = x;
                 }
                 if unsafe { *widths.get_unchecked(id) } > 64 {
-                    if let Some(p) = pw.get_mut(&id) {
-                        p.copy_from(sv);
-                    }
+                    Self::snapshot_wide(pw, id, sv);
                 }
             }
         }
@@ -5363,13 +5409,9 @@ impl Simulator {
     /// Check edge: compare signal_table[id] vs (prev_val[id], prev_xz[id]).
     #[inline]
     pub(super) fn check_edge_id(&self, id: usize, edge: EdgeKind) -> bool {
-        self.edge_fires_prev(
-            id,
-            edge,
-            self.prev_val[id],
-            self.prev_xz[id],
-            self.prev_wide.get(&id),
-        )
+        let wide = (self.signal_widths[id] > 64 && matches!(edge, EdgeKind::AnyEdge))
+            .then(|| Self::wide_edge_baseline(&self.prev_wide, id, self.signal_widths[id]));
+        self.edge_fires_prev(id, edge, self.prev_val[id], self.prev_xz[id], wide.as_deref())
     }
 
     /// Edge comparison against an EXPLICIT prev baseline (rather than the
@@ -5630,5 +5672,31 @@ impl Simulator {
             return;
         }
         self.check_edges_inner(None, false);
+    }
+}
+
+#[cfg(test)]
+mod wide_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn untouched_wide_cells_share_an_implicit_initial_baseline() {
+        let mut sim = crate::simulate(
+            "module tb; logic [129:0] mem[0:127]; initial $finish; endmodule",
+            0,
+        )
+        .unwrap();
+        let id = *sim.signal_name_to_id.get("mem[3]").unwrap();
+        assert!(!sim.prev_wide.contains_key(&id));
+        assert_eq!(sim.preponed_value_of(id), Value::new(130));
+        sim.signal_table[id] = Value::new(130);
+        assert!(!sim.check_edge_id(id, EdgeKind::AnyEdge));
+        sim.signal_table[id].set_bit(129, LogicBit::Z);
+        assert!(sim.check_edge_id(id, EdgeKind::AnyEdge));
+        sim.edge_signal_ids.push(id);
+        sim.snapshot_edge_signals_full();
+        assert!(!sim.check_edge_id(id, EdgeKind::AnyEdge));
+        assert_eq!(sim.preponed_value_of(id).get_bit(129), LogicBit::Z);
+        assert!(!sim.prev_wide.contains_key(&(id + 1)));
     }
 }

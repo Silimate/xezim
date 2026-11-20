@@ -23,34 +23,6 @@ impl Simulator {
         )
     }
 
-    /// `assign_array_item` over the sub-array spanning `dims` (normalized
-    /// bounds); `descending[k]` puts dimension `k`'s left bound at `hi`.
-    pub(super) fn assign_array_item_dims(
-        &mut self,
-        target: &str,
-        dims: &[(i64, i64)],
-        descending: &[bool],
-        dt: &DataType,
-        e: &Expression,
-    ) -> bool {
-        let e = Self::unparen(e);
-        if dims.is_empty() || !Self::may_be_array_item(e) {
-            return false;
-        }
-        let lists: Vec<Vec<i64>> = dims
-            .iter()
-            .enumerate()
-            .map(|(k, &(lo, hi))| {
-                if descending.get(k).copied().unwrap_or(false) {
-                    (lo..=hi).rev().collect()
-                } else {
-                    (lo..=hi).collect()
-                }
-            })
-            .collect();
-        self.assign_array_item(target, &lists, dt, e)
-    }
-
     /// §10.9.1, §10.10: store the unpacked array value `e` to the sub-array
     /// `target` whose dimensions list their indices in declared order, left
     /// bound first. Every source element is read before any is written, and
@@ -96,6 +68,47 @@ impl Simulator {
             self.write_pattern_leaf(name, v);
         }
         true
+    }
+
+    /// §9.4.5: the elements of the unpacked array named by `e` (a whole
+    /// array or a row of one, not a call) read now, each with its leaf path
+    /// below `e` (`[1][0]`, or `[1].a` under an element that is an unpacked
+    /// struct), in declared order. None when `e` names no unpacked array.
+    pub(super) fn array_item_elements(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
+        let e = Self::unparen(e);
+        if !Self::may_be_array_item(e) || matches!(e.kind, ExprKind::Call { .. }) {
+            return None;
+        }
+        let capture = self.pattern_nba_leaves.take();
+        let out = self.array_item_elements_now(e);
+        self.pattern_nba_leaves = capture;
+        out.filter(|v| !v.is_empty() && v.iter().all(|(s, _)| s.starts_with('[')))
+    }
+
+    fn array_item_elements_now(&mut self, e: &Expression) -> Option<Vec<(String, Value)>> {
+        if let Some(suffixes) = self.unpacked_row_suffixes(e) {
+            return Some(
+                suffixes
+                    .into_iter()
+                    .map(|s| {
+                        let v = self.eval_expr(&Self::append_leaf_path(e, &s));
+                        (s, v)
+                    })
+                    .collect(),
+            );
+        }
+        let src = self.foreach_check_operand_name(e)?;
+        if self.is_associative_array(&src) {
+            return None;
+        }
+        let (names, _) = self.stream_elem_order(&src)?;
+        names
+            .iter()
+            .map(|n| {
+                let v = self.get_signal_value_by_name(n)?;
+                Some((n.get(src.len()..)?.to_string(), v))
+            })
+            .collect()
     }
 
     /// The elements of the unpacked array `e` in declared order, left bound

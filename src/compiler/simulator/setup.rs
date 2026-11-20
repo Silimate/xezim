@@ -325,7 +325,7 @@ impl Simulator {
                 let span = fb.stmt.span;
                 let stmts = match fb.stmt.kind {
                     StatementKind::SeqBlock { stmts, .. } => stmts,
-                    other => vec![Statement::new(other, fb.stmt.span)],
+                    other => vec![Statement::new(other, fb.stmt.span)].into(),
                 };
                 let pid = self.next_pid;
                 self.next_pid += 1;
@@ -338,7 +338,7 @@ impl Simulator {
                     self.current_scope.clear();
                 }
                 self.process_origin.insert(pid, (span, "final block"));
-                self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
+                self.run_process_stmts(pid, &ProcCont::from_vec(stmts.into_vec()));
                 // A final block's $finish should NOT stop subsequent finals;
                 // re-clear after each.
                 self.finished = false;

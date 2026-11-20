@@ -543,3 +543,5 @@ mod time_literal_exact_1299;
 mod intra_delay_array_items;
 #[path = "scheduling/review_intra_delay_array_items.rs"]
 mod review_intra_delay_array_items;
+#[path = "scheduling/level_always_waits_for_writer.rs"]
+mod level_always_waits_for_writer;

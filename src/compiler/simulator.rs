@@ -8363,6 +8363,15 @@ pub struct Simulator {
     /// (#1149) Whether the `u32::MAX` marker (an entry with no resolvable
     /// read) is in `deferred_proc_entries`.
     deferred_proc_unres: bool,
+    // silimate: always_comb / always @* blocks wait for the writer to yield too
+    /// The buffer of a deferring settle's changed signals: the ones its
+    /// process wrote (the dirty seeds), then the outputs its eager entries
+    /// changed. A deferred `always` entry lists these, not every signal it
+    /// reads: re-dirtying a read that did not change (`x` of
+    /// `always_comb y = f(x)` woken by `g`) would wake blocks the change
+    /// never woke (`always @* z = f(x)`, whose sensitivity is `x` alone).
+    defer_changed: Vec<usize>,
+    // /silimate
     /// (#t0-comb-defer) Compile-time process starts still unrun in the
     /// time-0 slot. A commercial simulator queues the cont-assign /
     /// port-connect update events that a time-0 process write schedules

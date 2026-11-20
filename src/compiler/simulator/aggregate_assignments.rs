@@ -3817,6 +3817,9 @@ impl Simulator {
     /// (`m[1]`), pairing elements left to right. False, with nothing
     /// written, when `lvalue` is neither or the element counts differ.
     pub(super) fn copy_ret_row_to_part(&mut self, lvalue: &Expression, src: &str) -> bool {
+        // The selects are read once, before any element is written: a write
+        // may change what an index reads (`m[m[0][0]] = q.pop_front()`).
+        let lvalue = &self.freeze_index_chain(lvalue);
         let targets: Vec<Expression> = match &lvalue.kind {
             ExprKind::RangeSelect {
                 expr,
@@ -3869,6 +3872,32 @@ impl Simulator {
             self.assign_value(t, &v);
         }
         true
+    }
+
+    /// `e` with the index of each element select along its chain, and the
+    /// base of a slice, replaced by a literal of its value now, so writes
+    /// through it select the same elements however they change what an
+    /// index reads.
+    fn freeze_index_chain(&mut self, e: &Expression) -> Expression {
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index } => ExprKind::Index {
+                expr: Box::new(self.freeze_index_chain(expr)),
+                index: Box::new(self.capture_index_literal(index, expr)),
+            },
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.freeze_index_chain(expr)),
+                kind: *kind,
+                left: left.clone(),
+                right: right.clone(),
+            },
+            _ => return e.clone(),
+        };
+        Expression::new(kind, e.span)
     }
 
     /// Whether `e` is a pop that [`Self::pop_row_operand`] returns a row for.

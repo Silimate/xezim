@@ -126,7 +126,7 @@ endmodule
 }
 
 /// A popped row assigned to a slice and to a row of a 2-D array, pairing
-/// left to right (§7.6, §7.4.6), and pops of a subroutine's own queue that
+/// left to right, with the row selected once (§7.6, §7.4.6), and pops of a subroutine's own queue that
 /// hides a module queue of the same name (§13.3). As above, Verilator 5.046
 /// is no reference for these forms.
 #[test]
@@ -159,6 +159,8 @@ module tb;
     $display("R l %p n=%0d", lpop(), q.size());
     tpop();
     $display("R q=%p", q);
+    m[m[0][0]] = q.pop_front();
+    $display("R m=%p n=%0d", m, q.size());
   end
 endmodule
 "#);
@@ -170,6 +172,7 @@ endmodule
             "R l '{21, 22} n=1",
             "R t '{31, 32} n=0",
             "R q='{'{3, 4}}",
+            "R m='{'{3, 4}, '{5, 6}} n=0",
         ]
     );
 }

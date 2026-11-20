@@ -1369,6 +1369,68 @@ impl Simulator {
         }
     }
 
+    /// §23.6: `$root.top.a[i].m`, a name that selects a member after an
+    /// element select, in the shape its relative spelling `top.a[i].m` has
+    /// after elaboration: the dotted names up to the first select as one
+    /// identifier (`top.a`), then the selects and the later members
+    /// (`MemberAccess { Index { Ident, i }, m }`). The member and select arms
+    /// read a class property through a queue or array element (§7.10, §8.4)
+    /// and a field of a packed-struct element (§7.2.1) from that shape only;
+    /// as one identifier its flat key named no storage and the read was 0.
+    /// `None` for any other name, and when the flat key does name storage: a
+    /// generate block or instance-array element (`$root.top.g[1].x`) is a
+    /// scope whose constant index is part of the key.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn root_member_select_chain(
+        &self,
+        h: &HierarchicalIdentifier,
+        span: crate::ast::Span,
+    ) -> Option<Expression> {
+        let (_, inner) = h.path.split_last()?;
+        if h.path.len() < 3
+            || h.path[0].name.name != "$root"
+            || inner.iter().all(|s| s.selects.is_empty())
+            || self.unit_scope_decl_exists(&self.resolve_hier_name(h))
+        {
+            return None;
+        }
+        let first = h.path.iter().position(|s| !s.selects.is_empty())?;
+        let mut base = h.clone();
+        let rest = base.path.split_off(first + 1);
+        base.path.remove(0);
+        let selects = std::mem::take(&mut base.path.last_mut()?.selects);
+        base.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+        base.cached_resolved_name = crate::ast::cache::NameCache::new();
+        base.bound = crate::ast::binding::Bound::UNSET;
+        let mut chain = Expression::new(ExprKind::Ident(base), span);
+        let index = |chain: Expression, sel: &Expression| {
+            Expression::new(
+                ExprKind::Index {
+                    expr: Box::new(chain),
+                    index: Box::new(sel.clone()),
+                },
+                span,
+            )
+        };
+        for sel in &selects {
+            chain = index(chain, sel);
+        }
+        for seg in &rest {
+            chain = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(chain),
+                    member: seg.name.clone(),
+                },
+                span,
+            );
+            for sel in &seg.selects {
+                chain = index(chain, sel);
+            }
+        }
+        Some(chain)
+    }
+
     /// Read fast path for a select-free single-segment identifier: the frame
     /// local of that name, else the plain property of `this`. Everything the
     /// full path checks before those two reads is keyed on multi-segment or
@@ -2452,6 +2514,15 @@ impl Simulator {
                     abs.cached_resolved_name = crate::ast::cache::NameCache::new();
                     let rewritten = Expression::new(ExprKind::Ident(abs), expr.span);
                     return self.eval_expr_ctx_inner(&rewritten, ctx_width, unsigned_context);
+                }
+                // §23.6: a member after an element select
+                // (`$root.top.objs[1].v`, `$root.top.qs[i].a`) reads as the
+                // relative name's select chain.
+                if h.path.len() >= 3
+                    && h.path[0].name.name == "$root"
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span)
+                {
+                    return self.eval_expr_ctx_inner(&chain, ctx_width, unsigned_context);
                 }
                 if h.path.len() >= 2
                     && !self.local_stack.is_empty()

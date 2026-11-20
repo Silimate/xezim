@@ -548,3 +548,9 @@ mod level_always_waits_for_writer;
 // silimate: a level-sensitive block that writes nothing runs once the settle converges
 #[path = "scheduling/observer_runs_after_settle.rs"]
 mod observer_runs_after_settle;
+// silimate: a whole unpacked array a concurrent assertion reads is sampled
+#[path = "scheduling/sva_whole_array_sampled.rs"]
+mod sva_whole_array_sampled;
+// silimate: sampled-value functions of a whole unpacked array track its cells
+#[path = "scheduling/sva_array_sampled_fns.rs"]
+mod sva_array_sampled_fns;

@@ -644,6 +644,53 @@ impl Simulator {
         Some(acc)
     }
 
+    // silimate: sampled-value functions of a whole unpacked array track its cells
+    /// §11.4.5, §16.9.3: a fixed-size unpacked array against `$past` or
+    /// `$sampled` of a whole one (`mem == $past(mem)`). The call's value is
+    /// the concatenation of the cells, the left bound's first
+    /// (`whole_array_cells`), compared with the array's elements in order.
+    /// `None` for any other pair.
+    fn compare_fixed_array_sampled(
+        &mut self,
+        left: &Expression,
+        right: &Expression,
+        mode: PatternCmpMode,
+    ) -> Option<PatCmp> {
+        let sampled = |me: &Self, e: &Expression| match &e.kind {
+            ExprKind::SystemCall { name, args } if matches!(name.as_str(), "$past" | "$sampled") => {
+                args.first().and_then(|a| me.whole_array_cells(a)).map(|(_, ids)| ids.len())
+            }
+            _ => None,
+        };
+        let (arr, call, n) = match (sampled(self, left), sampled(self, right)) {
+            (_, Some(n)) => (left, right, n),
+            (Some(n), None) => (right, left, n),
+            (None, None) => return None,
+        };
+        let (name, lo, hi) = self.fixed_array_operand(arr)?;
+        let ew = self.coll_elem_width(&name)?;
+        if ew == 0 || (hi - lo + 1) as usize != n {
+            return (ew != 0).then_some(PatCmp::Unequal);
+        }
+        let v = self.eval_expr(call);
+        let desc = self.module.descending_arrays.contains(&name);
+        let mut acc = PatCmp::Equal;
+        for k in 0..n {
+            let idx = if desc { hi - k as i64 } else { lo + k as i64 };
+            let a = self
+                .get_signal_value_by_name(&format!("{name}[{idx}]"))
+                .unwrap_or_else(|| Value::new(ew));
+            let low = (n - 1 - k) * ew as usize;
+            let b = v.range_select(low + ew as usize - 1, low);
+            acc = acc.and(Self::coll_elem_cmp(&a, &b, Some(ew), mode));
+            if acc == PatCmp::Unequal {
+                break;
+            }
+        }
+        Some(acc)
+    }
+    // /silimate
+
     /// The element-wise comparison of two unpacked arrays — fixed,
     /// multi-dimensional, associative, dynamic or queue — under `mode`;
     /// `None` unless both operands are one (§7.4.3, §11.4.5).
@@ -659,6 +706,11 @@ impl Simulator {
         if let Some(c) = self.compare_fixed_arrays(left, right, mode) {
             return Some(c);
         }
+        // silimate: sampled-value functions of a whole unpacked array track its cells
+        if let Some(c) = self.compare_fixed_array_sampled(left, right, mode) {
+            return Some(c);
+        }
+        // /silimate
         if let Some(c) = self.compare_assoc_arrays(left, right, mode) {
             return Some(c);
         }

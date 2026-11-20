@@ -1751,7 +1751,7 @@ impl Simulator {
             self.process_origin
                 .insert(pid, (span, "declaration assignment"));
             self.t0_decl_init_pids.insert(pid);
-            self.event_queue.schedule(0, pid, stmts.into());
+            self.event_queue.schedule(0, pid, stmts.into_vec().into());
         }
         // §16.5/§16.14: declarative concurrent assertions exist before
         // Active processes run, including an initial clock's time-zero edge.

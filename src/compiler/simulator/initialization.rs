@@ -1794,7 +1794,7 @@ impl Simulator {
                     stmt: Statement::new(
                         StatementKind::SeqBlock {
                             name: None,
-                            stmts: literal,
+                            stmts: literal.into(),
                         },
                         span,
                     ),
@@ -1962,7 +1962,7 @@ impl Simulator {
             let st_span = st.span;
             let mut stmts = match st.kind {
                 StatementKind::SeqBlock { name: None, stmts } => stmts,
-                kind => vec![Statement::new(kind, st_span)],
+                kind => vec![Statement::new(kind, st_span)].into(),
             };
             stmts.insert(0, marker(VERILOG_DECL_RUNTIME_MARKER));
             b.stmt = Statement::new(StatementKind::SeqBlock { name: None, stmts }, st_span);

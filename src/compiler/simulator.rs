@@ -5496,7 +5496,9 @@ struct BlockScopeSave {
     /// The subroutine's `static` locals that a non-static block variable of
     /// the same name hides, as `static_local_syncs` depth and the
     /// `(name, key)` entries taken out of that frame until the block ends.
-    static_hidden: Option<(usize, Vec<(String, String)>)>,
+    // silimate: a for-init variable hides the subroutine's same-named static local
+    // Each entry keeps the position it was taken from.
+    static_hidden: Option<(usize, Vec<(usize, (String, String))>)>,
     /// `next_pid` at entry: a block that forked keeps its collection storage
     /// (a child may still use it).
     pid_mark: usize,

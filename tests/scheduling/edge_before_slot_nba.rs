@@ -69,14 +69,17 @@ endmodule
 }
 
 /// §9.7.4: a `wait` that an edge's process makes true resumes in the same
-/// Active region, before the slot's NBAs commit and wake `@(nb)`.
+/// Active region, before the slot's NBAs commit and wake `@(nb)`. The waiter
+/// reads a class property, which the write marks ready at once.
 #[test]
 fn a_wait_the_edge_releases_runs_before_the_nbas() {
     let src = r#"
 module top;
+  class box; bit go; endclass
+  box b = new;
   logic clk = 0;
   initial forever #5 clk = ~clk;
-  logic go = 0, nb = 0, other = 0;
+  logic nb = 0, other = 0;
   int fifo_count = 0;
   initial begin
     @(posedge clk);
@@ -85,13 +88,13 @@ module top;
   initial begin
     @(posedge clk);
     @(posedge clk);
-    go = 1;
+    b.go = 1;
     nb <= 1;
     @(nb);
     $display("T|%0t|fifo=%0d", $time, fifo_count);
   end
   initial begin
-    wait (go);
+    wait (b.go);
     fifo_count = 1;
   end
   initial #40 $finish;

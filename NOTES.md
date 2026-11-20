@@ -345,6 +345,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   elements. The element read counted as one bit wide, so the compare saw only
   the lowest bits: `'{3, 1}` compared equal, and a bubble sort in a function
   left its array unsorted (#421).
+* A queue method's argument written as an unpacked array concatenation
+  (`q.push_back({1, 2})` on a queue of `int [2]`, and the same in
+  `push_front` and `insert`) is stored as the new element `'{1, 2}`: the
+  formal has the queue's element type, so the concatenation is one of that
+  type (§7.10.2, §10.10). Every item of the stored element was x. (#424)
+* A `$root` name that selects a member after an element select
+  (`$root.tb.objs[1].v` through a queue of class handles, `$root.tb.qs[i].a`
+  through a queue of packed structs) reads and sizes like the same name
+  without `$root` (§23.6). It read 0, and in an expression it counted as one
+  bit wide. (#425)
 
 **Usability**
 

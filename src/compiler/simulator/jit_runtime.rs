@@ -602,6 +602,13 @@ impl Simulator {
             }
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
+                // §23.6: sized as the select chain it reads as.
+                if h.path.len() >= 3
+                    && h.path[0].name.name == "$root"
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span)
+                {
+                    return self.lrm_self_width(&chain);
+                }
                 let n = self.resolve_hier_name(h);
                 if let Some(w) = self
                     .lookup_signal_width(&n)
@@ -1544,6 +1551,11 @@ impl Simulator {
             return (w, None);
         }
         let evaluates = match &expr.kind {
+            // §23.6: a `$root` name that reads as a select chain is sized by
+            // reading it, once, as the chain's member read is.
+            ExprKind::Ident(h) if h.path.len() >= 3 && h.path[0].name.name == "$root" => {
+                self.root_member_select_chain(h, expr.span).is_some()
+            }
             ExprKind::Ident(_)
             | ExprKind::Number(NumberLiteral::Integer { .. })
             | ExprKind::Concatenation(_)
@@ -1596,6 +1608,13 @@ impl Simulator {
                     let keep = self.frame_var_width_static(name)
                         && self.frame_vector_range(name).is_some();
                     return (w, keep);
+                }
+                // §23.6: sized as the select chain it reads as.
+                if h.path.len() >= 3
+                    && h.path[0].name.name == "$root"
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span)
+                {
+                    return (self.infer_width_walk(&chain).0, false);
                 }
                 let n = self.resolve_hier_name(h);
                 // The resolution is node-stable only once the resolver has

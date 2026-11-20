@@ -51,3 +51,37 @@ fn level_always_observer_sees_only_settled_values() {
         "{out:#?}"
     );
 }
+
+const LIMIT: &str = r#"
+module top;
+  logic [3:0] a = 0;
+  wire [3:0] b = a;
+  always @* assert (b == 0) else $display("T|fail|%0t|%0d", $time, b);
+  initial begin
+    #1 a = 1;
+    #1 a = 2;
+    #1 $finish;
+  end
+endmodule
+"#;
+
+/// A held block runs in a pass the settle limit does not count, so it still
+/// runs when every settle uses its whole budget (`--settle-limit 1`: the
+/// assignment's pass is the only one allowed).
+#[test]
+fn level_always_observer_runs_at_the_settle_limit() {
+    let dir = std::env::temp_dir().join(format!("xezim_observer_limit_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("top.sv"), LIMIT).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--no-cache", "--settle-limit", "1", "top.sv"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run xezim");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    let got: Vec<&str> = stdout.lines().filter(|l| l.starts_with("T|")).collect();
+    assert_eq!(got, ["T|fail|1|1", "T|fail|2|2"], "{stdout}");
+}

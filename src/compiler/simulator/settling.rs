@@ -67,10 +67,17 @@ impl Simulator {
     }
 
     pub(super) fn settle_dispatch(&mut self) {
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // Only the serial settle holds such blocks until it converges.
+        self.refresh_comb_observer();
+        // /silimate
         if self.has_udp
             || self.has_timing_checks
             || self.proc_settle_defer
             || !self.deferred_proc_entries.is_empty()
+            // silimate: a level-sensitive block that writes nothing runs once the settle converges
+            || self.comb_observer_any
+            // /silimate
         {
             self.settle_combinatorial_inner();
         } else if self.bsp_shadow {
@@ -1412,6 +1419,18 @@ impl Simulator {
         }
     }
 
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// Rebuild `comb_observer` when the entry table changed size.
+    pub(super) fn refresh_comb_observer(&mut self) {
+        if self.comb_observer.len() != self.comb_entries.len() {
+            self.comb_observer = (self.comb_entries.iter())
+                .map(|e| u8::from(e.is_observer()))
+                .collect();
+            self.comb_observer_any = self.comb_observer.contains(&1);
+        }
+    }
+    // /silimate
+
     pub(super) fn settle_combinatorial_inner(&mut self) {
         if !self.ts_sleep.is_empty() {
             self.ts_wake_sleepers();
@@ -1448,12 +1467,7 @@ impl Simulator {
             self.build_comb_self_exempt();
         }
         // silimate: a level-sensitive block that writes nothing runs once the settle converges
-        if self.comb_observer.len() != self.comb_entries.len() {
-            self.comb_observer = (self.comb_entries.iter())
-                .map(|e| u8::from(e.is_observer()))
-                .collect();
-            self.comb_observer_any = self.comb_observer.contains(&1);
-        }
+        self.refresh_comb_observer();
         // /silimate
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
@@ -1953,7 +1967,14 @@ impl Simulator {
             }};
         }
 
-        for _iteration in 0..limit {
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // One pass past the limit is left for the held blocks, so a settle
+        // that converged (or gave up) on its last pass still runs them.
+        for _iteration in 0..=limit {
+            if _iteration == limit && !release_pass {
+                break;
+            }
+            // /silimate
             total_iters += 1;
             let mut evaluated_any = false;
             let capture_churn = _iteration + CHURN_TAIL >= limit;
@@ -3005,8 +3026,9 @@ impl Simulator {
                 gate_queue.clear();
             }
             // silimate: a level-sensitive block that writes nothing runs once the settle converges
-            // Nothing else is queued: the held blocks run in one more pass.
-            release_pass = next_list.is_empty() && !held.is_empty();
+            // Nothing else is queued, or this was the last pass the limit
+            // allows: the held blocks run in one more pass.
+            release_pass = !held.is_empty() && (next_list.is_empty() || _iteration + 1 >= limit);
             if release_pass {
                 for &e in &held {
                     self.comb_observer[e] = 1;

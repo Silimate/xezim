@@ -1367,7 +1367,7 @@ fn marked(marks: Vec<Statement>, s: Statement) -> Statement {
     Statement::new(
         StatementKind::SeqBlock {
             name: None,
-            stmts: v,
+            stmts: v.into(),
         },
         span,
     )
@@ -1490,7 +1490,7 @@ fn mark_writes(s: Statement, vars: &[(String, u32)], after: bool) -> Statement {
                     Statement::new(
                         StatementKind::SeqBlock {
                             name: None,
-                            stmts: v,
+                            stmts: v.into(),
                         },
                         span,
                     )

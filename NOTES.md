@@ -340,6 +340,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   there) or a package parameter (`import p::*`, `import p::V`, `p::V[k]`);
   every branch took `else` and the assignments in the others were lost
   (§6.20.2, §26.3, §27.5). (#342)
+* In a compiled method, a compare of two elements of a method-local queue or
+  dynamic array (`a[0] == a[1]`, a sort's `a[j] > a[j+1]`) compares the whole
+  elements. The element read counted as one bit wide, so the compare saw only
+  the lowest bits: `'{3, 1}` compared equal, and a bubble sort in a function
+  left its array unsorted (#421).
 
 **Usability**
 

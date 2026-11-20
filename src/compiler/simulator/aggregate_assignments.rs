@@ -3758,6 +3758,66 @@ impl Simulator {
             .unwrap_or_else(|| Value::zero(32))
     }
 
+    /// §7.10.2.4, §7.10.2.5: `q.pop_front()` / `q.pop_back()` on a queue whose
+    /// elements are fixed-size arrays (`int q[$][2]`, `pair_t q[$]`) returns
+    /// the removed row. A row has no packed cell of its own, only its
+    /// elements, so it travels as a call returning an unpacked array does:
+    /// copied in declared order to the return store, which the caller reads
+    /// by name (`%p`, a whole-array assignment, an unpacked concatenation).
+    /// An empty queue returns a row of the element type's default (§7.10.2).
+    /// The call is evaluated once. `None`, with nothing evaluated, when `e`
+    /// is no such pop.
+    pub(super) fn pop_row_operand(&mut self, e: &Expression) -> Option<String> {
+        const RET_SNAP: &str = "__xz_ret_coll__";
+        let (obj, pop) = self.queue_pop_call(e)?;
+        let &(_, (jlo, jhi), w) = self.module.arrays_2d.get(&obj)?;
+        let dt = self.module.var_decl_types.get(&obj).cloned()?;
+        let order: Vec<i64> = match self
+            .unpacked_decl_dims_of(&obj)
+            .and_then(|d| d.get(1).copied())
+        {
+            Some((l, r)) if l > r => (r..=l).rev().collect(),
+            _ => (jlo..=jhi).collect(),
+        };
+        let size = self.get_queue_size(&obj);
+        let idx = if pop == "pop_front" {
+            0
+        } else {
+            size.saturating_sub(1)
+        };
+        let default =
+            if super::elaborate::is_type_two_state_resolved(&dt, &self.module.typedef_types) {
+                Value::zero(w)
+            } else {
+                Value::new(w)
+            };
+        let row: Vec<Value> = order
+            .iter()
+            .map(|j| {
+                (size > 0)
+                    .then(|| self.get_signal_value_by_name(&format!("{obj}[{idx}][{j}]")))
+                    .flatten()
+                    .unwrap_or_else(|| default.clone())
+            })
+            .collect();
+        self.eval_builtin_method(&obj, &pop, &[]);
+        for (pos, v) in row.iter().enumerate() {
+            self.set_signal_value_by_name(&format!("{RET_SNAP}[{pos}]"), v.clone());
+        }
+        self.set_queue_size(RET_SNAP, row.len() as u64);
+        self.module.arrays.insert(RET_SNAP.to_string(), (0, -1, w));
+        self.module.dynamic_arrays.insert(RET_SNAP.to_string());
+        self.module.var_decl_types.insert(RET_SNAP.to_string(), dt);
+        Some(RET_SNAP.to_string())
+    }
+
+    /// Whether `e` is a pop that [`Self::pop_row_operand`] returns a row for.
+    /// Nothing is evaluated.
+    pub(super) fn is_pop_row_call(&mut self, e: &Expression) -> bool {
+        self.queue_pop_call(e)
+            .is_some_and(|(obj, _)| self.module.arrays_2d.contains_key(&obj))
+    }
+
     /// `q.pop_front()` / `q.pop_back()` — the queue name and which end.
     pub(super) fn queue_pop_call(&mut self, e: &Expression) -> Option<(String, String)> {
         let ExprKind::Call { func, .. } = &e.kind else {

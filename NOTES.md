@@ -45,6 +45,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * `wait (c) @(posedge clk);` resumes the process at the edge after `c`
   holds (§9.7.4). The event control the `wait` guards had been run where it
   could not suspend, so the process never resumed. (#437)
+* A variable declared in a for-init hides the task's or function's own
+  variable of the same name (§6.21, §12.7.1). In a task with an unassigned
+  `integer j;`, `for (integer j = 0; j < n; j++)` read the task's `j` (x)
+  and ran no iteration, with or without a timing control in the body.
+  (#438)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

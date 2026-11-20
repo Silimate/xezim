@@ -106,8 +106,12 @@ fn run(methods: &str) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let sv = dir.join("t.sv");
     std::fs::write(&sv, SRC).unwrap();
+    // Tier 0 compiles a method on its first call whatever its shape, and no
+    // method cache may hand back a block another build compiled.
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .env("XEZIM_COMPILE_METHODS", methods)
+        .env("XEZIM_METHOD_TIER", "0")
+        .env_remove("XEZIM_METHOD_CACHE")
         .current_dir(&dir)
         .args(["--no-cache"])
         .arg(&sv)

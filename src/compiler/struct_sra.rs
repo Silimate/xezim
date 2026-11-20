@@ -371,7 +371,7 @@ impl Ctx<'_> {
             Statement::new(
                 StatementKind::SeqBlock {
                     name: None,
-                    stmts: v,
+                    stmts: v.into(),
                 },
                 s.span,
             )
@@ -395,7 +395,7 @@ impl Ctx<'_> {
             StatementKind::Null => vec![s.clone()],
             StatementKind::SeqBlock { name, stmts } => mk(StatementKind::SeqBlock {
                 name: name.clone(),
-                stmts: self.stmts(stmts)?,
+                stmts: self.stmts(stmts)?.into(),
             }),
             StatementKind::VarDecl {
                 data_type,
@@ -430,7 +430,7 @@ impl Ctx<'_> {
                                             span: d.name.span,
                                         },
                                         dimensions: Vec::new(),
-                                        init,
+                                        init: init.map(Box::new),
                                         span: d.span,
                                     }],
                                 },

@@ -67,10 +67,17 @@ impl Simulator {
     }
 
     pub(super) fn settle_dispatch(&mut self) {
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // Only the serial settle holds such blocks until it converges.
+        self.refresh_comb_observer();
+        // /silimate
         if self.has_udp
             || self.has_timing_checks
             || self.proc_settle_defer
             || !self.deferred_proc_entries.is_empty()
+            // silimate: a level-sensitive block that writes nothing runs once the settle converges
+            || self.comb_observer_any
+            // /silimate
         {
             self.settle_combinatorial_inner();
         } else if self.bsp_shadow {
@@ -1412,6 +1419,23 @@ impl Simulator {
         }
     }
 
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// Rebuild `comb_observer` when the entry table changed size. Not
+    /// during a settle, which has taken the table out (a blocking write in
+    /// an interpreted block settles again from inside it).
+    pub(super) fn refresh_comb_observer(&mut self) {
+        if self.settling {
+            return;
+        }
+        if self.comb_observer.len() != self.comb_entries.len() {
+            self.comb_observer = (self.comb_entries.iter())
+                .map(|e| u8::from(e.is_observer()))
+                .collect();
+            self.comb_observer_any = self.comb_observer.contains(&1);
+        }
+    }
+    // /silimate
+
     pub(super) fn settle_combinatorial_inner(&mut self) {
         if !self.ts_sleep.is_empty() {
             self.ts_wake_sleepers();
@@ -1447,6 +1471,9 @@ impl Simulator {
         if self.comb_self_exempt.len() != self.comb_entries.len() {
             self.build_comb_self_exempt();
         }
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        self.refresh_comb_observer();
+        // /silimate
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
         }
@@ -1748,6 +1775,13 @@ impl Simulator {
             || trace_on
             || self.profile_report;
         let warn_x_on = self.warn_x && self.time > 0;
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // The held blocks (marked 2 in `comb_observer`), and whether this
+        // pass is the one that runs them.
+        let observe = self.comb_observer_any;
+        let mut held: Vec<usize> = Vec::new();
+        let mut release_pass = false;
+        // /silimate
         // Profiling counters accumulate in registers and fold back into `self`
         // once, instead of a read-modify-write per evaluation.
         // Dependents injected into the running pass, as a bitset plus the
@@ -1938,7 +1972,14 @@ impl Simulator {
             }};
         }
 
-        for _iteration in 0..limit {
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // One pass past the limit is left for the held blocks, so a settle
+        // that converged (or gave up) on its last pass still runs them.
+        for _iteration in 0..=limit {
+            if _iteration == limit && !release_pass {
+                break;
+            }
+            // /silimate
             total_iters += 1;
             let mut evaluated_any = false;
             let capture_churn = _iteration + CHURN_TAIL >= limit;
@@ -2204,6 +2245,21 @@ impl Simulator {
                     );
                     continue;
                 }
+                // silimate: a level-sensitive block that writes nothing runs once the settle converges
+                // §4.5, §9.2.2.2: such a block (immediate assertions,
+                // `$display`) is a process of its own, and nothing obliges it
+                // to run before the continuous assignments it reads settle.
+                // Run as soon as an input changed, it saw every step of a
+                // carry chain and asserted on values that never coexist. It
+                // waits for the other entries to converge, then runs once.
+                if observe && !release_pass && self.comb_observer[eidx] != 0 {
+                    if self.comb_observer[eidx] == 1 {
+                        self.comb_observer[eidx] = 2;
+                        held.push(eidx);
+                    }
+                    continue;
+                }
+                // /silimate
                 evaluated_any = true;
                 let dirty_before = self.dirty_list.len();
 
@@ -2974,6 +3030,22 @@ impl Simulator {
                 n_dc += gate_queue.len() as u64;
                 gate_queue.clear();
             }
+            // silimate: a level-sensitive block that writes nothing runs once the settle converges
+            // Nothing else is queued, or this was the last pass the limit
+            // allows: the held blocks run in one more pass.
+            release_pass = !held.is_empty() && (next_list.is_empty() || _iteration + 1 >= limit);
+            if release_pass {
+                for &e in &held {
+                    self.comb_observer[e] = 1;
+                    if !triggered[e] {
+                        triggered[e] = true;
+                        next_list.push(e);
+                    }
+                }
+                held.clear();
+                evaluated_any = true;
+            }
+            // /silimate
             // After one full topo scan: if no entry was evaluated, fixpoint.
             if !evaluated_any {
                 converged = true;
@@ -2991,6 +3063,12 @@ impl Simulator {
             }
         }
 
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // Only a settle that hit its limit leaves blocks held.
+        for &e in &held {
+            self.comb_observer[e] = 1;
+        }
+        // /silimate
         self.entry_evals += n_evals;
         self.prof_settle_dc_count += n_dc;
         self.prof_settle_ab_count += n_ab;

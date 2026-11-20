@@ -1490,9 +1490,10 @@ impl Simulator {
     /// a side-effect select nothing is evaluated: the expression is a literal
     /// as wide as the member's declared type (`root_member_declared_width`),
     /// which holds; else the chain through the collection's first element
-    /// that holds an object (`root_member_probe_index`), whose width holds
-    /// too, since every element has the declared type, once such an element
-    /// is found.
+    /// that holds an object (`root_member_probe_index`). The width of that
+    /// object's own property holds too, since every element has the declared
+    /// type; a member deeper than that is reached through handles it may
+    /// hold null, so its width does not.
     #[cold]
     #[inline(never)]
     pub(super) fn root_member_size(
@@ -1522,7 +1523,10 @@ impl Simulator {
         }
         let probe = self.root_member_probe_index(&base);
         let chain = self.root_member_select_chain(h, span, false, probe.unwrap_or(0))?;
-        Some((chain, probe.is_some()))
+        // The probed object's own property sizes the member; a deeper member
+        // is reached through handles that object may hold null, so its
+        // width is not kept.
+        Some((chain, probe.is_some() && rest.len() == 1))
     }
 
     /// The first index of the collection `base` names whose element is a
@@ -1557,10 +1561,14 @@ impl Simulator {
     /// collection `base` (`objs` of `$root.tb.objs[k].v`, with `rest` the
     /// segments from `v`), walked from the collection's declared element type
     /// through struct members and class properties (§7.2, §8.4). No element
-    /// is read, so a null handle at some index does not hide the width.
-    /// `None` when a later segment selects, the walk meets another type, a
-    /// class property is declared in a parameterized class (its width is the
-    /// object's own, §8.25), or a packed range does not fold.
+    /// is read, so a null handle at any level does not hide the width.
+    ///
+    /// A member declared in a parameterized class may be sized by the
+    /// object's own parameters (§8.25): there only a type whose ranges are
+    /// literals is accepted, and a type-parameter property ends the walk.
+    /// Elsewhere a range must fold with the design's parameters, since
+    /// `resolve_type_width` skips one it cannot fold and would hand back 1.
+    /// `None` when a later segment selects or the walk meets another type.
     fn root_member_declared_width(
         &self,
         base: &HierarchicalIdentifier,
@@ -1571,6 +1579,8 @@ impl Simulator {
         }
         let name = self.resolve_hier_name(base);
         let mut dt = self.module.var_decl_types.get(name.as_ref())?.clone();
+        // Whether the current type was declared in a parameterized class.
+        let mut in_param_class = false;
         for seg in rest {
             let member = seg.name.name.as_str();
             dt = match self.resolve_dt_ref(&dt) {
@@ -1585,42 +1595,43 @@ impl Simulator {
                 {
                     let owners = self.prop_owners(&name.name.name);
                     let (owner, cd) = owners.get(member)?;
-                    if self.class_is_parameterized(&name.name.name)
-                        || self.class_is_parameterized(owner)
+                    let pt = cd.property_types.get(member)?.clone();
+                    if let DataType::TypeReference { name: t, .. } = &pt
+                        && cd.type_param_names.contains(&t.name.name)
                     {
                         return None;
                     }
-                    cd.property_types.get(member)?.clone()
+                    in_param_class = self.class_is_parameterized(owner)
+                        || self.class_is_parameterized(&name.name.name);
+                    pt
                 }
                 _ => return None,
             };
         }
-        // A range `resolve_type_width` cannot fold is skipped, not failed,
-        // and would hand back 1: accept only ranges that fold here.
+        let params = (!in_param_class).then_some(&self.module.parameters);
         let folds = |dims: &[crate::ast::types::PackedDimension]| {
             dims.iter().all(|d| match d {
                 crate::ast::types::PackedDimension::Range { left, right, .. } => {
-                    let p = Some(&self.module.parameters);
-                    crate::elaborate::const_eval_i64_with_params(left, p).is_some()
-                        && crate::elaborate::const_eval_i64_with_params(right, p).is_some()
+                    crate::elaborate::const_eval_i64_with_params(left, params).is_some()
+                        && crate::elaborate::const_eval_i64_with_params(right, params).is_some()
                 }
                 crate::ast::types::PackedDimension::Unsized(_) => false,
             })
         };
-        let dims_fold = match &dt {
-            DataType::IntegerVector { dimensions, .. }
-            | DataType::TypeReference { dimensions, .. }
-            | DataType::Implicit { dimensions, .. } => folds(dimensions),
-            _ => true,
+        let sized = match &dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                folds(dimensions)
+            }
+            DataType::IntegerAtom { .. } => true,
+            // A named type in a parameterized class may be one of its own
+            // typedefs over its parameters.
+            DataType::TypeReference { dimensions, .. } => !in_param_class && folds(dimensions),
+            _ => !in_param_class,
         };
-        if !dims_fold {
+        if !sized {
             return None;
         }
-        let w = super::elaborate::resolve_type_width(
-            &dt,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        );
+        let w = super::elaborate::resolve_type_width(&dt, params, Some(&self.module.typedefs));
         (w > 0).then_some(w)
     }
 

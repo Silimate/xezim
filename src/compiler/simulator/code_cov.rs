@@ -4707,10 +4707,9 @@ impl Simulator {
                         .collect();
                     (fates, whole, dead)
                 }
-                Choice::Case(kind, sel, items) => match self.cov_case_fates(kind, sel, items) {
-                    Some(fates) => (fates, true, Vec::new()),
-                    None => continue,
-                },
+                Choice::Case(kind, sel, items) => {
+                    (self.cov_case_fates(kind, sel, items), true, Vec::new())
+                }
                 Choice::Ternary(c) => match self.cov_truth(c) {
                     Some(t) => {
                         let (yes, no) = if t {
@@ -4783,24 +4782,18 @@ impl Simulator {
     /// The fates of a constant `case`'s items and of its implicit
     /// `default`, matching the items as the run does: the first item that
     /// matches is taken, or the `default` (written or implicit) when none
-    /// does. `None` when a comparison has x or z bits.
+    /// does.
     fn cov_case_fates(
         &mut self,
         kind: &CaseKind,
         sel: &Expression,
         items: &[CaseItem],
-    ) -> Option<Vec<Fate>> {
-        let val = self.case_selector_value(kind, sel, items);
+    ) -> Vec<Fate> {
+        let comparison = self.case_comparison(kind, sel, items);
         let mut hit = None;
         for (i, it) in items.iter().enumerate() {
             for p in &it.patterns {
-                let pv = self.eval_expr(p);
-                let m = match kind {
-                    CaseKind::Casez => val.casez_eq(&pv),
-                    CaseKind::Casex => val.casex_eq(&pv),
-                    _ => val.case_eq(&pv),
-                };
-                if m.is_nonzero()? && hit.is_none() {
+                if self.case_item_matches(kind, &comparison, p) && hit.is_none() {
                     hit = Some(i);
                 }
             }
@@ -4820,7 +4813,7 @@ impl Simulator {
         } else {
             Fate::Taken
         });
-        Some(fates)
+        fates
     }
 
     fn cov_instrument_classes(&mut self, cov: &mut CodeCov) {

@@ -1970,26 +1970,36 @@ impl Simulator {
 
     /// A select the width probes may read through `base` in place of a
     /// side-effect select: the first index or key of the collection `base`
-    /// names, or the first whose element holds an object, when there is one,
-    /// so a null handle at the front does not hide a class property's width.
-    /// `base` has no side-effect select left, so naming it evaluates none.
+    /// names. When its elements are class handles, the first that holds an
+    /// object instead, however far back: a null element has no object to
+    /// size a property by, and sized through one a byte property read as 32
+    /// bits. With no object anywhere, the read itself is through a null
+    /// handle. `base` has no side-effect select left, so naming it evaluates
+    /// none.
     fn probe_select(&mut self, base: &Expression, span: crate::ast::Span) -> Expression {
         let zero = || Self::probe_index_literal(0, span);
-        let Some(name) = self.flat_member_name(base) else {
+        // An object's collection property (`h.items`, `items` in a method)
+        // is stored as `<handle>#items`.
+        let Some(name) = self
+            .expr_assoc_name(base)
+            .or_else(|| self.flat_member_name(base))
+        else {
             return zero();
         };
+        let handles = self.probe_coll_holds_handles(&name);
         let live = |me: &Self, elem: &str| {
-            me.get_signal_value_by_name(elem)
-                .and_then(|v| v.to_u64())
-                .is_some_and(|h| h != 0 && me.heap.get(h as usize).is_some_and(|o| o.is_some()))
+            handles
+                && me
+                    .get_signal_value_by_name(elem)
+                    .and_then(|v| v.to_u64())
+                    .is_some_and(|h| {
+                        h != 0 && me.heap.get(h as usize).is_some_and(|o| o.is_some())
+                    })
         };
-        // Bounded: the probe runs on every sizing of the read.
-        const SCAN: usize = 1024;
         if self.is_associative_array(&name) {
             let keys = self.assoc_top_level_keys_shared(&name);
             let Some(key) = keys
                 .iter()
-                .take(SCAN)
                 .find(|k| live(self, &format!("{name}[{k}]")))
                 .or(keys.first())
             else {
@@ -2003,14 +2013,46 @@ impl Simulator {
                 .parse::<i64>()
                 .map_or_else(|_| zero(), |k| Self::probe_index_literal(k, span));
         }
+        // A queue or dynamic array by its live size: the fixed-array table
+        // can hold a placeholder shape for it.
         let (lo, n) = match self.module.arrays.get(&name) {
-            Some(&(l, r, _)) => (l.min(r), l.abs_diff(r) + 1),
-            None => (0, self.get_queue_size(&name)),
+            Some(&(l, r, _)) if !self.module.dynamic_arrays.contains(&name) => {
+                (l.min(r), l.abs_diff(r) + 1)
+            }
+            _ => (0, self.get_queue_size(&name)),
         };
-        let k = (lo..lo + n.min(SCAN as u64) as i64)
-            .find(|k| live(self, &format!("{name}[{k}]")))
+        let k = handles
+            .then(|| (lo..lo + n as i64).find(|k| live(self, &format!("{name}[{k}]"))))
+            .flatten()
             .unwrap_or(lo);
         Self::probe_index_literal(k, span)
+    }
+
+    /// Whether the elements of the collection stored as `name` are class
+    /// handles: a design collection (`coll_elem_is_class_handle`), or an
+    /// object's property (`<h>#items`) declared with a class element type.
+    fn probe_coll_holds_handles(&self, name: &str) -> bool {
+        if self.coll_elem_is_class_handle(name) {
+            return true;
+        }
+        let Some((h, prop)) = name.split_once('#') else {
+            return false;
+        };
+        let Some(class) = h
+            .parse::<usize>()
+            .ok()
+            .and_then(|h| self.heap.get(h)?.as_ref())
+            .map(|o| o.class_name.clone())
+        else {
+            return false;
+        };
+        let class = class.split('#').next().unwrap_or(&class).trim();
+        let owners = self.prop_owners(class);
+        owners
+            .get(prop)
+            .and_then(|(_, cd)| cd.properties.get(prop))
+            .and_then(|sig| sig.type_name.as_deref())
+            .is_some_and(|t| self.resolve_typeref_class_name_str(t.trim()).is_some())
     }
 
     fn probe_index_literal(k: i64, span: crate::ast::Span) -> Expression {

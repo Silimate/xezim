@@ -246,9 +246,10 @@ fn the_read_keeps_the_members_width() {
 
 /// The probes that size an operand of a comparison, a shift or an arithmetic
 /// operator size a copy of the read whose side-effect selects name an
-/// element without being evaluated, past a null handle at the front of a
-/// queue or an associative array, and keep the member's own width (8 and 12
-/// bits below, where a sum wraps).
+/// element without being evaluated, past null handles at the front of a
+/// queue (1100 of them in `many`), an associative array and a class-property
+/// queue, and keep the member's own width (8 and 12 bits below, where a sum
+/// wraps).
 #[test]
 fn sizing_the_read_runs_no_side_effect() {
     let lines = run(r#"module tb;
@@ -267,8 +268,13 @@ fn sizing_the_read_runs_no_side_effect() {
       foreach (arr[k]) arr[k] = 12'(x * 10 + k);
     endfunction
   endclass
+  class H;
+    C items[$];
+  endclass
   C objs[$];
   C nul[$];
+  C many[$];
+  H hh;
   C an[int];
   C as_[string];
   C c;
@@ -290,6 +296,8 @@ fn sizing_the_read_runs_no_side_effect() {
     end
     nul.push_back(null); c = new(1); nul.push_back(c);
     an[5] = null; c = new(1); an[7] = c;
+    repeat (1100) many.push_back(null); c = new(1); many.push_back(c);
+    hh = new; hh.items.push_back(null); c = new(1); hh.items.push_back(c);
     c = new(1); as_["k"] = c; as_["a"] = null;
     calls = 0; r = objs[next()].v * 10 + objs[next()].v; $display("R c-arith %0d calls=%0d", r, calls);
     calls = 0; b = objs[next()].v == 2;                  $display("R c-eq %0d calls=%0d", b, calls);
@@ -304,6 +312,8 @@ fn sizing_the_read_runs_no_side_effect() {
     i = 0; b = qs[i++].a[2] == 0;                        $display("R bit-eq %0d i=%0d", b, i);
     i = 1; b = nul[i++].b + 8'hff == 8'h0f;              $display("R null-w %0d i=%0d", b, i);
     i = 7; b = an[i++].b + 8'hff == 8'h0f;               $display("R assoc-w %0d i=%0d", b, i);
+    i = 1100; $display("R far %0d", many[i++].b + 8'hff); $display("R far i=%0d", i);
+    i = 1; b = hh.items[i++].b + 8'hff == 8'h0f;         $display("R prop-w %0d i=%0d", b, i);
     calls = 0; b = as_[key()].b + 8'hff == 8'h0f;        $display("R str-w %0d calls=%0d", b, calls);
     i = 0; b = objs[i++].b + 8'hff == 8'h0f;             $display("R w8 %0d i=%0d", b, i);
     i = 0; b = qs[i++].a + 12'hfff == 12'h000;           $display("R w12 %0d i=%0d", b, i);
@@ -327,6 +337,9 @@ endmodule
             "R bit-eq 1 i=1",
             "R null-w 1 i=2",
             "R assoc-w 1 i=8",
+            "R far 15",
+            "R far i=1101",
+            "R prop-w 1 i=2",
             "R str-w 1 calls=1",
             "R w8 1 i=1",
             "R w12 1 i=1",

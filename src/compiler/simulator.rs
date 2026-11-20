@@ -383,6 +383,13 @@ fn method_boost_enabled() -> bool {
 // §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional packed range NBAs decline.
 // §26.3: package code reads its own package's parameters, variables and imports, and an
 // inlined package callee its own, ahead of the design's same-named declarations.
+// §13.5.2: a call that declines its output or inout write-back leaves no compiled call
+// behind its interpreter fallback.
+// §6.21, §13.4.2, §7.4.1: a static local that constant selects write whole before a read
+// carries nothing between calls, so its subroutine inlines; a subroutine selecting a variable
+// declared with an ascending or offset range does not inline.
+// §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
+// site, and boxed optional delays, initializers and case item patterns (#721).
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
 // §23.9: a frame local that hides a parameter is not a constant element select.
 // §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
@@ -1818,6 +1825,11 @@ struct CombEntryCold {
 // §10.3.2, §9.2.2.1: shared-read batches leave out members with fused branches or jump
 // tables, chain fusion relocates branches within one process class, and an instance's
 // read of an unnamed memory cell stays unresolved.
+// §13.4.1, §26.3: a scope-qualified function's return variable and the name of a callee
+// called through a package or `$unit` are not reads; its body's reads are.
+// §6.21, §13.4.2, §7.4.1: continuous assigns calling a static function whose local constant
+// selects write whole before a read compile; a call selecting an ascending or offset-range
+// variable of its callee stays interpreted.
 // §7.2, §7.4.2: a member select through constant element selects of a packed
 // struct is a compiled store.
 // §23.9: an index naming a frame local that hides a parameter is not constant.
@@ -7985,7 +7997,8 @@ pub struct Simulator {
     prev_val: Vec<u64>,
     prev_xz: Vec<u64>,
     /// Fallback for signals wider than 64 bits where the inline u64 pair
-    /// above can't represent the full state.
+    /// above can't represent the full state. Until its first snapshot a wide
+    /// signal has its full-width all-X baseline implicitly.
     prev_wide: HashMap<usize, Value>,
     /// Snapshot generation counter: bumped every `snapshot_edge_signals`.
     /// (Previously read by `EventWaiter::registered_snap_gen` to guard
@@ -10508,6 +10521,13 @@ pub struct Simulator {
     /// address), so the re-entrant evaluation reads the slice itself.
     #[serde(skip)]
     packed_named_sign_guard: usize,
+    /// The arithmetic or bitwise operand (its address) being evaluated
+    /// whose parent operator found no context-determined shift in it
+    /// (`has_context_shift`), so its own operator does not scan its operands
+    /// again: each level of a chain `a ^ b ^ ...` scanned the whole chain
+    /// under it.
+    #[serde(skip)]
+    shift_free_operand: usize,
     /// `module.functions` holds each `FunctionDeclaration` by value, so the
     /// obvious `get(name).cloned()` deep-copies a whole function AST — body,
     /// statements and all — on EVERY call. On a design that calls a function

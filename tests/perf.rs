@@ -75,5 +75,9 @@ mod select_store_counters;
 mod timing_check_conditions;
 #[path = "perf/struct_formal_member_calls.rs"]
 mod struct_formal_member_calls;
+#[path = "perf/static_local_select_cover.rs"]
+mod static_local_select_cover;
+#[path = "perf/local_select_width_chain.rs"]
+mod local_select_width_chain;
 #[path = "perf/packed_member_path_read.rs"]
 mod packed_member_path_read;

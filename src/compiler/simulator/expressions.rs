@@ -1387,7 +1387,8 @@ impl Simulator {
     /// (§11.4.2, §13.4.1). For sizing such a name, no select is evaluated:
     /// the chain is a literal as wide as the member's declared type (see
     /// `root_member_declared_width`), or, when that is not known, the chain
-    /// with each such select made 0 (every element has the same type).
+    /// with each such select made a fixed index (`root_member_probe_index`),
+    /// since every element has the same declared type.
     #[cold]
     #[inline(never)]
     pub(super) fn root_member_select_chain(
@@ -1431,8 +1432,19 @@ impl Simulator {
                 span,
             ));
         }
+        // Sizing without the declared width: a side-effect select of the
+        // collection itself probes its first element that holds an object.
+        let probe = if read
+            || selects
+                .first()
+                .is_none_or(|e| Self::cond_expr_is_effect_free(e, false))
+        {
+            0
+        } else {
+            self.root_member_probe_index(&base)
+        };
         let mut chain = Expression::new(ExprKind::Ident(base), span);
-        let index = |me: &mut Self, chain: Expression, sel: &Expression| {
+        let index = |me: &mut Self, chain: Expression, sel: &Expression, probe: i64| {
             let sel = if Self::cond_expr_is_effect_free(sel, false) {
                 sel.clone()
             } else if read {
@@ -1443,7 +1455,7 @@ impl Simulator {
                         size: None,
                         signed: true,
                         base: NumberBase::Decimal,
-                        value: "0".to_string(),
+                        value: probe.to_string(),
                         cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     sel.span,
@@ -1457,8 +1469,8 @@ impl Simulator {
                 span,
             )
         };
-        for sel in &selects {
-            chain = index(self, chain, sel);
+        for (k, sel) in selects.iter().enumerate() {
+            chain = index(self, chain, sel, if k == 0 { probe } else { 0 });
         }
         for seg in &rest {
             chain = Expression::new(
@@ -1469,10 +1481,39 @@ impl Simulator {
                 span,
             );
             for sel in &seg.selects {
-                chain = index(self, chain, sel);
+                chain = index(self, chain, sel, 0);
             }
         }
         Some(chain)
+    }
+
+    /// The first index of the collection `base` names whose element is a
+    /// live object when its elements are class handles, else 0: the element
+    /// the width probes read for a select they must not evaluate.
+    fn root_member_probe_index(&self, base: &HierarchicalIdentifier) -> i64 {
+        let name = self.resolve_hier_name(base);
+        let name = name.as_ref();
+        let holds_objects = self.module.var_decl_types.get(name).is_some_and(|dt| {
+            matches!(self.resolve_dt_ref(dt),
+                DataType::TypeReference { name: t, .. } if self.module.classes.contains_key(&t.name.name))
+        });
+        if !holds_objects {
+            return 0;
+        }
+        let (lo, n) = if self.module.dynamic_arrays.contains(name) {
+            (0, self.get_queue_size(name) as i64)
+        } else if let Some(&(l, r, _)) = self.module.arrays.get(name) {
+            (l.min(r), l.abs_diff(r) as i64 + 1)
+        } else {
+            return 0;
+        };
+        (lo..lo + n)
+            .find(|k| {
+                self.get_signal_value_by_name(&format!("{name}[{k}]"))
+                    .and_then(|v| v.to_u64())
+                    .is_some_and(|h| h != 0)
+            })
+            .unwrap_or(0)
     }
 
     /// The declared width of the member `rest` names below an element of the
@@ -1480,7 +1521,9 @@ impl Simulator {
     /// segments from `v`), walked from the collection's declared element type
     /// through struct members and class properties (§7.2, §8.4). No element
     /// is read, so a null handle at some index does not hide the width.
-    /// `None` when a later segment selects, or the walk meets another type.
+    /// `None` when a later segment selects, the walk meets another type, a
+    /// class property is declared in a parameterized class (its width is the
+    /// object's own, §8.25), or a packed range does not fold.
     fn root_member_declared_width(
         &self,
         base: &HierarchicalIdentifier,
@@ -1504,11 +1547,37 @@ impl Simulator {
                     if self.module.classes.contains_key(&name.name.name) =>
                 {
                     let owners = self.prop_owners(&name.name.name);
-                    let (_, cd) = owners.get(member)?;
+                    let (owner, cd) = owners.get(member)?;
+                    if self.class_is_parameterized(&name.name.name)
+                        || self.class_is_parameterized(owner)
+                    {
+                        return None;
+                    }
                     cd.property_types.get(member)?.clone()
                 }
                 _ => return None,
             };
+        }
+        // A range `resolve_type_width` cannot fold is skipped, not failed,
+        // and would hand back 1: accept only ranges that fold here.
+        let folds = |dims: &[crate::ast::types::PackedDimension]| {
+            dims.iter().all(|d| match d {
+                crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                    let p = Some(&self.module.parameters);
+                    crate::elaborate::const_eval_i64_with_params(left, p).is_some()
+                        && crate::elaborate::const_eval_i64_with_params(right, p).is_some()
+                }
+                crate::ast::types::PackedDimension::Unsized(_) => false,
+            })
+        };
+        let dims_fold = match &dt {
+            DataType::IntegerVector { dimensions, .. }
+            | DataType::TypeReference { dimensions, .. }
+            | DataType::Implicit { dimensions, .. } => folds(dimensions),
+            _ => true,
+        };
+        if !dims_fold {
+            return None;
         }
         let w = super::elaborate::resolve_type_width(
             &dt,

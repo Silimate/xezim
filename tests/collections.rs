@@ -104,6 +104,8 @@ mod queue_eq_unknown_elems;
 mod queue_local_shadow_restore;
 #[path = "collections/queue_member_init.rs"]
 mod queue_member_init;
+#[path = "collections/queue_of_fixed_rows_push_concat.rs"]
+mod queue_of_fixed_rows_push_concat;
 #[path = "collections/queue_ops_and_dist.rs"]
 mod queue_ops_and_dist;
 #[path = "collections/queue_read_past_size.rs"]

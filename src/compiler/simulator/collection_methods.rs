@@ -662,9 +662,11 @@ impl Simulator {
             }
             _ => None,
         };
-        let (arr, call, n) = match (sampled(self, left), sampled(self, right)) {
-            (_, Some(n)) => (left, right, n),
-            (Some(n), None) => (right, left, n),
+        // The call's side, kept for `==?`/`!=?`: only the right operand's
+        // unknown bits are wildcards.
+        let (arr, call, n, call_left) = match (sampled(self, left), sampled(self, right)) {
+            (_, Some(n)) => (left, right, n, false),
+            (Some(n), None) => (right, left, n, true),
             (None, None) => return None,
         };
         let (name, lo, hi) = self.fixed_array_operand(arr)?;
@@ -682,7 +684,8 @@ impl Simulator {
                 .unwrap_or_else(|| Value::new(ew));
             let low = (n - 1 - k) * ew as usize;
             let b = v.range_select(low + ew as usize - 1, low);
-            acc = acc.and(Self::coll_elem_cmp(&a, &b, Some(ew), mode));
+            let (l, r) = if call_left { (&b, &a) } else { (&a, &b) };
+            acc = acc.and(Self::coll_elem_cmp(l, r, Some(ew), mode));
             if acc == PatCmp::Unequal {
                 break;
             }

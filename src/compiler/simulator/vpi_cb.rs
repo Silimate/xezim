@@ -951,6 +951,26 @@ impl Simulator {
         }
     }
 
+    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+    /// The Post-NBA part of `vpi_slot_end`: the slot's leftover cbNBASynch and
+    /// cbReadWriteSynch routines. True when one ran.
+    pub(super) fn vpi_slot_post_nba(&mut self) -> bool {
+        if self.vpi_cb_mask & MASK_SLOT_END == 0 {
+            return false;
+        }
+        let mut fired = self.vpi_checkpoint();
+        for set in [TimedSet::Nba, TimedSet::Rw] {
+            if self.vpi_fire_due(set) {
+                fired = true;
+                if self.vpi_open_delta() {
+                    return true;
+                }
+            }
+        }
+        fired
+    }
+    // /silimate
+
     /// End of the current time slot: leftover cbNBASynch / cbReadWriteSynch,
     /// cbAtEndOfSimTime (Pre-Postponed), then cbReadOnlySynch (Postponed).
     ///

@@ -3839,8 +3839,21 @@ impl Simulator {
                     return;
                 }
             }
-            if let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind {
-                let vals: Vec<Value> = items.iter().map(|it| self.eval_expr(it.expr())).collect();
+            let vals: Option<Vec<Value>> = match &self.unpacked_pattern(arg).kind {
+                ExprKind::AssignmentPattern(items) => {
+                    Some(items.iter().map(|it| self.eval_expr(it.expr())).collect())
+                }
+                // §7.10.2, §10.10: the formal of `push_back`, `push_front`
+                // and `insert` has the row type, so braces (`{1, 2}`) are an
+                // unpacked array concatenation of it, element by element,
+                // as `'{1, 2}` is. Evaluated as one packed value they landed
+                // in the phantom scalar `q[i]` and the row read x.
+                ExprKind::Concatenation(parts) => {
+                    Some(self.unpacked_concat_operand_values(parts.iter().collect()))
+                }
+                _ => None,
+            };
+            if let Some(vals) = vals {
                 for (k, j) in dst.iter().enumerate() {
                     let v = vals.get(k).cloned().unwrap_or_else(|| Value::zero(32));
                     self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);

@@ -1420,8 +1420,13 @@ impl Simulator {
     }
 
     // silimate: a level-sensitive block that writes nothing runs once the settle converges
-    /// Rebuild `comb_observer` when the entry table changed size.
+    /// Rebuild `comb_observer` when the entry table changed size. Not
+    /// during a settle, which has taken the table out (a blocking write in
+    /// an interpreted block settles again from inside it).
     pub(super) fn refresh_comb_observer(&mut self) {
+        if self.settling {
+            return;
+        }
         if self.comb_observer.len() != self.comb_entries.len() {
             self.comb_observer = (self.comb_entries.iter())
                 .map(|e| u8::from(e.is_observer()))

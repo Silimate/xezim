@@ -23,6 +23,30 @@ use xezim_core::hasher::{HashMap, HashSet};
 /// leaves are not all plain signals (array or union members).
 pub type UnpackedStructLeaves = HashMap<usize, Vec<(String, String)>>;
 
+/// §13.4.2/§23.10: function-table suffixes shared by compilers using
+/// the same declarations, preserving admission of external state reads.
+pub(crate) struct FunctionScopeIndex<'a> {
+    functions: &'a HashMap<String, FunctionDeclaration>,
+    qualified_leaves: HashSet<&'a str>,
+}
+
+impl<'a> FunctionScopeIndex<'a> {
+    pub(crate) fn new(functions: &'a HashMap<String, FunctionDeclaration>) -> Self {
+        let qualified_leaves = functions
+            .keys()
+            .filter_map(|name| name.rsplit_once('.').map(|(_, leaf)| leaf))
+            .collect();
+        Self {
+            functions,
+            qualified_leaves,
+        }
+    }
+
+    pub(crate) fn qualified_leaf_count(&self) -> usize {
+        self.qualified_leaves.len()
+    }
+}
+
 const MAX_INLINE_DEPTH: usize = 8;
 
 /// Sentinel for a method receiver whose declared class could not be resolved
@@ -2182,6 +2206,7 @@ pub struct BytecodeCompiler<'a> {
     /// and narrows the fallback to just the inner $write/$display.
     tasks: Option<&'a HashMap<String, TaskDeclaration>>,
     functions: Option<&'a HashMap<String, FunctionDeclaration>>,
+    function_scope_index: Option<&'a FunctionScopeIndex<'a>>,
     /// A scalarized stand-in for the next `compile_pure_call`'s callee (see
     /// `compile_struct_member_call`); taken at the function-table lookup.
     struct_call_fd: Option<FunctionDeclaration>,
@@ -2308,8 +2333,7 @@ pub struct BytecodeCompiler<'a> {
     /// `typedef_types` key: such a type is not packed.
     typedef_unpacked_dims: Option<&'a HashMap<String, Vec<crate::ast::types::UnpackedDimension>>>,
     /// Declared types of explicitly typed value parameters.
-    param_decl_types:
-        Option<&'a xezim_core::shared_names::SharedNameMap<crate::ast::types::DataType>>,
+    param_decl_types: Option<&'a xezim_core::decl_types::ParamDeclTypeMap>,
     /// Ports collapsed onto the nets they connect, formal to actual.
     port_aliases: Option<&'a HashMap<String, String>>,
     /// Stack of pending `break` jump-target patches, one entry per enclosing
@@ -2489,6 +2513,7 @@ impl<'a> BytecodeCompiler<'a> {
             cov_fallback: false,
             tasks: None,
             functions: None,
+            function_scope_index: None,
             struct_call_fd: None,
             unpacked_structs: None,
             dpi_import_fds: None,
@@ -3608,10 +3633,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.port_aliases = Some(a);
     }
 
-    pub fn set_param_decl_types(
-        &mut self,
-        t: &'a xezim_core::shared_names::SharedNameMap<crate::ast::types::DataType>,
-    ) {
+    pub fn set_param_decl_types(&mut self, t: &'a xezim_core::decl_types::ParamDeclTypeMap) {
         self.param_decl_types = Some(t);
     }
 
@@ -3863,6 +3885,14 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_functions(&mut self, functions: &'a HashMap<String, FunctionDeclaration>) {
         self.functions = Some(functions);
+        self.function_scope_index = None;
+    }
+
+    /// Bind the index and its declaration table together. Replacing the
+    /// table through `set_functions` clears this borrowed index.
+    pub(crate) fn set_function_scope_index(&mut self, index: &'a FunctionScopeIndex<'a>) {
+        self.set_functions(index.functions);
+        self.function_scope_index = Some(index);
     }
 
     /// DPI import prototypes by SV-visible name. A compiled body may call an
@@ -3982,6 +4012,123 @@ impl<'a> BytecodeCompiler<'a> {
             | StatementKind::Wait { stmt: body, .. } => Self::stmt_declares(body),
             _ => false,
         }
+    }
+
+    /// §7.4.1: is `dt` a vector whose packed range is not `[N-1:0]` (an
+    /// ascending range, or a low bound other than 0), directly or through a
+    /// typedef? A bound that does not fold counts as one.
+    fn decl_has_offset_range(&self, dt: &crate::ast::types::DataType) -> bool {
+        use crate::ast::types::{DataType, PackedDimension};
+        let offset = |dims: &[PackedDimension]| {
+            dims.iter().any(|d| match d {
+                PackedDimension::Range { left, right, .. } => {
+                    let c =
+                        |e| crate::compiler::elaborate::const_eval_i64_with_params(e, self.params);
+                    c(right) != Some(0) || c(left).is_some_and(|l| l < 0)
+                }
+                PackedDimension::Unsized(_) => false,
+            })
+        };
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. } => {
+                    return offset(dimensions);
+                }
+                DataType::TypeReference {
+                    name, dimensions, ..
+                } => {
+                    if offset(dimensions) {
+                        return true;
+                    }
+                    match self.typedef_types.and_then(|t| t.get(&name.name.name)) {
+                        Some(next) => cur = next,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// §7.4.1, §11.5.1: does a subroutine select (`v[i]`, `v[7:4]`,
+    /// `v[i +: 2]`) one of its formals, locals or its result declared with a
+    /// packed range other than `[N-1:0]`? Such a select names the bits its
+    /// range labels, while an inlined body's select takes the label for a
+    /// raw bit position: `n[0]` of `reg [0:7] n` read bit 0. The body is not
+    /// inlined then; the interpreter places the label.
+    fn selects_offset_range_var(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        ret: Option<(&str, &crate::ast::types::DataType)>,
+        body: &[Statement],
+    ) -> bool {
+        fn decls<'s>(s: &'s Statement, out: &mut Vec<(&'s str, &'s crate::ast::types::DataType)>) {
+            match &s.kind {
+                StatementKind::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => out.extend(
+                    declarators
+                        .iter()
+                        .filter(|d| d.dimensions.is_empty())
+                        .map(|d| (d.name.name.as_str(), data_type)),
+                ),
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    stmts.iter().for_each(|s| decls(s, out))
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => {
+                    decls(then_stmt, out);
+                    if let Some(e) = else_stmt {
+                        decls(e, out);
+                    }
+                }
+                StatementKind::Case { items, .. } => {
+                    items.iter().for_each(|it| decls(&it.stmt, out))
+                }
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body } => decls(body, out),
+                _ => {}
+            }
+        }
+        let mut vars: Vec<(&str, &crate::ast::types::DataType)> = ports
+            .iter()
+            .filter(|p| p.dimensions.is_empty())
+            .map(|p| (p.name.name.as_str(), &p.data_type))
+            .chain(ret)
+            .collect();
+        body.iter().for_each(|s| decls(s, &mut vars));
+        let names: Vec<&str> = vars
+            .into_iter()
+            .filter(|(_, dt)| self.decl_has_offset_range(dt))
+            .map(|(n, _)| n)
+            .collect();
+        if names.is_empty() {
+            return false;
+        }
+        let mut sc = super::fb_scan::FbScan::new(None);
+        for s in body {
+            sc.stmt(s);
+        }
+        // The body of an instantiated module's function names its own
+        // variables instance-qualified too (`u0.n`).
+        sc.names.iter().any(|(n, flags)| {
+            flags & super::fb_scan::SEL != 0
+                && names
+                    .iter()
+                    .any(|m| n == m || n.strip_suffix(m).is_some_and(|p| p.ends_with('.')))
+        })
     }
 
     fn stmt_is_blocking(stmt: &Statement) -> bool {
@@ -4439,7 +4586,7 @@ impl<'a> BytecodeCompiler<'a> {
         // Unwrap the body, through one level of begin/end.
         let items: Vec<Statement> = match fd.items.as_slice() {
             [one] => match &one.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                StatementKind::SeqBlock { stmts, .. } => stmts.to_vec(),
                 _ => vec![one.clone()],
             },
             other => other.to_vec(),
@@ -4447,6 +4594,14 @@ impl<'a> BytecodeCompiler<'a> {
         // Nothing that suspends, and no nested calls we cannot see through.
         if items.iter().any(Self::stmt_is_blocking) {
             self.bail("Expr_Call_blocking");
+            return None;
+        }
+        if self.selects_offset_range_var(
+            &fd.ports,
+            Some((fd.name.name.name.as_str(), &fd.return_type)),
+            &items,
+        ) {
+            self.bail("Expr_Call_offset_range_select");
             return None;
         }
         let ret_is_string = self.decl_is_string(&fd.return_type, Some(&name));
@@ -5241,7 +5396,11 @@ impl<'a> BytecodeCompiler<'a> {
                         let eff_dt = if untyped
                             && let crate::ast::types::DataType::Implicit { signing, .. } = data_type
                         {
-                            Some(self.untyped_param_effective_dt(signing, d.init.as_ref(), st.span))
+                            Some(self.untyped_param_effective_dt(
+                                signing,
+                                d.init.as_deref(),
+                                st.span,
+                            ))
                         } else {
                             None
                         };
@@ -5307,6 +5466,9 @@ impl<'a> BytecodeCompiler<'a> {
         } else {
             return false;
         };
+        if self.selects_offset_range_var(&ports, None, &body) {
+            return false;
+        }
         // §13.3.1: a STATIC subroutine's variables — its locals and output
         // formals — keep their values between calls; an inline gives each
         // call fresh registers. That differs only for a variable whose value
@@ -5318,7 +5480,7 @@ impl<'a> BytecodeCompiler<'a> {
         if !matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic))
             && (ports.iter().any(|p| {
                 !matches!(p.direction, PortDirection::Input)
-                    && Self::static_local_carries(&p.name.name, &body)
+                    && Self::static_local_carries(&p.name.name, Some(&p.data_type), &body)
             }) || (body.iter().any(Self::stmt_declares) && Self::stmts_carry_static(&body)))
         {
             return false;
@@ -5646,12 +5808,17 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let items: Vec<Statement> = match fd.items.as_slice() {
             [one] => match &one.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                StatementKind::SeqBlock { stmts, .. } => stmts.to_vec(),
                 _ => vec![one.clone()],
             },
             other => other.to_vec(),
         };
         !items.iter().any(Self::stmt_is_blocking)
+            && !self.selects_offset_range_var(
+                &fd.ports,
+                Some((fd.name.name.name.as_str(), &fd.return_type)),
+                &items,
+            )
     }
 
     fn for_body_is_simple(&self, stmt: &Statement) -> bool {
@@ -5812,7 +5979,7 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::VarDecl { declarators, .. }
             | StatementKind::ParamDecl { declarators, .. } => declarators
                 .iter()
-                .all(|decl| decl.init.as_ref().map(&expr_simple).unwrap_or(true)),
+                .all(|decl| decl.init.as_deref().map(&expr_simple).unwrap_or(true)),
             StatementKind::NonblockingAssign { lvalue, rvalue, .. }
             | StatementKind::BlockingAssign { lvalue, rvalue } => {
                 // A SELF-READING array update (`ptr[i] <= ptr[i] + 1`) is
@@ -6515,7 +6682,7 @@ impl<'a> BytecodeCompiler<'a> {
                 body = Statement::new(
                     StatementKind::SeqBlock {
                         name: Some(n.clone()),
-                        stmts: vec![body],
+                        stmts: vec![body].into(),
                     },
                     stmt.span,
                 );
@@ -8447,6 +8614,9 @@ impl<'a> BytecodeCompiler<'a> {
             return hit;
         }
         let ok = self.functions.is_some_and(|f| {
+            if let Some(index) = self.function_scope_index {
+                return !index.qualified_leaves.contains(name);
+            }
             let suffix = format!(".{}", name);
             !f.keys().any(|k| k.ends_with(suffix.as_str()))
         });
@@ -9985,38 +10155,54 @@ impl<'a> BytecodeCompiler<'a> {
     /// element.
     fn declared_pattern_ctx(&mut self, lv: &Expression) -> Option<crate::ast::types::DataType> {
         use crate::compiler::packed_assignment_pattern_plan as pp;
-        let (h, elem) = match &lv.kind {
-            ExprKind::Ident(h) => (h, false),
-            ExprKind::Index { expr, .. } => match &expr.kind {
-                ExprKind::Ident(h) => (h, true),
-                _ => return None,
-            },
-            _ => return None,
+        let mut cur = lv;
+        let mut index_count = 0usize;
+        loop {
+            match &cur.kind {
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Index { expr, .. } => {
+                    index_count += 1;
+                    cur = expr;
+                }
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
         };
         if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
             return None;
         }
         let raw = Self::hier_raw_name(h);
         let scoped = self.scope_hint.as_deref().map(|sc| cat_dot(sc, &raw));
-        let (ty, w) = [scoped.as_deref(), Some(raw.as_ref())]
+        let (ty, unpacked, w) = [scoped.as_deref(), Some(raw.as_ref())]
             .into_iter()
             .flatten()
             .find_map(|n| {
                 // A port collapsed onto the net it connects takes that
                 // net's declared type (`port_aliases`, formal to actual).
                 let ty = pp::declared_type(n, self.var_decl_types?, self.port_aliases)?;
-                let w = if elem {
-                    if self.multi_dim_arrays.is_some_and(|m| m.contains(n)) {
+                let is_multi = self.multi_dim_arrays.is_some_and(|m| m.contains(n));
+                if self.arrays.contains_key(n) {
+                    if is_multi {
                         return None;
                     }
-                    self.arrays.get(n)?.2
+                    let w = self.arrays.get(n)?.2;
+                    Some((ty.clone(), 1usize, w))
                 } else {
+                    if is_multi {
+                        return None;
+                    }
                     let id = *self.signal_name_to_id.get(n)?;
-                    *self.signal_widths.get(id)?
-                };
-                Some((ty.clone(), w))
+                    let w = *self.signal_widths.get(id)?;
+                    Some((ty.clone(), 0usize, w))
+                }
             })?;
-        (pp::packed_width(&ty, &mut BcPatternTypeResolver(self)) == Some(w)).then_some(ty)
+        let packed_selects = index_count.checked_sub(unpacked)?;
+        if pp::packed_width(&ty, &mut BcPatternTypeResolver(self)) != Some(w) {
+            return None;
+        }
+        pp::peel_packed_dims(&ty, packed_selects, &mut BcPatternTypeResolver(self))
     }
 
     /// §10.8: the type of an assignment target, for the pattern `rvalue`
@@ -14148,7 +14334,7 @@ impl<'a> BytecodeCompiler<'a> {
             Statement::new(
                 StatementKind::SeqBlock {
                     name: block_name,
-                    stmts: kept,
+                    stmts: kept.into(),
                 },
                 body.span,
             )
@@ -14263,14 +14449,16 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::VarDecl {
                 lifetime,
                 declarators,
-                ..
+                data_type,
             } if !matches!(lifetime, Some(crate::ast::types::Lifetime::Automatic)) => {
                 // An initializer without an explicit `static` runs at every
                 // entry (see the interpreter's VarDecl).
                 let explicit = matches!(lifetime, Some(crate::ast::types::Lifetime::Static));
                 declarators.iter().any(|d| match &d.init {
                     Some(_) => explicit,
-                    None => Self::static_local_carries(&d.name.name, &stmts[i + 1..]),
+                    None => {
+                        Self::static_local_carries(&d.name.name, Some(data_type), &stmts[i + 1..])
+                    }
                 })
             }
             _ => false,
@@ -14309,7 +14497,7 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::VarDecl {
                 lifetime,
                 declarators,
-                ..
+                data_type,
             } => {
                 let explicit = matches!(lifetime, Some(Lifetime::Static));
                 let is_static = explicit || (!auto && lifetime.is_none());
@@ -14320,7 +14508,11 @@ impl<'a> BytecodeCompiler<'a> {
                         (explicit && d.name.name.contains('.'))
                             || match &d.init {
                                 Some(_) => explicit,
-                                None => Self::static_local_carries(&d.name.name, &stmts[i + 1..]),
+                                None => Self::static_local_carries(
+                                    &d.name.name,
+                                    Some(data_type),
+                                    &stmts[i + 1..],
+                                ),
                             }
                     })
             }
@@ -14334,8 +14526,101 @@ impl<'a> BytecodeCompiler<'a> {
     /// both arms of an `if`, every arm of a `case` with a default) before
     /// anything reads it — a loop body or a branch that writes it first
     /// only may write it — giving it a fresh value on every entry is then
-    /// unobservable. Conservative: any other first use carries.
-    pub(crate) fn static_local_carries(name: &str, rest: &[Statement]) -> bool {
+    /// unobservable. So are constant selects that, one after another and
+    /// none of them reading it, together write every bit of a vector `dt`
+    /// declares with constant bounds (`n[0] = a[7]; ... n[7] = a[0];`).
+    /// Conservative: any other first use carries.
+    pub(crate) fn static_local_carries(
+        name: &str,
+        dt: Option<&crate::ast::types::DataType>,
+        rest: &[Statement],
+    ) -> bool {
+        /// The labels of a vector not yet written by the constant selects
+        /// met so far, on the straight-line path from the declaration.
+        struct Cover {
+            /// Lowest and highest label.
+            lo: i64,
+            hi: i64,
+            /// One flag per label from `lo`: written yet.
+            done: Vec<bool>,
+            /// Labels still to write.
+            left: usize,
+        }
+        impl Cover {
+            /// §7.4.1: the labels of a vector declared with one packed
+            /// dimension of constant bounds, or of an integer atom.
+            fn of(dt: &crate::ast::types::DataType) -> Option<Cover> {
+                use crate::ast::types::{DataType, PackedDimension};
+                let (lo, hi) = match dt {
+                    DataType::IntegerVector { dimensions, .. }
+                    | DataType::Implicit { dimensions, .. } => {
+                        let [PackedDimension::Range { left, right, .. }] = dimensions.as_slice()
+                        else {
+                            return None;
+                        };
+                        let l = crate::compiler::elaborate::const_eval_i64_with_params(left, None)?;
+                        let r =
+                            crate::compiler::elaborate::const_eval_i64_with_params(right, None)?;
+                        (l.min(r), l.max(r))
+                    }
+                    DataType::IntegerAtom { .. } => {
+                        let w = crate::compiler::elaborate::resolve_type_width(dt, None, None);
+                        (0, i64::from(w) - 1)
+                    }
+                    _ => return None,
+                };
+                // A bound in the millions is no hand-written selects' work.
+                let n = usize::try_from(hi.checked_sub(lo)?.checked_add(1)?)
+                    .ok()
+                    .filter(|&n| (1..=1 << 16).contains(&n))?;
+                Some(Cover {
+                    lo,
+                    hi,
+                    done: vec![false; n],
+                    left: n,
+                })
+            }
+            /// Note labels `a..=b` written (clipped to the vector); true
+            /// once every label is.
+            fn write(&mut self, a: i64, b: i64) -> bool {
+                for l in a.min(b).max(self.lo)..=a.max(b).min(self.hi) {
+                    let slot = &mut self.done[(l - self.lo) as usize];
+                    if !*slot {
+                        *slot = true;
+                        self.left -= 1;
+                    }
+                }
+                self.left == 0
+            }
+        }
+        /// §11.5.1: the labels a select of `name` with constant bounds
+        /// writes (`n[3]`, `n[7:4]`, `n[4 +: 4]`, `n[7 -: 4]`).
+        fn const_select(name: &str, lv: &Expression) -> Option<(i64, i64)> {
+            let k =
+                |e: &Expression| crate::compiler::elaborate::const_eval_i64_with_params(e, None);
+            let (base, a, b) = match &lv.kind {
+                ExprKind::Index { expr, index } => {
+                    let i = k(index)?;
+                    (expr, i, i)
+                }
+                ExprKind::RangeSelect {
+                    expr,
+                    kind,
+                    left,
+                    right,
+                } => {
+                    let (a, n) = (k(left)?, k(right)?);
+                    match kind {
+                        RangeKind::Constant => (expr, a, n),
+                        RangeKind::IndexedUp if n > 0 => (expr, a, a.checked_add(n - 1)?),
+                        RangeKind::IndexedDown if n > 0 => (expr, a.checked_sub(n - 1)?, a),
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
+            whole(name, base).then_some((a, b))
+        }
         fn names(name: &str, f: &dyn Fn(&mut super::fb_scan::FbScan)) -> bool {
             let mut sc = super::fb_scan::FbScan::new(None);
             f(&mut sc);
@@ -14376,12 +14661,15 @@ impl<'a> BytecodeCompiler<'a> {
             if control_reads {
                 return Use::Read;
             }
-            match first_use(name, body) {
+            match first_use(name, body, None) {
                 Use::Read => Use::Read,
                 _ => Use::Maybe,
             }
         }
-        fn first_use(name: &str, s: &Statement) -> Use {
+        /// `cover`: the labels left to write, for a statement on the
+        /// straight-line path (None inside a branch or a loop, whose writes
+        /// may not run).
+        fn first_use(name: &str, s: &Statement, cover: Option<&mut Cover>) -> Use {
             let reads = |e: &Expression| names(name, &|sc| sc.expr(e));
             // Control transfers the scan refuses on their own.
             match &s.kind {
@@ -14412,14 +14700,14 @@ impl<'a> BytecodeCompiler<'a> {
                     return if control_reads(control) {
                         Use::Read
                     } else {
-                        first_use(name, stmt)
+                        first_use(name, stmt, cover)
                     };
                 }
                 StatementKind::Wait { condition, stmt } => {
                     return if reads(condition) {
                         Use::Read
                     } else {
-                        first_use(name, stmt)
+                        first_use(name, stmt, cover)
                     };
                 }
                 StatementKind::Null => return Use::None,
@@ -14432,6 +14720,17 @@ impl<'a> BytecodeCompiler<'a> {
                 StatementKind::BlockingAssign { lvalue, rvalue } => {
                     if whole(name, lvalue) && !reads(rvalue) {
                         Use::Write
+                    } else if let Some(cover) = cover
+                        && !reads(rvalue)
+                        && let Some((a, b)) = const_select(name, lvalue)
+                    {
+                        // Part of it, read by nothing yet: the whole of it
+                        // once every label is written.
+                        if cover.write(a, b) {
+                            Use::Write
+                        } else {
+                            Use::None
+                        }
                     } else {
                         Use::Read
                     }
@@ -14446,7 +14745,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if redeclares {
                         Use::Read
                     } else {
-                        seq(name, stmts)
+                        seq(name, stmts, cover)
                     }
                 }
                 StatementKind::If {
@@ -14458,9 +14757,9 @@ impl<'a> BytecodeCompiler<'a> {
                     if reads(condition) {
                         return Use::Read;
                     }
-                    let t = first_use(name, then_stmt);
+                    let t = first_use(name, then_stmt, None);
                     match else_stmt {
-                        Some(el) => branches(&[t, first_use(name, el)], true),
+                        Some(el) => branches(&[t, first_use(name, el, None)], true),
                         None => branches(&[t, Use::None], false),
                     }
                 }
@@ -14472,7 +14771,10 @@ impl<'a> BytecodeCompiler<'a> {
                     {
                         return Use::Read;
                     }
-                    let us: Vec<Use> = items.iter().map(|it| first_use(name, &it.stmt)).collect();
+                    let us: Vec<Use> = items
+                        .iter()
+                        .map(|it| first_use(name, &it.stmt, None))
+                        .collect();
                     branches(&us, items.iter().any(|it| it.is_default))
                 }
                 StatementKind::For {
@@ -14504,7 +14806,7 @@ impl<'a> BytecodeCompiler<'a> {
                     reads(array) || vars.iter().flatten().any(|v| v.name == name),
                     body,
                 ),
-                StatementKind::DoWhile { body, condition } => match first_use(name, body) {
+                StatementKind::DoWhile { body, condition } => match first_use(name, body, None) {
                     Use::Write => Use::Write,
                     Use::Read => Use::Read,
                     _ if reads(condition) => Use::Read,
@@ -14513,10 +14815,10 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => Use::Read,
             }
         }
-        fn seq(name: &str, stmts: &[Statement]) -> Use {
+        fn seq(name: &str, stmts: &[Statement], mut cover: Option<&mut Cover>) -> Use {
             let mut acc = Use::None;
             for s in stmts {
-                match first_use(name, s) {
+                match first_use(name, s, cover.as_deref_mut()) {
                     Use::None => {}
                     Use::Maybe => acc = Use::Maybe,
                     u => return u,
@@ -14524,7 +14826,8 @@ impl<'a> BytecodeCompiler<'a> {
             }
             acc
         }
-        seq(name, rest) == Use::Read
+        let mut cover = dt.and_then(Cover::of);
+        seq(name, rest, cover.as_mut()) == Use::Read
     }
 
     pub fn compile_stmt(&mut self, stmt: &Statement) -> bool {
@@ -14545,6 +14848,24 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("VarDecl_shadows_signal");
                 return false;
             }
+        }
+        // §7.4.1, §11.5.1: a block local declared with a packed range other
+        // than `[N-1:0]` is selected by its labels, which a compiled select
+        // does not place (`t[0:3]` of `reg [0:7] t` read the low nibble).
+        // Failing without a fallback keeps the whole block on the
+        // interpreter, which runs the declaration. An inlined subroutine's
+        // locals were checked when it was admitted (`selects_offset_range_var`).
+        if self.inlining_stack.is_empty()
+            && let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } = &stmt.kind
+            && declarators.iter().any(|d| d.dimensions.is_empty())
+            && self.decl_has_offset_range(data_type)
+        {
+            self.bail("VarDecl_offset_range");
+            return false;
         }
         let start = self.insns.len();
         let start_reg = self.next_reg;
@@ -15030,7 +15351,11 @@ impl<'a> BytecodeCompiler<'a> {
                     let eff_dt = if untyped
                         && let crate::ast::types::DataType::Implicit { signing, .. } = data_type
                     {
-                        Some(self.untyped_param_effective_dt(signing, decl.init.as_ref(), stmt.span))
+                        Some(self.untyped_param_effective_dt(
+                            signing,
+                            decl.init.as_deref(),
+                            stmt.span,
+                        ))
                     } else {
                         None
                     };
@@ -15738,9 +16063,15 @@ impl<'a> BytecodeCompiler<'a> {
                                 }
                             }
                         }
+                        let start = self.insns.len();
+                        let start_reg = self.next_reg;
                         if self.compile_expr(e, 0).is_some() {
                             return true;
                         }
+                        // A call can be emitted before its write-back
+                        // declines; the fallback below runs it again.
+                        self.truncate_insns(start);
+                        self.next_reg = start_reg;
                         self.bail("Expr_Call_stmt");
                         return self.emit_fallback(stmt);
                     }
@@ -16711,7 +17042,19 @@ impl<'a> BytecodeCompiler<'a> {
         {
             return self.compile_pattern(expr, ctx_width, pattern_ctx);
         }
-        let result = self.compile_expr_inner(expr, ctx_width, unsigned_context)?;
+        // §13.5.2: a call lowering can emit its call before a write-back of
+        // an output or inout actual declines it. Whatever then runs the
+        // expression in the interpreter (a statement fallback, `void'(...)`)
+        // makes the call itself, so the compiled one must not stay.
+        let call_start =
+            matches!(expr.kind, ExprKind::Call { .. }).then(|| (self.insns.len(), self.next_reg));
+        let Some(result) = self.compile_expr_inner(expr, ctx_width, unsigned_context) else {
+            if let Some((start, first_reg)) = call_start {
+                self.truncate_insns(start);
+                self.next_reg = first_reg;
+            }
+            return None;
+        };
         // §7.4.1: an element of a packed array of a named signed type
         // (`lane_t [0:8] x; x[1]`) is signed; the slice that read it is not.
         if matches!(expr.kind, ExprKind::Index { .. }) && self.packed_named_select_signed(expr) {
@@ -24112,7 +24455,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.method_string_ret_names = string_method_names.clone();
         // class-perf P2: the free-function table, for CallFreeFunction
         // lowering and string-return typing of free callees.
-        self.functions = Some(functions);
+        self.set_functions(functions);
         self.pkg_enum_consts = pkg_enum_consts.clone();
         self.static_member_names = static_member_names.clone();
         self.class_const_names = class_const_names.clone();
@@ -24242,6 +24585,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_string_ret_names.clear();
             self.pkg_enum_consts.clear();
             self.functions = None;
+            self.function_scope_index = None;
             self.dpi_import_fds = None;
             self.method_class = None;
             self.handle_member_types = None;
@@ -27274,16 +27618,7 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
         if self.0.params.is_some_and(|p| p.contains_key(name)) {
             return false;
         }
-        let span = crate::ast::Span::dummy();
-        let tn = crate::ast::types::TypeName {
-            scopes: Vec::new(),
-            name: crate::ast::Identifier {
-                name: name.to_string(),
-                span,
-            },
-            span,
-            bound: Default::default(),
-        };
+        let tn = crate::compiler::packed_assignment_pattern_plan::parse_type_name_str(name);
         self.0.typedef_type_entry(&tn, None).is_some()
     }
 

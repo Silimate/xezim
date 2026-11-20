@@ -554,3 +554,6 @@ mod sva_whole_array_sampled;
 // silimate: sampled-value functions of a whole unpacked array track its cells
 #[path = "scheduling/sva_array_sampled_fns.rs"]
 mod sva_array_sampled_fns;
+// silimate: the processes a clock edge wakes run before the slot's NBA region
+#[path = "scheduling/edge_before_slot_nba.rs"]
+mod edge_before_slot_nba;

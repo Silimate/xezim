@@ -70,14 +70,15 @@ impl Simulator {
             // `30000ps` under `timescale 1ns/1ps` must compare EQUAL to a
             // `$time` delta of 30, not 29.999999999999996 (the raw
             // secs/unit_s float residue). Computed as
-            // round(secs/prec) / 10^(unit−prec): both operands are integral
-            // f64s, so the division is exact for real timescale ratios.
+            // round(secs * 10^-prec) / 10^(unit−prec), each by an exact power
+            // of ten: a division by `10f64.powi(-15)` put `9200s` under
+            // `1ns/1fs` 2048 fs short (§3.14.1).
             // (Delay contexts route through eval_delay_ticks instead.)
             NumberLiteral::Time(s) => {
                 let (unit_exp, prec_exp) = self.current_timescale_exp();
-                let prec_s = 10f64.powi(prec_exp);
-                let ratio = 10f64.powi(unit_exp - prec_exp);
-                Value::from_f64((*s / prec_s).round() / ratio)
+                Value::from_f64(super::elaborate::time_literal_in_units(
+                    *s, unit_exp, prec_exp,
+                ))
             }
             // §5.7.1: unbased-unsized literal — a 1-bit FILL value; binary ops
             // and resize replicate it to the consuming context's width.
@@ -1775,13 +1776,86 @@ impl Simulator {
         // instance-scoped SIGNAL names (`<h>#arr[i].<m>`) that nothing
         // reads back, which is what left every element 0.
         if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-            if let Some((_, _, su)) = self
+            if let Some((handle, prop, su)) = self
                 .lvalue_root_is_unpacked_struct_prop(lvalue, true)
                 .then(|| self.class_unpacked_array_prop_of(lvalue))
                 .flatten()
             {
                 let probe0 = Self::index_expr(lvalue, 0);
                 if self.class_unpacked_elem_is_heap_owned(&probe0) {
+                    let class_name = self
+                        .heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone());
+                    let decl = class_name.and_then(|cls| {
+                        let cdef = self.module.classes.get(&cls)?;
+                        let dt = cdef.property_types.get(&prop)?.clone();
+                        let &(lo, hi, _) = cdef.array_properties.get(&prop)?;
+                        let (lo, hi) = self.inst_fixed_bounds(cdef, handle, &prop, (lo, hi));
+                        let desc = cdef
+                            .array_prop_decl_dims
+                            .get(&prop)
+                            .and_then(|d| d.first())
+                            .is_some_and(|&(l, r)| l > r);
+                        let indices: Vec<i64> = if desc {
+                            (lo..=hi).rev().collect()
+                        } else {
+                            (lo..=hi).collect()
+                        };
+                        Some((dt, indices))
+                    });
+                    if let Some((prop_dt, indices)) = decl {
+                        let outer_types: Vec<(DataType, Expression)> = items
+                            .iter()
+                            .filter_map(|it| {
+                                self.array_pattern_type_key(it)
+                                    .map(|(dt, e)| (dt, e.clone()))
+                            })
+                            .collect();
+                        let items_no_default: Vec<AssignmentPatternItem> = items
+                            .iter()
+                            .filter(|it| !matches!(it, AssignmentPatternItem::Default(_)))
+                            .cloned()
+                            .collect();
+                        let explicit_elems: Vec<bool> = self
+                            .pattern_elems_for_type(&items_no_default, &indices, &prop_dt)
+                            .into_iter()
+                            .map(|o| o.is_some())
+                            .collect();
+                        let elems: Vec<Option<Expression>> = self
+                            .pattern_elems_for_type(items, &indices, &prop_dt)
+                            .into_iter()
+                            .map(|o| o.cloned())
+                            .collect();
+                        for (k, (idx, item)) in indices.into_iter().zip(elems).enumerate() {
+                            let Some(item) = item.or_else(|| {
+                                (!outer_types.is_empty()).then(|| {
+                                    Expression::new(
+                                        ExprKind::AssignmentPattern(Vec::new()),
+                                        rvalue.span,
+                                    )
+                                })
+                            }) else {
+                                continue;
+                            };
+                            let elem = Self::index_expr(lvalue, idx);
+                            let slot_outer: &[_] = if explicit_elems.get(k).copied().unwrap_or(false)
+                            {
+                                &[]
+                            } else {
+                                &outer_types
+                            };
+                            self.assign_class_unpacked_elem_with_types(
+                                &elem,
+                                &item,
+                                &su,
+                                slot_outer,
+                            );
+                        }
+                        self.settle_after_proc_write();
+                        return;
+                    }
                     let ord: Vec<Expression> =
                         self.pattern_ordered(items).into_iter().cloned().collect();
                     if !ord.is_empty() {

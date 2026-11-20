@@ -314,9 +314,9 @@ impl Simulator {
                 (
                     n.clone(),
                     cd.is_default,
-                    cd.default_output_skew.clone(),
+                    cd.default_output_skew.as_deref().cloned(),
                     out_per_sig,
-                    cd.default_input_skew.clone(),
+                    cd.default_input_skew.as_deref().cloned(),
                     in_per_sig,
                 )
             })
@@ -331,8 +331,10 @@ impl Simulator {
             // A `#1ns` skew is an ABSOLUTE time literal (stored in seconds);
             // convert against the global tick directly — eval_delay_ticks'
             // module-timescale context isn't established at compile time.
+            // §3.14.1: by an exact power of ten (`secs / 1e-15` is not).
             if let ExprKind::Number(crate::ast::expr::NumberLiteral::Time(secs)) = &e.kind {
-                return (secs / slf.tick_s).round() as u64;
+                let ticks = super::elaborate::scale_pow10(*secs, -Self::secs_to_exp(slf.tick_s));
+                return super::elaborate::round_time_units(ticks) as u64;
             }
             // §14.4: a plain number is in the time unit of the module or
             // interface declaring the block (unlike statement delays, the
@@ -1705,7 +1707,7 @@ impl Simulator {
             let span = ib.stmt.span;
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, span)],
+                other => vec![Statement::new(other, span)].into(),
             };
             let pid = self.next_pid;
             self.next_pid += 1;
@@ -1718,7 +1720,7 @@ impl Simulator {
             }
             self.process_origin
                 .insert(pid, (span, "static initializer"));
-            self.event_queue.schedule(0, pid, stmts.into());
+            self.event_queue.schedule(0, pid, stmts.into_vec().into());
         }
         // §16.5/§16.14: declarative concurrent assertions exist before
         // Active processes run, including an initial clock's time-zero edge.
@@ -1823,10 +1825,10 @@ impl Simulator {
                     };
                     let stmts = match ib.stmt.kind {
                         StatementKind::SeqBlock { stmts, .. } => stmts,
-                        other => vec![Statement::new(other, ib.stmt.span)],
+                        other => vec![Statement::new(other, ib.stmt.span)].into(),
                     };
                     let is_blocking = stmts.iter().any(|st| self.stmt_is_blocking(st));
-                    (scope, span, block_label, is_blocking, None, Some(stmts))
+                    (scope, span, block_label, is_blocking, None, Some(stmts.into_vec()))
                 }
                 InitItem::Lazy(p) => {
                     let scope = p.scope();
@@ -1911,7 +1913,7 @@ impl Simulator {
                         let wrapped = Statement::new(
                             StatementKind::SeqBlock {
                                 name: None,
-                                stmts: stmts.clone(),
+                                stmts: stmts.clone().into(),
                             },
                             span,
                         );
@@ -1956,9 +1958,9 @@ impl Simulator {
         for ib in std::mem::take(&mut self.module.program_initial_blocks) {
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, ib.stmt.span)],
+                other => vec![Statement::new(other, ib.stmt.span)].into(),
             };
-            self.pending_reactive.push((stmts, ib.scope));
+            self.pending_reactive.push((stmts.into_vec(), ib.scope));
         }
         // The reactive region of time 0 runs at the end of the time-0 slot;
         // make sure that slot exists even when no module process starts

@@ -2412,6 +2412,10 @@ impl Simulator {
                 sub(hi);
             }
             ExprKind::SvaClocked { body, .. } => sub(body),
+            // silimate: a whole unpacked array a concurrent assertion reads is sampled
+            ExprKind::AssignmentPattern(items) => items.iter().for_each(|it| sub(it.expr())),
+            ExprKind::TypedPattern { pattern, .. } => sub(pattern),
+            // /silimate
             _ => {}
         }
     }
@@ -2676,6 +2680,16 @@ impl Simulator {
                 self.collect_sva_signal_ids(hi, out);
             }
             ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
+            // silimate: a whole unpacked array a concurrent assertion reads is sampled
+            // The operands of an assignment pattern (`m == '{a, b}`) are
+            // sampled like any other.
+            ExprKind::AssignmentPattern(items) => {
+                for it in items {
+                    self.collect_sva_signal_ids(it.expr(), out);
+                }
+            }
+            ExprKind::TypedPattern { pattern, .. } => self.collect_sva_signal_ids(pattern, out),
+            // /silimate
             _ => {}
         }
     }

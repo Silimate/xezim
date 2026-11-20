@@ -16,8 +16,8 @@ use std::process::Command;
 /// Writes `top.a` = 1 and `top.b` = 2 at time 0. `T0_WRITE` picks the
 /// callback that writes: `rw`, a cbReadWriteSynch registered from
 /// cbStartOfSimulation, or `rw2`, one registered from inside another
-/// cbReadWriteSynch, the way cocotb applies its writes. `rw2clk` is `rw2`
-/// raising `top.clk` too.
+/// cbReadWriteSynch, the way cocotb applies its writes. `rw3` adds a third
+/// level. `rw2clk` is `rw2` raising `top.clk` too.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
@@ -57,10 +57,17 @@ static PLI_INT32 outer(p_cb_data cb) {
     return 0;
 }
 
+static PLI_INT32 outer2(p_cb_data cb) {
+    (void)cb;
+    at(outer, cbReadWriteSynch);
+    return 0;
+}
+
 static PLI_INT32 start(p_cb_data cb) {
     (void)cb;
     const char *m = getenv("T0_WRITE");
-    at(m && strncmp(m, "rw2", 3) == 0 ? outer : rw, cbReadWriteSynch);
+    at(m && !strcmp(m, "rw3") ? outer2 : m && strncmp(m, "rw2", 3) == 0 ? outer : rw,
+       cbReadWriteSynch);
     return 0;
 }
 
@@ -155,7 +162,7 @@ fn time0_read_write_synch_writes_flush_deferred_reports() {
         let n = if m == "rw2clk" { 1 } else { 2 };
         all[..n].iter().map(|s| s.to_string()).collect()
     };
-    let bad: Vec<String> = ["rw", "rw2", "rw2clk"]
+    let bad: Vec<String> = ["rw", "rw2", "rw3", "rw2clk"]
         .iter()
         .map(|m| (m, run(&dir, &so, m)))
         .filter(|(m, got)| *got != want(m))

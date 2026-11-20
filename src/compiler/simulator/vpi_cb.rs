@@ -721,8 +721,11 @@ impl Simulator {
         // comes before the Reactive one. In the delta a slot-end callback
         // opened they mature once its Active region set is empty, before a
         // program or clocking waiter its clock woke runs (and may `$finish`).
+        // A callback the routine registered for this slot runs first: its
+        // writes may still flush a report.
         if self.vpi_slot_maturing
             && !self.deferred_asserts.is_empty()
+            && !self.vpi_synch_due()
             && !self.dirty_any
             && self.event_queue.next_time() != Some(self.time)
             && self.nba_fast.is_empty()

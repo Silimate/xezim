@@ -2865,7 +2865,7 @@ impl Simulator {
                 let assign = crate::ast::stmt::Statement::new(
                     crate::ast::stmt::StatementKind::BlockingAssign {
                         lvalue,
-                        rvalue: init_expr.clone(),
+                        rvalue: init_expr.as_ref().clone(),
                     },
                     d.name.span,
                 );
@@ -4536,7 +4536,7 @@ impl Simulator {
                             self.exec_statement(&Statement::new(
                                 StatementKind::NonblockingAssign {
                                     lvalue: lhs,
-                                    delay,
+                                    delay: delay.map(Box::new),
                                     rvalue: saved,
                                 },
                                 stmt.span,
@@ -4622,7 +4622,7 @@ impl Simulator {
                                 self.exec_statement(&Statement::new(
                                     StatementKind::NonblockingAssign {
                                         lvalue: target,
-                                        delay,
+                                        delay: delay.map(Box::new),
                                         rvalue: saved,
                                     },
                                     stmt.span,
@@ -4664,7 +4664,7 @@ impl Simulator {
                         self.exec_statement(&Statement::new(
                             StatementKind::NonblockingAssign {
                                 lvalue: leaf_lvalue,
-                                delay: delay_expr.clone(),
+                                delay: delay_expr.clone().map(Box::new),
                                 rvalue: saved,
                             },
                             stmt.span,
@@ -5604,7 +5604,7 @@ impl Simulator {
                     self.process_origin.insert(pid, (s.span, FORK_CHILD_ORIGIN));
                     self.inherit_fork_child_context(pid);
                     self.inherit_fork_m_scope(pid, self.current_pid, block_name.as_ref());
-                    let frame = self.fork_child_frame(s);
+                    let frame = self.fork_child_frame(s, stmts);
                     self.event_queue
                         .schedule(self.time, pid, ProcCont::from_frame(frame));
                     child_set.insert(pid);
@@ -6519,7 +6519,7 @@ impl Simulator {
                             Some((events.clone(), (**body).clone()))
                         }
                         _ if a.inferred_clock.is_some() => Some((
-                            vec![a.inferred_clock.clone().unwrap()],
+                            vec![a.inferred_clock.as_deref().unwrap().clone()],
                             resolved_expr.clone(),
                         )),
                         _ => match self.clocking_meta.get("__xz_default_clocking") {

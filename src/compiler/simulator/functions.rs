@@ -260,10 +260,10 @@ impl Simulator {
         // a stale same-named formal from an earlier call can't leak).
         // Only a formal whose declared type can name an interface (`virtual
         // x_if v`, or a typedef that may resolve to one) can carry a vif;
-        // an `int`/`bit`/`string` formal never had a key to set or clear, so
-        // the per-port format + resolve + hash was pure overhead on every
-        // call of every function.
-        let vif_formals: Vec<(&str, Option<&Expression>)> = fd
+        // an `int`/`bit`/`string` formal has no actual to resolve, so the
+        // per-port format + resolve + hash was pure overhead on every call
+        // of every function.
+        let mut vif_formals: Vec<(&str, Option<&Expression>)> = fd
             .ports
             .iter()
             .enumerate()
@@ -275,6 +275,14 @@ impl Simulator {
                 )
             })
             .collect();
+        // §13.5, §25.9: the keys are flat by name, so a caller's formal or
+        // local of the same name may have left one. A plain formal, or a
+        // variable the body declares, is this call's own and names no
+        // interface: it enters with no actual, which clears the key for the
+        // call and puts it back on return.
+        if !self.vif_local_names.is_empty() {
+            self.vif_own_names(&fd.ports, &fd.items, &mut vif_formals);
+        }
         let vif_saved = if vif_formals.is_empty() {
             Vec::new()
         } else {
@@ -2026,11 +2034,16 @@ impl Simulator {
                 }
             }
         }
-        put(
-            self.module.var_decl_types.as_map_mut(),
-            name,
-            saved.declared_type,
-        );
+        match saved.declared_type {
+            Some(ty) => {
+                self.module
+                    .var_decl_types
+                    .insert_shared(name.to_string(), ty);
+            }
+            None => {
+                self.module.var_decl_types.remove(name);
+            }
+        }
         put(
             &mut self.module.packed_struct_fields,
             name,
@@ -2064,6 +2077,34 @@ impl Simulator {
         );
         put(&mut self.var_class_types, name, saved.class_type);
         put(&mut self.var_typedef_types, name, saved.typedef_type);
+    }
+
+    /// §7.4.1/§13.5: a plain vector formal or return variable of a class
+    /// method binds without `register_formal_type_metadata`, so a range
+    /// other than `[w-1:0]` (`input logic [0:7] f`) was never recorded and
+    /// `f[0]` read and wrote bit 0, or another scope's range under the name
+    /// was used. Record the variable's own range, or drop that entry, behind
+    /// the method's metadata save (`meta_note`).
+    pub(super) fn note_plain_formal_range(&mut self, name: &str, dt: &DataType) {
+        let dims = match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }
+                if dimensions.len() == 1 =>
+            {
+                super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
+            }
+            _ => None,
+        };
+        match dims {
+            Some(d) if self.module.packed_full_dims.get(name) != Some(&d) => {
+                self.meta_note(name);
+                self.module.packed_full_dims.insert(name.to_string(), d);
+            }
+            None if self.module.packed_full_dims.contains_key(name) => {
+                self.meta_note(name);
+                self.module.packed_full_dims.remove(name);
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn register_formal_type_metadata(
@@ -2472,7 +2513,7 @@ impl Simulator {
                 }
             })
             .collect();
-        let saved_vif_formals: Vec<_> = td
+        let mut saved_vif_formals: Vec<_> = td
             .ports
             .iter()
             .enumerate()
@@ -2485,6 +2526,22 @@ impl Simulator {
                 (key, prior)
             })
             .collect();
+        // §13.5, §25.9: a plain formal, or a variable the body declares, is
+        // this call's own and names no interface; a caller's same-named
+        // formal or local may have left a key under its name (the keys are
+        // flat by name). Cleared for the call; the cleanup puts back what was
+        // saved above, and saves the body's variables here.
+        if !self.vif_local_names.is_empty() {
+            let mut own: Vec<(&str, Option<&Expression>)> = Vec::new();
+            self.vif_own_names(&td.ports, &td.items, &mut own);
+            for (name, _) in own {
+                let key = format!("__vif_local__{}", name);
+                let prior = self.signals.remove(&key);
+                if !td.ports.iter().any(|p| p.name.name == name) {
+                    saved_vif_formals.push((key, prior));
+                }
+            }
+        }
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
         // a stale same-named formal from an earlier call can't leak).

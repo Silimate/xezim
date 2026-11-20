@@ -753,6 +753,11 @@ impl Simulator {
                 }
             }
         }
+        // silimate: sampled-value functions of a whole unpacked array track its cells
+        // The watch's operand: a whole array's is the concatenation of its
+        // cells, read the same way off the clock's tick.
+        let operand = self.sampled_watches[widx].expr.clone();
+        // /silimate
         Some(self.sampled_cur_and_past(widx, &operand, n))
     }
 

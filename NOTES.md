@@ -67,6 +67,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   unpacked-array operand (§16.9.3). `$stable(mem)` had always held,
   `$changed(mem)` never had, and `mem == $past(mem)` compared against a
   constant. (#435)
+* A concurrent assertion that an `always` procedure reaches after a delay or
+  an event control starts an attempt at its clock's next tick, and a
+  deferred assertion there reports (§16.14.6, §16.4.2). The process had
+  dropped its pending instances each time it carried on in the same time
+  step, including when it looped back to its event control, and an instance
+  first queued after a delay attempted at once, outside any clock tick.
+  (#450)
 * `$dumpvars(0, tb_top.u)` called from another top-level module dumps
   `tb_top.u` and everything below it; the argument was ignored and the dump
   selected nothing. The same holds for a generate-block instance, a variable

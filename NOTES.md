@@ -10,12 +10,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
-* An `always_comb` or `always @*` block woken by another process's blocking
-  writes runs once that process suspends, after the continuous assignments it
-  reads have been updated, as the continuous assignments themselves already
-  did (§4.5, §9.2.2.2). It ran after each write instead, seeing values that
-  never coexist (the first write new, the second and the assignment's output
-  old), so an immediate assertion in it failed up to twice per time step.
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

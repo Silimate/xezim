@@ -2273,6 +2273,11 @@ pub struct BytecodeCompiler<'a> {
     /// a string no fixed width, so they are never resized to a context and
     /// compare by text.
     local_coll_strings: HashSet<String>,
+    // silimate: an element read of a method-local queue or dynamic array has its element's width
+    /// The element width of each `local_coll_names` entry with a fixed-width
+    /// element (`int q[$]`: 32), for sizing an element read as an operand.
+    local_coll_widths: HashMap<String, u32>,
+    // /silimate
     /// §10.8: the type an untyped assignment pattern takes, installed right
     /// before compiling an assignment-like source (an assignment RHS, an
     /// inlined formal's actual, a return value). `compile_expr_typed` takes
@@ -2539,6 +2544,9 @@ impl<'a> BytecodeCompiler<'a> {
             local_array_regs: HashMap::default(),
             local_coll_names: HashSet::default(),
             local_coll_strings: HashSet::default(),
+            // silimate: an element read of a method-local queue or dynamic array has its element's width
+            local_coll_widths: HashMap::default(),
+            // /silimate
             top_module_name: None,
             packed_elem_widths: None,
             assoc_elem_widths: None,
@@ -5023,6 +5031,9 @@ impl<'a> BytecodeCompiler<'a> {
                     Arc::from("VarDecl_local_coll"),
                 ))));
                 self.local_coll_names.insert(decl.name.name.clone());
+                // silimate: an element read of a method-local queue or dynamic array has its element's width
+                self.note_local_coll_width(&decl.name.name, data_type);
+                // /silimate
                 // §6.16: `typedef string q_t[$]` elements are
                 // strings, as a `string q[$]` local's are.
                 if self.typedef_coll_strings.contains(&type_name_key(tn)) {
@@ -5055,6 +5066,9 @@ impl<'a> BytecodeCompiler<'a> {
                     Arc::from("VarDecl_local_coll"),
                 ))));
                 self.local_coll_names.insert(decl.name.name.clone());
+                // silimate: an element read of a method-local queue or dynamic array has its element's width
+                self.note_local_coll_width(&decl.name.name, data_type);
+                // /silimate
                 if Self::dt_is_string(data_type) {
                     self.local_coll_strings.insert(decl.name.name.clone());
                 } else {
@@ -23866,6 +23880,31 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    // silimate: an element read of a method-local queue or dynamic array has its element's width
+    /// Record the element width of local collection `name` declared with
+    /// `dt`; a string or unsized element records none.
+    fn note_local_coll_width(&mut self, name: &str, dt: &crate::ast::types::DataType) {
+        let w = if Self::dt_is_string(dt) { 0 } else { self.decl_width(dt) };
+        if w > 0 {
+            self.local_coll_widths.insert(name.to_string(), w);
+        } else {
+            self.local_coll_widths.remove(name);
+        }
+    }
+
+    /// The element width of the method-local collection `hier` names.
+    fn local_coll_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
+        if hier.root.is_some() || hier.path.len() != 1 || !hier.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = hier.path[0].name.name.as_str();
+        if !self.local_coll_names.contains(name) {
+            return None;
+        }
+        self.local_coll_widths.get(name).copied()
+    }
+    // /silimate
+
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         if let Some(q) = self.own_pkg_qualified(expr) {
             return self.expr_max_width(&q);
@@ -24063,6 +24102,17 @@ impl<'a> BytecodeCompiler<'a> {
                 // once its enclosing block compiled. The sibling of the
                 // `expr_max_width returned 1 for every index select` bug fixed
                 // in the simulator earlier — same disease, other table.
+                // silimate: an element read of a method-local queue or dynamic array has its element's width
+                // A method-local queue or dynamic array (`int a[]`, read as
+                // `a[i]`) is in none of the tables below, so its element read
+                // sized at 1 bit, and a compare of two of them (`a[0] ==
+                // a[1]`, a sort's `a[j] > a[j+1]`) resized both to their
+                // LSBs first. Looked up first: the local shadows a module
+                // array of the same name.
+                ExprKind::Ident(hier) if self.local_coll_width_of(hier).is_some() => {
+                    self.local_coll_width_of(hier).unwrap_or(1)
+                }
+                // /silimate
                 ExprKind::Ident(hier) => self
                     .packed_elem_width_of(hier)
                     .or_else(|| {

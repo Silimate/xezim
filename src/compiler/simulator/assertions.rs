@@ -2011,6 +2011,12 @@ impl Simulator {
         }
         let mut var_sels = Vec::new();
         for mut e in sels {
+            // silimate: a whole unpacked array a concurrent assertion reads is sampled
+            if matches!(e.kind, ExprKind::Ident(_)) {
+                self.sva_all_cells(&e, &mut sampled_ids);
+                continue;
+            }
+            // /silimate
             match Self::sva_sel_kind(&e) {
                 Some(true) => {
                     self.sva_cells(&e, &mut sampled_ids);
@@ -2324,15 +2330,22 @@ impl Simulator {
             e.kind,
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
         );
-        if chain
-            && Self::sva_sel_root(e).is_some_and(|h| {
-                let n = self.resolve_hier_name(h);
-                self.array_first_id.contains_key(n.as_ref())
-                    || self.module.arrays.contains_key(n.as_ref())
-                    || self.module.arrays_2d.contains_key(n.as_ref())
-                    || self.module.arrays_nd.contains_key(n.as_ref())
-            })
-        {
+        let array = Self::sva_sel_root(e).is_some_and(|h| {
+            let n = self.resolve_hier_name(h);
+            self.array_first_id.contains_key(n.as_ref())
+                || self.module.arrays.contains_key(n.as_ref())
+                || self.module.arrays_2d.contains_key(n.as_ref())
+                || self.module.arrays_nd.contains_key(n.as_ref())
+        });
+        // silimate: a whole unpacked array a concurrent assertion reads is sampled
+        // §16.5.1: the whole array (`v inside {m}`, `m == '{default: 0}`)
+        // reads every cell, each at its sampled value.
+        if array && matches!(e.kind, ExprKind::Ident(_)) {
+            out.push(e.clone());
+            return;
+        }
+        // /silimate
+        if chain && array {
             out.push(e.clone());
             let mut cur = e;
             loop {

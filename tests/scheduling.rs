@@ -545,3 +545,6 @@ mod intra_delay_array_items;
 mod review_intra_delay_array_items;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
+// silimate: a whole unpacked array a concurrent assertion reads is sampled
+#[path = "scheduling/sva_whole_array_sampled.rs"]
+mod sva_whole_array_sampled;

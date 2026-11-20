@@ -1552,9 +1552,9 @@ impl Simulator {
             Self::rename_instance_locals(&mut ib.stmt, &ib.scope);
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, ib.stmt.span)],
+                other => vec![Statement::new(other, ib.stmt.span)].into(),
             };
-            self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
+            self.run_process_stmts(pid, &ProcCont::from_vec(stmts.into_vec()));
         } else {
             self.run_process_stmts(pid, stmts);
         }
@@ -1585,13 +1585,7 @@ impl Simulator {
         } else {
             v.to_u64().unwrap_or(0) as f64
         };
-        if precision_diff > 0 {
-            let q = 10f64.powi(precision_diff);
-            let x = (raw / q) * (1.0 + 1e-12);
-            (x.round() * q).round() as u64
-        } else {
-            raw.round() as u64
-        }
+        Self::quantize_delay_ticks(raw, precision_diff)
     }
 
     /// Roadmap step 13 (XEZIM_AOT=1): compile every process FSM body that
@@ -2445,12 +2439,23 @@ impl Simulator {
         // elaborator pre-scales by the module unit), so quantize to the
         // module-precision-per-tick grid. The grid ratio comes from EXPONENT
         // arithmetic (10^n is exact in f64 for small n; dividing seconds
-        // values is not), and a 1-ulp relative nudge keeps a half-grid delay
+        // values is not), and `round_time_units` keeps a half-grid delay
         // that arrived as x.49999999999996 from rounding the wrong way.
+        Self::quantize_delay_ticks(raw, precision_diff)
+    }
+
+    /// §3.14.1: `raw` global ticks rounded to the running scope's precision,
+    /// 10^`precision_diff` ticks. A count of 2^52 or more is a whole number
+    /// already: the relative nudge used before, `x * (1 + 1e-12)`, moved
+    /// `#9200s` under a 1 ps precision with a 1 fs tick by 9.2 ns.
+    #[inline]
+    pub(super) fn quantize_delay_ticks(raw: f64, precision_diff: i32) -> u64 {
+        use super::elaborate::{round_time_units, scale_pow10};
         if precision_diff > 0 {
-            let q = 10f64.powi(precision_diff);
-            let x = (raw / q) * (1.0 + 1e-12);
-            (x.round() * q).round() as u64
+            scale_pow10(
+                round_time_units(scale_pow10(raw, -precision_diff)),
+                precision_diff,
+            ) as u64
         } else {
             raw.round() as u64
         }
@@ -2709,20 +2714,92 @@ impl Simulator {
                 )
             }
             _ => {
+                // §10.9.1: an array matched to a sub-array (`'{wc, wc}`)
+                // supplies its elements, read now.
+                // A target whose shape is not known here (a class property,
+                // a member path) takes an array item the same way: an
+                // unpacked array is only ever matched to a sub-array.
+                if !matches!(
+                    shape,
+                    Some(
+                        super::intra_pattern_shape::ItemShape::Leaf(_)
+                            | super::intra_pattern_shape::ItemShape::Struct(_)
+                    )
+                ) && let Some(elems) = self.array_item_elements(e)
+                {
+                    // `[1][0]` or, for an element that is an unpacked
+                    // struct, `[1].a`: one path step per dimension or member,
+                    // in declared order, so the steps nest positionally.
+                    let rows = elems
+                        .into_iter()
+                        .map(|(suffix, v)| {
+                            let path = suffix
+                                .split(['[', '.'])
+                                .filter(|c| !c.is_empty())
+                                .map(|c| c.trim_end_matches(']').to_string())
+                                .collect();
+                            (path, v)
+                        })
+                        .collect();
+                    return self.kept_element_pattern(rows, e.span, slots);
+                }
                 let val = self.intra_item_value(shape, e);
-                let idx = self.intra_saved_next;
-                self.intra_saved_next += 1;
-                self.intra_saved.insert(idx, val);
-                slots.push(idx);
-                Expression::new(
-                    ExprKind::SystemCall {
-                        name: INTRA_KEPT_MARKER.to_string(),
-                        args: vec![Self::intra_slot_literal(idx, e.span)],
-                    },
-                    e.span,
-                )
+                self.kept_item(val, e.span, slots)
             }
         }
+    }
+
+    /// A captured value as an item of the pattern the delayed store runs.
+    fn kept_item(
+        &mut self,
+        val: Value,
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let idx = self.intra_saved_next;
+        self.intra_saved_next += 1;
+        self.intra_saved.insert(idx, val);
+        slots.push(idx);
+        Expression::new(
+            ExprKind::SystemCall {
+                name: INTRA_KEPT_MARKER.to_string(),
+                args: vec![Self::intra_slot_literal(idx, span)],
+            },
+            span,
+        )
+    }
+
+    /// Captured array elements, each with its index path, as a pattern
+    /// nested by dimension in declared order.
+    fn kept_element_pattern(
+        &mut self,
+        rows: Vec<(Vec<String>, Value)>,
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let mut items = Vec::new();
+        let mut rows = rows.into_iter().peekable();
+        while let Some((mut path, v)) = rows.next() {
+            if path.len() <= 1 {
+                items.push(AssignmentPatternItem::Ordered(
+                    self.kept_item(v, span, slots),
+                ));
+                continue;
+            }
+            let head = path.remove(0);
+            let mut group = vec![(path, v)];
+            while rows.peek().is_some_and(|(p, _)| p.first() == Some(&head)) {
+                let Some((mut p, v)) = rows.next() else {
+                    break;
+                };
+                p.remove(0);
+                group.push((p, v));
+            }
+            items.push(AssignmentPatternItem::Ordered(
+                self.kept_element_pattern(group, span, slots),
+            ));
+        }
+        Expression::new(ExprKind::AssignmentPattern(items), span)
     }
 
     pub(super) fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
@@ -3813,7 +3890,10 @@ impl Simulator {
                                         );
                                     } else {
                                         // Preserve first-call lifetimes and checkpoint numbering.
-                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        let mut cont: Vec<Statement> =
+                                            crate::ast::cache::with_fresh_scope_caches(|| {
+                                                td.items.to_vec()
+                                            });
                                         cont.push(Statement::new(
                                             StatementKind::ScopePop,
                                             stmt.span,
@@ -3848,7 +3928,8 @@ impl Simulator {
                             // bare free-task arm above (Stage 1).
                             self.push_instance_task_context(&mut cleanup);
                             self.task_cleanup.push(cleanup);
-                            let mut cont: Vec<Statement> = td.items.to_vec();
+                            let mut cont: Vec<Statement> =
+                                crate::ast::cache::with_fresh_scope_caches(|| td.items.to_vec());
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                             self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                             return;
@@ -3895,7 +3976,10 @@ impl Simulator {
                                         );
                                     } else {
                                         // Preserve first-call lifetimes and checkpoint numbering.
-                                        let mut cont: Vec<Statement> = td.items.to_vec();
+                                        let mut cont: Vec<Statement> =
+                                            crate::ast::cache::with_fresh_scope_caches(|| {
+                                                td.items.to_vec()
+                                            });
                                         cont.push(Statement::new(
                                             StatementKind::ScopePop,
                                             stmt.span,
@@ -5525,7 +5609,7 @@ impl Simulator {
                         let while_body = Statement::new(
                             StatementKind::SeqBlock {
                                 name: None,
-                                stmts: body_stmts,
+                                stmts: body_stmts.into(),
                             },
                             stmt.span,
                         );

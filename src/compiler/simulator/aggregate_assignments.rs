@@ -3811,6 +3811,66 @@ impl Simulator {
         Some(RET_SNAP.to_string())
     }
 
+    /// §7.6, §7.4.6: copy the row in the return store `src` (zero-based) to a
+    /// part of an unpacked array that `assign_pending_ret_collection` does not
+    /// take: a slice (`d[1:2]`) or a row of a fixed multi-dimensional array
+    /// (`m[1]`), pairing elements left to right. False, with nothing
+    /// written, when `lvalue` is neither or the element counts differ.
+    pub(super) fn copy_ret_row_to_part(&mut self, lvalue: &Expression, src: &str) -> bool {
+        let targets: Vec<Expression> = match &lvalue.kind {
+            ExprKind::RangeSelect {
+                expr,
+                kind: crate::ast::expr::RangeKind::Constant,
+                left,
+                right,
+            } if self.fixed_array_operand(expr).is_some() => {
+                let (l, r) = (self.eval_expr(left), self.eval_expr(right));
+                let (Some(l), Some(r)) = (
+                    l.to_i64().filter(|_| !l.has_xz()),
+                    r.to_i64().filter(|_| !r.has_xz()),
+                ) else {
+                    return false;
+                };
+                let idx: Vec<i64> = if l <= r {
+                    (l..=r).collect()
+                } else {
+                    (r..=l).rev().collect()
+                };
+                idx.into_iter()
+                    .map(|i| {
+                        Expression::new(
+                            ExprKind::Index {
+                                expr: expr.clone(),
+                                index: Box::new(
+                                    self.value_method_arg_expr(&Self::signed_loop_val(i)),
+                                ),
+                            },
+                            lvalue.span,
+                        )
+                    })
+                    .collect()
+            }
+            ExprKind::Index { .. } => match self.unpacked_row_suffixes(lvalue) {
+                Some(sfx) => sfx
+                    .iter()
+                    .map(|s| Self::append_leaf_path(lvalue, s))
+                    .collect(),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if targets.len() as u64 != self.get_queue_size(src) {
+            return false;
+        }
+        for (k, t) in targets.iter().enumerate() {
+            let v = self
+                .get_signal_value_by_name(&format!("{src}[{k}]"))
+                .unwrap_or_else(|| Value::zero(32));
+            self.assign_value(t, &v);
+        }
+        true
+    }
+
     /// Whether `e` is a pop that [`Self::pop_row_operand`] returns a row for.
     /// Nothing is evaluated.
     pub(super) fn is_pop_row_call(&mut self, e: &Expression) -> bool {
@@ -3844,10 +3904,15 @@ impl Simulator {
             return None;
         }
         if self.module.dynamic_arrays.contains(&obj) {
-            Some((obj, mname))
-        } else {
-            None
+            return Some((obj, mname));
         }
+        // A subroutine-local queue named in the two-segment form is stored
+        // under its per-call key (`@q#3`), which the pop itself resolves to.
+        let local = self.dyn_name_lookup(&obj)?;
+        self.module
+            .dynamic_arrays
+            .contains(local)
+            .then(|| (local.to_string(), mname))
     }
 
     /// Whether `name` is a row of a declared collection whose row kind is a

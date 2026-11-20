@@ -2101,8 +2101,10 @@ impl Simulator {
         // §7.10.2.4, §7.10.2.5: `r = q.pop_front()` on a queue of fixed-size
         // rows copies the removed row, as from a call returning an array.
         if let Some(src) = self.pop_row_operand(rvalue) {
-            self.pending_ret_collection = Some(src);
+            self.pending_ret_collection = Some(src.clone());
             if !self.assign_pending_ret_collection(lvalue) {
+                // A slice or a row of a fixed array takes it element-wise.
+                self.copy_ret_row_to_part(lvalue, &src);
                 self.settle_after_proc_write();
             }
             return;

@@ -124,3 +124,52 @@ endmodule
         ]
     );
 }
+
+/// A popped row assigned to a slice and to a row of a 2-D array, pairing
+/// left to right (§7.6, §7.4.6), and pops of a subroutine's own queue that
+/// hides a module queue of the same name (§13.3). As above, Verilator 5.046
+/// is no reference for these forms.
+#[test]
+fn popped_row_into_a_slice_or_a_row_and_from_a_local_queue() {
+    let lines = run(r#"
+module tb;
+  typedef int pair_t[2];
+  pair_t q[$];
+  int dst[4];
+  int m[2][2];
+  function automatic pair_t lpop();
+    pair_t q[$];
+    q.push_back('{21, 22});
+    q.push_back('{23, 24});
+    return q.pop_front();
+  endfunction
+  task automatic tpop();
+    pair_t q[$];
+    q.push_back('{31, 32});
+    $display("R t %p n=%0d", q.pop_back(), q.size());
+  endtask
+  initial begin
+    q.push_back('{1, 2});
+    q.push_back('{3, 4});
+    q.push_back('{5, 6});
+    dst[1:2] = q.pop_front();
+    $display("R dst=%p n=%0d", dst, q.size());
+    m[1] = q.pop_back();
+    $display("R m=%p n=%0d", m, q.size());
+    $display("R l %p n=%0d", lpop(), q.size());
+    tpop();
+    $display("R q=%p", q);
+  end
+endmodule
+"#);
+    assert_eq!(
+        lines,
+        [
+            "R dst='{0, 1, 2, 0} n=2",
+            "R m='{'{0, 0}, '{5, 6}} n=1",
+            "R l '{21, 22} n=1",
+            "R t '{31, 32} n=0",
+            "R q='{'{3, 4}}",
+        ]
+    );
+}

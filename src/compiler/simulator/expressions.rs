@@ -1380,12 +1380,19 @@ impl Simulator {
     /// `None` for any other name, and when the flat key does name storage: a
     /// generate block or instance-array element (`$root.top.g[1].x`) is a
     /// scope whose constant index is part of the key.
+    ///
+    /// The chain's readers may look its selects up more than once. A select
+    /// with a side effect (`objs[i++]`, `objs[next()]`) is therefore made a
+    /// literal: for a `read`, of its value, evaluated here once, left to
+    /// right (§11.4.2, §13.4.1); for sizing, of 0, without evaluating it,
+    /// since every element of the collection has the same declared type.
     #[cold]
     #[inline(never)]
     pub(super) fn root_member_select_chain(
-        &self,
+        &mut self,
         h: &HierarchicalIdentifier,
         span: crate::ast::Span,
+        read: bool,
     ) -> Option<Expression> {
         let (_, inner) = h.path.split_last()?;
         if h.path.len() < 3
@@ -1404,17 +1411,33 @@ impl Simulator {
         base.cached_resolved_name = crate::ast::cache::NameCache::new();
         base.bound = crate::ast::binding::Bound::UNSET;
         let mut chain = Expression::new(ExprKind::Ident(base), span);
-        let index = |chain: Expression, sel: &Expression| {
+        let index = |me: &mut Self, chain: Expression, sel: &Expression| {
+            let sel = if Self::cond_expr_is_effect_free(sel, false) {
+                sel.clone()
+            } else if read {
+                me.capture_index_literal(sel, &chain)
+            } else {
+                Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: true,
+                        base: NumberBase::Decimal,
+                        value: "0".to_string(),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
+                    }),
+                    sel.span,
+                )
+            };
             Expression::new(
                 ExprKind::Index {
                     expr: Box::new(chain),
-                    index: Box::new(sel.clone()),
+                    index: Box::new(sel),
                 },
                 span,
             )
         };
         for sel in &selects {
-            chain = index(chain, sel);
+            chain = index(self, chain, sel);
         }
         for seg in &rest {
             chain = Expression::new(
@@ -1425,7 +1448,7 @@ impl Simulator {
                 span,
             );
             for sel in &seg.selects {
-                chain = index(chain, sel);
+                chain = index(self, chain, sel);
             }
         }
         Some(chain)
@@ -2520,7 +2543,7 @@ impl Simulator {
                 // relative name's select chain.
                 if h.path.len() >= 3
                     && h.path[0].name.name == "$root"
-                    && let Some(chain) = self.root_member_select_chain(h, expr.span)
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span, true)
                 {
                     return self.eval_expr_ctx_inner(&chain, ctx_width, unsigned_context);
                 }

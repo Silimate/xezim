@@ -605,7 +605,7 @@ impl Simulator {
                 // §23.6: sized as the select chain it reads as.
                 if h.path.len() >= 3
                     && h.path[0].name.name == "$root"
-                    && let Some(chain) = self.root_member_select_chain(h, expr.span)
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span, false)
                 {
                     return self.lrm_self_width(&chain);
                 }
@@ -1554,7 +1554,7 @@ impl Simulator {
             // §23.6: a `$root` name that reads as a select chain is sized by
             // reading it, once, as the chain's member read is.
             ExprKind::Ident(h) if h.path.len() >= 3 && h.path[0].name.name == "$root" => {
-                self.root_member_select_chain(h, expr.span).is_some()
+                self.root_member_select_chain(h, expr.span, false).is_some()
             }
             ExprKind::Ident(_)
             | ExprKind::Number(NumberLiteral::Integer { .. })
@@ -1612,7 +1612,7 @@ impl Simulator {
                 // §23.6: sized as the select chain it reads as.
                 if h.path.len() >= 3
                     && h.path[0].name.name == "$root"
-                    && let Some(chain) = self.root_member_select_chain(h, expr.span)
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span, false)
                 {
                     return (self.infer_width_walk(&chain).0, false);
                 }

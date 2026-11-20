@@ -1381,11 +1381,13 @@ impl Simulator {
     /// generate block or instance-array element (`$root.top.g[1].x`) is a
     /// scope whose constant index is part of the key.
     ///
-    /// The chain's readers may look its selects up more than once. A select
-    /// with a side effect (`objs[i++]`, `objs[next()]`) is therefore made a
-    /// literal: for a `read`, of its value, evaluated here once, left to
-    /// right (§11.4.2, §13.4.1); for sizing, of 0, without evaluating it,
-    /// since every element of the collection has the same declared type.
+    /// The chain's readers may look its selects up more than once. For a
+    /// `read`, a select with a side effect (`objs[i++]`, `objs[next()]`) is
+    /// made a literal of its value, evaluated here once, left to right
+    /// (§11.4.2, §13.4.1). For sizing such a name, no select is evaluated:
+    /// the chain is a literal as wide as the member's declared type (see
+    /// `root_member_declared_width`), or, when that is not known, the chain
+    /// with each such select made 0 (every element has the same type).
     #[cold]
     #[inline(never)]
     pub(super) fn root_member_select_chain(
@@ -1410,6 +1412,25 @@ impl Simulator {
         base.cached_signal_id = crate::ast::cache::SignalCache::new(None);
         base.cached_resolved_name = crate::ast::cache::NameCache::new();
         base.bound = crate::ast::binding::Bound::UNSET;
+        if !read
+            && h.path.iter().any(|s| {
+                s.selects
+                    .iter()
+                    .any(|e| !Self::cond_expr_is_effect_free(e, false))
+            })
+            && let Some(w) = self.root_member_declared_width(&base, &rest)
+        {
+            return Some(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(w),
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: "0".to_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            ));
+        }
         let mut chain = Expression::new(ExprKind::Ident(base), span);
         let index = |me: &mut Self, chain: Expression, sel: &Expression| {
             let sel = if Self::cond_expr_is_effect_free(sel, false) {
@@ -1452,6 +1473,49 @@ impl Simulator {
             }
         }
         Some(chain)
+    }
+
+    /// The declared width of the member `rest` names below an element of the
+    /// collection `base` (`objs` of `$root.tb.objs[k].v`, with `rest` the
+    /// segments from `v`), walked from the collection's declared element type
+    /// through struct members and class properties (§7.2, §8.4). No element
+    /// is read, so a null handle at some index does not hide the width.
+    /// `None` when a later segment selects, or the walk meets another type.
+    fn root_member_declared_width(
+        &self,
+        base: &HierarchicalIdentifier,
+        rest: &[crate::ast::expr::HierPathSegment],
+    ) -> Option<u32> {
+        if rest.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.resolve_hier_name(base);
+        let mut dt = self.module.var_decl_types.get(name.as_ref())?.clone();
+        for seg in rest {
+            let member = seg.name.name.as_str();
+            dt = match self.resolve_dt_ref(&dt) {
+                DataType::Struct(su) => su
+                    .members
+                    .iter()
+                    .find(|m| m.declarators.iter().any(|d| d.name.name == member))?
+                    .data_type
+                    .clone(),
+                DataType::TypeReference { name, .. }
+                    if self.module.classes.contains_key(&name.name.name) =>
+                {
+                    let owners = self.prop_owners(&name.name.name);
+                    let (_, cd) = owners.get(member)?;
+                    cd.property_types.get(member)?.clone()
+                }
+                _ => return None,
+            };
+        }
+        let w = super::elaborate::resolve_type_width(
+            &dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        (w > 0).then_some(w)
     }
 
     /// Read fast path for a select-free single-segment identifier: the frame

@@ -332,6 +332,8 @@ mod compiled_method_string_loop;
 mod compiled_method_super;
 #[path = "classes/compiled_method_tiering.rs"]
 mod compiled_method_tiering;
+#[path = "classes/compiled_method_writeback_actual_once.rs"]
+mod compiled_method_writeback_actual_once;
 #[path = "classes/constraint_algebra_inherit.rs"]
 mod constraint_algebra_inherit;
 #[path = "classes/constraint_array_sum.rs"]
@@ -1343,3 +1345,9 @@ mod subroutine_actual_width_1256;
 mod packed_member_foreach_1192;
 #[path = "classes/unpacked_struct_packed_member_1192.rs"]
 mod unpacked_struct_packed_member_1192;
+#[path = "classes/vif_formal_name_clash_1297.rs"]
+mod vif_formal_name_clash_1297;
+#[path = "classes/review_writeback_actual_forms.rs"]
+mod review_writeback_actual_forms;
+#[path = "classes/class_constraint_sharing_721.rs"]
+mod class_constraint_sharing_721;

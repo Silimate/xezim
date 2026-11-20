@@ -36,6 +36,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   settled values (§4.5, §9.2.2.2). Inside a carry chain that the settle
   orders as a cycle, it had run once per carry step and asserted on
   intermediate sums. (#433)
+* The processes a clock edge wakes run before the slot's NBA region
+  (§4.4.2, §4.5). A testbench process that resumed from a delay at the
+  edge's time and wrote with `<=` (`#20 x <= v;` landing on a posedge), or
+  an intra-assignment delay maturing then, had its value seen by that
+  edge's flops and waiters, so a DUT captured its input one cycle early.
+  (#436)
+* `wait (c) @(posedge clk);` resumes the process at the edge after `c`
+  holds (§9.7.4). The event control the `wait` guards had been run where it
+  could not suspend, so the process never resumed. (#437)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

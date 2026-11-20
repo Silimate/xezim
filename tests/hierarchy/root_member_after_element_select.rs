@@ -214,6 +214,58 @@ endmodule
     );
 }
 
+/// §11.4.2, §13.4.1: an element select with a side effect is evaluated once
+/// per read of the name, also while the read's width is worked out.
+#[test]
+fn root_member_evaluates_a_side_effect_select_once() {
+    let lines = run(r#"
+module tb;
+  class C;
+    int v;
+    function new(int x);
+      v = x;
+    endfunction
+  endclass
+  typedef struct packed { logic [11:0] a; logic [3:0] b; } s_t;
+  C objs[$];
+  C c;
+  s_t qs[$];
+  int i, r, calls;
+  bit b;
+  function int next();
+    calls++;
+    return calls;
+  endfunction
+  initial begin
+    for (int k = 0; k < 6; k++) begin
+      c = new(k + 1);
+      objs.push_back(c);
+      qs.push_back({12'(k + 1), 4'h0});
+    end
+    i = 0; b = $root.tb.objs[i++].v == 1; $display("R a %0d i=%0d", b, i);
+    i = 0; r = $root.tb.objs[i++].v + 8'h1; $display("R b %0d i=%0d", r, i);
+    i = 0; $display("R c %0d", $root.tb.objs[i++].v + (8'h80 << 1'b1)); $display("R c i=%0d", i);
+    i = 0; b = $root.tb.qs[i++].a == 1; $display("R d %0d i=%0d", b, i);
+    i = 0; $display("R e %0d", $root.tb.qs[i++].a + (8'h80 << 1'b1)); $display("R e i=%0d", i);
+    calls = 0; r = $root.tb.objs[next()].v; $display("R f %0d calls=%0d", r, calls);
+  end
+endmodule
+"#);
+    assert_eq!(
+        lines,
+        [
+            "R a 1 i=1",
+            "R b 2 i=1",
+            "R c 257",
+            "R c i=1",
+            "R d 1 i=1",
+            "R e 257",
+            "R e i=1",
+            "R f 2 calls=1",
+        ]
+    );
+}
+
 #[test]
 fn root_names_through_generate_blocks_and_instance_arrays() {
     let lines = run(r#"

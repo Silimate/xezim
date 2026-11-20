@@ -392,6 +392,26 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   through a queue of packed structs) reads and sizes like the same name
   without `$root` (§23.6). It read 0, and in an expression it counted as one
   bit wide. (#425)
+* An event control on a member of an element of an unpacked array of packed
+  structs (`@(sa[1].a)`, also inside a larger expression such as
+  `@(sa[1].a ^ b)`) waits on that member's value (§9.4.2, §7.2.1). It watched
+  nothing: a procedural wait never woke (in a task with an automatic index it
+  returned at once), and an `always` block missed changes or woke on every
+  change of the element. (#439)
+* A whole row written to one row of an array whose rows are fixed-size
+  arrays is stored element by element: a brace concatenation to a row of a
+  2-D array (`m[1] = {3, 4}`), and a pattern, a concatenation or an array of
+  the row type written to an element of a queue, dynamic array or
+  associative array of fixed-size arrays (`qp[0] = '{1, 2}`, `aa["c"] = p`),
+  or a pattern written to a whole queue of them (§7.6, §10.10). The row read
+  x or 0. A row of an associative array also copies out (`r = aa["b"]`), a
+  missing one as the element type's default, and prints with `%p` as a
+  nested list. (#444)
+* In a queue of fixed-size arrays, `$` in the row select reads the last row
+  (`k.q[$][1]`, `mq[$][1]`), which read x, and a one-variable `foreach` over
+  a class-property queue or dynamic array of rows visits its current rows
+  instead of a 64-row buffer whose extra rows read x (§7.10.1, §12.7.3).
+  (#446)
 
 **Usability**
 

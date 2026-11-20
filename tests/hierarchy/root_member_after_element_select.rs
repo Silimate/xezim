@@ -4,9 +4,9 @@
 //! (`$root.tb.objs[1].v`, §8.4, §7.10), a field of a packed-struct element
 //! (`$root.tb.qs[i].a`, §7.2.1) or of an unpacked-struct element, with a
 //! constant, variable or `$` index, in the top or in an instance below it,
-//! and a member of a variable in a generate block. The value keeps its
-//! member's width in a concatenation. Expected values were checked on
-//! Verilator 5.046.
+//! and a member of a variable in a generate block. The read keeps its
+//! member's width in a concatenation and sizes a self-determined expression
+//! (§11.6.1). Expected values were checked on Verilator 5.046.
 
 fn run(src: &str) -> Vec<String> {
     let result = xezim::simulate(src, 100_000).unwrap();
@@ -163,6 +163,55 @@ module tb;
 endmodule
 "#);
     assert_eq!(lines, ["R w=033466 bits=8 8", "R cmp 1 53"]);
+}
+
+/// §11.6.1: in a self-determined expression the member's own width sizes the
+/// other operands, so `(8'h80 << 1)` keeps its carry out of bit 7.
+#[test]
+fn root_member_widens_the_other_operands() {
+    let lines = run(r#"
+module tb;
+  class C;
+    int v;
+    function new(int x);
+      v = x;
+    endfunction
+  endclass
+  typedef struct packed { logic [11:0] a; logic [3:0] b; } s_t;
+  typedef struct { logic [11:0] a; int b; } u_t;
+  C objs[$];
+  C c;
+  s_t qs[$];
+  u_t qu[$];
+  u_t uv;
+  int i;
+  logic [31:0] w;
+  initial begin
+    c = new(1);
+    objs.push_back(c);
+    qs.push_back({12'h001, 4'h0});
+    uv.a = 12'h001; uv.b = 1;
+    qu.push_back(uv);
+    i = 0;
+    $display("R a %0d %0d", $root.tb.objs[0].v + (8'h80 << 1'b1), $root.tb.objs[i].v + (8'h80 << 1'b1));
+    $display("R b %0d %0d", $root.tb.qs[0].a + (8'h80 << 1'b1), $root.tb.qu[i].a + (8'h80 << 1'b1));
+    $display("R c %0d", ($root.tb.objs[0].v + (8'h80 << 1'b1)) == 257);
+    w = {$root.tb.objs[0].v + (8'h80 << 1'b1)};
+    $display("R d %0d %0d", w, $bits($root.tb.objs[0].v + 8'h1));
+    $display("R e %0d", $root.tb.qs[0].a + 8'hff + 8'h01);
+  end
+endmodule
+"#);
+    assert_eq!(
+        lines,
+        [
+            "R a 257 257",
+            "R b 257 257",
+            "R c 1",
+            "R d 257 32",
+            "R e 257",
+        ]
+    );
 }
 
 #[test]

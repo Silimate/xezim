@@ -2677,6 +2677,8 @@ impl Simulator {
                 Self::collect_select_operands(expr, out);
                 Self::collect_select_operands(index, out);
             }
+            // A member name is no operand; the element it is read from is.
+            ExprKind::MemberAccess { expr, .. } => Self::collect_select_operands(expr, out),
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
@@ -3038,7 +3040,11 @@ impl Simulator {
                     // Not inside a class method: there the operands are
                     // reached through handles (`vif.data[0]`), which only
                     // the waiting process can evaluate.
-                    let selects = Self::event_expr_needs_value_wait(&ee.expr)
+                    // A term that reads a member of an array element
+                    // (`@(sa[1].a)`, `@(sa[1].a ^ b)`) is one too
+                    // (`unpacked_elem_member_term`).
+                    let selects = (Self::event_expr_needs_value_wait(&ee.expr)
+                        || self.unpacked_elem_member_term(&ee.expr))
                         && self.this_stack.last().copied().flatten().is_none();
                     let mut idents = Vec::new();
                     if selects {
@@ -3911,9 +3917,9 @@ impl Simulator {
     pub(super) fn expr_reads_frame_local(&self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Ident(h) => self.frame_bound_bare_name(h).is_some(),
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
-                self.expr_reads_frame_local(x)
-            }
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. } => self.expr_reads_frame_local(x),
             ExprKind::Index { expr, index } => {
                 self.expr_reads_frame_local(expr) || self.expr_reads_frame_local(index)
             }
@@ -3961,7 +3967,9 @@ impl Simulator {
             return;
         }
         match &mut e.kind {
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.freeze_frame_locals(x),
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. } => self.freeze_frame_locals(x),
             ExprKind::Index { expr, index } => {
                 self.freeze_frame_locals(expr);
                 self.freeze_frame_locals(index);
@@ -4083,6 +4091,65 @@ impl Simulator {
         Some((h, idx))
     }
 
+    /// §9.4.2, §7.2.1: whether event term `e` reads, anywhere in it, a
+    /// member of an element of a fixed-size unpacked array (`@(sa[1].a)`,
+    /// `@(posedge sa[i].in.clk)`, `@(m[1][0].hi[1])`, `@(sa[1].a ^ b)`). The
+    /// element is one signal, and a packed-struct member is some of its bits,
+    /// so like a select the term is an event on its value: it watches the
+    /// element the index names now, and fires only when the value moves.
+    /// Without this the member access collected no operand: a procedural
+    /// wait armed on nothing and never woke, and an `always` block on it
+    /// missed changes or woke on another member's.
+    pub(super) fn unpacked_elem_member_term(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut base = &**expr;
+                while let ExprKind::Paren(x) | ExprKind::MemberAccess { expr: x, .. } = &base.kind
+                {
+                    base = x;
+                }
+                if let Some((h, idx)) = Self::index_chain(base) {
+                    let d = self.unpacked_dims_of(&self.resolve_hier_name(h));
+                    if d > 0 && idx.len() >= d {
+                        return true;
+                    }
+                }
+                self.unpacked_elem_member_term(expr)
+            }
+            ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. } => self.unpacked_elem_member_term(x),
+            ExprKind::Index { expr, index } => {
+                self.unpacked_elem_member_term(expr) || self.unpacked_elem_member_term(index)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.unpacked_elem_member_term(expr)
+                    || self.unpacked_elem_member_term(left)
+                    || self.unpacked_elem_member_term(right)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.unpacked_elem_member_term(left) || self.unpacked_elem_member_term(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.unpacked_elem_member_term(condition)
+                    || self.unpacked_elem_member_term(then_expr)
+                    || self.unpacked_elem_member_term(else_expr)
+            }
+            ExprKind::Call { args: parts, .. }
+            | ExprKind::SystemCall { args: parts, .. }
+            | ExprKind::Concatenation(parts) => {
+                parts.iter().any(|p| self.unpacked_elem_member_term(p))
+            }
+            _ => false,
+        }
+    }
+
     /// Does `e` select an element of an unpacked array (at any depth)?
     pub(super) fn expr_selects_array_cell(&self, e: &Expression) -> bool {
         match &e.kind {
@@ -4102,9 +4169,9 @@ impl Simulator {
                     || self.expr_selects_array_cell(left)
                     || self.expr_selects_array_cell(right)
             }
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
-                self.expr_selects_array_cell(x)
-            }
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. } => self.expr_selects_array_cell(x),
             ExprKind::Binary { left, right, .. } => {
                 self.expr_selects_array_cell(left) || self.expr_selects_array_cell(right)
             }
@@ -4169,9 +4236,9 @@ impl Simulator {
                 self.collect_selected_cells(right, out);
             }
             ExprKind::NamedArg { expr: Some(x), .. }
-            | ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
-                self.collect_selected_cells(x, out)
-            }
+            | ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. } => self.collect_selected_cells(x, out),
             ExprKind::Binary { left, right, .. } => {
                 self.collect_selected_cells(left, out);
                 self.collect_selected_cells(right, out);

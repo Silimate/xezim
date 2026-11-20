@@ -41,6 +41,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   sampled value a time-0 assertion attempt and a `$past` at the first tick
   read, as on the reference simulator (§16.5.1, §38.36.3). A write to some
   bits of a vector sets only those bits' defaults.
+* A concurrent assertion reads a whole unpacked array it names
+  (`v inside {m}`, `m == '{...}`) at its cells' sampled values, as it does
+  the operands of an assignment pattern (§16.5.1). It had read them after
+  the edge's NBA region. (#434)
+* `$past`, `$stable` and `$changed` track every cell of a whole
+  unpacked-array operand (§16.9.3). `$stable(mem)` had always held,
+  `$changed(mem)` never had, and `mem == $past(mem)` compared against a
+  constant. (#435)
 * `$dumpvars(0, tb_top.u)` called from another top-level module dumps
   `tb_top.u` and everything below it; the argument was ignored and the dump
   selected nothing. The same holds for a generate-block instance, a variable

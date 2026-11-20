@@ -7,8 +7,9 @@
 //! (`k = j`) must read the loop's `j` too. Hiding the static and showing it
 //! again must keep the task's `j` bound to its shared cell when a block
 //! around the loop declares its own static (`m_order`'s second call reads
-//! the 3 its first call left). Verilator 5.036 (`--binary --timing`) prints
-//! the expected lines.
+//! the 3 its first call left). The same holds for a block variable that
+//! hides the static inside such a block (`m_blk`). Verilator 5.036
+//! (`--binary --timing`) prints the expected lines.
 
 use xezim::simulate;
 
@@ -58,6 +59,21 @@ module top;
       j = 3;
     end
   endtask
+  task m_blk(input bit show);
+    integer j;
+    begin
+      if (show) $display("T|blk|j=%0d", j);
+      begin
+        static integer k;
+        begin
+          integer j;
+          j = 1;
+          k = j;
+        end
+      end
+      j = 3;
+    end
+  endtask
   initial begin
     m(2);
     m_timed(2);
@@ -65,6 +81,8 @@ module top;
     m_two(2);
     m_order(2, 0);
     m_order(2, 1);
+    m_blk(0);
+    m_blk(1);
     $display("T|done|%0t", $time);
     $finish;
   end
@@ -93,6 +111,7 @@ fn for_init_variable_hides_a_static_task_variable() {
             "T|two|k=0",
             "T|two|k=1",
             "T|order|j=3",
+            "T|blk|j=3",
             "T|done|25",
         ]
     );

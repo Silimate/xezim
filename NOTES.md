@@ -327,7 +327,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   a port connection read by the child's clocked blocks, selects the declared
   bits. Compiled code did not fold the `$clog2`, and its select with unfolded
   bounds took the labels as physical bit positions, so on `input [11:2] a`
-  the upper bits read x (§11.5.1, §20.8.1). (#332)
+  the upper bits read x (§11.5.1, §20.8.1). A bound that does not fold, such
+  as a constant function, on a packed multidimensional base now selects whole
+  elements. (#332)
 * A variable declared inside a procedural block or function with a type
   parameter and packed dimensions (`T [1:0] tmp;`) is a packed array of the
   bound type; it held one element of the wrong width (§6.20.3, §7.4.1).

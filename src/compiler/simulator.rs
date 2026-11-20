@@ -4215,6 +4215,13 @@ struct DeferredReport {
     class_context: Option<String>,
     /// §20.12: what an assertion control selects the assertion by.
     ctl: CtlIdent,
+    // silimate: count a deferred assertion when its report matures, not when it is queued
+    /// The assertion's `assert_insts` entry and kind tag (0 assert, 1 assume,
+    /// 2 cover). Its outcome is counted there when the report matures; a
+    /// flushed or killed report counts as no attempt (§16.4.2, §20.12).
+    inst: usize,
+    tag: u8,
+    // /silimate
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's

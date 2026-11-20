@@ -190,3 +190,40 @@ endmodule
 "#;
     assert_eq!(lines(src), ["n_task=1@2,2@6 n_iff=1 n_c=2 n_cp=1"]);
 }
+
+/// An element member inside a larger event expression: an operator, a
+/// conditional, a concatenation and a function call. The expression's value
+/// decides, so a change of `sa[1].b` or one that leaves the value alone does
+/// not wake.
+#[test]
+fn compound_expressions_on_element_members() {
+    let src = r#"
+module tb;
+  typedef struct packed { logic [7:0] a; logic [7:0] b; } s_t;
+  s_t sa[2];
+  logic [7:0] b;
+  bit en;
+  int n_xor, n_sum, n_cond, n_cat, n_fn;
+  function automatic logic [7:0] f(logic [7:0] x); return x & 8'h0f; endfunction
+  initial begin #1; forever begin @(sa[1].a ^ b); n_xor++; end end
+  always @(sa[1].a + sa[0].b) if ($time > 0) n_sum++;
+  always @(en ? sa[1].a : 8'h00) if ($time > 0) n_cond++;
+  always @({sa[0].a, b}) if ($time > 0) n_cat++;
+  always @(f(sa[1].a)) if ($time > 0) n_fn++;
+  initial begin
+    sa[0] = '0; sa[1] = '0; b = 8'h0f; en = 0;
+    #2 sa[1].a = 8'h01;
+    #1 sa[1].b = 8'h02;
+    #1 sa[0].b = 8'h03;
+    #1 en = 1;
+    #1 sa[1].a = 8'h11;
+    #1 sa[0].a = 8'h04;
+    #1 b = 8'h0e;
+    #1 sa[1].a = 8'h21;
+    #1 $display("n_xor=%0d n_sum=%0d n_cond=%0d n_cat=%0d n_fn=%0d", n_xor, n_sum, n_cond, n_cat, n_fn);
+    $finish;
+  end
+endmodule
+"#;
+    assert_eq!(lines(src), ["n_xor=4 n_sum=4 n_cond=3 n_cat=2 n_fn=1"]);
+}

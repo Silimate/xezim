@@ -3040,8 +3040,9 @@ impl Simulator {
                     // Not inside a class method: there the operands are
                     // reached through handles (`vif.data[0]`), which only
                     // the waiting process can evaluate.
-                    // A member of an array element (`@(sa[1].a)`) is such a
-                    // term too (`unpacked_elem_member_term`).
+                    // A term that reads a member of an array element
+                    // (`@(sa[1].a)`, `@(sa[1].a ^ b)`) is one too
+                    // (`unpacked_elem_member_term`).
                     let selects = (Self::event_expr_needs_value_wait(&ee.expr)
                         || self.unpacked_elem_member_term(&ee.expr))
                         && self.this_stack.last().copied().flatten().is_none();
@@ -4090,36 +4091,63 @@ impl Simulator {
         Some((h, idx))
     }
 
-    /// §9.4.2, §7.2.1: whether event term `e` reads a member of an element
-    /// of a fixed-size unpacked array (`@(sa[1].a)`, `@(posedge
-    /// sa[i].in.clk)`, `@(m[1][0].hi[1])`). The element is one signal, and a
-    /// packed-struct member is some of its bits, so like a select the term
-    /// is an event on its value: it watches the element the index names now,
-    /// and fires only when the member's value moves. Without this the member
-    /// access collected no operand: a procedural wait armed on nothing and
-    /// never woke, and an `always` block on it missed changes or woke on
-    /// another member's.
+    /// §9.4.2, §7.2.1: whether event term `e` reads, anywhere in it, a
+    /// member of an element of a fixed-size unpacked array (`@(sa[1].a)`,
+    /// `@(posedge sa[i].in.clk)`, `@(m[1][0].hi[1])`, `@(sa[1].a ^ b)`). The
+    /// element is one signal, and a packed-struct member is some of its bits,
+    /// so like a select the term is an event on its value: it watches the
+    /// element the index names now, and fires only when the value moves.
+    /// Without this the member access collected no operand: a procedural
+    /// wait armed on nothing and never woke, and an `always` block on it
+    /// missed changes or woke on another member's.
     pub(super) fn unpacked_elem_member_term(&self, e: &Expression) -> bool {
-        let mut cur = e;
-        let mut member = false;
-        let elem = loop {
-            match &cur.kind {
-                ExprKind::Paren(x) => cur = x,
-                ExprKind::MemberAccess { expr, .. } => {
-                    member = true;
-                    cur = expr;
+        match &e.kind {
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut base = &**expr;
+                while let ExprKind::Paren(x) | ExprKind::MemberAccess { expr: x, .. } = &base.kind
+                {
+                    base = x;
                 }
-                ExprKind::Index { .. } if member => break cur,
-                // A select of the member's bits (`sa[1].hi[1]`).
-                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => cur = expr,
-                _ => return false,
+                if let Some((h, idx)) = Self::index_chain(base) {
+                    let d = self.unpacked_dims_of(&self.resolve_hier_name(h));
+                    if d > 0 && idx.len() >= d {
+                        return true;
+                    }
+                }
+                self.unpacked_elem_member_term(expr)
             }
-        };
-        let Some((h, idx)) = Self::index_chain(elem) else {
-            return false;
-        };
-        let d = self.unpacked_dims_of(&self.resolve_hier_name(h));
-        d > 0 && idx.len() >= d
+            ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. } => self.unpacked_elem_member_term(x),
+            ExprKind::Index { expr, index } => {
+                self.unpacked_elem_member_term(expr) || self.unpacked_elem_member_term(index)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.unpacked_elem_member_term(expr)
+                    || self.unpacked_elem_member_term(left)
+                    || self.unpacked_elem_member_term(right)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.unpacked_elem_member_term(left) || self.unpacked_elem_member_term(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.unpacked_elem_member_term(condition)
+                    || self.unpacked_elem_member_term(then_expr)
+                    || self.unpacked_elem_member_term(else_expr)
+            }
+            ExprKind::Call { args: parts, .. }
+            | ExprKind::SystemCall { args: parts, .. }
+            | ExprKind::Concatenation(parts) => {
+                parts.iter().any(|p| self.unpacked_elem_member_term(p))
+            }
+            _ => false,
+        }
     }
 
     /// Does `e` select an element of an unpacked array (at any depth)?

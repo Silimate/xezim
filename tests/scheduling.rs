@@ -545,3 +545,6 @@ mod intra_delay_array_items;
 mod review_intra_delay_array_items;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
+// silimate: sampled-value functions of a whole unpacked array track its cells
+#[path = "scheduling/sva_array_sampled_fns.rs"]
+mod sva_array_sampled_fns;

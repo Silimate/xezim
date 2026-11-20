@@ -8930,12 +8930,11 @@ pub struct Simulator {
     // /silimate
     // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
     /// Pids parked on a delay (`#d`, `#0`, an intra-assignment delay).
-    #[serde(skip)]
+    /// Checkpointed, with the queued continuations.
     delay_pids: HashSet<usize>,
     /// §16.14.6: pids whose running activation began when a delay ended, not
     /// at an event control: a procedural concurrent assertion they reach is
     /// not at its clock's tick, so its first attempt waits for the next one.
-    #[serde(skip)]
     delay_resumed: HashSet<usize>,
     // /silimate
     /// Parallel to `local_stack`: the frame generation each slot was pushed

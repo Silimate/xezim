@@ -40,6 +40,12 @@ module top;
     #1;
     a4: assert property (@(posedge clk) s == a + b) $display("T|a4|%0t", $time);
   end
+  // A forever loop whose delay comes first (no event control before it).
+  initial forever begin
+    #6;
+    a5: assert property (@(posedge clk) s == a + b) $display("T|a5|%0t", $time);
+    @(negedge clk);
+  end
   // A deferred assertion after a delay reports at the end of its slot.
   always @(posedge clk) begin
     #1;
@@ -65,7 +71,7 @@ fn procedural_assertions_after_a_delay_attempt_at_the_next_tick() {
             .collect()
     };
     let ticks = ["15", "25", "35", "45", "55", "65"];
-    for label in ["a1", "a2", "a3", "a4"] {
+    for label in ["a1", "a2", "a3", "a4", "a5"] {
         let want: Vec<String> = ticks.iter().map(|t| format!("T|{label}|{t}")).collect();
         assert_eq!(times(label), want, "{label}");
     }

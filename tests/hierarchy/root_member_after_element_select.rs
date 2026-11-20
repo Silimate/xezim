@@ -279,8 +279,12 @@ module tb;
       v = x;
     endfunction
   endclass
+  class K;
+    bit [63:0] v;
+  endclass
   class P #(int W = 8);
     logic [W-1:0] v;
+    K child;
     function new(int x);
       v = x;
     endfunction
@@ -323,6 +327,16 @@ module tb;
     calls = 0;
     b = $root.tb.wobjs[next()].v === (4'h8 << 1'b1);
     $display("R d %0d calls=%0d", b, calls);
+    // pobjs[1] holds a null child: sizing must not take its width from it.
+    p = new(1);
+    p.child = new;
+    p.child.v = 64'h10_0000_0000;
+    pobjs.push_back(p);
+    for (int n = 0; n < 2; n++) begin
+      calls = 1;
+      b = $root.tb.pobjs[next()].child.v === (36'h8_0000_0000 << 1'b1);
+      $display("R e %0d calls=%0d", b, calls);
+    end
   end
 endmodule
 "#);
@@ -333,6 +347,8 @@ endmodule
             "R b 1 calls=1",
             "R c 1 calls=1",
             "R d 1 calls=1",
+            "R e 1 calls=2",
+            "R e 1 calls=2",
         ]
     );
 }

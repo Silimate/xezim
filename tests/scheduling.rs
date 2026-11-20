@@ -557,3 +557,6 @@ mod sva_array_sampled_fns;
 // silimate: the processes a clock edge wakes run before the slot's NBA region
 #[path = "scheduling/edge_before_slot_nba.rs"]
 mod edge_before_slot_nba;
+// silimate: a wait's statement that suspends runs as the process's next statement
+#[path = "scheduling/wait_then_event_control.rs"]
+mod wait_then_event_control;

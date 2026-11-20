@@ -5563,12 +5563,19 @@ impl Simulator {
                             .insert(for_key, (Arc::clone(&pc.stmts), f.clone()));
                         f
                     };
-                    if !saved.is_empty() {
+                    // silimate: a for-init variable hides the subroutine's same-named static local
+                    // Shown again when the loop's scope closes (`block_scope_exit`).
+                    let static_hidden = self.hide_loop_statics(&names);
+                    // silimate: a for-init variable hides the subroutine's same-named static local
+                    if !saved.is_empty() || static_hidden.is_some() {
                         self.block_scope_saves.push(BlockScopeSave {
                             frame_key: Self::frame_key(&frame),
                             frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
                             loop_vars: saved,
                             owns_loop_frame,
+                            // silimate: a for-init variable hides the subroutine's same-named static local
+                            static_hidden,
+                            // /silimate
                             ..Default::default()
                         });
                     }

@@ -5058,6 +5058,9 @@ impl Simulator {
                         }
                     }
                 }
+                // silimate: a for-init variable hides the subroutine's same-named static local
+                let hidden_statics = self.hide_loop_statics(&fv_names);
+                // /silimate
                 // Loop vars declared signed (`for (int i = ...)`): the step
                 // (`--i`, `i = i-1`) can write back an unsigned result, which
                 // would make `i >= 0` always-true and spin a descending loop.
@@ -5129,6 +5132,9 @@ impl Simulator {
                 if shadow_frame {
                     self.pop_loop_frame();
                 }
+                // silimate: a for-init variable hides the subroutine's same-named static local
+                self.unhide_loop_statics(hidden_statics);
+                // /silimate
                 self.restore_loop_vars(&fv_saved);
                 // class-perf loop-heat boost (pass C): one call per loop exit.
                 self.record_ast_loop_heat(iters);

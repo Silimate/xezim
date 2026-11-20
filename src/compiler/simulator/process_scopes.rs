@@ -2115,6 +2115,41 @@ impl Simulator {
         self.restore_loop_vars(&sv.loop_vars);
     }
 
+    // silimate: a for-init variable hides the subroutine's same-named static local
+    /// §6.21, §12.7.1: a variable a for-init declares is automatic and local
+    /// to the loop, so it hides the subroutine's same-named `static` local:
+    /// its reads and writes must not reach the static's shared cell. Takes
+    /// the static's `static_local_syncs` entry out until the loop ends, as a
+    /// block declaration does (`BlockScopeSave::static_hidden`).
+    pub(super) fn hide_loop_statics(
+        &mut self,
+        names: &[String],
+    ) -> Option<(usize, Vec<(String, String)>)> {
+        if names.is_empty() || self.static_local_names.is_empty() {
+            return None;
+        }
+        let depth = self.static_local_syncs.len();
+        let (_, syncs) = self.static_local_syncs.last_mut()?;
+        let mut hidden = Vec::new();
+        for nm in names {
+            if let Some(i) = syncs.iter().position(|(n, _)| n == nm) {
+                hidden.push(syncs.remove(i));
+            }
+        }
+        (!hidden.is_empty()).then_some((depth, hidden))
+    }
+
+    /// The statics `hide_loop_statics` hid are visible again.
+    pub(super) fn unhide_loop_statics(&mut self, hidden: Option<(usize, Vec<(String, String)>)>) {
+        if let Some((depth, hidden)) = hidden
+            && self.static_local_syncs.len() == depth
+            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
+        {
+            syncs.extend(hidden);
+        }
+    }
+    // /silimate
+
     /// §6.21 for a synchronous loop: open the body block's scope once for
     /// the whole loop rather than once per iteration (each iteration's
     /// declarations replace the previous one's), and close it after the

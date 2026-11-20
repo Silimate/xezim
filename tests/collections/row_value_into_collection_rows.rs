@@ -250,3 +250,59 @@ endmodule
         ]
     );
 }
+
+/// §7.4.6, §10.4.1: a row write with an index past the end of a dynamic
+/// array or queue stores nothing, but its right-hand side still runs. §7.10.5:
+/// a full bounded queue takes no append. §7.8.6: a row an associative array
+/// does not hold reads as the element type's default. Values checked on
+/// Verilator 5.046, except the `logic` row: Verilator 5.046 reads its x
+/// default as 0.
+#[test]
+fn ignored_row_writes_bounded_queues_and_missing_rows() {
+    let lines = run(r#"
+module tb;
+  int da[][2];
+  int q[$][2];
+  int bq[$:1][2];
+  logic [7:0] la[string][2];
+  int ia[string][2];
+  logic [7:0] lr[2];
+  int ir[2];
+  int calls;
+  function automatic int bump();
+    calls++;
+    return calls;
+  endfunction
+  initial begin
+    da = new[1];
+    q.push_back('{1, 2});
+    calls = 0;
+    da[5] = {bump(), 0};
+    q[7] = {bump(), 5};
+    da[3] = '{bump(), 5};
+    $display("R calls=%0d da=%p q=%p", calls, da, q);
+    bq[0] = '{1, 2};
+    bq[1] = {3, 4};
+    bq[2] = '{5, 6};
+    bq[bq.size()] = {7, 8};
+    $display("R bq=%p size=%0d", bq, bq.size());
+    la["a"] = '{8'h12, 8'h34};
+    ia["a"] = '{1, 2};
+    ir = '{7, 7};
+    ir = ia["missing"];
+    $display("R ir=%p", ir);
+    lr = la["missing"];
+    $display("R lr=%p", lr);
+  end
+endmodule
+"#);
+    assert_eq!(
+        lines,
+        [
+            "R calls=3 da='{'{0, 0}} q='{'{1, 2}}",
+            "R bq='{'{1, 2}, '{3, 4}} size=2",
+            "R ir='{0, 0}",
+            "R lr='{'hXX, 'hXX}",
+        ]
+    );
+}

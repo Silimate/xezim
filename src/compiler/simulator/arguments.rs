@@ -2847,6 +2847,9 @@ impl Simulator {
                 self.p_elem_type(&rbase)
                     .and_then(|dt| self.unpacked_struct_of(&dt))
             });
+        // §7.8.6: an element of a row an associative array does not hold
+        // reads the element type's default.
+        let missing = self.assoc_row_missing_value(&rbase);
         for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
             if let Some(su) = &elem_su {
                 let (d, s) = (format!("{}{}", lbase, ls), format!("{}{}", rbase, rs));
@@ -2855,6 +2858,7 @@ impl Simulator {
             }
             let v = self
                 .get_signal_value_by_name(&format!("{}{}", rbase, rs))
+                .or_else(|| missing.clone())
                 .unwrap_or_else(|| Value::zero(32));
             self.set_signal_value_by_name(&format!("{}{}", lbase, ls), v);
         }

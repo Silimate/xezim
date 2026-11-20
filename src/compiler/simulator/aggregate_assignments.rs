@@ -5053,7 +5053,14 @@ impl Simulator {
             self.dollar_bound.pop();
             v
         };
-        let append = !assoc && matches!(self.declared_dim(name), Some(Dim::Queue));
+        // §7.10.5: a bounded queue (`[$:N]`) that is full takes no append.
+        let append = !assoc
+            && matches!(self.declared_dim(name), Some(Dim::Queue))
+            && self
+                .module
+                .queue_max_sizes
+                .get(name)
+                .is_none_or(|&m| size < m as u64);
         let mut base = match first.to_i64() {
             _ if first.has_xz() => None,
             _ if assoc => Some(format!("{}[{}]", name, self.assoc_key_str(name, &first))),
@@ -5072,8 +5079,12 @@ impl Simulator {
             };
         }
         let Some(base) = base else {
-            // The write is ignored. Only a row value is known to be one; any
-            // other right-hand side is left to the other paths.
+            // The write is ignored, but the right-hand side is still
+            // evaluated, so its calls run (§10.4.1). Only a row value is known
+            // to be one; any other right-hand side is left to the other paths.
+            if row_value {
+                self.eval_row_value_for_effects(rvalue);
+            }
             return row_value;
         };
         let dt = self.leaf_elem_type(&dt);
@@ -5089,6 +5100,53 @@ impl Simulator {
         // Comb readers of `q[i]` depend on the collection's `.size` proxy.
         self.touch_queue(name);
         true
+    }
+
+    /// Evaluate the items of the row value `e` (a pattern or a concatenation)
+    /// whose store is discarded, for their side effects only.
+    fn eval_row_value_for_effects(&mut self, e: &Expression) {
+        match &self.unpacked_pattern(e).kind {
+            ExprKind::AssignmentPattern(items) => {
+                for item in items {
+                    let _ = self.eval_expr(item.expr());
+                }
+            }
+            ExprKind::Concatenation(parts) => {
+                let _ = self.unpacked_concat_operand_values(parts.iter().collect());
+            }
+            _ => {}
+        }
+    }
+
+    /// §7.8.6: the value an element of a nonexistent row of an associative
+    /// array of fixed-size arrays reads (`row` is `aa[k]`): the element
+    /// type's default, x for a 4-state integral type, 0 for a 2-state one and
+    /// 0.0 for a real one. `None` when `row` is no such row.
+    pub(super) fn assoc_row_missing_value(&self, row: &str) -> Option<Value> {
+        let (coll, _) = row.strip_suffix(']')?.rsplit_once('[')?;
+        if !self.is_associative_array(coll) {
+            return None;
+        }
+        self.coll_fixed_row_dims(coll)?;
+        let leaf = self.leaf_elem_type(self.module.var_decl_types.get(coll)?);
+        if matches!(self.resolve_dt(&leaf), DataType::Real { .. }) {
+            return Some(Value::from_f64(0.0));
+        }
+        let w = super::elaborate::resolve_type_width(
+            &leaf,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        if w == 0 {
+            return None;
+        }
+        Some(
+            if super::elaborate::is_type_two_state_resolved(&leaf, &self.module.typedef_types) {
+                Value::zero(w)
+            } else {
+                Value::new(w)
+            },
+        )
     }
 
     /// §7.6, §10.9.1, §10.10: assign the row value `e` to the fixed-size

@@ -4247,6 +4247,23 @@ impl Simulator {
                 return;
             }
         }
+        // Every link this pass can collapse comes from a continuous assign.
+        // Explicit alias groups already share storage during construction (§10.11).
+        if self.module.continuous_assigns.is_empty() {
+            self.collapse_settled = Some((
+                self.signal_name_to_id.generation(),
+                self.module.continuous_assigns.len(),
+                self.module.continuous_assigns.as_ptr() as usize,
+                self.module.port_aliases.len(),
+                buf_collapse_on,
+            ));
+            if std::env::var("XEZIM_BUF_CENSUS").is_ok() {
+                eprintln!(
+                    "[BUF-CENSUS] cont_assigns=0 identity=0 identity_single_driver=0"
+                );
+            }
+            return;
+        }
         let arrays_settled = self.collapse_array_port_nets();
         let mut collapsed = 0usize;
         // A net the connect CA drives may have OTHER continuous drivers (a
@@ -4963,7 +4980,15 @@ impl Simulator {
     }
 
     pub(super) fn compile_edge_blocks(&mut self) {
-        use super::bytecode::BytecodeCompiler;
+        use super::bytecode::{BytecodeCompiler, FunctionScopeIndex};
+        let function_scope_index = FunctionScopeIndex::new(&self.module.functions);
+        xezim_core::oom_trace::checkpoint(
+            "compile.edge.index.ready",
+            &[
+                ("functions", self.module.functions.len()),
+                ("qualified_leaves", function_scope_index.qualified_leaf_count()),
+            ],
+        );
         let mut compiled = Vec::with_capacity(self.edge_blocks.len());
         let mut bc_count = 0;
         let mut max_regs: u32 = 0;
@@ -4974,6 +4999,10 @@ impl Simulator {
         let mut kept_bodies: Vec<(usize, Statement)> = Vec::new();
         let mut any_lazy = false;
         for (bi, block) in self.edge_blocks.iter().enumerate() {
+            xezim_core::oom_trace::checkpoint(
+                "compile.edge.block",
+                &[("block_index", bi), ("total", self.edge_blocks.len())],
+            );
             let lazy_body = block.lazy.as_ref().map(|l| l.materialize_body());
             any_lazy |= lazy_body.is_some();
             let body: &Statement = lazy_body.as_ref().unwrap_or(&block.stmt);
@@ -5030,7 +5059,7 @@ impl Simulator {
             compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
-            compiler.set_functions(&self.module.functions);
+            compiler.set_function_scope_index(&function_scope_index);
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
@@ -5106,6 +5135,19 @@ impl Simulator {
                     kept_bodies.push((bi, body));
                 }
             }
+            xezim_core::oom_trace::checkpoint(
+                "compile.edge.block.ready",
+                &[
+                    ("block_index", bi),
+                    (
+                        "instructions",
+                        compiled
+                            .last()
+                            .and_then(|block| block.as_ref())
+                            .map_or(0, |block| block.instructions.len()),
+                    ),
+                ],
+            );
         }
         if any_lazy {
             let blocks = Arc::make_mut(&mut self.edge_blocks);
@@ -5436,7 +5478,7 @@ impl Simulator {
                 compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_scope_hint(scope_hint);
                 compiler.set_tasks(&self.module.tasks);
-                compiler.set_functions(&self.module.functions);
+                compiler.set_function_scope_index(&function_scope_index);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
@@ -5479,7 +5521,7 @@ impl Simulator {
                 delay_compiler.set_scope_hint(self.process_scope_hint.get(&pid).cloned());
                 delay_compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 delay_compiler.set_tasks(&self.module.tasks);
-                delay_compiler.set_functions(&self.module.functions);
+                delay_compiler.set_function_scope_index(&function_scope_index);
                 delay_compiler.set_params(&self.module.parameters);
                 delay_compiler.set_param_leaf_idx(self.param_leaf_index());
                 delay_compiler.set_cast_widths(&self.cast_widths);
@@ -6227,6 +6269,123 @@ impl Simulator {
                 100.0 * (pure_insns + safe_insns) as f64
                     / (pure_insns + nonpure_insns).max(1) as f64
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_identity_collapse_tests {
+    use super::*;
+
+    /// IEEE 1800-2023 §§10.11, 13.3, 13.4: an explicit alias keeps one
+    /// storage object, and procedural subroutine writes execute normally.
+    #[test]
+    fn no_continuous_assigns_skip_census_and_preserve_procedural_aliases() {
+        let source = r#"
+module top;
+  logic [7:0] state, result, seen;
+  wire [7:0] a, b;
+  alias a = b;
+  function automatic integer next_value(input integer n);
+    state = n + 1;
+    next_value = state;
+  endfunction
+  task update;
+    result = next_value(4);
+  endtask
+  initial begin
+    update();
+    force a = 8'h5c;
+    #1;
+    seen = b;
+    release a;
+    #1;
+    $finish;
+  end
+endmodule
+"#;
+        let (_, module) = xezim_core::parse_and_elaborate_multi(
+            &[source.into()],
+            Some("top"),
+            &[],
+            &[],
+            &[],
+        )
+        .expect("elaborate procedural alias design");
+        assert!(module.continuous_assigns.is_empty());
+        assert!(!module.alias_pairs.is_empty());
+        let mut sim = Simulator::new(module, 10);
+        let alias_id = *sim.signal_name_to_id.get("a").expect("alias a");
+        assert_eq!(Some(&alias_id), sim.signal_name_to_id.get("b"));
+        assert!(sim.buf_collapse_write_sets.is_none());
+        sim.collapse_identity_port_nets();
+        let settled = sim.collapse_settled.expect("empty relation is settled");
+        assert_eq!(settled.0, sim.signal_name_to_id.generation());
+        assert_eq!(settled.1, sim.module.continuous_assigns.len());
+        assert_eq!(settled.2, sim.module.continuous_assigns.as_ptr() as usize);
+        assert_eq!(settled.3, sim.module.port_aliases.len());
+        sim.collapse_identity_port_nets();
+        assert_eq!(sim.collapse_settled, Some(settled));
+        assert!(sim.buf_collapse_write_sets.is_none());
+
+        sim.simulate();
+        assert!(sim.compile_errors.is_empty(), "{:?}", sim.compile_errors);
+        assert!(sim.finished);
+        assert_eq!(sim.error_count, 0);
+        for (name, expected) in [("state", 5), ("result", 5), ("seen", 0x5c)] {
+            assert_eq!(sim.get_signal(name).and_then(Value::to_u64), Some(expected));
+        }
+        assert!(sim.buf_collapse_write_sets.is_none());
+    }
+
+    /// IEEE 1800-2023 §§13.4.2, 23.6: top calls and two instances with
+    /// the same function leaf keep their respective module-state reads.
+    #[test]
+    fn indexed_edge_calls_keep_module_and_instance_external_names() {
+        let sim = crate::simulate(
+            r#"
+module leaf #(parameter BIAS = 20)(input logic clk);
+  int base = BIAS;
+  int result;
+  function automatic int calc(input int n);
+    calc = base + n;
+  endfunction
+  always @(posedge clk) result <= calc(3);
+endmodule
+module top;
+  logic clk = 0;
+  int base = 10;
+  int result, unique_result;
+  function automatic int calc(input int n);
+    calc = base + n;
+  endfunction
+  function automatic int unique_call(input int n);
+    unique_call = base + n + 1;
+  endfunction
+  leaf #(.BIAS(20)) u0(clk);
+  leaf #(.BIAS(30)) u1(clk);
+  always @(posedge clk) begin
+    result <= calc(3);
+    unique_result <= unique_call(5);
+  end
+  initial begin #1; clk = 1; #1; $finish; end
+endmodule
+"#,
+            10,
+        )
+        .expect("simulate indexed edge calls");
+        assert!(sim.finished);
+        assert_eq!(sim.error_count, 0);
+        assert!(sim.module.functions.contains_key("u0.calc"));
+        assert!(sim.module.functions.contains_key("u1.calc"));
+        assert!(sim.compiled_edge_blocks.iter().any(Option::is_some));
+        for (name, expected) in [
+            ("result", 13),
+            ("unique_result", 16),
+            ("u0.result", 23),
+            ("u1.result", 33),
+        ] {
+            assert_eq!(sim.get_signal(name).and_then(Value::to_u64), Some(expected));
         }
     }
 }

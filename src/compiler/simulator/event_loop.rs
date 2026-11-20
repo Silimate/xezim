@@ -2038,7 +2038,8 @@ impl Simulator {
                 || !self.nba_queue.is_empty()
                 || !self.packed_nba.is_empty()
                 || !self.pending_nba_triggers.is_empty()
-                || !self.pending_nba_instance_triggers.is_empty())
+                || !self.pending_nba_instance_triggers.is_empty()
+                || self.delayed_nba_due())
         {
             if self.dirty_any {
                 self.settle_combinatorial();
@@ -2051,6 +2052,17 @@ impl Simulator {
             self.toggled_clock_positions.clear();
             if self.finished {
                 return;
+            }
+            // §9.7.4: a `wait` the edge's processes made true resumes in this
+            // Active region too, before the NBAs commit (as in the cascade).
+            if !self.ready_condition_waiters.is_empty() {
+                let prev = self.in_edge_cont;
+                self.in_edge_cont = true;
+                self.drain_condition_waiters(true, false);
+                self.in_edge_cont = prev;
+                if self.finished {
+                    return;
+                }
             }
         }
         // /silimate

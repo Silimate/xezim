@@ -1351,3 +1351,6 @@ mod vif_formal_name_clash_1297;
 mod review_writeback_actual_forms;
 #[path = "classes/class_constraint_sharing_721.rs"]
 mod class_constraint_sharing_721;
+// silimate: compares of method-local collection elements keep the element width
+#[path = "classes/compiled_method_local_coll_compare.rs"]
+mod compiled_method_local_coll_compare;

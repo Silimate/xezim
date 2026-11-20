@@ -545,3 +545,6 @@ mod intra_delay_array_items;
 mod review_intra_delay_array_items;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
+// silimate: the processes a clock edge wakes run before the slot's NBA region
+#[path = "scheduling/edge_before_slot_nba.rs"]
+mod edge_before_slot_nba;

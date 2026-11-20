@@ -277,7 +277,7 @@ fn block(mut v: Vec<Statement>, span: Span) -> Statement {
         Statement::new(
             StatementKind::SeqBlock {
                 name: None,
-                stmts: v,
+                stmts: v.into(),
             },
             span,
         )
@@ -2163,10 +2163,10 @@ impl Instr<'_> {
                 // A block's declarations end with it.
                 let outer = self.here.locals.clone();
                 self.boundary();
-                let stmts = self.stmts(stmts);
+                let stmts = self.stmts(stmts.to_vec());
                 self.boundary();
                 self.here.locals = outer;
-                out.push(rebuilt(StatementKind::SeqBlock { name, stmts }));
+                out.push(rebuilt(StatementKind::SeqBlock { name, stmts: stmts.into() }));
             }
             // Each fork branch stays one process.
             StatementKind::ParBlock {
@@ -4472,7 +4472,7 @@ impl Simulator {
                     .unwrap_or_default();
                 (span, scope, false)
             }
-            Some((span, scope)) => (span, scope, false),
+            Some((span, scope)) => (span, scope.to_string(), false),
             None if ca.rhs_parent_scoped && kinds & KIND_EXPRESSION != 0 => {
                 let base = Self::cov_lhs_base(&ca.lhs)?;
                 let base = base
@@ -5866,7 +5866,7 @@ impl Simulator {
             let scope = ca
                 .origin
                 .as_ref()
-                .map(|(_, s)| s.as_str())
+                .map(|(_, s)| &**s)
                 .filter(|s| !s.is_empty());
             let lhs = self
                 .tie_bits(&ca.lhs, scope)

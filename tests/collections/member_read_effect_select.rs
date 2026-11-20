@@ -249,7 +249,7 @@ fn the_read_keeps_the_members_width() {
 /// element without being evaluated, past null handles at the front of a
 /// queue (1100 of them in `many`), an associative array and a class-property
 /// queue, and keep the member's own width (8 and 12 bits below, where a sum
-/// wraps).
+/// wraps), for an associative array of packed structs too.
 #[test]
 fn sizing_the_read_runs_no_side_effect() {
     let lines = run(r#"module tb;
@@ -279,6 +279,7 @@ fn sizing_the_read_runs_no_side_effect() {
   C as_[string];
   C c;
   s_t qs[$];
+  s_t sa[int];
   int i, r, calls;
   bit b;
   function int next();
@@ -296,6 +297,7 @@ fn sizing_the_read_runs_no_side_effect() {
     end
     nul.push_back(null); c = new(1); nul.push_back(c);
     an[5] = null; c = new(1); an[7] = c;
+    sa[3] = {12'd1, 4'd0}; sa[9] = {12'd2, 4'd0};
     repeat (1100) many.push_back(null); c = new(1); many.push_back(c);
     hh = new; hh.items.push_back(null); c = new(1); hh.items.push_back(c);
     c = new(1); as_["k"] = c; as_["a"] = null;
@@ -317,6 +319,7 @@ fn sizing_the_read_runs_no_side_effect() {
     calls = 0; b = as_[key()].b + 8'hff == 8'h0f;        $display("R str-w %0d calls=%0d", b, calls);
     i = 0; b = objs[i++].b + 8'hff == 8'h0f;             $display("R w8 %0d i=%0d", b, i);
     i = 0; b = qs[i++].a + 12'hfff == 12'h000;           $display("R w12 %0d i=%0d", b, i);
+    i = 9; b = sa[i++].a + 12'hffe == 12'h000;           $display("R sa-w %0d i=%0d", b, i);
     $finish;
   end
 endmodule
@@ -343,6 +346,7 @@ endmodule
             "R str-w 1 calls=1",
             "R w8 1 i=1",
             "R w12 1 i=1",
+            "R sa-w 1 i=10",
         ]
     );
 }

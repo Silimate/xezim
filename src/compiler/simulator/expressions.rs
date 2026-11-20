@@ -1988,21 +1988,16 @@ impl Simulator {
         };
         let handles = self.probe_coll_holds_handles(&name);
         let live = |me: &Self, elem: &str| {
-            handles
-                && me
-                    .get_signal_value_by_name(elem)
-                    .and_then(|v| v.to_u64())
-                    .is_some_and(|h| {
-                        h != 0 && me.heap.get(h as usize).is_some_and(|o| o.is_some())
-                    })
+            me.get_signal_value_by_name(elem)
+                .and_then(|v| v.to_u64())
+                .is_some_and(|h| h != 0 && me.heap.get(h as usize).is_some_and(|o| o.is_some()))
         };
         if self.is_associative_array(&name) {
             let keys = self.assoc_top_level_keys_shared(&name);
-            let Some(key) = keys
-                .iter()
-                .find(|k| live(self, &format!("{name}[{k}]")))
-                .or(keys.first())
-            else {
+            let found = handles
+                .then(|| keys.iter().find(|k| live(self, &format!("{name}[{k}]"))))
+                .flatten();
+            let Some(key) = found.or(keys.first()) else {
                 return zero();
             };
             if self.is_string_keyed_array(&name) {

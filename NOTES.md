@@ -19,12 +19,23 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   reports. A report replaced the pending report of another copy with the
   same assertion statement, so that copy's action did not run, and a
   failure there printed nothing.
+* A deferred assertion (`assert #0`, `assert final`) report matures only
+  after the time slot's leftover cbNBASynch and cbReadWriteSynch routines
+  have run (§4.5, §16.4.1). cocotb applies its writes from a
+  cbReadWriteSynch it registers inside another one, so an `always_comb`'s
+  time-0 failure on x inputs matured before the writes re-ran the block and
+  flushed it. (#432)
 * An `always_comb` or `always @*` block woken by another process's blocking
   writes runs once that process suspends, after the continuous assignments it
   reads have been updated, as the continuous assignments themselves already
   did (§4.5, §9.2.2.2). It ran after each write instead, seeing values that
   never coexist (the first write new, the second and the assignment's output
   old), so an immediate assertion in it failed up to twice per time step.
+* A level-sensitive `always` block that writes no signal (an immediate
+  assertion, a `$display`) runs once the settle has converged, on the
+  settled values (§4.5, §9.2.2.2). Inside a carry chain that the settle
+  orders as a cycle, it had run once per carry step and asserted on
+  intermediate sums. (#433)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick

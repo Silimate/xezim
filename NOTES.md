@@ -412,6 +412,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   a class-property queue or dynamic array of rows visits its current rows
   instead of a 64-row buffer whose extra rows read x (§7.10.1, §12.7.3).
   (#446)
+* `pop_front()` and `pop_back()` on a queue of fixed-size arrays return the
+  removed row (§7.10.2.4, §7.10.2.5): in `%p`, an assignment to a fixed-size
+  or dynamic array, a slice or a row of a 2-D array, an equality, an actual
+  argument and `return q.pop_front();`. They returned 0, so the target read
+  `'{0, 0}`. (#447)
+* A member read through an element select whose index has a side effect
+  (`objs[i++].v`, `qs[i++].a`, `objs[next()].v`) evaluates the index once
+  (§11.4.2, §13.4). The lookups that find the element, and the width probes
+  of a comparison or an arithmetic operator above the read, each evaluated it
+  again, so `i++` ran up to thirteen times and the read returned another
+  element's member. (#445)
 
 **Usability**
 

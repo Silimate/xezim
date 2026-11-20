@@ -266,6 +266,46 @@ endmodule
     );
 }
 
+/// §11.6.1, §8.4: with a side-effect select, the member's width comes from
+/// its declared type, not from some element, which may be null.
+#[test]
+fn root_member_with_a_side_effect_select_is_sized_by_its_declared_type() {
+    let lines = run(r#"
+module tb;
+  class C;
+    byte v;
+    function new(byte x);
+      v = x;
+    endfunction
+  endclass
+  typedef struct packed { logic [7:0] a; logic [3:0] b; } s_t;
+  C objs[$];
+  C c;
+  s_t qs[$];
+  int calls;
+  bit b;
+  function int next();
+    calls++;
+    return calls;
+  endfunction
+  initial begin
+    objs.push_back(null);
+    c = new(16);
+    objs.push_back(c);
+    qs.push_back({8'h00, 4'h0});
+    qs.push_back({8'h10, 4'h0});
+    calls = 0;
+    b = $root.tb.objs[next()].v === (4'h8 << 1'b1);
+    $display("R a %0d calls=%0d", b, calls);
+    calls = 0;
+    b = $root.tb.qs[next()].a === (4'h8 << 1'b1);
+    $display("R b %0d calls=%0d", b, calls);
+  end
+endmodule
+"#);
+    assert_eq!(lines, ["R a 1 calls=1", "R b 1 calls=1"]);
+}
+
 #[test]
 fn root_names_through_generate_blocks_and_instance_arrays() {
     let lines = run(r#"

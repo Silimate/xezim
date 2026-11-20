@@ -920,7 +920,7 @@ pub fn defer_static_syscall_inits(
                         name: format!("{}{}", compiler::simulator::M_ROOT_MARK, p.name.name),
                         span,
                     }),
-                    stmts: vec![block.stmt],
+                    stmts: vec![block.stmt].into(),
                 },
                 span,
             );
@@ -928,7 +928,7 @@ pub fn defer_static_syscall_inits(
             block.stmt = Statement::new(
                 StatementKind::SeqBlock {
                     name: None,
-                    stmts: vec![scoped],
+                    stmts: vec![scoped].into(),
                 },
                 span,
             );
@@ -1067,6 +1067,9 @@ fn reinstall_ooc_constraint_bodies(
                 .map(std::sync::Arc::make_mut)
             {
                 if let Some(con) = cd.constraints.get_mut(constraint_name) {
+                    // The prototype may be shared with other copies of the
+                    // class; the body belongs to this one.
+                    let con = std::sync::Arc::make_mut(con);
                     con.items = items.clone();
                     con.has_body = true;
                 }

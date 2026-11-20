@@ -513,3 +513,11 @@ mod generate_real_struct_members_1099;
 mod rooted_packed_scope;
 #[path = "hierarchy/nettype_input_port_actuals_1280.rs"]
 mod nettype_input_port_actuals_1280;
+#[path = "hierarchy/prepared_body_release_721.rs"]
+mod prepared_body_release_721;
+#[path = "hierarchy/parameter_type_sharing_721.rs"]
+mod parameter_type_sharing_721;
+#[path = "hierarchy/assignment_origin_sharing_721.rs"]
+mod assignment_origin_sharing_721;
+#[path = "hierarchy/upward_scope_sharing_721.rs"]
+mod upward_scope_sharing_721;

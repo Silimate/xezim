@@ -266,8 +266,9 @@ endmodule
     );
 }
 
-/// §11.6.1, §8.4: with a side-effect select, the member's width comes from
-/// its declared type, not from some element, which may be null.
+/// §11.6.1, §8.4, §8.25: with a side-effect select, the member's width comes
+/// from its declared type, or, for a property of a parameterized class, from
+/// a live element: never from a null one.
 #[test]
 fn root_member_with_a_side_effect_select_is_sized_by_its_declared_type() {
     let lines = run(r#"
@@ -278,9 +279,19 @@ module tb;
       v = x;
     endfunction
   endclass
+  class P #(int W = 8);
+    logic [W-1:0] v;
+    function new(int x);
+      v = x;
+    endfunction
+  endclass
   typedef struct packed { logic [7:0] a; logic [3:0] b; } s_t;
   C objs[$];
   C c;
+  P pobjs[$];
+  P p;
+  P #(.W(12)) wobjs[$];
+  P #(.W(12)) w;
   s_t qs[$];
   int calls;
   bit b;
@@ -292,6 +303,12 @@ module tb;
     objs.push_back(null);
     c = new(16);
     objs.push_back(c);
+    pobjs.push_back(null);
+    p = new(16);
+    pobjs.push_back(p);
+    wobjs.push_back(null);
+    w = new(16);
+    wobjs.push_back(w);
     qs.push_back({8'h00, 4'h0});
     qs.push_back({8'h10, 4'h0});
     calls = 0;
@@ -300,10 +317,24 @@ module tb;
     calls = 0;
     b = $root.tb.qs[next()].a === (4'h8 << 1'b1);
     $display("R b %0d calls=%0d", b, calls);
+    calls = 0;
+    b = $root.tb.pobjs[next()].v === (4'h8 << 1'b1);
+    $display("R c %0d calls=%0d", b, calls);
+    calls = 0;
+    b = $root.tb.wobjs[next()].v === (4'h8 << 1'b1);
+    $display("R d %0d calls=%0d", b, calls);
   end
 endmodule
 "#);
-    assert_eq!(lines, ["R a 1 calls=1", "R b 1 calls=1"]);
+    assert_eq!(
+        lines,
+        [
+            "R a 1 calls=1",
+            "R b 1 calls=1",
+            "R c 1 calls=1",
+            "R d 1 calls=1",
+        ]
+    );
 }
 
 #[test]

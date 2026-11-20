@@ -3,8 +3,12 @@
 //! has the same name, the loop's reads and writes must reach the loop
 //! variable. They reached the task's static cell instead: the condition read
 //! the static (x, never assigned), and the loop ran no iteration, with and
-//! without a timing control in its body. Verilator 5.036 (`--binary
-//! --timing`) prints the expected lines.
+//! without a timing control in its body. A later initializer
+//! (`k = j`) must read the loop's `j` too. Hiding the static and showing it
+//! again must keep the task's `j` bound to its shared cell when a block
+//! around the loop declares its own static (`m_order`'s second call reads
+//! the 3 its first call left). Verilator 5.036 (`--binary --timing`) prints
+//! the expected lines.
 
 use xezim::simulate;
 
@@ -39,10 +43,28 @@ module top;
       $display("T|keep|after=%0d", j);
     end
   endtask
+  task m_two(input integer n);
+    integer j;
+    for (integer j = 0, k = j; k < n; k++) $display("T|two|k=%0d", k);
+  endtask
+  task m_order(input integer n, input bit show);
+    integer j;
+    begin
+      if (show) $display("T|order|j=%0d", j);
+      begin
+        static integer k;
+        for (integer j = 0; j < n; j++) k = j;
+      end
+      j = 3;
+    end
+  endtask
   initial begin
     m(2);
     m_timed(2);
     m_keep(2);
+    m_two(2);
+    m_order(2, 0);
+    m_order(2, 1);
     $display("T|done|%0t", $time);
     $finish;
   end
@@ -68,6 +90,9 @@ fn for_init_variable_hides_a_static_task_variable() {
             "T|keep|j=0",
             "T|keep|j=1",
             "T|keep|after=7",
+            "T|two|k=0",
+            "T|two|k=1",
+            "T|order|j=3",
             "T|done|25",
         ]
     );

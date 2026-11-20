@@ -5489,6 +5489,9 @@ impl Simulator {
                     if owns_loop_frame {
                         self.push_loop_frame();
                     }
+                    // silimate: a for-init variable hides the subroutine's same-named static local
+                    // Shown again when the loop's scope closes (`block_scope_exit`).
+                    let mut static_hidden = None;
                     for fi in init {
                         match fi {
                             ForInit::VarDecl {
@@ -5499,6 +5502,8 @@ impl Simulator {
                                 let rv = self.declare_for_init_var(data_type, &name.name, e);
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
+                                    // silimate: a for-init variable hides the subroutine's same-named static local
+                                    self.hide_loop_static(&name.name, &mut static_hidden);
                                 } else {
                                     // §12.7.1: a variable declared in the for-init
                                     // has AUTOMATIC lifetime — it is local to the
@@ -5563,9 +5568,6 @@ impl Simulator {
                             .insert(for_key, (Arc::clone(&pc.stmts), f.clone()));
                         f
                     };
-                    // silimate: a for-init variable hides the subroutine's same-named static local
-                    // Shown again when the loop's scope closes (`block_scope_exit`).
-                    let static_hidden = self.hide_loop_statics(&names);
                     // silimate: a for-init variable hides the subroutine's same-named static local
                     if !saved.is_empty() || static_hidden.is_some() {
                         self.block_scope_saves.push(BlockScopeSave {

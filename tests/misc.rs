@@ -671,3 +671,9 @@ mod localparam_self_determined_1143;
 mod comb_timescale;
 #[path = "misc/comb_batch_branches_1284.rs"]
 mod comb_batch_branches_1284;
+
+#[path = "misc/declaration_order_snapshots.rs"]
+mod declaration_order_snapshots;
+
+#[path = "misc/shared_procedural_bodies.rs"]
+mod shared_procedural_bodies;

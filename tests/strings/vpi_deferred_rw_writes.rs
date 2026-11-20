@@ -16,7 +16,8 @@ use std::process::Command;
 /// Writes `top.a` = 1 and `top.b` = 2 at time 0. `T0_WRITE` picks the
 /// callback that writes: `rw`, a cbReadWriteSynch registered from
 /// cbStartOfSimulation, or `rw2`, one registered from inside another
-/// cbReadWriteSynch, the way cocotb applies its writes.
+/// cbReadWriteSynch, the way cocotb applies its writes. `rw2clk` is `rw2`
+/// raising `top.clk` too.
 const DRIVER_C: &str = r#"
 #include <stdlib.h>
 #include <string.h>
@@ -42,8 +43,11 @@ static void at(PLI_INT32 (*rtn)(p_cb_data), int reason) {
 
 static PLI_INT32 rw(p_cb_data cb) {
     (void)cb;
+    const char *m = getenv("T0_WRITE");
     put("top.a", 1);
     put("top.b", 2);
+    if (m && !strcmp(m, "rw2clk"))
+        put("top.clk", 1);
     return 0;
 }
 
@@ -56,7 +60,7 @@ static PLI_INT32 outer(p_cb_data cb) {
 static PLI_INT32 start(p_cb_data cb) {
     (void)cb;
     const char *m = getenv("T0_WRITE");
-    at(m && !strcmp(m, "rw2") ? outer : rw, cbReadWriteSynch);
+    at(m && strncmp(m, "rw2", 3) == 0 ? outer : rw, cbReadWriteSynch);
     return 0;
 }
 
@@ -71,8 +75,19 @@ static void boot(void) {
 void (*vlog_startup_routines[])(void) = {boot, 0};
 "#;
 
+/// The program's waiter runs in the Reactive region, after the Observed
+/// region where the `#0` report matures, and ends the run there.
 const TOP_SV: &str = r#"
+program fin (input logic clk);
+  initial begin
+    @(posedge clk);
+    $finish;
+  end
+endprogram
+
 module top;
+  logic clk = 0;
+  fin f (.clk);
   logic [3:0] a, b;
   logic [4:0] s;
   assign s = a + b;
@@ -117,6 +132,12 @@ fn run(dir: &Path, so: &Path, mode: &str) -> Vec<String> {
         .current_dir(dir)
         .output()
         .expect("failed to run xezim");
+    assert!(
+        out.status.success(),
+        "T0_WRITE={mode}: xezim failed\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| l.starts_with("T|"))
@@ -127,12 +148,18 @@ fn run(dir: &Path, so: &Path, mode: &str) -> Vec<String> {
 #[test]
 fn time0_read_write_synch_writes_flush_deferred_reports() {
     let (dir, so) = setup();
-    let want = ["T|zero|pass|0", "T|final|pass|0"];
-    let bad: Vec<String> = ["rw", "rw2"]
+    // With `rw2clk` the program ends the run at time 0, after the `#0`
+    // report matured and before the Postponed region of the `final` one.
+    let want = |m: &str| -> Vec<String> {
+        let all = ["T|zero|pass|0", "T|final|pass|0"];
+        let n = if m == "rw2clk" { 1 } else { 2 };
+        all[..n].iter().map(|s| s.to_string()).collect()
+    };
+    let bad: Vec<String> = ["rw", "rw2", "rw2clk"]
         .iter()
         .map(|m| (m, run(&dir, &so, m)))
-        .filter(|(_, got)| got != &want)
-        .map(|(m, got)| format!("T0_WRITE={m}: got {got:?}, want {want:?}"))
+        .filter(|(m, got)| *got != want(m))
+        .map(|(m, got)| format!("T0_WRITE={m}: got {got:?}, want {:?}", want(m)))
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(bad.is_empty(), "{}", bad.join("\n"));

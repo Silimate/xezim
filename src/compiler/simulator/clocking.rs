@@ -1058,6 +1058,23 @@ impl Simulator {
         // /silimate
     }
 
+    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+    /// The pending `#0` reports alone (Observed region), counted before any
+    /// of their actions run; the `final` ones wait for the Postponed region.
+    pub(super) fn mature_deferred_observed(&mut self) {
+        let (zero, finals): (Vec<_>, Vec<_>) = std::mem::take(&mut self.deferred_asserts)
+            .into_iter()
+            .partition(|d| d.kind != crate::ast::stmt::DeferredAssertion::Final);
+        self.deferred_asserts = finals;
+        if !self.finished {
+            for d in &zero {
+                self.imm_assert_count(d.inst, d.tag, d.passed);
+            }
+        }
+        self.run_deferred_actions(zero);
+    }
+    // /silimate
+
     /// The actions of matured deferred reports (see `mature_deferred_asserts`).
     fn run_deferred_actions(&mut self, group: Vec<DeferredReport>) {
         for d in group {

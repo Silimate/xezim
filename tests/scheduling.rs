@@ -554,3 +554,6 @@ mod sva_whole_array_sampled;
 // silimate: sampled-value functions of a whole unpacked array track its cells
 #[path = "scheduling/sva_array_sampled_fns.rs"]
 mod sva_array_sampled_fns;
+// silimate: a wait's statement that suspends runs as the process's next statement
+#[path = "scheduling/wait_then_event_control.rs"]
+mod wait_then_event_control;

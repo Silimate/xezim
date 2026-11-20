@@ -257,6 +257,8 @@ mod param_sized_array;
 mod param_struct_widths_and_nba_patterns;
 #[path = "types/parameter_const_eval_corners.rs"]
 mod parameter_const_eval_corners;
+#[path = "types/pattern_array_type_keys_1290.rs"]
+mod pattern_array_type_keys_1290;
 #[path = "types/pattern_context_in_child_ports.rs"]
 mod pattern_context_in_child_ports;
 #[path = "types/pattern_params_and_call_member.rs"]
@@ -797,3 +799,7 @@ mod nettype_declaration_initializer_drivers;
 mod unsized_decimal_width_1120;
 #[path = "types/negative_bound_packed_slice_write_1193.rs"]
 mod negative_bound_packed_slice_write_1193;
+#[path = "types/review_pattern_type_keys_params.rs"]
+mod review_pattern_type_keys_params;
+#[path = "types/local_select_declared_range.rs"]
+mod local_select_declared_range;

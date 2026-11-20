@@ -48,7 +48,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * A variable declared in a for-init hides the task's or function's own
   variable of the same name (§6.21, §12.7.1). In a task with an unassigned
   `integer j;`, `for (integer j = 0; j < n; j++)` read the task's `j` (x)
-  and ran no iteration, with or without a timing control in the body.
+  and ran no iteration, with or without a timing control in the body. A
+  later initializer (`k = j`) also reads the loop's `j` now. (#438)
+* A task's static variable keeps its value across calls when a nested block
+  hides it inside a block that declares its own static. The hidden variable
+  had been put back out of order, and the outer block's exit dropped it.
   (#438)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default

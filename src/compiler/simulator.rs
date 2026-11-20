@@ -8920,6 +8920,24 @@ pub struct Simulator {
     /// Pids whose continuation `continue_stmts_or_trampoline` rescheduled
     /// with their context left live on the simulator.
     trampolined_pids: HashSet<usize>,
+    // silimate: a continuation of the same activation is no flush point
+    /// §16.4.2: pids whose next `run_process_stmts_inner` entry continues the
+    /// running activation (`continue_stmts_or_trampoline`), not a resume
+    /// after a suspension: their pending deferred reports and procedural
+    /// assertion instances stay queued.
+    #[serde(skip)]
+    cont_pids: HashSet<usize>,
+    // /silimate
+    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+    /// Pids parked on a delay (`#d`, `#0`, an intra-assignment delay).
+    #[serde(skip)]
+    delay_pids: HashSet<usize>,
+    /// §16.14.6: pids whose running activation began when a delay ended, not
+    /// at an event control: a procedural concurrent assertion they reach is
+    /// not at its clock's tick, so its first attempt waits for the next one.
+    #[serde(skip)]
+    delay_resumed: HashSet<usize>,
+    // /silimate
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
     /// `Simulator` exactly like `local_stack`, and moved into/out of a

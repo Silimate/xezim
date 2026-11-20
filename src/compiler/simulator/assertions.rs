@@ -2087,6 +2087,12 @@ impl Simulator {
         // A procedural assertion registers while its procedure runs, which
         // for an edge-triggered procedure is at the tick that starts its
         // first attempt: take that edge as seen (§16.14.6).
+        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+        // One reached after a delay is not at a tick: its first attempt
+        // waits for the clock's next event.
+        let at_tick =
+            procedural && (self.settling || !self.delay_resumed.contains(&self.current_pid));
+        // /silimate
         let mut clock_events = Vec::with_capacity(events.len());
         for mut event in events {
             self.sva_fold_scopes(&mut event.expr);
@@ -2106,7 +2112,8 @@ impl Simulator {
                 previous: Value::all_x(1),
             };
             clock_event.previous = self.sva_event_value(&clock_event);
-            if procedural {
+            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+            if at_tick {
                 let bit = clock_event.previous.get_bit(0);
                 let opposite = match (clock_event.event.edge, bit) {
                     (Some(Edge::Posedge), LogicBit::One) => Some(LogicBit::Zero),

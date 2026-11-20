@@ -39,7 +39,9 @@ use serde::ser::{SerializeSeq, Serializer};
 // §8.23 / §25.9: ClassMemberNames::vif_typedef_leaves.
 // §13.5.1: MethodAdmission::coll_formal_positions.
 // §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x10";
+// §9.4.2 / §9.3.2: Simulator::prev_wide holds a wide signal only once it is sampled; the
+// frame cache of a synchronous fork child is rebuilt, not carried (#721).
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x11";
 
 #[derive(Default)]
 struct Session {
@@ -1076,13 +1078,19 @@ impl Simulator {
     /// lists in the order it reads them, so an entry is never left out of
     /// the stream once its owner is numbered: the lists after it would be
     /// numbered one too high on restore, and a `Seen` reference would name
-    /// the wrong list or none. An entry whose key statement is not in its
-    /// owner list (a fork child's frame owns itself, and its key is the
-    /// statement the frame was cloned from) cannot be carried over, so it
-    /// gets `NO_NODE`, which a restore skips, and no frame.
+    /// the wrong list or none. Fork entries retain the original child list,
+    /// so their source nodes can be located too. Any entry whose key is
+    /// absent from its owner gets `NO_NODE`, which a restore skips, and
+    /// no frame; numbering still includes that owner.
     fn checkpoint_cont_cache(&self) -> Vec<ContCacheEntry> {
         let mut out = Vec::new();
         for (&(node, kind), (owner, frame)) in &self.blocking_cont_cache {
+            // Callable syntax is rebuilt separately on restore. Rebuild
+            // this derived cache too; live children own their continuations.
+            // Skip before numbering lists, not after creating a New reference.
+            if kind == super::process_scopes::SYNCHRONOUS_FORK_FRAME_KIND {
+                continue;
+            }
             let owner = stmts_ref(owner);
             let owner_n = match &owner {
                 StmtsRef::New(..) => with(|s| s.saved.len() as u32 - 1),
@@ -1125,7 +1133,7 @@ impl Simulator {
             let (Some(owner), Some(frame)) = (admit_ref(e.owner), admit_ref(e.frame)) else {
                 continue;
             };
-            if e.node == NO_NODE {
+            if e.node == NO_NODE || e.kind == super::process_scopes::SYNCHRONOUS_FORK_FRAME_KIND {
                 continue;
             }
             let entry = with(|s| {

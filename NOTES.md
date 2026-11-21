@@ -10,23 +10,270 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A deferred assertion (`assert #0`, `assert final`) counts its outcome in
+  the results file when its report matures. A report flushed because its
+  process resumed in the same time slot, or because its `always_comb` ran
+  again, ran no action and now counts as no attempt (§16.4.2); it counted as
+  a failure, so an assertion that never reported one read as failing.
+* The `always_comb` copies of a generate loop keep their own deferred
+  reports. A report replaced the pending report of another copy with the
+  same assertion statement, so that copy's action did not run, and a
+  failure there printed nothing.
+* A deferred assertion (`assert #0`, `assert final`) report matures only
+  after the time slot's leftover cbNBASynch and cbReadWriteSynch routines
+  have run (§4.5, §16.4.1). cocotb applies its writes from a
+  cbReadWriteSynch it registers inside another one, so an `always_comb`'s
+  time-0 failure on x inputs matured before the writes re-ran the block and
+  flushed it. (#432)
+* An `always_comb` or `always @*` block woken by another process's blocking
+  writes runs once that process suspends, after the continuous assignments it
+  reads have been updated, as the continuous assignments themselves already
+  did (§4.5, §9.2.2.2). It ran after each write instead, seeing values that
+  never coexist (the first write new, the second and the assignment's output
+  old), so an immediate assertion in it failed up to twice per time step.
+* A level-sensitive `always` block that writes no signal (an immediate
+  assertion, a `$display`) runs once the settle has converged, on the
+  settled values (§4.5, §9.2.2.2). Inside a carry chain that the settle
+  orders as a cycle, it had run once per carry step and asserted on
+  intermediate sums. (#433)
+* The processes a clock edge wakes run before the slot's NBA region
+  (§4.4.2, §4.5). A testbench process that resumed from a delay at the
+  edge's time and wrote with `<=` (`#20 x <= v;` landing on a posedge), or
+  an intra-assignment delay maturing then, had its value seen by that
+  edge's flops and waiters, so a DUT captured its input one cycle early.
+  (#436)
+* `wait (c) @(posedge clk);` resumes the process at the edge after `c`
+  holds (§9.7.4). The event control the `wait` guards had been run where it
+  could not suspend, so the process never resumed. (#437)
+* A variable declared in a for-init hides the task's or function's own
+  variable of the same name (§6.21, §12.7.1). In a task with an unassigned
+  `integer j;`, `for (integer j = 0; j < n; j++)` read the task's `j` (x)
+  and ran no iteration, with or without a timing control in the body. A
+  later initializer (`k = j`) also reads the loop's `j` now. (#438)
+* A task's static variable keeps its value across calls when a nested block
+  hides it inside a block that declares its own static. The hidden variable
+  had been put back out of order, and the outer block's exit dropped it.
+  (#438)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick
   read, as on the reference simulator (§16.5.1, §38.36.3). A write to some
   bits of a vector sets only those bits' defaults.
+* A concurrent assertion reads a whole unpacked array it names
+  (`v inside {m}`, `m == '{...}`) at its cells' sampled values, as it does
+  the operands of an assignment pattern (§16.5.1). It had read them after
+  the edge's NBA region. (#434)
+* `$past`, `$stable` and `$changed` track every cell of a whole
+  unpacked-array operand (§16.9.3). `$stable(mem)` had always held,
+  `$changed(mem)` never had, and `mem == $past(mem)` compared against a
+  constant. (#435)
+* A procedural concurrent assertion, or a deferred assertion, that an
+  `always` procedure reaches after a delay or an event control reports
+  (§16.4.2, §16.14.6). Its process had dropped its pending instances on
+  every interpreter entry, including same-time continuations and the loop
+  back to its event control. They are now flushed only where the process
+  resumes. An instance's attempt starts at its clock's event in the time
+  step where it matures, if there is one, and otherwise at the next event.
+  A delay that moves time on waits for the next tick, and a `#0` keeps the
+  tick of the edge that woke the procedure. At the time-0 edge, such an
+  attempt reads the default sampled values (§16.5.1). (#450)
+* `$dumpvars(0, tb_top.u)` called from another top-level module dumps
+  `tb_top.u` and everything below it; the argument was ignored and the dump
+  selected nothing. The same holds for a generate-block instance, a variable
+  and `$fsdbDumpvars` (§21.7.1.2, §23.6). (Silimate/xezim#306)
+* An old-style subroutine port declaration of a user-defined type with
+  packed dimensions (`input s_t [N-1:0] in;`) declares the port `in` of
+  type `s_t [N-1:0]` (§13.4, A.2.2.1). The type name was taken as the port,
+  so strict mode reported the next body declaration as following a
+  statement (§9.3.1), and a second declarator or a second packed dimension
+  was a parse error.
+* An `always` block that starts with an event control waits there before
+  any `initial` block writes, as on the reference simulator and Icarus
+  Verilog (§9.2), when the control has no `iff` and nothing after it waits
+  on an event again (a `wait`, another event control, or one in a called
+  task or joined `fork`). `initial clk = 0; always @(clk) #10 clk = ~clk;`
+  starts its clock wherever the two blocks sit in the source; the time-0
+  change was missed when the `initial` block ran first.
+* In a `.v` file, a variable declaration assignment (`reg clk = 1'b0;`) is
+  an `initial` assignment at time 0 (IEEE 1364-2005 §6.2.1), so the
+  variable changes from x then and the processes waiting on it wake, as on
+  the reference simulator. In a `.sv` file, or with `-sv`, it still sets
+  the value before time 0 with no event (§6.8). The clock of the Analog
+  Devices HDL testbenches (`reg clk = 1'b0; always @(*) #10 clk <= ~clk;`)
+  never started. A runtime initializer in a `.v` file
+  (`reg m = $test$plusargs("MODE");`) runs at time 0 with the others, and a
+  `--compile -o` artifact keeps the `-sv` choice it was compiled with.
+* An equality, relational, logical, reduction or `inside` operator is 1 bit
+  wide in the interpreter too, so it no longer widens the operator around
+  it (§11.6.1, Table 11-21). In a self-determined condition,
+  `if ((~a) | (m == 5'd12))` over a 1-bit `a` and a 5-bit `m` read `~a` as
+  5'b11110 and took the branch; so did `?:`, loop and `case` conditions,
+  `wait`, an event's `iff` and assertions, and `$display` printed such an
+  expression 5 bits wide. An assignment to a 1-bit target hid it by
+  truncating. (Silimate/xezim#337)
+* An enum label used in a port connection of an instance inside a module
+  (`.din(state == STREAM)`) is a declared constant, not a §6.10 implicit
+  net. A label from a package (`import pk::*`) or `$unit` read x in that
+  module, in the connection and elsewhere, once the module sat two or more
+  levels below the top: every use took the instance path. A label of the
+  module's own enum got an "implicit 1-bit net created" warning, under
+  `` `default_nettype none `` too (§6.19, §26.3). (Silimate/xezim#305)
+* `$readmemh` and `$readmemb` load a multidimensional unpacked array, or a
+  partially indexed one (`ram[1]`), and `$writememh` and `$writememb` write
+  one (§21.4.3, §21.5). The words are in row-major order, the rightmost
+  dimension fastest and each dimension from its low index to its high one.
+  The start and finish addresses and the file's `@` entries count elements
+  in that order, as in Verilator, Icarus and the reference simulator. Both
+  reported that the array names no unpacked memory and did nothing, so
+  Caliptra's testbench loaded no firmware into its byte-wide
+  `caliptra_sram`. (Silimate/xezim#328)
+* A module-scope task evaluates an input actual at the formal's width, as
+  if assigned to it (§13.5, §11.6.1), as functions and class methods
+  already did: `t({2{1'b1}} << 4)` into `input [31:0] v` binds `32'h30`,
+  not 0, and `t(-b)` sign-fills the formal. A task or function formal whose
+  bounds name a parameter (`input [W-1:0] v`) now gives its actual that
+  width too. The operands of `&&`, `||`, `->` and `<->` stay
+  self-determined there: `(a << 1) || 1'b0` shifts at `a`'s width.
+  (Silimate/xezim#331)
+* A text macro defined in a `-y`/`-v` library file, itself or through an
+  `` `include `` of the design's headers, is defined for the library files
+  read after it, as for source files (§22.5.1, §3.12.1). A library module
+  that included the headers did not share them with the library modules it
+  instantiates, which then failed to parse. Library files are now read in a
+  fixed order, the order their modules are resolved in. (Silimate/xezim#310)
+* A `-v`/`-y` library file with a byte that is not UTF-8 (a Latin-1 `®` in a
+  comment) is decoded as source files are, the byte becoming U+FFFD. The
+  whole file was dropped ("stream did not contain valid UTF-8") and its
+  modules were not found.
+* A conditional generate branch that no instance selects is not checked
+  for struct members that do not exist: it is not elaborated, so its names
+  are never resolved (§27.5). Caliptra's `kmac.sv` with `EnFullKmac = 0` and
+  `entropy_src.sv` with `Stub = 0` were rejected with "not a member of the
+  struct or union". A branch some instance selects is still checked.
+  (Silimate/xezim#339)
+* With `-s`, a top-level module that was not selected (and what only it
+  instantiates) is not checked for connections to ports its targets do not
+  declare: it is never elaborated (§23.3.2). A connection there stopped the
+  run; Verilator runs it. An elaborated top is still checked.
+* A generate-if condition or generate-case selector may read a package
+  parameter by its package-scoped name, such as `p::Info[k].variant` with
+  `k` a genvar, without the module importing the package (§27.5, §11.2.1,
+  §26.3). It was rejected as not a constant expression.
+* An input port reads with its own declared signedness when it is
+  connected to a concatenation, a select or a net of the other signedness
+  (§23.3.3.7, §11.8.1): `input logic signed [12:0] e_i` connected to
+  `{c[11], c}` reads -27, not 8165, so `a_i - e_i` and `e_i < 0` are
+  signed in the module. A net driven by `assign` from a variable of the
+  other signedness keeps its own too. lowRISC Muntjac's FPU returned 1e-8
+  for `fadd.s pi + 1e-8`. (Silimate/xezim#352)
+* An instance that leaves an interface port unconnected (absent from a
+  named list, `.p()`, or an empty ordered slot) is an elaboration error
+  naming the port and the instance, as on Verilator and the reference
+  simulator (§25.3, §23.3.3). It used to elaborate, the port's members
+  reading x of their own, which hid a stale testbench.
+  `--relax-unconnected-interface-port` (or
+  `XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT=1`) keeps that behavior, with a
+  warning. (Silimate/xezim#340)
+* An event control on a member of a packed struct waits on that member:
+  `@(posedge a.clk)` on the member's least significant bit and `@(a.valid)`
+  on a change of its bits (§9.4.2, §7.2.1). The whole struct vector was
+  watched, so an edge was judged on another member's bit and any member's
+  change woke the block. A clock forwarded through a struct member to a
+  module's clock port (`.clk(b.clk)`) fired the child's flops on the wrong
+  edges; Caliptra-SS `otp_ctrl`'s OTP macro missed its Init command.
+* A process whose task calls never wait at one time step (a task that can
+  wait but does not, calling itself or another such task) is reported as a
+  zero-delay loop, naming the process and its source, at
+  `XEZIM_STALL_LIMIT` nested calls or before the native stack runs out. It
+  overflowed the stack and aborted with SIGABRT, with no message about the
+  design.
+* A typedef of a parameterized class that names a member type of its type
+  parameter (`class E #(type T); typedef T::hw_t hw_t;`) is that member type
+  in the specialization a class scope names: `E#(cfg_t)::hw_t` is
+  `cfg_t::hw_t`, also through a typedef of the specialization and as a type
+  parameter's default (`parameter type H = E#(C)::hw_t`). A type parameter
+  bound to a class names that class as a scope (`C::hw_t`). These were
+  32-bit types with no diagnostic, and member writes were lost (§8.25.1,
+  §6.20.3). (#389)
+* A packed struct whose members are all 2-state starts at 0 also when a
+  member is a packed array of another 2-state struct (`s_t [1:0] e;`); it
+  started as x, while its writes already dropped x/z (§7.2.1, §6.8). (#387)
+* In a module instance, an `always_comb` that reads one bit of a vector and
+  writes another bit of it runs again whenever the bit it reads changes, also
+  when the vector's range depends on a parameter (`logic [P+1:0] b`). The
+  block used to run once at time zero and never again: its sensitivity sized
+  the vector with the top module's parameters instead of the instance's
+  (§9.2.2.2.1). Caliptra's `caliptra_prim_arbiter_fixed`, whose priority tree
+  is built from such blocks in a generate loop, now follows its requests; its
+  index had stayed x. (Silimate/xezim#395)
+* A variable declared inside a process, task or function of an instantiated
+  module whose packed dimension calls a value system function on the
+  instance's parameters (`logic [$clog2(P)-1:0] v;`, `$signed(P)`,
+  `int'(P)`) has this instance's width. It was one bit wide in a process and
+  32 bits wide in a subroutine; a keccak `theta()` sized that way computed
+  every SHA3 digest wrong (§6.20.2, §20.8.1, §23.10).
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the
   attempts, nonvacuous passes, vacuous passes, failures, disabled attempts and
   cover matches (§16.14.3). The summed `assertions` list is unchanged.
+* A part-select through an index into an output port of an instantiated
+  module (`f[0][31:1]` on `output logic [0:0][31:1] f`) counts the port's
+  declared labels, as on a variable (§7.4.1, §11.5.1, §23.2.2.3). The port
+  had no declared type on file, so it took a store that mapped the labels
+  twice: a whole-element write was dropped, `f[0][30:2]` landed one bit low,
+  an ascending element mirrored the wrong way and a slice of a 3-D port's
+  middle dimension wrote bits. VeeR EH2's flush path stayed x after reset.
+  (Silimate/xezim#316)
 * Vacuity follows §16.14.8 through nested properties: `a |-> (c |-> b)`
   succeeds vacuously while `c` is false, so it runs no pass action and a
   `cover` of it does not match, and `p or q` with a sequence operand is never
   vacuous.
+* A size cast whose width is a field of a struct parameter (`pt.DEPTH'(x)`,
+  `(pt.DEPTH)'(x)`) evaluates its operand at that width and resizes to it
+  (§6.24.1). The width was ignored: the operand passed through at its own
+  width, or a same-named parameter sized it. The VeeR EL2 branch predictor
+  never updated its BHT, and every taken loop branch cost a cycle (EL2
+  hello_world: mcycle 809, now 742 as on the reference simulator); VeeR EH2
+  sizes its fetch bus tags this way. (Silimate/xezim#322)
+* Braces nested in an unpacked array concatenation are a vector or string
+  concatenation, one element of the target (§10.10.3): `q = {q, {pc, insn}}`
+  on a queue of 64-bit elements appends one element, as on the reference
+  simulator. xezim spliced the braced operands as separate elements, which
+  gave CHERIoT Ibex's testbench spurious `dii_if` errors. Braces around a
+  queue or unpacked array operand, which no vector concatenation can hold,
+  still splice. A selected queue (`rows[0] = {rows[0], {pc, insn}}`) follows
+  the same rule, and each operand of an unpacked array concatenation
+  assigned to a queue or array is evaluated once: `q = {q, f()}` called `f`
+  twice, and `q = {m[i++]}` advanced `i` more than once. (Silimate/xezim#336)
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
+* A part-select after an index into a multi-dimensional packed array selects
+  whole elements of the next dimension (§7.4.3, §11.5.1): `a[0][5:0]` on
+  `logic [3:0][5:0][7:0] a` is 48 bits. Continuous assignments, compiled
+  `always` blocks and NBAs wrote and read it as 6 bits, and its RHS was
+  evaluated at that width (§11.6.1); this included indexed part-selects,
+  variable indices and an element of an unpacked array. An NBA to a range of
+  the outer dimension (`pv[4:3] <= v` on `logic [5:0][7:0] pv`) wrote 2 bits.
+  The VeeR EH2 interrupt controller's priority tree went x at reset and
+  instruction fetch stalled. (Silimate/xezim#309)
+* The port width check (§23.3.3) measures a connection through an index
+  and a range of the next dimension, `.o(a[2][4:2])` on
+  `logic [3:0][5:0][7:0] a`, as the 24 bits it selects (§7.4.3). It counted
+  the labels and warned that the connection was 3 bits; the same width also
+  decided input port substitution and inout z-fill. (Silimate/xezim#316)
+* A module named `gated_clk_cell` is elaborated from its body like any
+  other. Every instance of that name ran as `assign clk_out = clk_in`, an
+  optimization for OpenC910's pass-through cell, so Wujian100's latch-based
+  clock gate never gated (its rtc test ran 15.4 ms instead of 2.26 ms) and
+  the cell's signals could not be reached by hierarchical name. A cell that
+  is exactly that pass-through keeps the direct assignment. (Silimate/xezim#344)
+* An unpacked-array port connected to a slice whose bounds are parameter
+  expressions, `.p(arr[0:N-1])`, inside an instantiated module takes the
+  slice's elements in order (§7.4.6, §23.3.3). Port element `t` took bit `t`
+  of the first element, and an output port drove nothing, so the Intel FPGA
+  NPU's vector register files got garbage. (Silimate/xezim#364)
 * `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
   adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
   `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so
@@ -36,6 +283,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§21.6, §38.17). The seed line the run prints (`[xezim] seed: <n>`, or
   `[xezim] random seed: <n> (replay with -sv_seed <n>)` for `random`) names
   the option the seed came from. (Silimate/xezim#2)
+* `$writememh` and `$writememb` write one word per line, with an
+  `@<address>` line only before a word that `$readmem*` would not otherwise
+  load at its address: the first word of a range that does not start at the
+  memory's first address, and the word after a gap, such as an associative
+  array's missing keys (§21.5). A whole memory is then data only, as
+  Verilator writes it. Every line was `@<address> <word>`, so tools that
+  compare a dump with a golden file failed: NVDLA's sanity3 checktest
+  failed with identical data. `--writemem-every-address` keeps the old
+  layout. (Silimate/xezim#335)
 * Code coverage leaves out what a constant condition rules out in an
   instance, as the reference simulator does: a `case` whose selector and
   items are constants, an `if` chain or `?:` on parameters, genvars or ports
@@ -45,6 +301,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   totals; a design unit counts an item that any of its instances counts.
   `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`)
   counts them as before (§11.2.1, §12.4, §12.5). (Silimate/xezim#25)
+* `vpi_handle(vpiLeftRange)` and `vpi_handle(vpiRightRange)` of an element
+  or sub-array of an unpacked array give its own range (§38.11), and
+  `vpi_chk_error` fills `file` with an empty string instead of NULL (§38.3).
+  cocotb writing a list to an unpacked-array port (the I3C core's
+  `axi_adapter_id_filter` tests) read a value through the NULL range handle
+  and then crashed logging the error. (Silimate/xezim#349)
 * Toggle coverage counts each instance's input and inout ports in that
   instance, as commercial simulators do, with the value the connection gives
   the port: a port connected to a whole net shows that net's counts, one
@@ -81,9 +343,135 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* `$readmemh` and `$readmemb` load an associative array whose index type is
+  integral, each address a key (§21.4): from the file's addresses, from
+  address 0 when the file gives none, or between the start and finish
+  addresses given, through a local or a hierarchical name (`lmem.mem`).
+  `$writememh` and `$writememb` write the elements that exist, in index
+  order (§21.5). Both reported that the array names no unpacked memory and
+  did nothing, so the VeeR EH1, EH2 and EL2 testbenches loaded no program.
+  (Silimate/xezim#301)
+* An `always @*` whose statement starts with a delay or a `wait`
+  (`always @(*) #10 clk <= ~clk;`, the clock generator of the ADI HDL
+  testbenches) waits at `@*` for what that statement reads, as §9.4.2.2
+  says. Its inferred sensitivity came out empty, so the block ran as
+  combinational logic without its event control and spun in delta cycles at
+  one timestamp. A block that suspends is also woken by a nonblocking update
+  of a variable it writes, which lands after it is back at `@*`; a blocking
+  write it makes as it runs still wakes nothing. (Silimate/xezim#303)
+* A struct passed through a type parameter keeps its member types when the
+  struct and its member typedefs are declared in a module below the top:
+  `a[i].id` on a `T [N-1:0] a` port read the member as a 32-bit `int` once the
+  struct was 32 bits or wider, and a child typedef of the same name took the
+  member's place (§6.20.3, §23.10).
+* In a module below the top, a write to a member of an element of a packed
+  array of structs (`b_o.dw[0].value <= d` on an output port,
+  `s2.e[0].dw[1].value <= d` on a variable) lands in the variable, which stayed
+  x, and a member of a packed-struct net (`wire t_t n; ... n.a`) reads the net
+  and wakes its readers, which kept a stale value (§7.2, §7.4.2, §6.7.1).
+  (#347, #348)
+* A part-select bounded by `$clog2` of a constant (`a[$clog2(N)-1:3]`), as in
+  a port connection read by the child's clocked blocks, selects the declared
+  bits. Compiled code did not fold the `$clog2`, and its select with unfolded
+  bounds took the labels as physical bit positions, so on `input [11:2] a`
+  the upper bits read x (§11.5.1, §20.8.1). A bound that does not fold, such
+  as a constant function, on a packed multidimensional base now selects whole
+  elements. (#332)
+* A variable declared inside a procedural block or function with a type
+  parameter and packed dimensions (`T [1:0] tmp;`) is a packed array of the
+  bound type; it held one element of the wrong width (§6.20.3, §7.4.1).
+  (#333)
+* An unpacked-array parameter works in the generate conditions of a module
+  below the top (`if (Info[k].variant == ...)`, `if (V[k] == 1)`), whether it
+  is a `localparam` of that module (also when its struct typedef is declared
+  there) or a package parameter (`import p::*`, `import p::V`, `p::V[k]`);
+  every branch took `else` and the assignments in the others were lost
+  (§6.20.2, §26.3, §27.5). (#342)
+* In a compiled method, a compare of two elements of a method-local queue or
+  dynamic array (`a[0] == a[1]`, a sort's `a[j] > a[j+1]`) compares the whole
+  elements. The element read counted as one bit wide, so the compare saw only
+  the lowest bits: `'{3, 1}` compared equal, and a bubble sort in a function
+  left its array unsorted (#421).
+* A queue method's argument written as an unpacked array concatenation
+  (`q.push_back({1, 2})` on a queue of `int [2]`, and the same in
+  `push_front` and `insert`) is stored as the new element `'{1, 2}`: the
+  formal has the queue's element type, so the concatenation is one of that
+  type (§7.10.2, §10.10). Every item of the stored element was x. (#424)
+* A `$root` name that selects a member after an element select
+  (`$root.tb.objs[1].v` through a queue of class handles, `$root.tb.qs[i].a`
+  through a queue of packed structs) reads and sizes like the same name
+  without `$root` (§23.6). It read 0, and in an expression it counted as one
+  bit wide. (#425)
+* An event control on a member of an element of an unpacked array of packed
+  structs (`@(sa[1].a)`, also inside a larger expression such as
+  `@(sa[1].a ^ b)`) waits on that member's value (§9.4.2, §7.2.1). It watched
+  nothing: a procedural wait never woke (in a task with an automatic index it
+  returned at once), and an `always` block missed changes or woke on every
+  change of the element. (#439)
+* A whole row written to one row of an array whose rows are fixed-size
+  arrays is stored element by element: a brace concatenation to a row of a
+  2-D array (`m[1] = {3, 4}`), and a pattern, a concatenation or an array of
+  the row type written to an element of a queue, dynamic array or
+  associative array of fixed-size arrays (`qp[0] = '{1, 2}`, `aa["c"] = p`),
+  or a pattern written to a whole queue of them (§7.6, §10.10). The row read
+  x or 0. A row of an associative array also copies out (`r = aa["b"]`), a
+  missing one as the element type's default, and prints with `%p` as a
+  nested list. (#444)
+* In a queue of fixed-size arrays, `$` in the row select reads the last row
+  (`k.q[$][1]`, `mq[$][1]`), which read x, and a one-variable `foreach` over
+  a class-property queue or dynamic array of rows visits its current rows
+  instead of a 64-row buffer whose extra rows read x (§7.10.1, §12.7.3).
+  (#446)
+* `pop_front()` and `pop_back()` on a queue of fixed-size arrays return the
+  removed row (§7.10.2.4, §7.10.2.5): in `%p`, an assignment to a fixed-size
+  or dynamic array, a slice or a row of a 2-D array, an equality, an actual
+  argument and `return q.pop_front();`. They returned 0, so the target read
+  `'{0, 0}`. (#447)
+* A member read through an element select whose index has a side effect
+  (`objs[i++].v`, `qs[i++].a`, `objs[next()].v`) evaluates the index once
+  (§11.4.2, §13.4). The lookups that find the element, and the width probes
+  of a comparison or an arithmetic operator above the read, each evaluated it
+  again, so `i++` ran up to thirteen times and the read returned another
+  element's member. (#445)
 
 **Usability**
 
+* A name that two wildcard-imported packages both declare, which §26.3
+  makes invisible, is now reported with both packages and the scope that
+  imports them, including in a cast (`size_e'(x)`), where it used to be an
+  undeclared identifier. `--relax-wildcard-import-conflict` (or
+  `XEZIM_RELAX_WILDCARD_IMPORT_CONFLICT=1`) resolves it to the first of
+  those imports in source order, as simulators that accept the name do, with
+  a warning naming both packages. It is not part of `--compat`: the
+  reference simulator rejects the name.
+* C and C++ DPI sources (`.c`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.C`) on the
+  command line or in a `-f` file are compiled with `$CC`/`$CXX` (else
+  Clang, else `cc`/`c++`), with xezim's `svdpi.h` and `vpi_user.h` on the
+  include path, linked with any `.o`/`.a` files named the same way into one
+  shared library and loaded like `--dpi-lib`; they used to be parsed as
+  SystemVerilog. The objects and library are cached by the preprocessed
+  sources and the commands, under `xezim/dpi` in the cache directory (a
+  private `xezim-<uid>` in the temporary directory when none is set).
+  `-CFLAGS`/`-LDFLAGS` (also `-ccflags`/`-ldflags`) add compiler and linker
+  arguments; with `-LDFLAGS` the library is linked again every run. A
+  `.so`/`.dylib`/`.dll` named among the files is loaded as `--dpi-lib`
+  (§35). (Silimate/xezim#307)
+* A DPI import that no `--dpi-lib` library defines binds to the C function
+  of that name in the libraries the process already has loaded, as the
+  reference simulator does, so `import "DPI-C" function string
+  getenv(input string name);` and other C library functions need no library
+  of their own (§35.5.1). An import found nowhere is still a `Fatal` when
+  called. (Silimate/xezim#338)
+* A procedural assignment to an ANSI output port declared with no data type
+  (`output q`, `output [3:0] c`), which IEEE 1800-2023 §23.2.2.3 makes a net,
+  is reported as such: the error names the port and module, says the port is a
+  net because its declaration has no data type (§6.5), and suggests declaring
+  it `output logic` rather than `output`, which keeps its range and signing.
+  `--relax-untyped-output-port` (or
+  `XEZIM_RELAX_UNTYPED_OUTPUT_PORT=1`) takes such a port as a variable, with a
+  warning, as Verilator does; OpenHW CORE-ET relies on it. A port declared as a
+  net (`output wire q`) stays an error. It is not part of `--compat`: the
+  reference simulator rejects the construct.
 * FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
   `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
   machines (one- and two-process, enum, parameter and `` `define `` encodings,
@@ -98,6 +486,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   simulators with one flag: no time cap, `--relax-implicit-static`,
   `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
   or `-do` run time still sets the run length.
+* A run that SIGTERM or Ctrl-C (SIGINT) stops still closes its dumps through
+  the normal exit, and now exits 143 or 130 (128 + the signal number) instead
+  of 0, so a harness that judges a run by its exit status does not take a
+  killed run for a passing one. (Silimate/xezim#350)
 * `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
   `$finish` or no events remain, as with `-do "run -all"`. The default is
   unchanged: a design that never finishes still stops.
@@ -111,21 +503,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
   to be read as source files or top names, and `-licqueue` as `-l icqueue`,
   which sent the transcript to a file named `icqueue`.
-* Code coverage counting rules, each its own option and off by default.
-  Five follow the code coverage defaults the reference simulator documents:
-  `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
-  signals declared in generate blocks out of toggle coverage;
-  `--code-coverage-expressions=logical` scores only the conditions with a
-  `&&` or `||`, a term covered once it has been 0 and 1;
-  `--code-coverage-granularity=block` counts straight-line blocks, implicit
-  `else` and `default` arms included and continuous assignments not; and
-  `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
-  makes, an asynchronous reset's included. FSM coverage skips the code a
-  constant condition rules out, as statement and branch coverage do, also
-  where the rest of the condition can't change it (`if (EN && go)` with `EN`
-  0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of bits whose
-  only drivers are constants (`{4'b0, x}`, a port tied to `1'b0` and the
-  ports wired to it). Each has an `XEZIM_*` variable. See
+* Code coverage counting rules, each its own option and off by default,
+  inferred from CVDP's coverage targets. On its target-100 designs, enum
+  toggles, generate-block toggles and a constant expression term were bins
+  no stimulus can reach: `--no-toggle-enums` and `--no-toggle-generate`
+  leave enum variables and the signals declared in generate blocks out of
+  toggle coverage, and `--code-coverage-expressions=logical` scores only the
+  conditions with a `&&` or `||`, a term covered once it has been 0 and 1.
+  `--code-coverage-granularity=block` counts straight-line blocks, not
+  continuous assignments, and not the implicit arm of an `if` without an
+  `else` or a `case` without a `default`, where no statement runs (Verilator
+  5.038's line coverage has no line for one either; the arm stays in branch
+  coverage). `--no-fsm-reset-transitions` leaves out the FSM transitions
+  only a reset makes, an asynchronous reset's included. FSM coverage skips
+  the code a constant condition rules out, as statement and branch coverage
+  do, also where the rest of the condition can't change it (`if (EN && go)`
+  with `EN` 0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of
+  bits whose only drivers are constants (`{4'b0, x}`, a port tied to `1'b0`
+  and the ports wired to it). Each has an `XEZIM_*` variable. See
   docs/coverage-guide.md, "Counting rules".
 * `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
   an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
@@ -135,6 +530,42 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `xezim_cov.json` gains a `type`, the data type the signal was declared with
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
+
+**Performance**
+
+* A member select through constant element selects of a packed struct
+  (`st.e[1].dw[0].value <= d`, `x = st.e[1].dw[0].value`) compiles to one
+  static bit range of the container instead of running in the interpreter
+  (§7.2, §7.4.2). (#356)
+* A packed declaration inside an instance is sized against that instance's
+  parameters overlaid on the design-wide table (§23.10). The parameters under
+  each scope are now collected once, and up to four shared copies of the
+  table, kept for the outermost scopes in use, move between instances by
+  taking off and putting on only the scopes the two do not share, instead of the whole table being copied whenever a select or an
+  assignment pattern moved to another instance. On a large design whose
+  continuous assignments assign patterns to instance-sized structs, each such
+  evaluation took about 1 ms. (#356)
+* The interpreter reads a struct typedef in place when it walks a dotted
+  name's declared type to see whether the name is a class handle, instead of
+  copying the whole typedef for every segment. Register blocks whose field
+  structs have hundreds of members spent much of a run copying them. (#356)
+* A `release` finds the drivers of the released net through an index of the
+  continuous assignments and combinational blocks that write each signal,
+  built at the first release, instead of scanning every one of them two or
+  three times (§10.6.2). A testbench that releases a signal on every clock
+  paid for those scans every cycle. (#356)
+* A read of a packed-struct member below the first level
+  (`hwif_out.REG.field.value`, `decoded_reg_strb.rf.trig_r`) compiles to one
+  range select of the root variable instead of running in the interpreter,
+  as a write to it already did (§7.2). Register blocks read their field
+  storage this way in every flop and read-back mux. (#356)
+* A dotted call (`u_a.c_fn()`) finds whether its prefix names an instance
+  in the sorted instance index instead of scanning every instance (§35.5.3).
+  (#356)
+* The interface-alias name cache no longer keeps the answers for a
+  subroutine call's own storage keys (`@q#17`), which are new on every call:
+  on a design with interface ports it grew by an entry per call and element
+  for the whole run, to gigabytes over a long run. (#356)
 
 **Maintenance**
 

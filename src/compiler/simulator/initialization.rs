@@ -4389,6 +4389,11 @@ impl Simulator {
             block_scope_saves: Vec::new(),
             hoisted_scope: (0, 0),
             trampolined_pids: HashSet::default(),
+            // silimate: a continuation of the same activation is no flush point
+            cont_pids: HashSet::default(),
+            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+            delay_pids: HashMap::default(),
+            delay_resumed: HashSet::default(),
             local_gen_stack: Vec::new(),
             class_context_stack: vec![],
             method_local_base: vec![],
@@ -5172,6 +5177,7 @@ impl Simulator {
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),
+            always_sva_names: HashSet::default(),
             sampled_registering: false,
             pending_t0_triggers: Vec::new(),
             time0_port_edges: Vec::new(),

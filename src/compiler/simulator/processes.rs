@@ -1050,6 +1050,27 @@ impl Simulator {
         // Consumed by whichever path runs this entry (see the direct-run
         // branch below).
         let trampolined = !self.trampolined_pids.is_empty() && self.trampolined_pids.remove(&pid);
+        // silimate: a continuation of the same activation is no flush point
+        // §16.4.2: a process resuming after a suspension reaches a flush
+        // point and drops its pending deferred reports and procedural
+        // assertion instances; a same-time trampoline entry of the running
+        // activation (`continue_stmts_or_trampoline`) does not.
+        if self.cont_pids.is_empty() || !self.cont_pids.remove(&pid) {
+            self.flush_deferred_asserts(pid);
+            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+            // A `#0` leaves the activation in its time step.
+            match self.delay_pids.remove(&pid) {
+                Some(true) => {
+                    self.delay_resumed.insert(pid);
+                }
+                Some(false) => {}
+                None if !self.delay_resumed.is_empty() => {
+                    self.delay_resumed.remove(&pid);
+                }
+                None => {}
+            }
+        }
+        // /silimate
         // A process terminated by `disable fork` (LRM §9.6.2) must not run any
         // remaining queued continuation (e.g. the resume of a `#delay` it was
         // parked on when killed). Pids are monotonic and never reused, so it is
@@ -2855,6 +2876,9 @@ impl Simulator {
     /// restores the process context, exactly as an immediate `@event` re-arm.
     pub(super) fn continue_stmts_or_trampoline(&mut self, pid: usize, cont: ProcCont) {
         if RPS_DEPTH.with(|c| c.get()) > RPS_TRAMPOLINE_DEPTH {
+            // silimate: a continuation of the same activation is no flush point
+            self.cont_pids.insert(pid);
+            // /silimate
             // The context stays live; mark the entry as this pid's own
             // continuation (see `run_scheduled_process_inner`).
             if !self.local_stack.is_empty() || !self.this_stack.is_empty() {
@@ -3436,7 +3460,12 @@ impl Simulator {
     pub(super) fn run_process_stmts_inner(&mut self, pid: usize, pc: &ProcCont) {
         let stmts: &[Statement] = pc.frame();
         self.current_pid = pid;
-        self.flush_deferred_asserts(pid);
+        // silimate: a continuation of the same activation is no flush point
+        // §16.4.2: the flush happens where the process resumes
+        // (`run_scheduled_process_inner`); every continuation of the running
+        // activation enters here too (a chained frame, an `always` body
+        // looping back to its event control), and is none.
+        // /silimate
         // Install THIS process's own instance scope as the resolution hint.
         // The hint is transient sibling-scope state: the previous process (or
         // a $display argument it evaluated) may have left its scope behind,
@@ -4651,6 +4680,8 @@ impl Simulator {
                     cont.extend(release);
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
+                    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+                    self.delay_pids.insert(pid, delay > 0);
                     self.event_queue.schedule(self.time + delay, pid, cont);
                     return;
                 }
@@ -4827,6 +4858,8 @@ impl Simulator {
                         }
                         // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
                         let cont = pc.pushed_body(body, pc.start + i + 1);
+                        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+                        self.delay_pids.insert(pid, delay > 0);
                         if delay == 0 {
                             // `#0` — IEEE 1800-2017 §4.4.2.3: suspend into the
                             // Inactive region of the SAME time slot, not the

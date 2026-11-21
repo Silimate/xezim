@@ -2330,7 +2330,7 @@ impl Simulator {
                 _ => false,
             };
         // §6.4: `real`/`shortreal` variables default to 0.0.
-        let is_real_type = super::elaborate::is_type_real(data_type);
+        let is_real_type = self.dt_is_real(data_type);
         // §6.11.3: the declared signedness every declarator's value and
         // later reads carry.
         let decl_signed = !plain_class
@@ -3187,6 +3187,9 @@ impl Simulator {
                         bare
                     };
                     self.adopt_local_shape(&name);
+                    if let Some(bounds) = self.declared_fixed_dims(dims) {
+                        self.module.unpacked_decl_dims.insert(name.clone(), bounds);
+                    }
                     match shape.len() {
                         2 => {
                             self.module
@@ -3598,6 +3601,9 @@ impl Simulator {
                     None
                 };
                 if let Some(shape) = nd_shape {
+                    if let Some(bounds) = self.declared_fixed_dims(&dims) {
+                        self.module.unpacked_decl_dims.insert(name.clone(), bounds);
+                    }
                     self.module.arrays.remove(&name);
                     if shape.len() == 2 {
                         self.module
@@ -4796,24 +4802,9 @@ impl Simulator {
                     // §4.9.4: matures in the target slot's NBA REGION — the
                     // separate queue commits inside apply_nba, so Active
                     // reads at the same time still see the old value.
-                    //
-                    // Reference-parity (#145): a delayed NBA whose captured
-                    // value equals the CURRENT value is elided at SCHEDULE
-                    // time (`q = 0; q <= #5 0; #1 q = 1;` leaves q at 1 —
-                    // the reference never lands the update). Elide only when
-                    // no delayed NBA is already pending for the id: a
-                    // pending entry, not the register, is the truth then
-                    // (the #142 rule).
                     let mut v = val.resize_for_assign(w);
-                    // Normalize signedness to the TARGET before comparing —
-                    // the apply site does the same at maturity, and without
-                    // it the elision compare saw identical bits as unequal
-                    // Values and always pushed.
                     v.is_signed = self.signal_signed[id];
-                    let pending_here = self.delayed_nba.iter().any(|(_, sid, _)| *sid == id);
-                    if pending_here || self.signal_table[id] != v {
-                        self.delayed_nba.push((self.time + d, id, v));
-                    }
+                    self.delayed_nba.push((self.time + d, id, v));
                 } else {
                     let frozen = self.freeze_lvalue_indices(lvalue);
                     let qval = if self.nba_target_is_assoc_elem(lvalue) {
@@ -4877,7 +4868,7 @@ impl Simulator {
                     self.exec_case_matches(expr, items);
                     return;
                 }
-                let val = self.case_selector_value(kind, expr, items);
+                let comparison = self.case_comparison(kind, expr, items);
                 // SV-2023: under unique/unique0/priority, pre-pass the items
                 // and emit a violation message if multiple match or (for
                 // unique/priority) none match without a default.
@@ -4893,22 +4884,7 @@ impl Simulator {
                             continue;
                         }
                         for pat in &item.patterns {
-                            let hit = match kind {
-                                CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                                CaseKind::Casez => {
-                                    let pv = self.eval_expr(pat);
-                                    val.casez_eq(&pv).is_true()
-                                }
-                                CaseKind::Casex => {
-                                    let pv = self.eval_expr(pat);
-                                    val.casex_eq(&pv).is_true()
-                                }
-                                _ => {
-                                    let pv = self.eval_expr(pat);
-                                    val.case_eq(&pv).is_true()
-                                }
-                            };
-                            if hit {
+                            if self.case_item_matches(kind, &comparison, pat) {
                                 match_count += 1;
                                 break;
                             }
@@ -4944,22 +4920,7 @@ impl Simulator {
                         continue;
                     }
                     for pat in &item.patterns {
-                        let hit = match kind {
-                            CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                            CaseKind::Casez => {
-                                let pv = self.eval_expr(pat);
-                                val.casez_eq(&pv).is_true()
-                            }
-                            CaseKind::Casex => {
-                                let pv = self.eval_expr(pat);
-                                val.casex_eq(&pv).is_true()
-                            }
-                            _ => {
-                                let pv = self.eval_expr(pat);
-                                val.case_eq(&pv).is_true()
-                            }
-                        };
-                        if hit {
+                        if self.case_item_matches(kind, &comparison, pat) {
                             self.exec_statement(&item.stmt);
                             matched = true;
                             break;
@@ -5436,8 +5397,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
-                    self.fork_block_children
-                        .insert(nm.name.clone(), child_set.clone());
+                    self.register_named_fork(&nm.name, &child_set);
                 }
                 match join_type {
                     // `join` waits for all, `join_any` for the first; both suspend
@@ -5901,7 +5861,10 @@ impl Simulator {
                                 // like `f = e` (`return b + u` with a byte b
                                 // and 8-bit u in an int function is 9 bits).
                                 // §10.8: a pattern takes the return type.
-                                None => match self.ret_pattern_value(e) {
+                                None => match self
+                                    .ret_struct_elem_value(e)
+                                    .or_else(|| self.ret_pattern_value(e))
+                                {
                                     Some(v) => v,
                                     None => match self.fn_ret_ctx_stack.last() {
                                         Some(&w) if w > 0 => self.eval_expr_ctx(e, w),
@@ -5944,9 +5907,10 @@ impl Simulator {
             }
             StatementKind::Disable(target) => {
                 let name = crate::ast::stmt::disable_name(target);
+                let fork_target = self.named_fork_target(target);
                 // §38.36.1 cbDisable, reported once the disable took effect.
                 if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_DISABLE) != 0 {
-                    self.vpi_note_disable(name);
+                    self.vpi_note_disable(name, fork_target.as_deref());
                 }
                 // IEEE 1800-2017 §9.6.2. `disable_target` was set but never
                 // read: the only effect was `break_flag`, a GLOBAL flag. So a
@@ -5959,7 +5923,7 @@ impl Simulator {
                 // fork block has already returned, so trying to unwind to it
                 // below would run off the end of the disabling process and drop
                 // its continuation — which is exactly what used to happen.
-                if let Some(children) = self.fork_block_children.get(name).cloned() {
+                if let Some(children) = fork_target.as_ref().and_then(|key| self.fork_block_children.get_mut(key)).map(std::mem::take) {
                     let mut to_kill: HashSet<usize> = HashSet::default();
                     for &c in &children {
                         to_kill.insert(c);
@@ -6278,7 +6242,7 @@ impl Simulator {
                         ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
                             if let Some(name) = self.sva_named_key(&a.expr) =>
                         {
-                            if let Some(body) = self.module.property_decls.get(&name).cloned() {
+                            if let Some(body) = self.sva_body_with_defaults(&name) {
                                 body
                             } else {
                                 a.expr.clone()
@@ -6308,18 +6272,7 @@ impl Simulator {
                                 });
                             let resolved = pname.and_then(|n| {
                                 let body = self.module.property_decls.get(&n).cloned()?;
-                                let formals = self
-                                    .module
-                                    .property_params
-                                    .get(&n)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let mut map: HashMap<String, Expression> = HashMap::default();
-                                for (i, f) in formals.iter().enumerate() {
-                                    if let Some(actual) = args.get(i) {
-                                        map.insert(f.clone(), actual.clone());
-                                    }
-                                }
+                                let map = self.sva_bind_actuals(&n, args);
                                 Some(super::elaborate::rewrite_expr(
                                     &body,
                                     "",
@@ -6582,12 +6535,23 @@ impl Simulator {
                 // resolve it — it was parsed and DISCARDED before, so a
                 // local `typedef struct packed {...} t; t v;` lost the
                 // member layout. Enum members become named constants.
-                let w = super::elaborate::resolve_type_width(
-                    &td.data_type,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
+                // §8.5: in a class method, by the class's own constants too.
+                let spec = self.class_type_env(&td.data_type);
+                let w = {
+                    let params = self.spec_param_env(&spec);
+                    super::elaborate::resolve_type_width_env(
+                        &td.data_type,
+                        Some(&params),
+                        Some(&self.module.typedefs),
+                    )
+                };
                 self.type_tables_gen += 1;
+                self.declaration_typedefs.get_or_insert_with(|| {
+                    (
+                        self.module.typedefs.clone(),
+                        self.module.typedef_types.clone(),
+                    )
+                });
                 self.module.typedefs.insert(td.name.name.clone(), w);
                 self.module
                     .typedef_types

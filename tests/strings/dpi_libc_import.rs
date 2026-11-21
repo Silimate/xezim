@@ -1,6 +1,6 @@
 //! An import that no `--dpi-lib` library defines binds to the function of
-//! that name in the libraries the process already has loaded, as the
-//! reference simulator and Verilator do (IEEE 1800-2023 §35.5.1: the import
+//! that name in the libraries the process already has loaded, as a
+//! Verilator model links any C function (IEEE 1800-2023 §35.5.1: the import
 //! names a C function). `import "DPI-C" function string getenv(input string
 //! name);` used to need a library of its own; without one the first call
 //! stopped the run with "has no implementation". An import found nowhere is

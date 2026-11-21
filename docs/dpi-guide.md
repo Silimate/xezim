@@ -289,7 +289,7 @@ xezim --dpi-lib /abs/path/to/libfoo.so [more --dpi-lib paths …] <sv files>
   a bridge library, say), in either command-line order.
 * An import that no `--dpi-lib` library defines is looked up among the
   libraries the process already has loaded (`dlsym(RTLD_DEFAULT, …)`), as
-  the reference simulator and Verilator do, so a C library function needs
+  a Verilator model links any C function, so a C library function needs
   no library of its own:
   `import "DPI-C" function string getenv(input string name);`.
 * A library that cannot be loaded is an error: xezim prints why and exits 1

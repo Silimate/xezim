@@ -206,6 +206,7 @@ fn design_cache_key(
     // An elaboration with unobserved-port elision on leaves nets out, so it
     // must not serve a run that may observe them.
     hash.bytes(&[xezim_core::elaborate::port_elision_requested() as u8]);
+    hash.bytes(&[xezim_core::elaborate::vpi_net_drivers() as u8]);
     // A run that downgraded driver conflicts to warnings must not serve one
     // that reports them as errors.
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
@@ -1343,6 +1344,7 @@ fn simulate_multi_inner(
     profile_input: Option<&str>,
     collapse_islands: bool,
 ) -> Result<compiler::Simulator, String> {
+    xezim_core::elaborate::set_vpi_net_drivers(compiler::simulator::foreign_libraries_configured());
     let _oom_trace = xezim_core::oom_trace::session();
     let total_start = WallTimer::now();
     let compilation_start = WallTimer::now();
@@ -1650,9 +1652,12 @@ fn simulate_multi_inner(
     sim.simulate();
     rss_trace("simulated");
     if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+        let named = sim.signals.map_entries().count();
         eprintln!(
-            "[MEM-CENSUS] end of run: runtime name->value map {} entries; {}",
+            "[MEM-CENSUS] end of run: runtime name->value map {} entries ({} named, {} dense); {}",
             sim.signals.len(),
+            named,
+            sim.signals.len() - named,
             sim.class_heap_census()
         );
     }

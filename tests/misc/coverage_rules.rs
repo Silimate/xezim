@@ -370,12 +370,11 @@ endmodule
 /// `--code-coverage-granularity=block` counts straight-line blocks, each
 /// at its first statement: a process body up to its first branch (5), each
 /// arm (6, 8, 10, 11), the code after a branch (14) or a loop, a loop body
-/// (23) and the code after a delay (25, with 26). An implicit `else` or
-/// `default` is a block of its own (9, 17), run when no written arm is; an
-/// `else if` is an `else` making a decision (20), and the chain's implicit
-/// `else` belongs to its last `if`. A continuous assignment (3) and the
-/// `always` construct itself are no blocks. Branch coverage or not, the
-/// blocks are the same.
+/// (23) and the code after a delay (25, with 26). An `else if` is an `else`
+/// making a decision (20). The implicit `else` or `default` of an `if` or
+/// `case` that has none (9, 17, 20) is no block: no statement runs there. A
+/// continuous assignment (3) and the `always` construct itself are no
+/// blocks. Branch coverage or not, the blocks are the same.
 #[test]
 fn block_granularity() {
     let d = scratch("blocks");
@@ -403,17 +402,14 @@ fn block_granularity() {
         (5, "block"),
         (6, "block"),
         (8, "block"),
-        (9, "default (implicit)"),
         (10, "block"),
         (11, "block"),
         (14, "block"),
         (17, "block"),
-        (17, "else (implicit)"),
         (17, "block"),
         (19, "block"),
         (19, "block"),
         (20, "block"),
-        (20, "else (implicit)"),
         (20, "block"),
         (22, "block"),
         (23, "block"),
@@ -424,7 +420,7 @@ fn block_granularity() {
     .collect();
     assert_eq!(rows(&json), expected, "{u}");
     assert!(
-        u.contains("\"statement\": {\"covered\": 17, \"total\": 18, \"percent\": 94.44}"),
+        u.contains("\"statement\": {\"covered\": 14, \"total\": 15, \"percent\": 93.33}"),
         "{u}"
     );
     let stmts = run(
@@ -433,6 +429,116 @@ fn block_granularity() {
         &["--code-coverage=stmt", "--code-coverage-granularity=block"],
     );
     assert_eq!(rows(&stmts), expected, "{stmts}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+const NESTED: &str = "\
+module n(input logic clk, input logic [1:0] a, input logic [1:0] b, output logic [3:0] o);
+  always @(posedge clk)
+    case (a)
+      2'd0: case (b)
+              2'd0: o <= 1;
+              2'd1: o <= 2;
+            endcase
+      2'd1: if (b == 2'd3) o <= 3;
+      2'd2: begin
+        o <= 4;
+        if (b[0]) o <= 5;
+        else if (b[1]) o <= 6;
+      end
+    endcase
+endmodule
+module tb;
+  logic clk = 0; logic [1:0] a = 0, b = 0; wire [3:0] o;
+  n u(.clk, .a, .b, .o);
+  always #5 clk = ~clk;
+  initial begin
+    #2 a = 0; b = 0;
+    #10 b = 1;
+    #10 a = 1; b = 0;
+    #10 a = 2; b = 1;
+    #10 b = 2;
+    #10 $finish;
+  end
+endmodule
+";
+
+/// In block granularity the arm an `if` or `case` doesn't write is no
+/// block, nested or not: the outer `case` has no `default` (`a` is never
+/// 3), nor has the inner one (`b` is never 2 or 3 while `a` is 0), the
+/// `if` at line 8 has no `else` (taken whenever `b` isn't 3) and the chain
+/// at lines 11-12 ends without one (never taken). The blocks are the
+/// process body (3), the outer items (4, 8, 10), the inner items (5, 6),
+/// the `if` arm at line 8 (never run), and at lines 11-12 the `if` arm, the
+/// `else if` and its arm. Branch coverage still has the implicit arms, with
+/// their counts.
+#[test]
+fn implicit_arms_are_no_blocks() {
+    let d = scratch("implicit_arms");
+    let rows = |json: &str| -> Vec<(u32, String, u64)> {
+        scope(json, "tb.u")
+            .split("{\"file\": \"t.sv\", \"line\": ")
+            .skip(1)
+            .take_while(|r| r.contains("\"count\"") && !r.contains("\"arms\""))
+            .map(|r| {
+                let line = r[..r.find(',').unwrap()].parse().unwrap();
+                let count = r[r.find("\"count\": ").unwrap() + 9..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                (line, strings(r, "kind")[0].to_string(), count)
+            })
+            .collect()
+    };
+    let expected: Vec<(u32, String, bool)> = [
+        (3, true),
+        (4, true),
+        (5, true),
+        (6, true),
+        (8, true),
+        (8, false),
+        (10, true),
+        (11, true),
+        (12, true),
+        (12, true),
+    ]
+    .into_iter()
+    .map(|(l, hit)| (l, "block".to_string(), hit))
+    .collect();
+    for args in [
+        &["--code-coverage=stmt,branch", "--code-coverage-granularity=block"][..],
+        &["--code-coverage=stmt", "--code-coverage-granularity=block"][..],
+    ] {
+        let json = run(&d, NESTED, args);
+        let u = scope(&json, "tb.u");
+        let got: Vec<(u32, String, bool)> =
+            rows(&json).into_iter().map(|(l, k, c)| (l, k, c > 0)).collect();
+        assert_eq!(got, expected, "{args:?}: {u}");
+        let stmts = u.split("\"branches\"").next().unwrap();
+        assert!(!stmts.contains("(implicit)"), "{args:?}: {stmts}");
+        assert!(
+            u.contains("\"statement\": {\"covered\": 9, \"total\": 10, \"percent\": 90.00}"),
+            "{args:?}: {u}"
+        );
+    }
+    let json = run(
+        &d,
+        NESTED,
+        &["--code-coverage=stmt,branch", "--code-coverage-granularity=block"],
+    );
+    let u = scope(&json, "tb.u");
+    let branches = &u[u.find("\"branches\"").expect("branches")..];
+    for (line, arm, count) in [
+        (3, "default (implicit)", 0),
+        (4, "default (implicit)", 0),
+        (8, "else (implicit)", 1),
+        (11, "else (implicit)", 0),
+    ] {
+        let at = format!("{{\"line\": {line}, \"arm\": \"{arm}\", \"count\": {count}}}");
+        assert!(branches.contains(&at), "{at}: {branches}");
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 

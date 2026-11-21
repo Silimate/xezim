@@ -683,7 +683,7 @@ impl Simulator {
             DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
             _ => None,
         };
-        let fill = if su.is_none() && super::elaborate::is_type_real(self.resolve_dt_ref(dt)) {
+        let fill = if su.is_none() && self.dt_is_real(dt) {
             // §6.8, Table 6-7: a real/shortreal element starts at real 0.0.
             Value::from_f64(0.0)
         } else if su.is_none() && self.type_starts_x(dt) {
@@ -774,10 +774,10 @@ impl Simulator {
     /// are `real`/`shortreal`, so a new element starts at real 0.0.
     pub(super) fn coll_elem_is_real(&self, name: &str) -> bool {
         if let Some(dt) = self.class_member_coll_type(name) {
-            return super::elaborate::is_type_real(self.resolve_dt_ref(dt));
+            return self.dt_is_real(dt);
         }
         self.p_elem_type_ref(name)
-            .is_some_and(|dt| super::elaborate::is_type_real(self.resolve_dt_ref(&dt)))
+            .is_some_and(|dt| self.dt_is_real(&dt))
     }
 
     /// The declared element type of the class-member collection stored at
@@ -913,7 +913,7 @@ impl Simulator {
             };
             let dv = if nested.is_some() {
                 Value::zero(0)
-            } else if super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type)) {
+            } else if self.dt_is_real(&m.data_type) {
                 Value::from_f64(0.0)
             } else if Self::dt_is_class_handle(&m.data_type, &self.module) {
                 // §8.4: a class handle member starts null.
@@ -1067,10 +1067,10 @@ impl Simulator {
                     width: super::elaborate::resolve_type_width(
                         rt,
                         Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
+                        Some(self.method_typedef_widths()),
                     ),
                     signed: super::elaborate::is_type_signed(rt),
-                    real: super::elaborate::is_type_real(rt),
+                    real: self.dt_is_real(rt),
                     two_state: super::elaborate::is_type_two_state(rt),
                     class,
                     collection: self.fn_returns_collection(rt),
@@ -1750,7 +1750,13 @@ impl Simulator {
                         }
                         None => port,
                     };
-                    if !plain && matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
+                    // §7.4.1, §13.5: so does a formal that is a packed array
+                    // of a named type (`lane_t [0:1] v`, or a typedef of
+                    // one): its range labels its elements and their type
+                    // gives them their signing, as for a function's formal.
+                    if !plain
+                        && (matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
+                            || self.names_packed_array_of_named(&port.data_type))
                     {
                         self.register_formal_type_metadata(
                             &port.name.name,
@@ -2031,7 +2037,17 @@ impl Simulator {
                     // derived from a CLASS type-param (not in module.parameters)
                     // isn't mis-resolved to `1` and truncates the caller's
                     // value.
-                    if matches!(&port.data_type, DataType::TypeReference { .. }) {
+                    if !plain_class
+                        && port.dimensions.is_empty()
+                        && self.method_dt_is_real(handle, cname, &port.data_type)
+                    {
+                        // §13.5, §6.12.1: a real formal (declared `real`,
+                        // through a typedef, or by a type parameter bound to
+                        // one) holds a real; an integral actual converts.
+                        if !val.is_real && port.direction != PortDirection::Output {
+                            val = Value::from_f64(val.to_f64());
+                        }
+                    } else if matches!(&port.data_type, DataType::TypeReference { .. }) {
                         if plain_class {
                             // A class handle is bound as passed.
                         } else if let Some(pw) = param_w {
@@ -2277,14 +2293,8 @@ impl Simulator {
                                 self.method_formal_param_width(handle, cname, &f.return_type)
                             {
                                 w
-                            } else if plan.type_gen == self.type_tables_gen {
-                                rp.width
                             } else {
-                                super::elaborate::resolve_type_width(
-                                    &f.return_type,
-                                    Some(&self.module.parameters),
-                                    Some(&self.module.typedefs),
-                                )
+                                rp.width
                             }
                             .max(1);
                             match self.widths.get_mut(rn) {
@@ -2862,7 +2872,7 @@ impl Simulator {
                     && matches!(&f.return_type, DataType::TypeReference { .. })
                     && let Some(w) = self.method_formal_param_width(handle, &cname, &f.return_type)
                 {
-                    if w != ret.width {
+                    if w != ret.width || ret.is_fill {
                         ret = ret.resize_for_assign(w);
                     }
                     if let DataType::TypeReference { name, .. } = &f.return_type
@@ -2890,7 +2900,7 @@ impl Simulator {
                                 )
                             }
                         };
-                        if w > 0 && w != ret.width {
+                        if w > 0 && (w != ret.width || ret.is_fill) {
                             ret = ret.resize_for_assign(w);
                         }
                     }
@@ -2932,8 +2942,8 @@ impl Simulator {
                                 Some(&self.module.typedefs),
                             ),
                         };
-                        if w > 0 && w != ret.width {
-                            ret = ret.resize(w);
+                        if w > 0 && (w != ret.width || ret.is_fill) {
+                            ret = ret.resize_for_assign(w);
                         }
                         ret.is_signed = plan.ret.as_ref().map_or_else(
                             || super::elaborate::is_type_signed(&f.return_type),

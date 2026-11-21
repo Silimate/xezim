@@ -2077,6 +2077,8 @@ fn append_adopted_libs_to_merged(
             how,
             mods.join(", ")
         ));
+        // Each adopted library starts its own directive context (§22.2).
+        extra.push_str("`default_nettype wire\n");
         extra.push_str(&text);
         if !extra.ends_with('\n') {
             extra.push('\n');
@@ -4357,6 +4359,10 @@ suppressed but the explicit SDF annotation still applies."
                 *t = rewritten;
             }
         }
+        // A saved image can be loaded later with a VPI or DPI library (§38.34).
+        xezim_core::elaborate::set_vpi_net_drivers(
+            _output_file.is_some() || !vpi_libs.is_empty() || !dpi_libs.is_empty(),
+        );
         match xezim_core::parse_and_elaborate_multi_preprocessed(
             &sources,
             top_module.as_deref(),
@@ -4555,11 +4561,17 @@ suppressed but the explicit SDF annotation still applies."
 }
 
 /// §20.10: translate end-of-run severity state into a process exit status.
-/// `$fatal` must never exit 0 — its finish_number is a diagnostics level, not
+/// A run that a signal stopped exits 128 + the signal number. `$fatal` must
+/// never exit 0 — its finish_number is a diagnostics level, not
 /// a success code, so any `$fatal` fails the run. `$error` only fails when the
 /// user opts in with `--error-exit` (matching the "promote errors" switch other
 /// simulators provide), so existing flows that tolerate errors keep working.
 fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool) -> i32 {
+    // A run that SIGINT or SIGTERM stopped exits 128 + the signal (130,
+    // 143), after the dumps are finalized: it did not run to its end.
+    if let Some(code) = xezim::compiler::interrupted_exit_status() {
+        return code;
+    }
     if sim.saw_fatal {
         return 1;
     }

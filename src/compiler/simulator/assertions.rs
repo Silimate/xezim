@@ -2093,6 +2093,12 @@ impl Simulator {
         // A procedural assertion registers while its procedure runs, which
         // for an edge-triggered procedure is at the tick that starts its
         // first attempt: take that edge as seen (§16.14.6).
+        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+        // One reached after a delay is not at a tick: its first attempt
+        // waits for the clock's next event.
+        let at_tick =
+            procedural && (self.settling || !self.delay_resumed.contains(&self.current_pid));
+        // /silimate
         let mut clock_events = Vec::with_capacity(events.len());
         for mut event in events {
             self.sva_fold_scopes(&mut event.expr);
@@ -2112,7 +2118,8 @@ impl Simulator {
                 previous: Value::all_x(1),
             };
             clock_event.previous = self.sva_event_value(&clock_event);
-            if procedural {
+            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+            if at_tick {
                 let bit = clock_event.previous.get_bit(0);
                 let opposite = match (clock_event.event.edge, bit) {
                     (Some(Edge::Posedge), LogicBit::One) => Some(LogicBit::Zero),
@@ -2179,6 +2186,7 @@ impl Simulator {
             procedural,
             captured,
             matured: Vec::new(),
+            tick_time: None,
             explicit_disable,
             disable_scope,
             ctl,
@@ -3189,17 +3197,40 @@ impl Simulator {
             }
             // Only the sites whose clock event was recorded tick. The others
             // check their asynchronous abort conditions (§16.12.14).
-            if !std::mem::take(&mut self.sva_sites[i].fired) {
+            let fired = std::mem::take(&mut self.sva_sites[i].fired);
+            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+            // §16.14.6: an instance maturing in a time step whose tick has
+            // passed (one queued after a `#0`) starts its attempt at that
+            // tick; the attempts in flight have taken it already.
+            let late = !fired
+                && !self.sva_sites[i].matured.is_empty()
+                && self.sva_sites[i].tick_time == Some(self.time);
+            // /silimate
+            if !fired && !late {
                 if self.sva_sites[i].async_abort && !self.sva_sites[i].attempts.is_empty() {
                     self.sva_abort_step_site(i);
                 }
                 continue;
             }
+            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+            self.sva_sites[i].tick_time = Some(self.time);
+            let held = late.then(|| {
+                let n = self.sva_sites[i].attempts.len();
+                let metas = self.sva_take_meta(i, n);
+                (std::mem::take(&mut self.sva_sites[i].attempts), metas)
+            });
+            // /silimate
             let node = self.sva_sites[i].node.clone();
             // §16.12.14: attempts an abort settled since the last tick come
             // first; a `disable iff` at this tick does not reach them.
-            let settled = std::mem::take(&mut self.sva_sites[i].settled);
-            let settled_meta = std::mem::take(&mut self.sva_sites[i].settled_meta);
+            let (settled, settled_meta) = if late {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    std::mem::take(&mut self.sva_sites[i].settled),
+                    std::mem::take(&mut self.sva_sites[i].settled_meta),
+                )
+            };
             // LRM §16.5.1: the referenced-signal ids whose Preponed samples
             // this fire's predicates must read through the sampled-value overlay.
             let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
@@ -3208,8 +3239,11 @@ impl Simulator {
             *self.activation_scope.borrow_mut() = Some(self.sva_sites[i].scope.clone());
             // LRM §16.9.3: refresh the past-value snapshots BEFORE anything
             // evaluates, so `$past(<sig>)` in a consequent that comes due
-            // this tick reads the previous cycle's sample too.
-            self.refresh_sva_past_snapshots(i, &sampled_ids);
+            // this tick reads the previous cycle's sample too. A late start
+            // reads the ones its tick took.
+            if !late {
+                self.refresh_sva_past_snapshots(i, &sampled_ids);
+            }
             // §20.12 Off/Kill: no new attempt; those in flight go on.
             let starts = !self.assert_ctl_on || self.sva_site_ctl(i).enabled();
             // The attempts this tick starts: one, or for a procedural
@@ -3227,6 +3261,12 @@ impl Simulator {
             // start along with those in flight.
             if self.sva_cancel_disabled(i) {
                 self.assert_insts[inst].disabled += fresh;
+                // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+                if let Some((attempts, metas)) = held {
+                    self.sva_sites[i].attempts = attempts;
+                    self.sva_sites[i].attempt_meta = metas;
+                }
+                // /silimate
                 self.sva_sites[i].sampled_ids = sampled_ids;
                 self.sva_report_outcomes(i, settled, settled_meta);
                 self.active_sva_site = prev_active;
@@ -3322,6 +3362,16 @@ impl Simulator {
             if self.vpi_assert_on {
                 self.vpi_assert_fire_steps(i);
             }
+            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+            // The attempts in flight, stepped at the tick, stay ahead.
+            if let Some((mut attempts, mut metas)) = held {
+                let site = &mut self.sva_sites[i];
+                attempts.append(&mut site.attempts);
+                metas.append(&mut site.attempt_meta);
+                site.attempts = attempts;
+                site.attempt_meta = metas;
+            }
+            // /silimate
             self.sva_report_outcomes(i, results, result_meta);
             self.active_sva_site = prev_active;
             *self.activation_scope.borrow_mut() = prev_activation_scope;

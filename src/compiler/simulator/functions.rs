@@ -434,7 +434,7 @@ impl Simulator {
                 // already dropped.
                 let value = match self.formal_pattern_value(port, &args[i]) {
                     Some(v) => v,
-                    None => match self.actual_context_width(port) {
+                    None => match self.free_actual_context_width(port) {
                         Some(w) => self.eval_expr_ctx(&args[i], w),
                         None => self.eval_expr(&args[i]),
                     },
@@ -572,7 +572,7 @@ impl Simulator {
         // initial value is the type default: x for a 4-state type, 0 for a
         // 2-state one. An empty `function integer y(); endfunction` returns
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
-        let mut ret_init = if super::elaborate::is_type_real(&fd.return_type) {
+        let mut ret_init = if self.dt_is_real(&fd.return_type) {
             Value::from_f64(0.0)
         } else if match &ret_tp {
             Some((_, c)) => self.concrete_type_two_state(c),
@@ -932,8 +932,8 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            if w > 0 && w != result.width {
-                result = result.resize(w);
+            if w > 0 && (w != result.width || result.is_fill) {
+                result = result.resize_for_assign(w);
             }
             // §13.4.1, §6.18: the result has the return type's sign, through
             // a typedef too.
@@ -2831,9 +2831,16 @@ impl Simulator {
                         // §13.5, §11.6.1: as a function's (`exec_function_call`),
                         // a task's input actual is context-determined by its
                         // formal; `t(x + y)` over 8-bit operands lost the carry.
+                        // A module- or package-scope task's formal sized by a
+                        // parameter (`input [W-1:0] v`) gives its width too.
+                        let width = if method_ctx.is_none() {
+                            self.free_actual_context_width(port)
+                        } else {
+                            self.actual_context_width(port)
+                        };
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
-                            None => match self.actual_context_width(port) {
+                            None => match width {
                                 Some(w) => self.eval_expr_ctx(&args[i], w),
                                 None => self.eval_expr(&args[i]),
                             },

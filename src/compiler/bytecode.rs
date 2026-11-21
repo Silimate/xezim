@@ -359,9 +359,7 @@ pub enum StrOpKind {
     HexToA,   // [v]
     OctToA,   // [v]
     BinToA,   // [v]
-    /// [a, b] -> unsigned-byte strcmp difference: the ORDER the `==`/`<`
-    /// family of operators compares strings by (§6.16 Table 6-9). Only the
-    /// `compare()` METHOD takes signed-byte differences.
+    /// Unsigned byte ordering for relational operators (§6.16 Table 6-9).
     Order,
     /// [v] -> the operand converted to a `string` value: its bytes with
     /// every NUL removed (§6.16 — `string'(24'hab0063)` is 2 characters,
@@ -745,7 +743,7 @@ pub enum Insn {
     LoadCollElem(RegId, RegId, Box<str>, RegId),
     /// Element WRITE `q[i] = v` / `aa[k] = v` on the same receivers.
     /// (handle_reg, member, index_reg, value_reg). The exec arm mirrors the
-    /// `expr_assoc_name` arm of `assign_value_index` directly — §7.10.2.3
+    /// `expr_assoc_name` arm of `assign_value_index` directly — §7.10.1
     /// queue append, §10.7 width fit off the live store, exact changed-
     /// detect insert, touch_queue, waiter notify, settle — so storage and
     /// side effects match the AST path. No-op on a null receiver.
@@ -1648,6 +1646,17 @@ struct LocalArrayBind {
     elem_signed: Option<bool>,
 }
 
+/// A fixed unpacked local addressed by constant numeric index.
+#[derive(Clone, Copy)]
+struct LocalArrayBank {
+    base: RegId,
+    width: u32,
+    len: usize,
+    lo: i64,
+    descending: bool,
+    element: Option<LocalKind>,
+}
+
 /// A member of a packed-struct formal that an inlined body reads as a slice
 /// of the formal's register.
 #[derive(Clone)]
@@ -2252,11 +2261,10 @@ pub struct BytecodeCompiler<'a> {
     /// carries it (`fb_carry`); absent when the type is not carryable.
     local_const_kinds: HashMap<String, LocalKind>,
     /// Register-bank locals: a small fixed-size local unpacked array whose
-    /// elements live in consecutive VM registers. name -> (base reg, element
-    /// width, length, declared lo index). Only CONSTANT indexes can address a
+    /// elements live in consecutive VM registers. Only CONSTANT indexes address a
     /// bank — the registers have no runtime indexing — so any dynamic access
     /// fails the enclosing compile, which rolls back to the AST path.
-    local_array_regs: HashMap<String, (RegId, u32, usize, i64)>,
+    local_array_regs: HashMap<String, LocalArrayBank>,
     /// class-perf row 3: bare names of LOCAL queue / dynamic-array
     /// declarations compiled in this method body (delegated to the
     /// interpreter via a StmtFallback of the declaration, so the per-call
@@ -3897,6 +3905,15 @@ impl<'a> BytecodeCompiler<'a> {
     /// typedef? A bound that does not fold counts as one.
     fn decl_has_offset_range(&self, dt: &crate::ast::types::DataType) -> bool {
         use crate::ast::types::{DataType, PackedDimension};
+        // §7.4.1: so is a packed array of a named signed type. A select of
+        // one of its elements is signed, which the interpreter reads from
+        // the declaration of the formal or local.
+        if self
+            .typedef_types
+            .is_some_and(|t| signed_named_packed_elem_depth(dt, t).is_some())
+        {
+            return true;
+        }
         let offset = |dims: &[PackedDimension]| {
             dims.iter().any(|d| match d {
                 PackedDimension::Range { left, right, .. } => {
@@ -4289,6 +4306,24 @@ impl<'a> BytecodeCompiler<'a> {
             };
             owned_args = v;
             &owned_args
+        } else if args.len() < fd.ports.len()
+            && fd.ports[args.len()..].iter().all(|p| {
+                matches!(p.direction, PortDirection::Input)
+                    && p.default
+                        .as_ref()
+                        .is_some_and(|d| matches!(d.kind, ExprKind::Number(_)))
+            })
+        {
+            // §13.5.3: a literal default has the same meaning in the caller
+            // and callee scopes. Bind it using the usual formal conversion.
+            let mut full_args = args.to_vec();
+            full_args.extend(
+                fd.ports[args.len()..]
+                    .iter()
+                    .filter_map(|p| p.default.clone()),
+            );
+            owned_args = full_args;
+            &owned_args
         } else {
             args
         };
@@ -4406,8 +4441,62 @@ impl<'a> BytecodeCompiler<'a> {
                 [crate::ast::types::UnpackedDimension::Unsized(_)]
             ) && matches!(p.direction, PortDirection::Input)
         };
+        let mut array_output = |p: &crate::ast::decl::FunctionPort, a: &Expression| {
+            use crate::ast::types::{Lifetime, UnpackedDimension};
+            if p.direction != PortDirection::Output || fd.lifetime != Some(Lifetime::Automatic) {
+                return None;
+            }
+            let ExprKind::Ident(h) = &a.kind else {
+                return None;
+            };
+            if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                return None;
+            }
+            let bank = *self.local_array_regs.get(&h.path[0].name.name)?;
+            let number = |e: &Expression| {
+                if let ExprKind::Number(n) = &e.kind {
+                    self.eval_number_static(n)?.to_u64()
+                } else {
+                    None
+                }
+            };
+            let (left, right) = match p.dimensions.as_slice() {
+                [UnpackedDimension::Range { left, right, .. }] => (number(left)?, number(right)?),
+                [UnpackedDimension::Expression { expr, .. }] => (0, number(expr)?.checked_sub(1)?),
+                _ => return None,
+            };
+            let element = self.local_kind_of(&p.data_type, Some(&name))?;
+            if !matches!(element, LocalKind::Int { .. })
+                || bank.element != Some(element)
+                || left.max(right) > i32::MAX as u64
+                || left.abs_diff(right).checked_add(1)? != bank.len as u64
+            {
+                return None;
+            }
+            Some((
+                bank,
+                i64::try_from(left.min(right)).ok()?,
+                left > right,
+                element,
+            ))
+        };
+        let output_bank = fd
+            .ports
+            .iter()
+            .position(|p| p.direction == PortDirection::Output && !p.dimensions.is_empty())
+            .and_then(|index| {
+                if fd
+                    .ports
+                    .iter()
+                    .enumerate()
+                    .any(|(i, p)| i != index && p.direction != PortDirection::Input)
+                {
+                    return None;
+                }
+                Some((index, array_output(&fd.ports[index], args.get(index)?)?))
+            });
         if fd.ports.len() != args.len()
-            || fd.ports.iter().zip(args).any(|(p, a)| {
+            || fd.ports.iter().zip(args).enumerate().any(|(i, (p, a))| {
                 // §13.5.2 output formals ride the existing ref-writeback
                 // machinery: the body sees a register, the caller's actual
                 // is written on return. AES-style helpers
@@ -4417,6 +4506,7 @@ impl<'a> BytecodeCompiler<'a> {
                     PortDirection::Input | PortDirection::Ref | PortDirection::Output
                 ) || !p.dimensions.is_empty())
                     && !(is_unsized_dim(p) && dyn_array_formal(p, a))
+                    && output_bank.is_none_or(|(index, _)| index != i)
             })
         {
             self.bail("Expr_Call_ports");
@@ -4501,7 +4591,42 @@ impl<'a> BytecodeCompiler<'a> {
         let mut real_formal_names: Vec<String> = Vec::new();
         let mut array_binds: Vec<(String, LocalArrayBind)> = Vec::new();
         let mut struct_binds: Vec<(String, (RegId, Vec<(String, FormalMember)>))> = Vec::new();
+        let mut output_elements = Vec::new();
         for (i, (p, a)) in fd.ports.iter().zip(args).enumerate() {
+            if let Some((_, (bank, lo, descending, element))) =
+                output_bank.filter(|(index, _)| *index == i)
+            {
+                // §13.5.3: initialize a private formal array and copy it back in
+                // declaration order, including on an early return.
+                let init = self.type_default_value_in(&p.data_type, bank.width, Some(&name));
+                let mut regs = Vec::with_capacity(bank.len);
+                for offset in 0..bank.len {
+                    let slot = self.alloc_reg();
+                    self.emit(Insn::LoadConst(slot, Box::new(init.clone())));
+                    self.local_kinds.insert(slot, element);
+                    let out = if descending == bank.descending {
+                        offset
+                    } else {
+                        bank.len - 1 - offset
+                    };
+                    output_elements.push((bank.base + out as RegId, slot));
+                    regs.push(slot);
+                }
+                let LocalKind::Int { signed, .. } = element else {
+                    unreachable!()
+                };
+                array_binds.push((
+                    p.name.name.clone(),
+                    LocalArrayBind {
+                        regs,
+                        lo,
+                        elem_w: bank.width,
+                        is_real: false,
+                        elem_signed: Some(signed),
+                    },
+                ));
+                continue;
+            }
             if is_unsized_dim(p) {
                 // Dynamic-array formal from a fixed assignment pattern: one
                 // register per element, evaluated in the CALLER's scope. The
@@ -4775,6 +4900,9 @@ impl<'a> BytecodeCompiler<'a> {
         // §13.5.3: copy-out assigns the caller's lvalues after return. Restore
         // its locals and loop constants first, including for indexed targets.
         if ok {
+            for (target, value) in output_elements {
+                self.emit(Insn::Move(target, value));
+            }
             for (target, value, width) in &ref_writes {
                 if !self.compile_blocking_target(target, *value, *width) {
                     ok = false;
@@ -4959,7 +5087,7 @@ impl<'a> BytecodeCompiler<'a> {
                         match (l, r) {
                             (Some(l), Some(r)) => {
                                 let (lo, hi) = (l.min(r) as i64, l.max(r) as i64);
-                                Some((lo, (hi - lo + 1) as usize))
+                                Some((lo, (hi - lo + 1) as usize, l > r))
                             }
                             _ => None,
                         }
@@ -4968,13 +5096,13 @@ impl<'a> BytecodeCompiler<'a> {
                         .fold_const(expr)
                         .and_then(|v| v.to_u64())
                         .filter(|&n| n > 0)
-                        .map(|n| (0i64, n as usize)),
+                        .map(|n| (0i64, n as usize, false)),
                     _ => None,
                 }
             } else {
                 None
             };
-            let Some((lo, len)) = bounds.filter(|&(_, n)| n <= 64) else {
+            let Some((lo, len, descending)) = bounds.filter(|&(_, n, _)| n <= 64) else {
                 self.bail("VarDecl_array");
                 return false;
             };
@@ -4993,8 +5121,18 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("VarDecl_array");
                 return false;
             };
-            self.local_array_regs
-                .insert(decl.name.name.clone(), (base, ew, len, lo));
+            let element = self.local_kind_of(data_type, None);
+            self.local_array_regs.insert(
+                decl.name.name.clone(),
+                LocalArrayBank {
+                    base,
+                    width: ew,
+                    len,
+                    lo,
+                    descending,
+                    element,
+                },
+            );
             return true;
         }
         // §6.16 string local: no declared width — bind at width
@@ -5705,6 +5843,35 @@ impl<'a> BytecodeCompiler<'a> {
             )
     }
 
+    /// `q.pop_front()` / `q.pop_back()` on a plain (possibly dotted) name,
+    /// under any parentheses.
+    fn is_queue_pop_call(e: &Expression) -> bool {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &e.kind {
+            e = inner;
+        }
+        let ExprKind::Call { func, args } = &e.kind else {
+            return false;
+        };
+        if !args.is_empty() {
+            return false;
+        }
+        let plain = |h: &crate::ast::expr::HierarchicalIdentifier| {
+            h.path.iter().all(|s| s.selects.is_empty())
+        };
+        let (method, recv_ok) = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                (h.path.last().map(|s| s.name.name.as_str()), plain(h))
+            }
+            ExprKind::MemberAccess { expr, member } => (
+                Some(member.name.as_str()),
+                matches!(&expr.kind, ExprKind::Ident(h) if plain(h)),
+            ),
+            _ => (None, false),
+        };
+        recv_ok && matches!(method, Some("pop_front" | "pop_back"))
+    }
+
     fn for_body_is_simple(&self, stmt: &Statement) -> bool {
         let expr_simple = |e: &Expression| -> bool { self.expr_loop_simple(e) };
         let lv_simple = |e: &Expression| -> bool {
@@ -5876,7 +6043,13 @@ impl<'a> BytecodeCompiler<'a> {
                     _ => false,
                 };
                 let _ = expr_reads_name; // superseded by the form-aware audit
-                lv_simple(lvalue) && expr_simple(rvalue) && !self_read_skewed
+                // §7.10.2: `v[i] = q.pop_front();` — the pop is evaluated by
+                // the interpreter into a register (it names no loop
+                // variable), the loop and the store stay compiled. Such a
+                // drain loop used to run whole in the AST interpreter (#1210).
+                let queue_pop = matches!(stmt.kind, StatementKind::BlockingAssign { .. })
+                    && Self::is_queue_pop_call(rvalue);
+                lv_simple(lvalue) && (expr_simple(rvalue) || queue_pop) && !self_read_skewed
             }
             StatementKind::SeqBlock { stmts, .. } => {
                 stmts.iter().all(|st| self.for_body_is_simple(st))
@@ -8244,6 +8417,15 @@ impl<'a> BytecodeCompiler<'a> {
             self.emit_to_real(v);
         } else {
             self.emit(Insn::Resize(v, ab.elem_w));
+            if let Some(kind) = ab
+                .regs
+                .first()
+                .and_then(|r| self.local_kinds.get(r))
+                .copied()
+            {
+                self.local_kinds.insert(v, kind);
+                self.emit_local_fit(v);
+            }
         }
         if let Some(k) = self.eval_const_expr(idx) {
             let i = (k as i64).checked_sub(ab.lo)?;
@@ -9075,6 +9257,38 @@ impl<'a> BytecodeCompiler<'a> {
         dt // A cyclic alias must not acquire a concrete local kind.
     }
 
+    /// §6.24.1: whether the named cast `T'(x)` (`pkg::T'(x)`) targets a
+    /// typedef of a real type, so the cast is a real operand of its context.
+    fn named_cast_is_real(&self, args: &[Expression]) -> bool {
+        let (scope, leaf) = match args.first().map(|a| &a.kind) {
+            Some(ExprKind::Ident(h)) if h.path.len() >= 2 => {
+                let n = h.path.len();
+                (
+                    Some(h.path[n - 2].name.name.as_str()),
+                    h.path[n - 1].name.name.as_str(),
+                )
+            }
+            Some(ExprKind::Ident(h)) if h.path.len() == 1 => (None, h.path[0].name.name.as_str()),
+            Some(ExprKind::MemberAccess { expr, member }) => match &expr.kind {
+                ExprKind::Ident(h) => (
+                    h.path.last().map(|s| s.name.name.as_str()),
+                    member.name.as_str(),
+                ),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let get = |key: &str| {
+            self.local_typedef_types
+                .get(key)
+                .or_else(|| self.typedef_types.and_then(|t| t.get(key)))
+        };
+        scope
+            .and_then(|s| get(&format!("{s}::{leaf}")))
+            .or_else(|| get(leaf))
+            .is_some_and(|dt| self.decl_is_real(dt, None))
+    }
+
     fn decl_is_real(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> bool {
         crate::compiler::elaborate::is_type_real(self.resolved_decl_type(dt, scope))
     }
@@ -9317,7 +9531,9 @@ impl<'a> BytecodeCompiler<'a> {
                     local.lo + local.regs.len() as i64 - 1,
                     local.elem_w,
                 ))
-            } else if let Some(&(_, width, len, lo)) = self.local_array_regs.get(&name) {
+            } else if let Some(&LocalArrayBank { width, len, lo, .. }) =
+                self.local_array_regs.get(&name)
+            {
                 Some((lo, lo + len as i64 - 1, width))
             } else {
                 scope
@@ -10526,7 +10742,7 @@ impl<'a> BytecodeCompiler<'a> {
         if self.local_array_regs.is_empty() {
             return false;
         }
-        fn expr_hits(e: &Expression, banks: &HashMap<String, (RegId, u32, usize, i64)>) -> bool {
+        fn expr_hits(e: &Expression, banks: &HashMap<String, LocalArrayBank>) -> bool {
             match &e.kind {
                 ExprKind::Ident(h) => h.path.len() == 1 && banks.contains_key(&h.path[0].name.name),
                 ExprKind::Index { expr, index } => {
@@ -10559,7 +10775,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         let banks = &self.local_array_regs;
-        fn walk(st: &Statement, banks: &HashMap<String, (RegId, u32, usize, i64)>) -> bool {
+        fn walk(st: &Statement, banks: &HashMap<String, LocalArrayBank>) -> bool {
             match &st.kind {
                 StatementKind::BlockingAssign { lvalue, rvalue }
                 | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
@@ -11434,7 +11650,17 @@ impl<'a> BytecodeCompiler<'a> {
                     _ => return None,
                 }
             }
-            ExprKind::MemberAccess { expr, member } => self.const_param_member(expr, &member.name)?,
+            ExprKind::MemberAccess { expr, member } => {
+                self.const_param_member(expr, &member.name)?
+            }
+            // §20.8.1: as the interpreter computes it, a 32-bit result, signed
+            // as `system_function_result` types it (`$clog2(1) - 1 < 0`).
+            ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
+                let v = self.clog2_const_operand(&args[0])?;
+                let mut r = Value::from_u64(u64::from(clog2_u64(v)), 32);
+                r.is_signed = true;
+                r
+            }
             _ => return None,
         };
         (!v.has_xz() && !v.is_real).then_some(v)
@@ -12172,9 +12398,9 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::SystemCall { name, args } => match name.as_str() {
                 "$__xz_type_cast" => matches!(
                     args.first().map(|a| &a.kind),
-                    Some(ExprKind::TypeLiteral(dt))
-                        if crate::compiler::elaborate::is_type_real(dt)
+                    Some(ExprKind::TypeLiteral(dt)) if self.decl_is_real(dt, None)
                 ),
+                "$__xz_named_cast" => self.named_cast_is_real(args),
                 n => system_function_is_real(n),
             },
             ExprKind::Call { func, .. } => self.call_returns_real(func),
@@ -12195,8 +12421,7 @@ impl<'a> BytecodeCompiler<'a> {
         let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone()) else {
             return false;
         };
-        let real =
-            |fd: &FunctionDeclaration| crate::compiler::elaborate::is_type_real(&fd.return_type);
+        let real = |fd: &FunctionDeclaration| self.decl_is_real(&fd.return_type, Some(&name));
         self.functions.and_then(|f| f.get(&name)).is_some_and(real)
             || self
                 .dpi_import_fds
@@ -12247,18 +12472,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    /// §11.8.2 operators with a REAL operand. Neither operand real: None, and
-    /// the integral rules apply. Otherwise:
-    /// - an arithmetic operator's result is real, so each integral operand is
-    ///   evaluated SELF-determined and then converted. The surrounding context
-    ///   width never reaches it — `(u - 2) * 1.0` with `int unsigned u = 1`
-    ///   converts the 32-bit 4294967295, not a 64-bit all-ones;
-    /// - a relational or equality operator's operands take real type from
-    ///   each other, so the real type propagates ONE operator into the
-    ///   integral side, whose own operands are then self-determined (see
-    ///   `compile_in_real_context`): `3.5 == 7/2` compares 3.5 with 3.5. As
-    ///   in the reference simulator, this happens only for a constant
-    ///   integral side; a run-time one is converted whole.
+    /// §11.8.2: integral operands of real arithmetic and comparisons are
+    /// self-determined before conversion, including constant expressions.
     fn compile_real_operator(
         &mut self,
         op: BinaryOp,
@@ -12286,26 +12501,10 @@ impl<'a> BytecodeCompiler<'a> {
         if !lr && !rr {
             return None;
         }
-        // The reference simulator propagates into a comparison only when the
-        // integral side is itself CONSTANT (`3.5 == 7/2` divides as reals);
-        // a run-time integral side is converted from its self-determined
-        // value (`x == a/b` divides as integers).
-        let lp = cmp && !lr && self.expr_is_constant(left);
-        let rp = cmp && !rr && self.expr_is_constant(right);
-        let l = if lp {
-            self.compile_in_real_context(left)
-        } else {
-            self.compile_real_operand(left, lr)
-        };
-        let Some(l) = l else {
+        let Some(l) = self.compile_real_operand(left, lr) else {
             return Some(None);
         };
-        let r = if rp {
-            self.compile_in_real_context(right)
-        } else {
-            self.compile_real_operand(right, rr)
-        };
-        let Some(r) = r else {
+        let Some(r) = self.compile_real_operand(right, rr) else {
             return Some(None);
         };
         Some(Some(self.emit_real_binop(op, l, r)))
@@ -14291,12 +14490,12 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => false,
             }
         }
-        Self::block_has_carried_static(stmts) || stmts.iter().any(nested)
+        Self::block_has_carried_static(stmts, None) || stmts.iter().any(nested)
     }
 
     /// §6.21: does a process block declare a static local whose value can
     /// carry from one activation to the next (see `static_local_carries`)?
-    fn block_has_carried_static(stmts: &[Statement]) -> bool {
+    fn block_has_carried_static(stmts: &[Statement], caller: Option<&Self>) -> bool {
         stmts.iter().enumerate().any(|(i, s)| match &s.kind {
             StatementKind::VarDecl {
                 lifetime,
@@ -14309,12 +14508,63 @@ impl<'a> BytecodeCompiler<'a> {
                 declarators.iter().any(|d| match &d.init {
                     Some(_) => explicit,
                     None => {
-                        Self::static_local_carries(&d.name.name, Some(data_type), &stmts[i + 1..])
+                        let rest = &stmts[i + 1..];
+                        !caller.is_some_and(|c| c.first_call_copies_output(&d.name.name, rest))
+                            && Self::static_local_carries(&d.name.name, Some(data_type), rest)
                     }
                 })
             }
             _ => false,
         })
+    }
+
+    /// §13.5.1: a function copies its output back before the next statement.
+    /// A whole local used solely as that output cannot carry an old value
+    /// into the rest of the block. Only simple positional actuals prove it.
+    fn first_call_copies_output(&self, local: &str, rest: &[Statement]) -> bool {
+        let Some(Statement {
+            kind: StatementKind::Expr(call),
+            ..
+        }) = rest.first()
+        else {
+            return false;
+        };
+        let ExprKind::Call { func, args } = &call.kind else {
+            return false;
+        };
+        let ExprKind::Ident(h) = &func.kind else {
+            return false;
+        };
+        if h.root.is_some() || h.path.iter().any(|seg| !seg.selects.is_empty()) {
+            return false;
+        }
+        let name = Self::hier_raw_name(h);
+        let Some(fd) = self.functions.and_then(|f| f.get(&name)) else {
+            return false;
+        };
+        if fd.ports.len() != args.len()
+            || !matches!(fd.return_type, crate::ast::types::DataType::Void(_))
+        {
+            return false;
+        }
+        let mut written = false;
+        for (port, actual) in fd.ports.iter().zip(args) {
+            match &actual.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    if h.path[0].name.name == local {
+                        if port.direction != PortDirection::Output {
+                            return false;
+                        }
+                        written = true;
+                    }
+                }
+                ExprKind::Number(_) => {}
+                _ => return false,
+            }
+        }
+        written
     }
 
     /// §6.21: does a subroutine body declare, at any depth, a static
@@ -14849,6 +15099,35 @@ impl<'a> BytecodeCompiler<'a> {
             return Some(false);
         };
         let dst = map.get(&dst)?;
+        // §7.2 / §13.5: project an automatic scalar-member constructor to
+        // registers, then scatter. The destination may also be an actual.
+        if nb_delay.is_none()
+            && let ExprKind::Call { func, args } = &rvalue.kind
+        {
+            let ExprKind::Ident(h) = &func.kind else { return Some(false); };
+            let [segment] = h.path.as_slice() else { return Some(false); };
+            let constructor = self.scoped_callee_name(segment.name.name.clone())
+                .and_then(|name| self.functions?.get(&name));
+            if !constructor.is_some_and(|f| super::struct_sra::projectable_constructor(f, args)) {
+                return Some(false);
+            }
+            let leaves: Option<Vec<_>> = dst.iter().map(|(member, leaf)| {
+                let id = self.signal_name_to_id.get(leaf.as_str()).copied()?;
+                Some((member.clone(), id, *self.signal_widths.get(id)?))
+            }).collect();
+            let Some(leaves) = leaves else { return Some(false); };
+            let mut writes = Vec::with_capacity(leaves.len());
+            for (member, id, width) in leaves {
+                let Some(value) = self.compile_struct_member_call(func, args, &member) else {
+                    return Some(false);
+                };
+                writes.push(Insn::BlockingAssign(as_sig_id(id), value, width));
+            }
+            for insn in writes {
+                self.emit(insn);
+            }
+            return Some(true);
+        }
         let Some(src) = id_of(rvalue).flatten().and_then(|id| map.get(&id)) else {
             return Some(false);
         };
@@ -15450,28 +15729,42 @@ impl<'a> BytecodeCompiler<'a> {
                 // §12.5: the selector and the items are sized to the widest
                 // of them. An operation selector (`a8 + 8'd1`) narrower than
                 // an item is computed at that width, in the compare chain.
-                let sel_w = if matches!(
-                    expr.kind,
-                    ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
-                ) {
-                    let own = self.lrm_self_width(expr);
-                    let mut w = own;
-                    for p in items.iter().flat_map(|it| it.patterns.iter()) {
-                        if !matches!(p.kind, ExprKind::Range(..)) {
-                            w = w.max(self.lrm_self_width(p));
-                        }
-                    }
-                    (w > own).then_some(w)
-                } else {
-                    None
+                let operation = |e: &Expression| {
+                    matches!(
+                        e.kind,
+                        ExprKind::Binary { .. }
+                            | ExprKind::Unary { .. }
+                            | ExprKind::Conditional { .. }
+                    )
                 };
+                let patterns = items.iter().flat_map(|it| &it.patterns);
+                let op_selector = operation(expr);
+                let op_item = !inside_kind && patterns.clone().any(operation);
+                let common_w = if op_selector || op_item {
+                    let own = self.lrm_self_width(expr);
+                    patterns
+                        .clone()
+                        .filter(|p| !matches!(p.kind, ExprKind::Range(..)))
+                        .fold(own, |w, p| w.max(self.lrm_self_width(p)))
+                } else {
+                    0
+                };
+                let sel_w =
+                    (op_selector && common_w > self.lrm_self_width(expr)).then_some(common_w);
+                let case_unsigned = !inside_kind
+                    && (self.expr_signedness(expr) == Some(false)
+                        || patterns
+                            .clone()
+                            .any(|p| self.expr_signedness(p) == Some(false)));
                 // ROM shape: plain `case` whose every arm assigns a CONSTANT
                 // to the SAME variable, constant patterns throughout. One
                 // table lookup replaces the whole compare chain. `===`
                 // semantics hold exactly: the patterns are fully defined, so
                 // a selector with any x/z bit matches none of them → default.
                 if sel_w.is_none() && matches!(kind, crate::ast::stmt::CaseKind::Case) {
-                    if let Some((lhs, table, default, res_w)) = self.case_lut_shape(items) {
+                    if case_unsigned
+                        && let Some((lhs, table, default, res_w)) = self.case_lut_shape(items)
+                    {
                         if let Some(sel) = self.compile_expr(expr, 0) {
                             let dst = self.alloc_reg();
                             self.emit(Insn::CaseLut(
@@ -15498,7 +15791,9 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     return true;
                 }
-                if let Some(val_reg) = self.compile_expr(expr, sel_w.unwrap_or(0)) {
+                if let Some(val_reg) =
+                    self.compile_expr_typed(expr, sel_w.unwrap_or(0), case_unsigned)
+                {
                     let mut end_jumps: Vec<usize> = Vec::new();
                     let mut default_item: Option<&Statement> = None;
                     // Every pattern arm is mutually exclusive and jumps to the
@@ -15529,7 +15824,9 @@ impl<'a> BytecodeCompiler<'a> {
                                 let cmp_reg = self.alloc_reg();
                                 self.emit(Insn::CaseEq(cmp_reg, masked, known_reg));
                                 Some(cmp_reg)
-                            } else if let Some(pat_reg) = self.compile_expr(pat, 0) {
+                            } else if let Some(pat_reg) =
+                                self.compile_expr_typed(pat, common_w, case_unsigned)
+                            {
                                 let cmp_reg = self.alloc_reg();
                                 self.emit(match kind {
                                     crate::ast::stmt::CaseKind::Casez => {
@@ -15597,7 +15894,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // when such a local can be observed doing so.
                 if !self.method_mode
                     && self.inlining_stack.is_empty()
-                    && Self::block_has_carried_static(stmts)
+                    && Self::block_has_carried_static(stmts, Some(self))
                 {
                     self.bail("static_block_local");
                     return false;
@@ -18060,8 +18357,13 @@ impl<'a> BytecodeCompiler<'a> {
                 // through an unrolled loop var) index: a plain register move.
                 if let ExprKind::Ident(h) = &expr.kind {
                     if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
-                        if let Some(&(base, ew, len, lo)) =
-                            self.local_array_regs.get(&h.path[0].name.name)
+                        if let Some(&LocalArrayBank {
+                            base,
+                            width: ew,
+                            len,
+                            lo,
+                            ..
+                        }) = self.local_array_regs.get(&h.path[0].name.name)
                         {
                             let Some(iv) = self.fold_const(index).and_then(|v| v.to_u64()) else {
                                 // Dynamic index into registers is impossible.
@@ -18547,8 +18849,50 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return Some(dest);
                     }
-                    let l = self.compile_expr(left, 0)?;
-                    let r = self.compile_expr(right, 0)?;
+                    // §7.4.1, §11.5.1: bounds the compiler cannot fold are
+                    // still labels of the declared range. A descending range
+                    // that does not start at 0 (`input [11:2] a`) shifts them
+                    // to physical bits; an ascending one also mirrors their
+                    // order, which only the interpreter's select does.
+                    // Only for a plain vector: on a packed multi-D base the
+                    // bounds select whole elements (`a[$clog2(2+2)-1:0]` on
+                    // `logic [3:0][7:0] a` is two bytes), which the bit-range
+                    // `RangeSelect` below does not scale, so that select is
+                    // the interpreter's too.
+                    let elems = matches!(&expr.kind, ExprKind::Ident(h)
+                        if self.packed_elem_width_of(h).is_some_and(|w| w > 1));
+                    let plain =
+                        !elems && matches!(&expr.kind, ExprKind::Ident(_) | ExprKind::Index { .. });
+                    let dim = self.sel_base_dim(expr).filter(|_| plain);
+                    let interpreted = if elems {
+                        Some("range_sel_dyn_elements")
+                    } else if dim.is_some_and(|(l, r)| l < r) {
+                        Some("range_sel_dyn_ascending")
+                    } else {
+                        None
+                    };
+                    if let Some(site) = interpreted {
+                        self.truncate_insns(base_start);
+                        self.next_reg = base_reg;
+                        if let Some(r) = self.emit_expr_fallback(whole, ctx_width, site) {
+                            return Some(r);
+                        }
+                        self.bail(site);
+                        return None;
+                    }
+                    let mut l = self.compile_expr(left, 0)?;
+                    let mut r = self.compile_expr(right, 0)?;
+                    if let Some((_, lo)) = dim.filter(|&(_, lo)| lo != 0) {
+                        let off = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            off,
+                            Box::new(Value::from_u64(lo as u64, 32)),
+                        ));
+                        let (pl, pr) = (self.alloc_reg(), self.alloc_reg());
+                        self.emit(Insn::Sub(pl, l, off));
+                        self.emit(Insn::Sub(pr, r, off));
+                        (l, r) = (pl, pr);
+                    }
                     let dest = self.alloc_reg();
                     self.emit(Insn::RangeSelect(dest, base, l, r));
                     Some(dest)
@@ -18888,6 +19232,14 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     r
                 }
+                // §20.8.1: `$clog2` of a constant (a parameter, a literal) is
+                // that constant; anything else keeps the interpreter call.
+                "$clog2" if args.len() == 1 && self.fold_const(expr).is_some() => {
+                    let v = self.fold_const(expr)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::LoadConst(dest, Box::new(v)));
+                    Some(dest)
+                }
                 // §21.3.3 `$sformatf` with a LITERAL template and specs the
                 // native filler covers exactly — parsed once here, filled
                 // from register Values at exec. Anything else (non-literal
@@ -18952,19 +19304,24 @@ impl<'a> BytecodeCompiler<'a> {
                     ));
                     Some(dst)
                 }
-                "$signed" => {
-                    let r = self.compile_expr(args.first()?, 0)?;
-                    self.emit(Insn::SetSigned(r));
-                    Some(r)
-                }
-                "$unsigned" => {
-                    // §6.24.1: reinterpret as unsigned. This was a NO-OP,
-                    // so the operand kept its runtime signed flag and the
-                    // context Resize SIGN-extended — `unsigned'(sa)` in a
-                    // 32-bit context read fffffff4 instead of 000000f4
-                    // (the $display path was already correct).
-                    let r = self.compile_expr(args.first()?, 0)?;
-                    self.emit(Insn::ClearSigned(r));
+                "$signed" | "$unsigned" => {
+                    // §6.24.1: the sign conversion consumes a literal's fill.
+                    let arg = args.first()?;
+                    let signed = name == "$signed";
+                    let mut operand = arg;
+                    while let ExprKind::Paren(inner) = &operand.kind {
+                        operand = inner;
+                    }
+                    if let ExprKind::Number(n) = &operand.kind {
+                        let mut v = self.eval_number_static(n)?;
+                        v.is_fill = false;
+                        v.is_signed = signed;
+                        let dst = self.alloc_reg();
+                        self.emit(Insn::LoadConst(dst, Box::new(v)));
+                        return Some(dst);
+                    }
+                    let r = self.compile_expr(arg, 0)?;
+                    self.emit(if signed { Insn::SetSigned(r) } else { Insn::ClearSigned(r) });
                     Some(r)
                 }
                 "$__xz_size_cast" => {
@@ -19057,7 +19414,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("type_cast_stream");
                         return None;
                     }
-                    let is_real = crate::compiler::elaborate::is_type_real(&dt);
+                    let is_real = self.decl_is_real(&dt, None);
                     let w = crate::compiler::elaborate::resolve_type_width(&dt, self.params, None)
                         .max(1);
                     // §6.24.1: an integral target is the operand's context
@@ -21687,8 +22044,13 @@ impl<'a> BytecodeCompiler<'a> {
         if let ExprKind::Index { expr, index } = &lhs.kind {
             if let ExprKind::Ident(h) = &expr.kind {
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
-                    if let Some(&(base, ew, len, lo)) =
-                        self.local_array_regs.get(&h.path[0].name.name)
+                    if let Some(&LocalArrayBank {
+                        base,
+                        width: ew,
+                        len,
+                        lo,
+                        ..
+                    }) = self.local_array_regs.get(&h.path[0].name.name)
                     {
                         let Some(iv) = self.fold_const(index).and_then(|v| v.to_u64()) else {
                             self.bail("local_array_dyn_index");
@@ -22514,7 +22876,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // width. Missing this returned the 1-bit default and a
                     // bank store truncated every value to its LSB.
                     if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
-                        if let Some(&(_, ew, _, _)) =
+                        if let Some(&LocalArrayBank { width: ew, .. }) =
                             self.local_array_regs.get(&hier.path[0].name.name)
                         {
                             return ew;
@@ -22668,8 +23030,47 @@ impl<'a> BytecodeCompiler<'a> {
                     pv.to_u64().map(|u| u as i64)
                 }
             }
+            // §20.8.1: `$clog2` of a constant is a constant (`a[$clog2(N)-1:3]`).
+            ExprKind::SystemCall { name, args } if name == "$clog2" && args.len() == 1 => {
+                Some(i64::from(clog2_u64(self.clog2_const_operand(&args[0])?)))
+            }
             _ => self.eval_const_expr(e).map(|v| v as i64),
         }
+    }
+
+    /// §20.8.1: the operand of a `$clog2` that folds, as the unsigned value
+    /// the interpreter's `$clog2` reads: a literal at its full value up to 64
+    /// bits (`64'h1_0000_0000`, which `eval_const_expr` would narrow to 32), a
+    /// parameter, or an unrolled loop's index, optionally in parentheses.
+    /// An operator expression is self-determined (§11.6.1: `8'hff + 8'h01` is
+    /// 0, `64'd1 << 33` keeps bit 33), which neither `eval_const_bound`
+    /// (64-bit integers) nor `eval_const_expr` (32 bits) models, so it keeps
+    /// the interpreter's call. So does a frame local that hides a parameter
+    /// (§23.9), and an x/z or wider than 64-bit value.
+    fn clog2_const_operand(&self, e: &Expression) -> Option<u64> {
+        let v = match &e.kind {
+            ExprKind::Paren(inner) => return self.clog2_const_operand(inner),
+            ExprKind::Number(n) => self.eval_number_static(n)?,
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let name = h.path[0].name.name.as_str();
+                // A `foreach` index is an `int` (§12.7.3).
+                if let Some(&k) = self.const_var_binds.get(name) {
+                    return Some(u64::from(k as u32));
+                }
+                match self.local_const_vars.get(name) {
+                    Some(v) => v.clone(),
+                    None if self.frame_bound_target(e) => return None,
+                    None => self.lookup_param_value(h)?,
+                }
+            }
+            _ => return None,
+        };
+        if v.has_xz() || v.is_real || v.width > 64 {
+            return None;
+        }
+        v.to_u64()
     }
 
     fn eval_const_expr(&self, e: &Expression) -> Option<u32> {
@@ -27411,5 +27812,15 @@ impl crate::compiler::packed_assignment_pattern_plan::PatternTypeResolver
             return hit;
         }
         None
+    }
+}
+
+/// §20.8.1: the ceiling of the base-2 logarithm, with `$clog2(0)` and
+/// `$clog2(1)` both 0 (the interpreter's `$clog2`).
+fn clog2_u64(v: u64) -> u32 {
+    if v <= 1 {
+        0
+    } else {
+        64 - (v - 1).leading_zeros()
     }
 }

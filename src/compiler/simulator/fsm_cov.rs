@@ -724,7 +724,7 @@ impl Walk<'_> {
                 }
             }
         }
-        let sel = self.sim.case_selector_value(kind, expr, items);
+        let comparison = self.sim.case_comparison(kind, expr, items);
         let mut default = None;
         for (k, it) in items.iter().enumerate() {
             if it.is_default {
@@ -732,13 +732,7 @@ impl Walk<'_> {
                 continue;
             }
             for p in &it.patterns {
-                let hit = match kind {
-                    CaseKind::CaseInside => self.sim.case_inside_match(&sel, p),
-                    CaseKind::Casez => sel.casez_eq(&self.sim.eval_expr(p)).is_true(),
-                    CaseKind::Casex => sel.casex_eq(&self.sim.eval_expr(p)).is_true(),
-                    _ => sel.case_eq(&self.sim.eval_expr(p)).is_true(),
-                };
-                if hit {
+                if self.sim.case_item_matches(kind, &comparison, p) {
                     return Some(Some(k));
                 }
             }

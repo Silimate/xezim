@@ -92,7 +92,7 @@ impl Simulator {
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
                     if vm_regs[r].width != *width {
-                        let resized = vm_regs[r].resize(*width);
+                        let resized = vm_regs[r].resize_for_assign(*width);
                         vm_regs[r] = resized;
                     }
                 }
@@ -406,22 +406,10 @@ impl Simulator {
                             vm_regs[*else_r as usize] = vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if vm_regs[*cond as usize].has_unknown() {
-                        let t = &vm_regs[*then_r as usize];
-                        let e = &vm_regs[*else_r as usize];
-                        // §11.3.1: a real result can't hold X, so bit-merging the
-                        // branches reads their IEEE-754 bits as garbage (a real
-                        // 1000.0 came out as 4.65e18). Return a defined real value
-                        // (x condition → the else/false branch) instead.
-                        if t.is_real || e.is_real {
-                            e.clone()
-                        } else {
-                            t.merge_unknown(e)
-                        }
-                    } else if vm_regs[*cond as usize].is_true() {
-                        vm_regs[*then_r as usize].clone()
-                    } else {
-                        vm_regs[*else_r as usize].clone()
+                    let v = match vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => vm_regs[*then_r as usize].clone(),
+                        Some(false) => vm_regs[*else_r as usize].clone(),
+                        None => vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize]),
                     };
                     vm_regs[*dest as usize] = v;
                 }
@@ -732,7 +720,7 @@ impl Simulator {
                     // value's `is_fill` verbatim).
                     let sv = &vm_regs[*s as usize];
                     vm_regs[*d as usize] = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
@@ -913,7 +901,7 @@ impl Simulator {
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
                     if vm_regs[r].width != *width {
-                        let resized = vm_regs[r].resize(*width);
+                        let resized = vm_regs[r].resize_for_assign(*width);
                         vm_regs[r] = resized;
                     }
                 }
@@ -1213,22 +1201,10 @@ impl Simulator {
                             vm_regs[*else_r as usize] = vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if vm_regs[*cond as usize].has_unknown() {
-                        let t = &vm_regs[*then_r as usize];
-                        let e = &vm_regs[*else_r as usize];
-                        // §11.3.1: a real result can't hold X, so bit-merging the
-                        // branches reads their IEEE-754 bits as garbage (a real
-                        // 1000.0 came out as 4.65e18). Return a defined real value
-                        // (x condition → the else/false branch) instead.
-                        if t.is_real || e.is_real {
-                            e.clone()
-                        } else {
-                            t.merge_unknown(e)
-                        }
-                    } else if vm_regs[*cond as usize].is_true() {
-                        vm_regs[*then_r as usize].clone()
-                    } else {
-                        vm_regs[*else_r as usize].clone()
+                    let v = match vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => vm_regs[*then_r as usize].clone(),
+                        Some(false) => vm_regs[*else_r as usize].clone(),
+                        None => vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize]),
                     };
                     vm_regs[*dest as usize] = v;
                 }
@@ -1291,7 +1267,7 @@ impl Simulator {
                     // value's `is_fill` verbatim).
                     let sv = &vm_regs[*s as usize];
                     vm_regs[*d as usize] = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
@@ -2415,7 +2391,7 @@ impl Simulator {
                 let n = *n_args as usize;
                 // Value-const actuals + row-2 write-back temps (the
                 // builtin arms read/eval them through the ordinary
-                // expression paths — §7.10.2.3 queue append, §15.5.5
+                // expression paths — §7.10.1 queue append, §15.5.5
                 // event keys, string keys — all carried).
                 let callee_class = self
                     .heap
@@ -2631,14 +2607,9 @@ impl Simulator {
                     let key = self.assoc_key_str(&an, &idx_val);
                     // class-perf: pre-sized manual renderer, as in `LoadCollElem`.
                     let elem_name = Self::name_with_key(&an, &key);
-                    // Keep the established queue-unpack growth behavior in
-                    // sync with the AST path.
                     let is_assoc = self.is_associative_array(&an);
-                    if !is_assoc {
-                        let kval = idx_val.to_i64().unwrap_or(0);
-                        if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
-                            self.set_queue_size(&an, kval as u64 + 1);
-                        }
+                    if !is_assoc && self.prepare_sequence_write(&an, &idx_val).is_none() {
+                        return 1;
                     }
                     // §10.7: fit to the DECLARED element width when one
                     // was recorded; otherwise store as-is.
@@ -3186,13 +3157,22 @@ impl Simulator {
                         } else {
                             vr.inline_bits()
                         };
-                        match bits.and_then(|(v, x)| vm_resize_bits(v, x, cw, sg, w)) {
+                        // §11.8.3: widening a signed four-state value copies
+                        // its sign on both planes, including an x or z MSB.
+                        let resized = bits.and_then(|(v, x)| {
+                            if sg && w > cw && cw > 0 && x & (1u64 << (cw - 1)) != 0 {
+                                None
+                            } else {
+                                vm_resize_bits(v, x, cw, sg, w)
+                            }
+                        });
+                        match resized {
                             Some((nv, nx)) => {
                                 vr.set_inline_bits(nv, nx);
                                 vr.width = w;
                             }
                             None => {
-                                let resized = self.vm_regs[r].resize(w);
+                                let resized = self.vm_regs[r].resize_for_assign(w);
                                 self.vm_regs[r] = resized;
                             }
                         }
@@ -3634,7 +3614,7 @@ impl Simulator {
                     // skip preserves `is_fill` verbatim).
                     let sv = &self.vm_regs[*s as usize];
                     let nv = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
@@ -3750,22 +3730,10 @@ impl Simulator {
                                 self.vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if self.vm_regs[*cond as usize].has_unknown() {
-                        let t = self.vm_regs[*then_r as usize].clone();
-                        let e = self.vm_regs[*else_r as usize].clone();
-                        // §11.3.1: a real result can't hold X — bit-merging the
-                        // branches would read their IEEE-754 bits as garbage.
-                        // Return a defined real value (else branch) when either
-                        // branch is real.
-                        if t.is_real || e.is_real {
-                            e
-                        } else {
-                            t.merge_unknown(&e)
-                        }
-                    } else if self.vm_regs[*cond as usize].is_true() {
-                        self.vm_regs[*then_r as usize].clone()
-                    } else {
-                        self.vm_regs[*else_r as usize].clone()
+                    let v = match self.vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => self.vm_regs[*then_r as usize].clone(),
+                        Some(false) => self.vm_regs[*else_r as usize].clone(),
+                        None => self.vm_regs[*then_r as usize].merge_unknown(&self.vm_regs[*else_r as usize]),
                     };
                     self.vm_regs[*dest as usize] = v;
                 }

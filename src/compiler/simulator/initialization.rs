@@ -3308,7 +3308,11 @@ impl Simulator {
                 }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
-                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
+                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
+                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
+                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        _ => Value::all_z(signal_widths_vec[id]),
+                    };
                 }
             }
         }
@@ -3548,7 +3552,11 @@ impl Simulator {
             let prefix = format!("{}[", base);
             for (name, &id) in signal_name_to_id.iter() {
                 if name.starts_with(prefix.as_str()) {
-                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
+                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
+                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
+                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        _ => Value::all_z(signal_widths_vec[id]),
+                    };
                 }
             }
         }
@@ -3868,7 +3876,7 @@ impl Simulator {
         let cast_widths: HashMap<String, (u32, bool)> = {
             let mut m: HashMap<String, (u32, bool)> = HashMap::default();
             for (name, dt) in &module.typedef_types {
-                if super::elaborate::is_type_real(dt) {
+                if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     continue;
                 }
                 let w = super::elaborate::resolve_type_width(
@@ -3899,6 +3907,45 @@ impl Simulator {
                     .map(|depth| (p.clone(), depth))
             })
             .collect();
+        let packed_named_signed_types = module.typedef_types.values().any(|dt| {
+            matches!(
+                dt,
+                DataType::IntegerAtom { .. }
+                    | DataType::IntegerVector { .. }
+                    | DataType::Enum(_)
+                    | DataType::Struct(_)
+            ) && super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+        });
+        // §7.2, §7.4.1: the names of structure members that are packed
+        // arrays of a named signed type, in any structure type the design
+        // declares. A select of a member path consults the member's declared
+        // type only when its last name is one of these.
+        let packed_named_signed_members: HashSet<String> = {
+            let types = &module.typedef_types;
+            let mut names: HashSet<String> = HashSet::default();
+            let class_props = module
+                .classes
+                .values()
+                .flat_map(|cd| cd.property_types.values());
+            for dt in types
+                .values()
+                .chain(module.var_decl_types.values())
+                .chain(class_props)
+            {
+                let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, types)
+                else {
+                    continue;
+                };
+                for member in &su.members {
+                    if super::bytecode::signed_named_packed_elem_depth(&member.data_type, types)
+                        .is_some()
+                    {
+                        names.extend(member.declarators.iter().map(|d| d.name.name.clone()));
+                    }
+                }
+            }
+            names
+        };
         let packed_named_signed: HashMap<String, usize> = {
             let types = &module.typedef_types;
             let mut m: HashMap<String, usize> = HashMap::default();
@@ -4148,6 +4195,7 @@ impl Simulator {
             deferred_proc_entries: Vec::new(),
             deferred_proc_seen: Vec::new(),
             deferred_proc_unres: false,
+            defer_changed: Vec::new(),
             t0_starts_remaining: 0,
             rand_scope_nd: HashMap::default(),
             rand_scope_nd_dyn: HashMap::default(),
@@ -4209,6 +4257,7 @@ impl Simulator {
             static_vif_bindings: HashMap::default(),
             static_vif_names: HashSet::default(),
             vif_capable_statics: std::cell::OnceCell::new(),
+            scoped_unpacked_leaves: std::cell::OnceCell::new(),
             may_bind_static_vif: true,
             static_vif_array_names: HashSet::default(),
             recv_call_memo: Vec::new(),
@@ -4633,6 +4682,7 @@ impl Simulator {
             method_plans: std::cell::RefCell::new(HashMap::default()),
             meta_frames: Vec::new(),
             meta_pending: 0,
+            declaration_typedefs: None,
             type_tables_gen: 0,
             formal_struct_layouts: HashMap::default(),
             local_type_pool: Vec::new(),
@@ -4764,6 +4814,8 @@ impl Simulator {
             cast_widths,
             packed_named_signed,
             packed_named_signed_props,
+            packed_named_signed_types,
+            packed_named_signed_members,
             packed_named_sign_guard: 0,
             shift_free_operand: 0,
             fn_decl_cache: HashMap::default(),
@@ -4809,6 +4861,7 @@ impl Simulator {
             comb_time0_fired: false,
             comb_time0_deferred: Vec::new(),
             comb_time0_deferred_done: false,
+            comb_time0_held: Vec::new(),
             comb_dep_offsets: Vec::new(),
             ts_comb: Vec::new(),
             comb_plan: Vec::new(),
@@ -4896,6 +4949,7 @@ impl Simulator {
             edge_exec_wrote: Vec::new(),
             edge_exec_seen: Vec::new(),
             proc_depth: 0,
+            stmts_depth: 0,
             deferred_comb: Vec::new(),
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
@@ -5125,6 +5179,7 @@ impl Simulator {
             edge_t0_pending: Vec::new(),
             edge_forced_fire: Vec::new(),
             in_pre_process_settle: false,
+            comb_direct_eval: false,
         };
         sim.unpacked_struct_leaves = sim.build_unpacked_struct_leaves();
         sim.has_coll_rows = !sim.module.coll_shapes.is_empty()

@@ -505,11 +505,13 @@ impl Simulator {
             entries.push(CombEntry {
                 item: CombItem::TimingCheck { idx: w },
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope: None,
                     scope_hint: None,
                     read_signal_ids: vec![watch.sig],
                     write_signal_ids: Vec::new(),
                     span: crate::ast::Span::dummy(),
                     cov: None,
+                    time0_effects: false,
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,

@@ -39,6 +39,8 @@ mod c910_scoped_cont_assign;
 mod class_method_hier_subroutine_calls;
 #[path = "hierarchy/colliding_actual_child_body.rs"]
 mod colliding_actual_child_body;
+#[path = "hierarchy/default_nettype_inferred_ports.rs"]
+mod default_nettype_inferred_ports;
 #[path = "hierarchy/defparam_upward_paths.rs"]
 mod defparam_upward_paths;
 #[path = "hierarchy/disable_targets.rs"]
@@ -117,6 +119,8 @@ mod inout_port_default;
 mod instance_var_init_signedness;
 #[path = "hierarchy/interface_array_element_ports.rs"]
 mod interface_array_element_ports;
+#[path = "hierarchy/interface_array_whole_ports.rs"]
+mod interface_array_whole_ports;
 #[path = "hierarchy/interface_default_clocking.rs"]
 mod interface_default_clocking;
 #[path = "hierarchy/ivtest_port_cluster.rs"]
@@ -259,6 +263,8 @@ mod vif_in_subroutines;
 mod vif_typedef_null_default;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
+#[path = "hierarchy/wildcard_to_implicit_nets.rs"]
+mod wildcard_to_implicit_nets;
 
 #[path = "hierarchy/nested_modules_and_zpad.rs"]
 mod nested_modules_and_zpad;
@@ -513,6 +519,8 @@ mod generate_real_struct_members_1099;
 
 #[path = "hierarchy/rooted_packed_scope.rs"]
 mod rooted_packed_scope;
+#[path = "hierarchy/clog2_port_connection_select.rs"]
+mod clog2_port_connection_select;
 #[path = "hierarchy/nettype_input_port_actuals_1280.rs"]
 mod nettype_input_port_actuals_1280;
 #[path = "hierarchy/prepared_body_release_721.rs"]
@@ -523,3 +531,5 @@ mod parameter_type_sharing_721;
 mod assignment_origin_sharing_721;
 #[path = "hierarchy/upward_scope_sharing_721.rs"]
 mod upward_scope_sharing_721;
+#[path = "hierarchy/vif_whole_unpacked_1311.rs"]
+mod vif_whole_unpacked_1311;

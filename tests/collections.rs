@@ -397,3 +397,5 @@ mod pattern_self_read;
 mod pattern_self_read_scopes;
 #[path = "collections/queue_pop_drain_loop_1210.rs"]
 mod queue_pop_drain_loop_1210;
+#[path = "collections/queue_of_fixed_rows_push_concat.rs"]
+mod queue_of_fixed_rows_push_concat;

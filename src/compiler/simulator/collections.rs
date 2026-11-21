@@ -2127,28 +2127,6 @@ impl Simulator {
                     Some(f) => f,
                     None => self.fold_enclosing_param_expr(e)?,
                 };
-                // §8.25: a bare SELF-REFERENCE — the argument names the
-                // class whose specialization context we are resolving in
-                // (`uvm_object_registry#(C,"C") type_id`, written by
-                // `uvm_object_utils(C)`) — denotes the CURRENT
-                // specialization `C#(sig)`, not the default. Without
-                // this, a static method entered through a specialization
-                // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
-                // declared `C#(T2)`) keyed the registry on the default
-                // `C`, so the factory created default-specialized objects
-                // and the `$cast` in `uvm_create_on` correctly rejected
-                // them.
-                //
-                // Only inside that class's own declaration (or a derived
-                // one): elsewhere the bare name IS the default
-                // specialization — a non-parameterized class whose typedef
-                // names `C` must not read `C#(sig)` just because its method
-                // happens to run under an active `C#(sig)` context.
-                if let Some((b, s)) = &self.current_spec {
-                    if frag == *b && self.inside_class_decl_of(b) {
-                        return Some(format!("{}#({})", b, s));
-                    }
-                }
                 // Resolve bare type-param names (e.g. `T`, `this_type`)
                 // through the active specialization so the typedef's
                 // specialization carries concrete values.
@@ -3559,6 +3537,44 @@ impl Simulator {
         // sign-extended scalar). Clamp so element-scan loops can't spin
         // formatting billions of `name[i]` lookups.
         if raw > 1 << 26 { 0 } else { raw }
+    }
+
+    /// Check a sequence element write before touching its backing store. Queues
+    /// append only at their current size (IEEE 1800-2023 §7.10.1).
+    pub(super) fn prepare_sequence_write(&mut self, name: &str, index: &Value) -> Option<i64> {
+        let i = index.to_index();
+        let size = self.get_queue_size(name);
+        if i.is_some_and(|i| i >= 0 && (i as u64) < size) {
+            return i;
+        }
+        if self.is_queue_store(name) {
+            let room = self.module.queue_max_sizes.get(name).is_none_or(|&max| size < u64::from(max));
+            if i == Some(size as i64) && room {
+                self.set_queue_size(name, size + 1);
+                return i;
+            }
+            self.warn_invalid_queue_write(name, i, size);
+            return None;
+        }
+        // Other sequence stores retain their existing assignment behavior.
+        if let Some(i) = i && i >= 0 {
+            self.set_queue_size(name, i as u64 + 1);
+        }
+        i
+    }
+
+    pub(super) fn is_queue_store(&self, name: &str) -> bool {
+        self.module.queue_vars.contains(name)
+            || matches!(self.declared_dim(name), Some(Dim::Queue))
+            || name.rsplit_once("::").is_some_and(|(owner, member)| {
+                self.module.classes.get(owner.split('#').next().unwrap_or(owner))
+                    .is_some_and(|cd| cd.queue_property_names.contains(member))
+            })
+    }
+
+    pub(super) fn warn_invalid_queue_write(&self, name: &str, index: Option<i64>, size: u64) {
+        let index = index.map_or_else(|| "x/z".to_string(), |i| i.to_string());
+        eprintln!("[xezim][warning] ignoring write to queue {name}[{index}] with size {size} (IEEE 1800-2023 §7.10.1)");
     }
 
     pub(super) fn set_queue_size(&mut self, obj_name: &str, size: u64) {

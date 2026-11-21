@@ -64,6 +64,17 @@ module top;
     #0;
     a8: assert property (@(posedge clk) $past(a) != a) $display("T|a8|%0t", $time);
   end
+  // A delay one clock period long ends in the time step of a clock edge.
+  // The delay's resume and the clock's toggle are both Active events of
+  // that step, which run in either order (§4.7). If the edge comes first,
+  // the instance matures and attempts at that edge; if the resume comes
+  // first, the edge wakes the procedure before the instance matures, and
+  // that resume flushes it (§16.4.2). Either way, an attempt starts only at
+  // a tick.
+  always @(posedge clk) begin
+    #10;
+    a9: assert property (@(posedge clk) s == a + b) $display("T|a9|%0t", $time);
+  end
   // A deferred assertion after a delay reports at the end of its slot.
   always @(posedge clk) begin
     #1;
@@ -98,6 +109,47 @@ fn procedural_assertions_after_a_delay_attempt_at_the_next_tick() {
     let own = ["5", "15", "25", "35", "45", "55", "65"];
     assert_eq!(times("a6"), at("a6", &own), "a6");
     assert_eq!(times("a8"), at("a8", &["25", "45", "65"]), "a8");
+    // An ordering race, not a check on how many attempts `a9` makes.
+    let off = times("a9")
+        .into_iter()
+        .filter(|l| !l.ends_with('5'))
+        .collect::<Vec<_>>();
+    assert!(off.is_empty(), "a9 attempted off a tick: {off:?}");
     let d1 = ["6", "16", "26", "36", "46", "56", "66"];
     assert_eq!(times("d1"), at("d1", &d1), "d1");
+}
+
+/// §16.5.1: the attempt a `#0` leaves at the time-0 edge reads the default
+/// sampled values (`a` has no initializer, so x), not the values the
+/// testbench wrote at time 0. The block runs as a process (its body has a
+/// delay), which the default-value scan did not cover, so the attempt read
+/// `a == 3` and passed.
+const T0: &str = r#"
+module top;
+  logic clk = 0;
+  logic [3:0] a;
+  initial a = 3;
+  initial begin
+    #0 clk = 1;
+    forever #5 clk = ~clk;
+  end
+  initial #25 $finish;
+  always @(posedge clk) begin
+    #0;
+    t0: assert property (@(posedge clk) a == 3) $display("T|t0|%0t", $time);
+      else $display("F|t0|%0t", $time);
+  end
+endmodule
+"#;
+
+#[test]
+fn a_time0_attempt_reads_the_default_sampled_values() {
+    let sim = simulate(T0, 1000).expect("simulate failed");
+    let got: Vec<String> = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim_end().to_string())
+        .filter(|l| l.starts_with("T|") || l.starts_with("F|"))
+        .collect();
+    assert_eq!(got, ["F|t0|0", "T|t0|10", "T|t0|20"]);
 }

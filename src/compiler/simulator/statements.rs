@@ -5570,7 +5570,7 @@ impl Simulator {
                         *self.name_resolve_hint.borrow_mut() = saved_hint_nested;
                         // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
                         // The activation goes on after a delay, not at an event control.
-                        if !self.settling {
+                        if !self.settling && delay > 0 {
                             self.delay_resumed.insert(self.current_pid);
                         }
                         // /silimate

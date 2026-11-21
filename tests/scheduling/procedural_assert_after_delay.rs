@@ -1,7 +1,8 @@
 //! IEEE 1800-2023 §16.14.6, §16.4.2: a procedural concurrent assertion that
-//! a procedure reaches after a delay or an event control queues one instance,
-//! and its attempt starts at the clock's next tick. A deferred assertion
-//! there reports at the end of its time slot.
+//! a procedure reaches after a delay or an event control queues one instance.
+//! Its attempt starts at the clock's tick in that time step, when there was
+//! one (after a `#0`), and otherwise at the clock's next tick. A deferred
+//! assertion there reports at the end of its time slot.
 //!
 //! The process flushed its pending instances and reports when it looped
 //! back to its event control in the same time slot, which is no flush point
@@ -46,6 +47,23 @@ module top;
     a5: assert property (@(posedge clk) s == a + b) $display("T|a5|%0t", $time);
     @(negedge clk);
   end
+  // A `#0` stays in the time step of the edge: each attempt is at that tick.
+  always @(posedge clk) begin
+    #0;
+    a6: assert property (@(posedge clk) s == a + b) $display("T|a6|%0t", $time);
+  end
+  // A `#0` after a delay that moved time on keeps the next tick.
+  always @(posedge clk) begin
+    #1;
+    #0;
+    a7: assert property (@(posedge clk) s == a + b) $display("T|a7|%0t", $time);
+  end
+  // An attempt at its time step's tick reads that tick's `$past`: `a`
+  // changes at 20, 40 and 60.
+  always @(posedge clk) begin
+    #0;
+    a8: assert property (@(posedge clk) $past(a) != a) $display("T|a8|%0t", $time);
+  end
   // A deferred assertion after a delay reports at the end of its slot.
   always @(posedge clk) begin
     #1;
@@ -70,14 +88,16 @@ fn procedural_assertions_after_a_delay_attempt_at_the_next_tick() {
             .cloned()
             .collect()
     };
+    let at = |label: &str, ticks: &[&str]| -> Vec<String> {
+        ticks.iter().map(|t| format!("T|{label}|{t}")).collect()
+    };
     let ticks = ["15", "25", "35", "45", "55", "65"];
-    for label in ["a1", "a2", "a3", "a4", "a5"] {
-        let want: Vec<String> = ticks.iter().map(|t| format!("T|{label}|{t}")).collect();
-        assert_eq!(times(label), want, "{label}");
+    for label in ["a1", "a2", "a3", "a4", "a5", "a7"] {
+        assert_eq!(times(label), at(label, &ticks), "{label}");
     }
-    let want: Vec<String> = ["6", "16", "26", "36", "46", "56", "66"]
-        .iter()
-        .map(|t| format!("T|d1|{t}"))
-        .collect();
-    assert_eq!(times("d1"), want, "d1");
+    let own = ["5", "15", "25", "35", "45", "55", "65"];
+    assert_eq!(times("a6"), at("a6", &own), "a6");
+    assert_eq!(times("a8"), at("a8", &["25", "45", "65"]), "a8");
+    let d1 = ["6", "16", "26", "36", "46", "56", "66"];
+    assert_eq!(times("d1"), at("d1", &d1), "d1");
 }

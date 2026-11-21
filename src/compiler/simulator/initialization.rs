@@ -4344,7 +4344,7 @@ impl Simulator {
             // silimate: a continuation of the same activation is no flush point
             cont_pids: HashSet::default(),
             // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
-            delay_pids: HashSet::default(),
+            delay_pids: HashMap::default(),
             delay_resumed: HashSet::default(),
             local_gen_stack: Vec::new(),
             class_context_stack: vec![],

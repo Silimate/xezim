@@ -1057,10 +1057,16 @@ impl Simulator {
         if self.cont_pids.is_empty() || !self.cont_pids.remove(&pid) {
             self.flush_deferred_asserts(pid);
             // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
-            if !self.delay_pids.is_empty() && self.delay_pids.remove(&pid) {
-                self.delay_resumed.insert(pid);
-            } else if !self.delay_resumed.is_empty() {
-                self.delay_resumed.remove(&pid);
+            // A `#0` leaves the activation in its time step.
+            match self.delay_pids.remove(&pid) {
+                Some(true) => {
+                    self.delay_resumed.insert(pid);
+                }
+                Some(false) => {}
+                None if !self.delay_resumed.is_empty() => {
+                    self.delay_resumed.remove(&pid);
+                }
+                None => {}
             }
         }
         // /silimate
@@ -4608,7 +4614,7 @@ impl Simulator {
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
                     // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
-                    self.delay_pids.insert(pid);
+                    self.delay_pids.insert(pid, delay > 0);
                     self.event_queue.schedule(self.time + delay, pid, cont);
                     return;
                 }
@@ -4786,7 +4792,7 @@ impl Simulator {
                         // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
                         let cont = pc.pushed_body(body, pc.start + i + 1);
                         // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
-                        self.delay_pids.insert(pid);
+                        self.delay_pids.insert(pid, delay > 0);
                         if delay == 0 {
                             // `#0` — IEEE 1800-2017 §4.4.2.3: suspend into the
                             // Inactive region of the SAME time slot, not the

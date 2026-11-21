@@ -405,7 +405,9 @@ fn method_boost_enabled() -> bool {
 // §11.6.1, §7.10: an element read of a method-local queue or dynamic array has its element's
 // width, so a compare of two of them no longer resizes both to one bit. On an upstream bump,
 // take upstream's value and bump it once more.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3097;
+// §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
+// §23.9: a frame local that hides a parameter is not a constant element select.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3098;
 // /silimate
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
@@ -1864,7 +1866,10 @@ struct CombEntryCold {
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB054";
+// §7.2, §7.4.2: a member select through constant element selects of a packed
+// struct is a compiled store.
+// §23.9: an index naming a frame local that hides a parameter is not constant.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB055";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

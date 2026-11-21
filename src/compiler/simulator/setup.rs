@@ -740,6 +740,15 @@ impl Simulator {
     /// that cannot suspend all run as one group, at the position of the
     /// first of them. Static initializers keep running first. Clock
     /// generators take their slot in the same order (`ClockGen::t0_rank`).
+    ///
+    /// Two kinds of process run ahead of that order, after the static
+    /// initializers. First the `always` processes that wait at their event
+    /// control before time 0 (`t0_event_led`, `always_waits_before_time0`):
+    /// they only arm the wait, so a time-0 write such as `initial clk = 0;`
+    /// wakes `always @(clk) #10 clk = ~clk;` wherever the two sit in the
+    /// source, as in the reference simulator and Icarus. Then the Verilog
+    /// declaration assignments (`t0_decl_init_pids`), which run before every
+    /// `initial` block there too.
     pub(super) fn order_time0_processes(&mut self) {
         let pids = self.event_queue.slot_pids(0);
         let (rank, gen_ranks) = {
@@ -810,23 +819,27 @@ impl Simulator {
                 placed.push((pid, info));
             }
             type Key = (u8, usize, Vec<usize>, Vec<usize>, usize);
-            let key_of = |i: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
+            let key_of = |i: usize, pid: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
                 match info {
+                    _ if self.t0_decl_init_pids.contains(&pid) => (2, 0, Vec::new(), Vec::new(), i),
                     None => (0, 0, Vec::new(), Vec::new(), i),
+                    Some((root, pos, _)) if self.t0_event_led.contains(&pid) => {
+                        (1, *root, pos.clone(), pos.clone(), i)
+                    }
                     Some((root, pos, grouped)) => {
                         let at = if *grouped {
                             anchor[root].clone()
                         } else {
                             pos.clone()
                         };
-                        (1, *root, at, pos.clone(), i)
+                        (3, *root, at, pos.clone(), i)
                     }
                 }
             };
             let mut keyed: Vec<(Key, usize)> = placed
                 .iter()
                 .enumerate()
-                .map(|(i, (pid, info))| (key_of(i, info), *pid))
+                .map(|(i, (pid, info))| (key_of(i, *pid, info), *pid))
                 .collect();
             keyed.sort();
             let gen_ranks: Vec<(usize, usize)> = self
@@ -834,7 +847,7 @@ impl Simulator {
                 .iter()
                 .map(|(gi, scope, span)| {
                     let (root, pos) = position(scope, *span);
-                    let k: Key = (1, root, pos.clone(), pos, usize::MAX);
+                    let k: Key = (3, root, pos.clone(), pos, usize::MAX);
                     (*gi, keyed.partition_point(|(kk, _)| *kk < k))
                 })
                 .collect();
@@ -853,6 +866,7 @@ impl Simulator {
         }
         self.t0_pid_ord = rank;
         self.t0_timing_free = HashSet::default();
+        self.t0_event_led = HashSet::default();
     }
 
     /// Account one event popped from the current slot against the FIFO rank
@@ -2195,6 +2209,16 @@ impl Simulator {
                 });
                 return None;
             }
+            // §9.4.2.2: an `@*` whose statement reads nothing never wakes, and
+            // a plain `always` waits at it first. The comb-settle path strips
+            // the event control, so a suspending body (`always @* #5 x = 1;`)
+            // ran every delta there instead of never.
+            if self.stmt_is_blocking(&body)
+                && leading_event(&ab.stmt)
+                    .is_some_and(|e| matches!(e, EventControl::Star | EventControl::ParenStar))
+            {
+                return None;
+            }
             return Some(AlwaysBlock {
                 kind: ab.kind,
                 stmt: body,
@@ -2696,7 +2720,7 @@ impl Simulator {
         let mut remaining = Vec::new();
         for ab in blocks.into_iter() {
             self.hoist_static_decls(&ab.stmt, &ab.scope);
-            if let Some(rest) = self.classify_one_always_block(ab, None) {
+            if let Some(rest) = self.classify_always_block_noting_start(ab, None) {
                 remaining.push(rest);
             }
         }
@@ -2706,18 +2730,149 @@ impl Simulator {
                 DeferredAlways::Lazy { lazy, .. } => (lazy.materialize(), Some(lazy)),
             };
             self.hoist_static_decls(&ab.stmt, &ab.scope);
-            if let Some(rest) = self.classify_one_always_block(ab, lazy) {
+            if let Some(rest) = self.classify_always_block_noting_start(ab, lazy) {
                 remaining.push(rest);
             }
         }
         for p in pending {
             let ab = Self::materialize_pending_always(p);
             self.hoist_static_decls(&ab.stmt, &ab.scope);
-            if let Some(rest) = self.classify_one_always_block(ab, None) {
+            if let Some(rest) = self.classify_always_block_noting_start(ab, None) {
                 remaining.push(rest);
             }
         }
         self.module.always_blocks = remaining;
+    }
+
+    /// `classify_one_always_block`, noting the processes it starts for a
+    /// block that waits at its event control before time 0
+    /// (`t0_event_led`).
+    fn classify_always_block_noting_start(
+        &mut self,
+        ab: AlwaysBlock,
+        lazy: Option<LazyAlways>,
+    ) -> Option<AlwaysBlock> {
+        let first_pid = self.next_pid;
+        let event_led = self.always_waits_before_time0(&ab.stmt, &ab.scope);
+        let rest = self.classify_one_always_block(ab, lazy);
+        if event_led {
+            self.t0_event_led.extend(first_pid..self.next_pid);
+        }
+        rest
+    }
+
+    /// Whether an `always` statement is already waiting at its event
+    /// control when the `initial` blocks start at time 0 (§9.2 leaves the
+    /// order open). The reference simulator arms such a block first when it
+    /// starts with an event control that has no `iff`, and nothing after
+    /// that control waits on an event again: no other event control, no
+    /// `wait (expr)`, and none in a task it calls or in a `fork` it joins.
+    /// A delay, a function call or a `fork ... join_none` does not count.
+    /// Any other `always` block starts in source order.
+    pub(super) fn always_waits_before_time0(&self, stmt: &Statement, scope: &str) -> bool {
+        match &stmt.kind {
+            StatementKind::TimingControl {
+                control: TimingControl::Event(event),
+                stmt: body,
+            } => {
+                let iff = matches!(event, EventControl::EventExpr(items)
+                    if items.iter().any(|item| item.iff.is_some()));
+                !iff && !self.stmt_waits_on_event(body, scope, 4)
+            }
+            StatementKind::SeqBlock { stmts, .. } => match stmts.split_first() {
+                Some((first, rest)) => {
+                    self.always_waits_before_time0(first, scope)
+                        && !rest.iter().any(|st| self.stmt_waits_on_event(st, scope, 4))
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether running `stmt` can wait on an event: an event control (a
+    /// statement's or an intra-assignment one), a `wait (expr)`, a `fork`
+    /// that joins such a statement, or a call to a task that does. A call
+    /// whose callee does not resolve counts as waiting.
+    fn stmt_waits_on_event(&self, stmt: &Statement, scope: &str, depth: u8) -> bool {
+        let intra_event = |e: &Expression| {
+            matches!(&e.kind, ExprKind::SystemCall { name, .. }
+                if name == crate::intra_delay::INTRA_EVENT_MARKER)
+        };
+        match &stmt.kind {
+            StatementKind::TimingControl { control, stmt } => {
+                matches!(control, TimingControl::Event(_))
+                    || self.stmt_waits_on_event(stmt, scope, depth)
+            }
+            StatementKind::Wait { .. } => true,
+            StatementKind::BlockingAssign { rvalue, .. }
+            | StatementKind::NonblockingAssign { rvalue, .. } => intra_event(rvalue),
+            StatementKind::Expr(e) => {
+                let callee = match &e.kind {
+                    ExprKind::Call { func, .. } => &**func,
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => e,
+                    _ => return false,
+                };
+                let ExprKind::Ident(h) = &callee.kind else {
+                    return true;
+                };
+                let raw: String = h
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let mut cands = Vec::with_capacity(2);
+                if !scope.is_empty() {
+                    cands.push(format!("{}.{}", scope, raw));
+                }
+                cands.push(raw);
+                for c in &cands {
+                    if let Some(td) = self.module.tasks.get(c.as_str()) {
+                        return depth == 0
+                            || td
+                                .items
+                                .iter()
+                                .any(|st| self.stmt_waits_on_event(st, scope, depth - 1));
+                    }
+                    if self.module.functions.contains_key(c.as_str()) {
+                        return false;
+                    }
+                }
+                true
+            }
+            StatementKind::SeqBlock { stmts, .. } => stmts
+                .iter()
+                .any(|st| self.stmt_waits_on_event(st, scope, depth)),
+            StatementKind::ParBlock {
+                join_type, stmts, ..
+            } => {
+                *join_type != JoinType::JoinNone
+                    && stmts
+                        .iter()
+                        .any(|st| self.stmt_waits_on_event(st, scope, depth))
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt_waits_on_event(then_stmt, scope, depth)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| self.stmt_waits_on_event(e, scope, depth))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| self.stmt_waits_on_event(&it.stmt, scope, depth)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => self.stmt_waits_on_event(body, scope, depth),
+            _ => false,
+        }
     }
 
     /// Build pre-computed combinatorial entries with sensitivity sets.

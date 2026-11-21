@@ -489,7 +489,11 @@ fn print_usage() {
     eprintln!("                   expr, T = toggle, F = fsm; U adds nothing");
     eprintln!("  -covworkdir <dir>, -covscope <name>, -covtest <name>  Write the results to");
     eprintln!("                   <dir>/<scope>/<test>/xezim_cov.json (cov_work/scope/test)");
-    eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -access <spec>,");
+    eprintln!("  -sv              Read .v files as SystemVerilog too: a variable declaration");
+    eprintln!("                   assignment there (`reg clk = 0;`) sets the value before");
+    eprintln!("                   time 0 with no event (§6.8), instead of being a time-0");
+    eprintln!("                   `initial` assignment (IEEE 1364-2005 §6.2.1)");
+    eprintln!("  -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -access <spec>,");
     eprintln!("  +access+<spec>, -<step>args=.., -suppress <ids>, -nowarn <id>, +fcover,");
     eprintln!("  -sva, -assertdebug, -covoverwrite, -licqueue, -R, -errormax <n>,");
     eprintln!("  -xmlibdirname <dir>, -cds_implicit_tmpdir <dir>  Accepted, no effect");
@@ -4413,6 +4417,10 @@ suppressed but the explicit SDF annotation still applies."
                     // `#[serde(skip)]` and would be silently dropped.
                     // Materialize before serialize so the artifact is complete.
                     elab.materialize_pending();
+                    // The language choice (`-sv`) is part of the design: a
+                    // `.v` file's declaration assignments become time-0
+                    // processes now, and the loaded artifact keeps them.
+                    xezim::compiler::Simulator::seal_verilog_decl_inits(&mut elab);
                     match xezim::write_compiled(&elab, out) {
                         Ok(()) => println!("Wrote compiled artifact to {}", out),
                         Err(e) => {

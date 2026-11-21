@@ -938,7 +938,15 @@ impl Simulator {
     /// value, so end each such process with `SAMPLED_DEFAULT_MARKER`.
     pub(super) fn mark_deferred_inits(&mut self) {
         let dummy = |sp: crate::ast::Span| sp.start == 0 && sp.end == 0;
-        let blocks = self.module.static_init_blocks.iter_mut().map(|b| (b, true));
+        // A Verilog declaration assignment (`seal_verilog_decl_inits`) is an
+        // `initial` assignment at time 0, not a declaration initializer in
+        // this sense: a time-0 sample still reads the x before it.
+        let blocks = self
+            .module
+            .static_init_blocks
+            .iter_mut()
+            .filter(|b| Self::verilog_decl_block(&b.stmt).is_none())
+            .map(|b| (b, true));
         let synthesized = self.module.initial_blocks.iter_mut().filter_map(|b| {
             let s = &b.stmt;
             let ok = dummy(s.span)

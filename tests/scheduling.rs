@@ -241,6 +241,8 @@ mod shared_task_frames;
 mod specify_delays_and_event_list;
 #[path = "scheduling/star_sensitivity_and_implicit_port_net.rs"]
 mod star_sensitivity_and_implicit_port_net;
+#[path = "scheduling/star_suspending_body.rs"]
+mod star_suspending_body;
 #[path = "scheduling/static_local_nba_per_instance.rs"]
 mod static_local_nba_per_instance;
 #[path = "scheduling/struct_member_read_sensitivity.rs"]
@@ -253,6 +255,8 @@ mod sva_time0_default_samples;
 mod task_body_delay_scaling;
 #[path = "scheduling/time0_process_order.rs"]
 mod time0_process_order;
+#[path = "scheduling/time0_startup.rs"]
+mod time0_startup;
 #[path = "scheduling/timing_check_delayed_nets_singlelimit.rs"]
 mod timing_check_delayed_nets_singlelimit;
 #[path = "scheduling/typeparam_pool_wait.rs"]

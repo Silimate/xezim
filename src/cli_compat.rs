@@ -206,10 +206,17 @@ pub(crate) fn handle_flag(
         return Ok(used);
     }
     match t {
-        // SystemVerilog is always on, every file already shares one
-        // compilation unit (macros and `$unit` declarations carry across
-        // files), and there is no separate optimizer, GUI or 32-bit mode.
-        "-sv" | "-mfcu" | "-quiet" | "-64" | "-32" | "-nologo" | "-batch" => Ok(1),
+        // `-sv` reads `.v` files as SystemVerilog too: a variable declaration
+        // assignment in one sets the value before time 0 (IEEE 1800-2023
+        // §6.8) instead of assigning it at time 0 (IEEE 1364-2005 §6.2.1).
+        "-sv" => {
+            xezim::compiler::simulator::set_sv_all_files(true);
+            Ok(1)
+        }
+        // Every file already shares one compilation unit (macros and `$unit`
+        // declarations carry across files), and there is no separate
+        // optimizer, GUI or 32-bit mode.
+        "-mfcu" | "-quiet" | "-64" | "-32" | "-nologo" | "-batch" => Ok(1),
         _ if t.starts_with("-mfcu=") || is_pass_through_args(t) => Ok(1),
         // No license to queue for, and no elaborated snapshot to rerun
         // (`-R`): every run compiles the sources it is given.

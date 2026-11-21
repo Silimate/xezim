@@ -2021,6 +2021,24 @@ impl Simulator {
                     arrays.as_deref_mut(),
                 );
             }
+            // §9.4.2.2: a statement behind a procedural timing control
+            // (`#10 clk <= ~clk;`, `@(e) q = d;`, `wait (c) y = a;`) is still
+            // part of the block, and `@*` adds what it reads. Skipping it left
+            // the inferred list of `always @(*) #10 clk <= ~clk;` empty, so the
+            // block went to the comb-settle path, which drops the event
+            // control and re-ran the body every delta. The control's own
+            // operands (the delay, the event, the condition) are not among the
+            // §9.4.2.2 contexts and stay out, as in the reference simulator.
+            StatementKind::TimingControl { stmt: inner, .. }
+            | StatementKind::Wait { stmt: inner, .. } => {
+                Self::collect_stmt_rw(
+                    inner,
+                    module,
+                    reads.as_deref_mut(),
+                    writes,
+                    arrays.as_deref_mut(),
+                );
+            }
             // §9.2.2.2: a function body reached through `collect_function_reads`
             // usually ends in `return <expr>` — dropping it hid every module
             // variable the function reads only there, so an always_comb calling
@@ -2430,7 +2448,7 @@ impl Simulator {
             } => {
                 if let TimingControl::Event(event) = control {
                     let sens = if matches!(event, EventControl::Star | EventControl::ParenStar) {
-                        self.star_sens_from_body(body)
+                        self.star_sens_from_body(body, self.stmt_is_blocking(body))
                     } else {
                         self.event_to_sens(event)
                     };
@@ -2461,7 +2479,7 @@ impl Simulator {
                                         },
                                         stmt.span,
                                     );
-                                    self.star_sens_from_body(&rest)
+                                    self.star_sens_from_body(&rest, self.stmt_is_blocking(&rest))
                                 } else {
                                     self.event_to_sens(event)
                                 };
@@ -2579,8 +2597,8 @@ impl Simulator {
     }
 
     /// §9.4.2.2 — the inferred sensitivity of `@*` / `@(*)`: every signal READ
-    /// by the statement it guards, minus the ones that statement writes (a
-    /// variable assigned by the block is not part of its own sensitivity).
+    /// by the statement it guards, minus, unless `suspends`, the ones that
+    /// statement writes.
     ///
     /// `event_to_sens` yields an EMPTY list for Star, and the process path
     /// then took the "just execute body" fallthrough — so an `always @(*)`
@@ -2588,7 +2606,16 @@ impl Simulator {
     /// combinational body (it re-runs and settles), but with any timing
     /// control in the body (`always @(*) begin #0; ... end`) it became an
     /// infinite delta-cycle loop that never let time advance.
-    pub(super) fn star_sens_from_body(&self, body: &Statement) -> Vec<Sensitivity> {
+    ///
+    /// `suspends`: the statement runs as a process, which waits at `@*` only
+    /// between activations. Its own blocking writes happen while it runs and
+    /// cannot wake it (a waiter compares against its value at arm time), so
+    /// the whole §9.4.2.2 list applies, written variables included: the
+    /// nonblocking update of `always @(*) #10 clk <= ~clk;` lands after the
+    /// block re-arms and is what wakes it for the next half period. The
+    /// comb-settle path re-runs a block on any change of its inputs, its own
+    /// writes included, so for that path they stay out.
+    pub(super) fn star_sens_from_body(&self, body: &Statement, suspends: bool) -> Vec<Sensitivity> {
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
         // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
@@ -2612,7 +2639,7 @@ impl Simulator {
             // §9.2.2.2.1: exclude reads of variables this block writes —
             // at MEMBER granularity too (same rule as the comb-entry path),
             // or the base fallback below would re-introduce the self-dep.
-            if Self::self_written_read(r, &reads, &writes, &whole) {
+            if !suspends && Self::self_written_read(r, &reads, &writes, &whole) {
                 continue;
             }
             // Prefer the instance-scoped name when one exists, mirroring the

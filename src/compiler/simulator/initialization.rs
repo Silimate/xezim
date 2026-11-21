@@ -1735,6 +1735,261 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1364-2005 §6.2.1: in Verilog, a variable declaration assignment
+    /// (`reg clk = 1'b0;`) is an `initial` assignment, so the variable
+    /// changes from x at time 0 and the processes waiting on it wake.
+    /// SystemVerilog (IEEE 1800-2023 §6.8, §10.5) sets the value before time
+    /// 0 instead, with no event, which is how elaboration stores it. Like the
+    /// reference simulator, a module is Verilog when its file is a `.v` file
+    /// and `-sv` was not given. Only the module-level `reg`, `integer` and
+    /// `time` variables qualify: §6.2.1 allows the assignment only at module
+    /// level, and the other variable types are SystemVerilog's.
+    ///
+    /// Each one is set back to x, and its assignment moves into a static
+    /// initializer that opens with `VERILOG_DECL_INIT_MARKER`, which
+    /// `compile` runs at time 0 after the `always` processes that arm first.
+    /// A runtime initializer (`reg m = $test$plusargs("MODE");`) is already
+    /// a static initializer, which elaboration made with a placeholder value:
+    /// it is marked in place (`VERILOG_DECL_RUNTIME_MARKER`) and runs right
+    /// after the literal values, in declaration order, so it reads them and
+    /// nothing overwrites what it assigns. (Verilog requires a constant
+    /// there, and the reference simulator and Icarus reject a runtime one in
+    /// a `.v` file; xezim accepts it.)
+    ///
+    /// The result is part of the design, so a compiled artifact keeps the
+    /// `-sv` choice it was compiled with: `--compile -o` seals the design
+    /// before writing it, and a sealed design is left as it is.
+    pub fn seal_verilog_decl_inits(module: &mut ElaboratedModule) {
+        Self::seal_verilog_decl_inits_as(module, true);
+    }
+
+    /// `record`: leave the (possibly empty) literal block in the design even
+    /// when no variable qualifies, so a reload knows the choice was made.
+    pub(super) fn seal_verilog_decl_inits_as(module: &mut ElaboratedModule, record: bool) {
+        use crate::ast::types::IntegerVectorType;
+        if module
+            .static_init_blocks
+            .iter()
+            .any(|b| Self::verilog_decl_block(&b.stmt) == Some(VERILOG_DECL_INIT_MARKER))
+        {
+            return;
+        }
+        let span = crate::ast::Span::dummy();
+        let marker = |name: &str| {
+            Statement::new(
+                StatementKind::Expr(Expression::new(
+                    ExprKind::SystemCall {
+                        name: name.to_string(),
+                        args: Vec::new(),
+                    },
+                    span,
+                )),
+                span,
+            )
+        };
+        let mut literal = vec![marker(VERILOG_DECL_INIT_MARKER)];
+        let finish = |module: &mut ElaboratedModule, literal: Vec<Statement>| {
+            if record || literal.len() > 1 {
+                module.static_init_blocks.push(super::elaborate::InitialBlock {
+                    stmt: Statement::new(
+                        StatementKind::SeqBlock {
+                            name: None,
+                            stmts: literal.into(),
+                        },
+                        span,
+                    ),
+                    scope: String::new(),
+                });
+            }
+        };
+        if sv_all_files() || module.source_files.is_empty() {
+            finish(module, literal);
+            return;
+        }
+        let is_verilog = |def: &str| {
+            let def = xezim_core::bind_spec_base(def);
+            module
+                .src_file_of_module
+                .get(def)
+                .and_then(|&i| module.source_files.get(i as usize))
+                .and_then(|f| std::path::Path::new(f).extension())
+                .is_some_and(|e| e.eq_ignore_ascii_case("v"))
+        };
+        let top = is_verilog(&module.name);
+        let instances: HashMap<&str, bool> = module
+            .instances
+            .iter()
+            .map(|i| (i.path.as_str(), is_verilog(&i.def_name)))
+            .collect();
+        if !top && !instances.values().any(|&v| v) {
+            finish(module, literal);
+            return;
+        }
+        // The variables a static initializer assigns whole: by name, or by
+        // its instance's scope and a bare name.
+        let assigned = |st: &Statement, scope: &str| -> Option<String> {
+            let StatementKind::BlockingAssign { lvalue, .. } = &st.kind else {
+                return None;
+            };
+            let ExprKind::Ident(h) = &lvalue.kind else {
+                return None;
+            };
+            if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let name = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if !scope.is_empty() {
+                let scoped = format!("{scope}.{name}");
+                if module.signals.contains_key(scoped.as_str()) {
+                    return Some(scoped);
+                }
+            }
+            module.signals.contains_key(name.as_str()).then_some(name)
+        };
+        fn top_level(st: &Statement) -> &[Statement] {
+            match &st.kind {
+                StatementKind::SeqBlock { name: None, stmts } => stmts,
+                _ => std::slice::from_ref(st),
+            }
+        }
+        let mut runtime: HashSet<String> = HashSet::default();
+        for b in &module.static_init_blocks {
+            for st in top_level(&b.stmt) {
+                if let Some(n) = assigned(st, &b.scope) {
+                    runtime.insert(n);
+                }
+            }
+        }
+        let mut found: Vec<String> = Vec::new();
+        let mut deferred: HashSet<String> = HashSet::default();
+        for (name, sig) in module.signals.iter() {
+            let n = name.as_str();
+            // Declared directly in a Verilog module: the top, or an instance.
+            let verilog = match n.rsplit_once('.') {
+                None => top,
+                Some((scope, _)) => instances.get(scope).copied().unwrap_or(false),
+            };
+            if !verilog
+                || sig.is_const
+                || sig.is_real
+                || sig.width == 0
+                || matches!(
+                    sig.direction,
+                    Some(PortDirection::Input) | Some(PortDirection::Inout)
+                )
+                || module.nets.contains(n)
+                || module.two_state_signals.contains(n)
+                || module.events.contains(n)
+                || module.parameters.contains_key(n)
+            {
+                continue;
+            }
+            let kind_ok = matches!(
+                module.var_decl_types.get(n),
+                Some(DataType::IntegerVector {
+                    kind: IntegerVectorType::Reg,
+                    ..
+                }) | Some(DataType::IntegerAtom {
+                    kind: IntegerAtomType::Integer | IntegerAtomType::Time,
+                    ..
+                })
+            );
+            if !kind_ok {
+                continue;
+            }
+            if runtime.contains(n) {
+                // Its value is the placeholder; the static initializer
+                // assigns the real one.
+                deferred.insert(n.to_string());
+            } else if (0..sig.width as usize).any(|i| sig.value.get_bit(i) != LogicBit::X) {
+                found.push(n.to_string());
+            }
+        }
+        found.sort_unstable();
+        // A static initializer that assigns one of them runs with them.
+        let moving: Vec<usize> = if deferred.is_empty() {
+            Vec::new()
+        } else {
+            module
+                .static_init_blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| {
+                    top_level(&b.stmt)
+                        .iter()
+                        .any(|st| assigned(st, &b.scope).is_some_and(|n| deferred.contains(&n)))
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        for n in found.iter().chain(deferred.iter()) {
+            let Some(sig) = module.signals.get_mut(n.as_str()) else {
+                continue;
+            };
+            let mut x = Value::all_x(sig.width);
+            x.is_signed = sig.value.is_signed;
+            let init = std::mem::replace(&mut sig.value, x);
+            if deferred.contains(n) {
+                continue;
+            }
+            literal.push(Statement::new(
+                StatementKind::BlockingAssign {
+                    lvalue: super::vpi_model::ident_expr(n),
+                    rvalue: Expression::new(
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                            size: Some(init.width),
+                            signed: init.is_signed,
+                            base: crate::ast::expr::NumberBase::Binary,
+                            value: init.to_bin_string(),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                        }),
+                        span,
+                    ),
+                },
+                span,
+            ));
+        }
+        // Marked in place, so the elaboration order of the initializers is
+        // kept.
+        for i in moving {
+            let b = &mut module.static_init_blocks[i];
+            let st = std::mem::replace(&mut b.stmt, Statement::new(StatementKind::Null, span));
+            let st_span = st.span;
+            let mut stmts = match st.kind {
+                StatementKind::SeqBlock { name: None, stmts } => stmts,
+                kind => vec![Statement::new(kind, st_span)].into(),
+            };
+            stmts.insert(0, marker(VERILOG_DECL_RUNTIME_MARKER));
+            b.stmt = Statement::new(StatementKind::SeqBlock { name: None, stmts }, st_span);
+        }
+        finish(module, literal);
+    }
+
+    /// Which Verilog declaration-assignment block `st` is: the marker it
+    /// opens with (see `seal_verilog_decl_inits`).
+    pub(super) fn verilog_decl_block(st: &Statement) -> Option<&'static str> {
+        let StatementKind::SeqBlock { name: None, stmts } = &st.kind else {
+            return None;
+        };
+        let StatementKind::Expr(e) = &stmts.first()?.kind else {
+            return None;
+        };
+        match &e.kind {
+            ExprKind::SystemCall { name, .. } if name == VERILOG_DECL_INIT_MARKER => {
+                Some(VERILOG_DECL_INIT_MARKER)
+            }
+            ExprKind::SystemCall { name, .. } if name == VERILOG_DECL_RUNTIME_MARKER => {
+                Some(VERILOG_DECL_RUNTIME_MARKER)
+            }
+            _ => None,
+        }
+    }
+
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
         let _oom_scope = xezim_core::oom_trace::scope("construct simulator", "", &module.name, "");
         let phase_total = std::time::Instant::now();
@@ -1750,6 +2005,9 @@ impl Simulator {
             let scale = (1e-9_f64 / tick_s).round();
             (max_time as f64 * scale.max(1.0)) as u64
         };
+        // Before anything reads a starting value: a Verilog variable
+        // declaration assignment takes effect at time 0, not before it.
+        Self::seal_verilog_decl_inits_as(&mut module, false);
         // X-init coercion: when XEZIM_INIT_ZERO=1, signals matching one of
         // XEZIM_INIT_ZERO_PATHS (comma-separated substring filters) start
         // at 0 instead of X. Use this for designs where intentional `1'bx`
@@ -4558,6 +4816,8 @@ impl Simulator {
             clock_generators: Vec::new(),
             clock_gen_src: Vec::new(),
             t0_timing_free: HashSet::default(),
+            t0_event_led: HashSet::default(),
+            t0_decl_init_pids: HashSet::default(),
             t0_pid_ord: HashMap::default(),
             fast_delay_always: HashMap::default(),
             lazy_initial: HashMap::default(),

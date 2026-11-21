@@ -64,6 +64,9 @@ static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 const COND_AUDIT_EVALS: u8 = 4;
 /// `--dump-timescales`: print every module's timescale before the run starts.
 static DUMP_TIMESCALES: AtomicBool = AtomicBool::new(false);
+/// `-sv`: compile every source file as SystemVerilog, `.v` files included
+/// (see `Simulator::seal_verilog_decl_inits`).
+static SV_ALL_FILES: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 /// Opaque handle base for `process::self()` (IEEE 1800-2023 §9.7). The token is
@@ -637,6 +640,13 @@ const VIF_VALUE_MARKER: &str = "$__xz_vif_value";
 /// Ends a deferred declaration initializer: `(<target>, ...)` records the
 /// values it gave as their default sampled values (see `sampled_defaults`).
 const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
+/// Opens a static initializer that holds Verilog declaration assignments
+/// (IEEE 1364-2005 §6.2.1), which `compile` runs at time 0 after the
+/// `always` processes have armed (see `Simulator::seal_verilog_decl_inits`).
+/// The literal values' block opens with this marker; a runtime
+/// initializer's block opens with `VERILOG_DECL_RUNTIME_MARKER`.
+const VERILOG_DECL_INIT_MARKER: &str = "$__xz_verilog_decl_init";
+const VERILOG_DECL_RUNTIME_MARKER: &str = "$__xz_verilog_decl_runtime";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
@@ -666,6 +676,18 @@ pub fn set_dump_timescales(enabled: bool) {
 #[inline]
 fn dump_timescales_enabled() -> bool {
     DUMP_TIMESCALES.load(Ordering::Relaxed)
+}
+
+/// `-sv`: read `.v` files as SystemVerilog too. Without it a `.v` file is
+/// Verilog (IEEE 1364-2005), where a variable declaration assignment is an
+/// `initial` assignment (§6.2.1), as in the reference simulator.
+pub fn set_sv_all_files(enabled: bool) {
+    SV_ALL_FILES.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+fn sv_all_files() -> bool {
+    SV_ALL_FILES.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -9684,6 +9706,13 @@ pub struct Simulator {
     /// Pids of `initial` blocks that cannot suspend (no timing control,
     /// no blocking call); see `order_time0_processes`.
     t0_timing_free: HashSet<usize>,
+    /// Pids of `always` processes whose statement starts with an event
+    /// control: they wait there before any `initial` block runs (see
+    /// `order_time0_processes`).
+    t0_event_led: HashSet<usize>,
+    /// The time-0 processes of the Verilog variable declaration assignments
+    /// (`seal_verilog_decl_inits`).
+    t0_decl_init_pids: HashSet<usize>,
     /// Time-0 activation index of each process queued at time 0, consulted
     /// by `clock_rank_on_pop` until the first drain settles the generators.
     t0_pid_ord: HashMap<usize, usize>,

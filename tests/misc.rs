@@ -685,3 +685,5 @@ mod declaration_order_snapshots;
 mod shared_procedural_bodies;
 #[path = "misc/deferred_assertion_counts.rs"]
 mod deferred_assertion_counts;
+#[path = "misc/relax_wildcard_import_conflict.rs"]
+mod relax_wildcard_import_conflict;

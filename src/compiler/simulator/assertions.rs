@@ -3214,11 +3214,6 @@ impl Simulator {
             }
             // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
             self.sva_sites[i].tick_time = Some(self.time);
-            let held = late.then(|| {
-                let n = self.sva_sites[i].attempts.len();
-                let metas = self.sva_take_meta(i, n);
-                (std::mem::take(&mut self.sva_sites[i].attempts), metas)
-            });
             // /silimate
             let node = self.sva_sites[i].node.clone();
             // §16.12.14: attempts an abort settled since the last tick come
@@ -3261,12 +3256,6 @@ impl Simulator {
             // start along with those in flight.
             if self.sva_cancel_disabled(i) {
                 self.assert_insts[inst].disabled += fresh;
-                // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
-                if let Some((attempts, metas)) = held {
-                    self.sva_sites[i].attempts = attempts;
-                    self.sva_sites[i].attempt_meta = metas;
-                }
-                // /silimate
                 self.sva_sites[i].sampled_ids = sampled_ids;
                 self.sva_report_outcomes(i, settled, settled_meta);
                 self.active_sva_site = prev_active;
@@ -3312,13 +3301,31 @@ impl Simulator {
             let saved = self.install_preponed(&sampled_ids);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
             let mut metas = self.sva_take_meta(i, attempts.len());
+            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+            // A late start steps only the attempts it started (the last ones;
+            // a Kill or Reset from a start callback may have dropped them):
+            // the older ones took this tick's step already, and stay where
+            // assertion controls reach them.
+            let skip = if late {
+                attempts.len().saturating_sub(started)
+            } else {
+                0
+            };
+            // /silimate
             let mut results: Vec<SvaOutcome> = settled;
             let mut result_meta: Vec<SvaAttemptMeta> = settled_meta;
             result_meta.resize(results.len(), new_meta);
             let mut live: Vec<SvaState> = Vec::with_capacity(attempts.len());
             let mut live_meta: Vec<SvaAttemptMeta> = Vec::with_capacity(attempts.len());
             let all_matches = self.sva_sites[i].all_matches;
-            for (mut st, mut meta) in attempts.drain(..).zip(metas.drain(..)) {
+            for (k, (mut st, mut meta)) in attempts.drain(..).zip(metas.drain(..)).enumerate() {
+                // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+                if k < skip {
+                    live.push(st);
+                    live_meta.push(meta);
+                    continue;
+                }
+                // /silimate
                 meta.clock_steps += 1;
                 if all_matches {
                     let step = match (&*node, &mut st) {
@@ -3360,18 +3367,8 @@ impl Simulator {
             // still in flight after advancing; `sva_report_outcomes` reports
             // the ones it decided.
             if self.vpi_assert_on {
-                self.vpi_assert_fire_steps(i);
+                self.vpi_assert_fire_steps(i, skip);
             }
-            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
-            // The attempts in flight, stepped at the tick, stay ahead.
-            if let Some((mut attempts, mut metas)) = held {
-                let site = &mut self.sva_sites[i];
-                attempts.append(&mut site.attempts);
-                metas.append(&mut site.attempt_meta);
-                site.attempts = attempts;
-                site.attempt_meta = metas;
-            }
-            // /silimate
             self.sva_report_outcomes(i, results, result_meta);
             self.active_sva_site = prev_active;
             *self.activation_scope.borrow_mut() = prev_activation_scope;

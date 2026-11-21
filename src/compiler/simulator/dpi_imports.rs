@@ -106,10 +106,19 @@ impl Simulator {
     /// formals keep the caller value untouched (mirrors the direct integral
     /// formal handling that a raw `TypeReference` port bypassed).
     pub(super) fn scalar_formal_integral(&self, dt: &DataType) -> Option<(u32, bool)> {
+        self.scalar_integral_in(dt, &self.module.typedef_types, &self.module.typedefs)
+    }
+
+    pub(super) fn scalar_integral_in(
+        &self,
+        dt: &DataType,
+        types: &HashMap<String, DataType>,
+        widths: &super::elaborate::TypedefTable,
+    ) -> Option<(u32, bool)> {
         use crate::ast::types::DataType as DT;
         // Enum and real stay out: enum formals were never width-adapted and a
         // real typedef must round (not resize) — keep the prior behavior.
-        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        let resolved = super::elaborate::resolve_typedef_chain(dt, types);
         let is_resolved_int =
             matches!(&resolved, DT::IntegerVector { .. } | DT::IntegerAtom { .. })
                 || matches!(
@@ -123,19 +132,18 @@ impl Simulator {
         // on every alias in the chain, not just its terminal element type.
         let named_width = matches!(dt, DT::TypeReference { name, dimensions, .. }
             if !dimensions.is_empty()
-                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs)
+                || super::elaborate::lookup_scoped_type(name, widths)
                     .is_some_and(|width| *width > 0));
         let width_type = if named_width { dt } else { resolved };
         let pw = super::elaborate::resolve_type_width(
             width_type,
             Some(&self.module.parameters),
-            Some(&self.module.typedefs),
+            Some(widths),
         );
         if pw == 0 {
             return None;
         }
-        let signed =
-            super::elaborate::is_type_signed_resolved(&resolved, &self.module.typedef_types);
+        let signed = super::elaborate::is_type_signed_resolved(&resolved, types);
         Some((pw, signed))
     }
 
@@ -186,7 +194,7 @@ impl Simulator {
             {
                 value = value.to_two_state();
             }
-        } else if super::elaborate::is_type_real(dt) && !value.is_real {
+        } else if self.dt_is_real(dt) && !value.is_real {
             value = Value::from_f64(value.to_f64());
         }
         value
@@ -209,7 +217,7 @@ impl Simulator {
             let mut by_w: HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>> = HashMap::default();
             for td in self.module.typedef_types.values() {
                 let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
-                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                if let Some(fields) = self.struct_field_layout(&resolved) {
                     let total: u32 = fields.iter().map(|f| f.2).sum();
                     by_w.entry(total).or_default().push(fields);
                 }
@@ -228,7 +236,10 @@ impl Simulator {
             })
     }
 
-    pub(super) fn struct_field_layout(dt: &DataType) -> Option<Vec<(String, u32, u32, bool)>> {
+    pub(super) fn struct_field_layout(
+        &self,
+        dt: &DataType,
+    ) -> Option<Vec<(String, u32, u32, bool)>> {
         let su = match dt {
             DataType::Struct(su) if !su.packed => su,
             _ => return None,
@@ -237,7 +248,7 @@ impl Simulator {
         let mut offset: u32 = 0;
         for m in su.members.iter().rev() {
             let fw = resolve_type_width(&m.data_type, None, None);
-            let fr = super::elaborate::is_type_real(&m.data_type);
+            let fr = self.dt_is_real(&m.data_type);
             for d in &m.declarators {
                 fields.push((d.name.name.clone(), offset, fw, fr));
                 offset += fw;
@@ -716,20 +727,28 @@ impl Simulator {
             DpiRetKind::String => Type::pointer(),
         };
         let cif = Cif::new(arg_types, ret_type);
-        for lib in &self.dpi_libraries {
-            let sym = unsafe { lib.get::<*mut c_void>(&cname) };
-            if let Ok(s) = sym {
-                self.dpi_bindings.insert(
-                    sv_name.to_string(),
-                    DpiBinding {
-                        ret,
-                        arg_kinds: arg_kinds.clone(),
-                        cif: cif.clone(),
-                        fn_ptr: CodePtr::from_ptr(*s),
-                    },
-                );
-                return;
-            }
+        let fn_ptr = self
+            .dpi_libraries
+            .iter()
+            .find_map(|lib| unsafe { lib.get::<*mut c_void>(&cname) }.ok().map(|s| *s))
+            // §35.5.1: an import names a C function wherever it is defined.
+            // One that no --dpi-lib library defines is looked up among the
+            // libraries the process already has loaded (the C library, the
+            // xezim executable), so
+            // `import "DPI-C" function string getenv(input string name);`
+            // needs no library of its own. A name found nowhere stays
+            // unbound and keeps its "no implementation" diagnostic.
+            .or_else(|| loaded_c_symbol(&cname));
+        if let Some(p) = fn_ptr {
+            self.dpi_bindings.insert(
+                sv_name.to_string(),
+                DpiBinding {
+                    ret,
+                    arg_kinds,
+                    cif,
+                    fn_ptr: CodePtr::from_ptr(p),
+                },
+            );
         }
     }
 
@@ -761,6 +780,13 @@ impl Simulator {
     }
 
     pub(super) fn dpi_value_to_logic_words(v: &Value, width: u32) -> (Vec<u32>, Vec<u32>) {
+        let fitted;
+        let v = if v.width < width || v.is_fill {
+            fitted = v.resize_for_assign(width);
+            &fitted
+        } else {
+            v
+        };
         let nwords = width.div_ceil(32).max(1) as usize;
         let mut aval = vec![0u32; nwords];
         let mut bval = vec![0u32; nwords];
@@ -2044,4 +2070,20 @@ impl Simulator {
         self.compile();
         self.simulate();
     }
+}
+
+/// The address of the C symbol `cname` (NUL-terminated) in the global symbol
+/// scope: the executable, the libraries it was linked with (the C library)
+/// and every library opened `RTLD_GLOBAL`. `None` when no loaded object
+/// defines it.
+#[cfg(unix)]
+fn loaded_c_symbol(cname: &[u8]) -> Option<*mut c_void> {
+    // SAFETY: `cname` is NUL-terminated, and `dlsym` only looks the name up.
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr().cast()) };
+    (!p.is_null()).then_some(p)
+}
+
+#[cfg(not(unix))]
+fn loaded_c_symbol(_cname: &[u8]) -> Option<*mut c_void> {
+    None
 }

@@ -2,7 +2,7 @@
 //! each select it reads, excluding only what it writes. In a module instance,
 //! a block that reads one bit of a vector whose range depends on a parameter
 //! (`logic [P+1:0] b`) and writes another bit of it never ran again after time
-//! zero (#395): the sensitivity code sized the vector with the top module's
+//! zero: the sensitivity code sized the vector with the top module's
 //! parameters, where the instance's `P` is not visible, so it came out one bit
 //! wide, the read fell outside it and counted as a whole-vector read, and the
 //! block's own element write excluded that. Caliptra's

@@ -79,5 +79,8 @@ mod struct_formal_member_calls;
 mod static_local_select_cover;
 #[path = "perf/local_select_width_chain.rs"]
 mod local_select_width_chain;
+
+#[path = "perf/fallback_hotspots.rs"]
+mod fallback_hotspots;
 #[path = "perf/packed_member_path_read.rs"]
 mod packed_member_path_read;

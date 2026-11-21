@@ -1,6 +1,6 @@
 //! §11.5.1, §20.8.1, §23.3.3: a part-select bounded by `$clog2(...)` in a
 //! port connection (`.raddr({a[$clog2(N)-1:3], 3'b000})`), read by a clocked
-//! block of the child (issue #332).
+//! block of the child.
 //!
 //! The child's reads of the port compile the connection expression. The
 //! compiler did not fold `$clog2` of a constant, so the bounds counted as

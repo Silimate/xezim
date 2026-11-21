@@ -550,7 +550,7 @@ impl Simulator {
         }
         self.colliding_static_colls = colliding_names.iter().cloned().collect();
         self.colliding_static_colls_ready = true;
-        let mut static_cols: Vec<(String, bool, u32, bool)> = Vec::new();
+        let mut static_cols = Vec::new();
         for cd in self.module.classes.values() {
             for (name, is_assoc, width) in &cd.static_collections {
                 let is_str = cd
@@ -574,11 +574,15 @@ impl Simulator {
                     *is_assoc,
                     *width,
                     is_str,
+                    cd.queue_property_names.contains(name),
                 ));
             }
         }
         self.register_struct_member_collections();
-        for (name, is_assoc, width, is_str) in static_cols {
+        for (name, is_assoc, width, is_str, is_queue) in static_cols {
+            if is_queue {
+                self.module.queue_vars.insert(name.clone());
+            }
             if is_assoc {
                 self.module
                     .associative_arrays
@@ -1549,6 +1553,7 @@ impl Simulator {
         // constant nets, and the reference fires them once at t0. Snapshotting
         // AFTER the settle erased that change and the blocks never ran.
         self.snapshot_edge_signals_full();
+        self.hold_time0_effect_entries();
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();

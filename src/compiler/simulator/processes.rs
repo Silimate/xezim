@@ -615,6 +615,7 @@ impl Simulator {
                 // the slot (see the main loop's release).
                 if self.t0_starts_remaining > 0 {
                     self.t0_starts_remaining = 0;
+                    self.release_time0_held();
                     self.drain_deferred_proc_settle();
                     continue;
                 }
@@ -3326,7 +3327,8 @@ impl Simulator {
     pub(super) fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
         // A call chain that never waits nests one activation per call; stop
         // it with a diagnostic before it exhausts the native stack.
-        if self.stmts_depth >= 64 && self.process_nesting_exceeded(pid) {
+        let at_limit = self.stall_limit != 0 && u64::from(self.stmts_depth) >= self.stall_limit;
+        if (at_limit || self.stmts_depth >= 64) && self.process_nesting_exceeded(pid) {
             return;
         }
         self.stmts_depth += 1;
@@ -5455,7 +5457,7 @@ impl Simulator {
                 // owns the §12.5.3 unique/unique0/priority violation checks,
                 // so only intercept when some arm can actually suspend.
                 if !items.iter().any(|i| i.pattern.is_some()) && self.stmt_is_blocking(stmt) {
-                    let val = self.case_selector_value(kind, expr, items);
+                    let comparison = self.case_comparison(kind, expr, items);
                     let chosen: Option<&Statement> = items
                         .iter()
                         .find_map(|item| {
@@ -5463,22 +5465,7 @@ impl Simulator {
                                 return None;
                             }
                             for pat in &item.patterns {
-                                let hit = match kind {
-                                    CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                                    CaseKind::Casez => {
-                                        let pv = self.eval_expr(pat);
-                                        val.casez_eq(&pv).is_true()
-                                    }
-                                    CaseKind::Casex => {
-                                        let pv = self.eval_expr(pat);
-                                        val.casex_eq(&pv).is_true()
-                                    }
-                                    _ => {
-                                        let pv = self.eval_expr(pat);
-                                        val.case_eq(&pv).is_true()
-                                    }
-                                };
-                                if hit {
+                                if self.case_item_matches(kind, &comparison, pat) {
                                     return Some(&item.stmt);
                                 }
                             }
@@ -5795,8 +5782,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
-                    self.fork_block_children
-                        .insert(nm.name.clone(), child_pids.clone());
+                    self.register_named_fork(&nm.name, &child_pids);
                 }
 
                 // An empty fork (or one whose only items were declarations)

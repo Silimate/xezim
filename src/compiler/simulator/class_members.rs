@@ -1413,8 +1413,10 @@ impl Simulator {
                 // collection on it. Without this, both the WRITE
                 // (`f().member[k] = v`) and the READ (`f().member.exists(k)`)
                 // resolved `member` to nothing, so writes were silently
-                // dropped and reads came back empty.
-                ExprKind::Call { .. } => {
+                // dropped and reads came back empty. A literal base is the
+                // handle such a call returned, made once already
+                // (`freeze_handle_receiver`, §11.3.2).
+                ExprKind::Call { .. } | ExprKind::Number(_) => {
                     let h = self.eval_expr(base).to_u64().unwrap_or(0) as usize;
                     if h != 0 {
                         self.handle_collection_name(h, &member.name)

@@ -33,6 +33,8 @@ mod dpi_export_task_waits;
 mod dpi_export_types;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
+#[path = "strings/dpi_libc_import.rs"]
+mod dpi_libc_import;
 #[path = "strings/dpi_library_loading.rs"]
 mod dpi_library_loading;
 #[path = "strings/dpi_real_int_conversion.rs"]
@@ -49,6 +51,8 @@ mod format_lrm_compliance;
 mod format_real_integral_889;
 #[path = "strings/format_sibling_fixes.rs"]
 mod format_sibling_fixes;
+#[path = "strings/fscanf_whitespace_directive_eof.rs"]
+mod fscanf_whitespace_directive_eof;
 #[path = "strings/fwrite_buffered_flush_points.rs"]
 mod fwrite_buffered_flush_points;
 #[path = "strings/fwrite_mcd_fd.rs"]
@@ -91,6 +95,8 @@ mod ref_arg_assoc_writeback;
 mod ref_arg_collection_writeback;
 #[path = "strings/review_vpi_unlabelled_block_data.rs"]
 mod review_vpi_unlabelled_block_data;
+#[path = "strings/scanf_four_state_digits.rs"]
+mod scanf_four_state_digits;
 #[path = "strings/string_eq_relational_2state.rs"]
 mod string_eq_relational_2state;
 #[path = "strings/string_index_write_frame_local.rs"]
@@ -123,12 +129,16 @@ mod system_task_gaps;
 mod uvm_dpi_driver_linkage;
 #[path = "strings/uvm_dpi_user_library_wins.rs"]
 mod uvm_dpi_user_library_wins;
+#[path = "strings/vpi_array_elem_range.rs"]
+mod vpi_array_elem_range;
 #[path = "strings/vpi_array_ports.rs"]
 mod vpi_array_ports;
 #[path = "strings/vpi_assertion_controls.rs"]
 mod vpi_assertion_controls;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
+#[path = "strings/vpi_deposit_unchanged_driver.rs"]
+mod vpi_deposit_unchanged_driver;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
 mod vpi_mcd_and_time_queries;
 #[path = "strings/vpi_net_kinds.rs"]

@@ -1,4 +1,4 @@
-//! Issue #306: `$dumpvars(0, tb_top.u)` called from a DIFFERENT top-level
+//! `$dumpvars(0, tb_top.u)` called from a DIFFERENT top-level
 //! module dumped nothing.
 //!
 //! IEEE 1800-2023 §21.7.1.2 lets `$dumpvars` name any scope, and §23.6
@@ -44,14 +44,16 @@ endmodule
 /// `dump_ctl`, and return the run's output and the fully-qualified `$var`
 /// names of `out.vcd`, sorted.
 fn dumped(tag: &str, in_tb: &str, in_ctl: &str) -> (String, Vec<String>) {
-    let dir = std::env::temp_dir().join(format!(
-        "xezim_dumpvars_xtop_{tag}_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("xezim_dumpvars_xtop_{tag}_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("mkdir");
     let sv = dir.join("dut.sv");
-    fs::write(&sv, SRC.replace("{IN_TB}", in_tb).replace("{IN_CTL}", in_ctl)).expect("write sv");
+    fs::write(
+        &sv,
+        SRC.replace("{IN_TB}", in_tb).replace("{IN_CTL}", in_ctl),
+    )
+    .expect("write sv");
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .current_dir(&dir)
         .args(["--no-cache", "--wave"])

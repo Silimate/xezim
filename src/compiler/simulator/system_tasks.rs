@@ -903,14 +903,12 @@ impl Simulator {
                     // parser builds `Index`/`MemberAccess` around it — so it
                     // used to be dropped here without a word and the dump fell
                     // back to the whole design; `dump_scope_arg` is the
-                    // `$dumpvars` renderer for that spelling. So is a name the
-                    // elaborator ROOTED, `tb_top.u` from another top-level
-                    // module (§23.6): it is already the absolute path, and
-                    // the signal resolver's scope stripping cut it to `u`.
+                    // `$dumpvars` renderer for that spelling.
                     let name = match &a.kind {
                         ExprKind::Ident(hier)
-                            if hier.root.is_none()
-                                && hier.path.iter().all(|seg| seg.selects.is_empty()) =>
+                            if hier.root.as_deref() != Some("$root")
+                                && hier.path.len() == 1
+                                && hier.path[0].selects.is_empty() =>
                         {
                             let s = self.resolve_hier_name(hier);
                             (!s.is_empty()).then(|| s.to_string())

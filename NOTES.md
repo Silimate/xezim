@@ -75,7 +75,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   resumes. An instance's attempt starts at its clock's event in the time
   step where it matures, if there is one, and otherwise at the next event.
   A delay that moves time on waits for the next tick, and a `#0` keeps the
-  tick of the edge that woke the procedure. (#450)
+  tick of the edge that woke the procedure. At the time-0 edge, such an
+  attempt reads the default sampled values (§16.5.1). (#450)
 * `$dumpvars(0, tb_top.u)` called from another top-level module dumps
   `tb_top.u` and everything below it; the argument was ignored and the dump
   selected nothing. The same holds for a generate-block instance, a variable

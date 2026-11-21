@@ -2070,7 +2070,11 @@ impl Simulator {
                 // Collection return: the VALUE leaves via the side channel;
                 // the result register is never consumed by the caller.
                 (0u32, false)
-            } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
+            } else if let Some(pair) = self.scalar_integral_in(
+                &_f.return_type,
+                self.method_typedef_types(),
+                self.method_typedef_widths(),
+            ) {
                 pair
             } else if let Some(pair) = self.enum_type_info(&_f.return_type) {
                 // Step 6: an enum RETURN is integral — width of the enum's base
@@ -2254,7 +2258,7 @@ impl Simulator {
                 resolve_type_width(
                     &pre.return_type,
                     Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
+                    Some(self.method_typedef_widths()),
                 )
             } else {
                 let values: HashMap<String, Value> =
@@ -2263,7 +2267,7 @@ impl Simulator {
                 super::elaborate::resolve_type_width_env(
                     &pre.return_type,
                     Some(&scope),
-                    Some(&self.module.typedefs),
+                    Some(self.method_typedef_widths()),
                 )
             };
             if w > 0 { w } else { pre.static_result_width }
@@ -3810,7 +3814,7 @@ impl Simulator {
         if result.is_real && !pre.is_class_result && !pre.is_void_result {
             result = Self::compiled_ret_from_real(&result, result_width);
         }
-        if result_width > 0 && result.width != result_width {
+        if result_width > 0 && (result.width != result_width || result.is_fill) {
             result = result.resize_for_assign(result_width);
         }
         if !pre.is_class_result && !pre.is_void_result && !result.is_real {
@@ -3890,7 +3894,7 @@ impl Simulator {
                     continue;
                 }
                 let copy_in = matches!(port.direction, PortDirection::Ref | PortDirection::Inout);
-                let real = matches!(port.data_type, crate::ast::types::DataType::Real { .. });
+                let real = self.dt_is_real(&port.data_type);
                 if !copy_in || real || !scalar.contains(&i) {
                     never(self);
                     return None;
@@ -4013,7 +4017,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            if super::elaborate::is_type_real(&pre.return_type) {
+            if self.dt_is_real(&pre.return_type) {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state(&pre.return_type) {
                 Value::zero(rw)
@@ -4238,7 +4242,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            if super::elaborate::is_type_real(&pre.return_type) {
+            if self.dt_is_real(&pre.return_type) {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state(&pre.return_type) {
                 Value::zero(rw)

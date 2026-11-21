@@ -594,16 +594,38 @@ impl Simulator {
                 if self.assign_struct_concat(name, exprs.iter().collect()) {
                     return true;
                 }
-                let mut flat: Vec<&Expression> = exprs.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
+                // §10.10.3: braces nested in the concatenation are a vector
+                // or string concatenation, one element, unless they hold a
+                // collection operand (see `splice_array_braces`), when the
+                // elements are not themselves arrays.
+                let mut flat: Vec<&Expression> = Vec::new();
+                if self.foreach_dims(name).is_none_or(|d| d.len() == 1) {
+                    self.splice_array_braces(exprs, &mut flat);
+                } else {
+                    flat.extend(exprs.iter());
+                    while let Some(i) = flat
+                        .iter()
+                        .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
+                    {
+                        if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
+                            flat.splice(i..i, c);
+                        }
                     }
                 }
                 let vals = self.unpacked_concat_operand_values(flat);
+                self.set_queue_size(name, vals.len() as u64);
+                for (i, v) in vals.into_iter().enumerate() {
+                    let v = self.fit_queue_push_elem(name, v);
+                    self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
+                }
+                true
+            }
+            // §7.4.6, §7.10.1: a slice of a queue or array (`obj.q[1:$]`),
+            // read in full before the target is written.
+            ExprKind::RangeSelect { .. } if !is_assoc => {
+                let Some((vals, _)) = self.collection_slice_values(e) else {
+                    return false;
+                };
                 self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
                     let v = self.fit_queue_push_elem(name, v);

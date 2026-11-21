@@ -5346,12 +5346,19 @@ impl Simulator {
         // testbench writing those through the simulator's interface, the
         // reference simulator updates it with them, so it can change with
         // them or after.
+        // silimate: a net's VPI driver stage is part of the net, not a variable
+        // A net's driver stage (`<net>$vpidrv<k>`, which elaboration adds
+        // when a VPI library may deposit on the net) is part of that net.
         let mut loose = vec![false; n];
         for id in assigned.iter().filter_map(|(x, scope)| self.cov_signal(x, Some(scope))) {
-            if id < n && !self.module.nets.contains(self.name_for_id(id)) {
+            if id < n
+                && !self.module.nets.contains(self.name_for_id(id))
+                && !xezim_core::elaborate::is_delay_stage_net(self.name_for_id(id))
+            {
                 loose[id] = true;
             }
         }
+        // /silimate
         let mut top = vec![false; n];
         for (name, _) in self.vpi_port_directions.iter().filter(|(name, dir)| {
             !name.contains('.') && matches!(dir, PortDirection::Input | PortDirection::Inout)

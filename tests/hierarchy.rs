@@ -352,6 +352,8 @@ mod bind_generate_paths;
 
 #[path = "hierarchy/signed_generate_instances.rs"]
 mod signed_generate_instances;
+#[path = "hierarchy/signed_port_unsigned_actual.rs"]
+mod signed_port_unsigned_actual;
 
 #[path = "hierarchy/vif_sibling_regressions.rs"]
 mod vif_sibling_regressions;

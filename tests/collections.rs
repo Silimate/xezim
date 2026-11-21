@@ -54,6 +54,8 @@ mod dyn_array_of_mailboxes;
 mod fixed_array_member_initializer;
 #[path = "collections/fixed_array_member_pattern_forms.rs"]
 mod fixed_array_member_pattern_forms;
+#[path = "collections/fixed_array_row_copy_order.rs"]
+mod fixed_array_row_copy_order;
 #[path = "collections/foreach_assoc_key_types.rs"]
 mod foreach_assoc_key_types;
 #[path = "collections/foreach_blocking_resume.rs"]
@@ -395,3 +397,5 @@ mod stream_with_range_unpack;
 mod pattern_self_read;
 #[path = "collections/pattern_self_read_scopes.rs"]
 mod pattern_self_read_scopes;
+#[path = "collections/queue_pop_drain_loop_1210.rs"]
+mod queue_pop_drain_loop_1210;

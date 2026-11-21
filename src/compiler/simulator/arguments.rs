@@ -263,7 +263,7 @@ impl Simulator {
     /// the class (or an ancestor) wins over a same-named global one, and a
     /// type parameter takes the type bound on the running object (§8.25).
     pub(super) fn method_ret_conv(&self, rt: &DataType, cname: &str) -> RetConv {
-        let tt = &self.module.typedef_types;
+        let tt = self.method_typedef_types();
         if let DataType::TypeReference {
             name, dimensions, ..
         } = rt
@@ -284,7 +284,7 @@ impl Simulator {
                 };
             }
         }
-        self.fn_ret_conv(rt)
+        Self::ret_conv_of(super::elaborate::resolve_typedef_chain(rt, tt), tt)
     }
 
     /// `ret_conv_of` for a concrete type-parameter binding, given by name.
@@ -339,7 +339,7 @@ impl Simulator {
     #[cold]
     #[inline(never)]
     pub(super) fn method_ret_typedef_fit(&self, rt: &DataType, cname: &str) -> (u32, Option<bool>) {
-        let tt = &self.module.typedef_types;
+        let tt = self.method_typedef_types();
         let dt = match rt {
             DataType::TypeReference {
                 name, dimensions, ..
@@ -361,7 +361,7 @@ impl Simulator {
         let w = resolve_type_width(
             dt,
             Some(&self.module.parameters),
-            Some(&self.module.typedefs),
+            Some(self.method_typedef_widths()),
         );
         (w, Some(super::elaborate::is_type_signed_resolved(dt, tt)))
     }
@@ -819,6 +819,24 @@ impl Simulator {
                 || Self::packed_dims_are_constant(&port.data_type))
     }
 
+    /// `actual_context_width` for a module- or package-scope task or
+    /// function, whose formal bounds may also name a parameter
+    /// (`input [W-1:0] v`): such a bound resolves where the call binds, to
+    /// the width the bound value is then fitted to (`fit_scalar_formal_seed`),
+    /// so the actual is evaluated at that width.
+    pub(super) fn free_actual_context_width(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+    ) -> Option<u32> {
+        self.actual_context_width(port).or_else(|| {
+            Self::actual_ctx_shape(port)
+                .then(|| self.scalar_formal_integral(&port.data_type))
+                .flatten()
+                .map(|(w, _)| w)
+                .filter(|w| *w > 0)
+        })
+    }
+
     /// Parameter-free arithmetic bounds (including macro-expanded `[64-1:0]`)
     /// have a fixed width just like literal bounds.
     pub(super) fn packed_dims_are_constant(dt: &DataType) -> bool {
@@ -1026,7 +1044,7 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let is_real = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+            let is_real = self.dt_is_real(&m.data_type);
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
@@ -1102,7 +1120,9 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let dv = if super::elaborate::is_type_real(&m.data_type) {
+            // §6.18: a typedef preserves the member's real type.
+            let is_real = self.dt_is_real(&m.data_type);
+            let dv = if is_real {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
@@ -1137,7 +1157,6 @@ impl Simulator {
                             &m.data_type,
                             &self.module.typedef_types,
                         );
-                        let is_real = super::elaborate::is_type_real(&m.data_type);
                         let signed = self.type_is_signed_concrete(&m.data_type);
                         Some(Self::fit_local_decl_init(
                             raw,
@@ -1881,7 +1900,7 @@ impl Simulator {
                         Some(&self.module.parameters),
                         Some(&self.module.typedefs),
                     );
-                    let r = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+                    let r = self.dt_is_real(&m.data_type);
                     for md in &m.declarators {
                         keys.push((format!("{}.{}", port_name, md.name.name), w, r));
                     }
@@ -2368,8 +2387,12 @@ impl Simulator {
             return self.bind_array_arg(port, &selected);
         }
         let arg = self.unpacked_pattern(arg);
-        // #1108: an array member of an instance-array element.
-        let folded = self.inst_array_member_canon(arg);
+        // #1108: an array member of an instance-array element; #1311: an
+        // array of an interface through a virtual interface (§25.9).
+        let folded = match self.inst_array_member_canon(arg) {
+            Some(f) => Some(f),
+            None => self.vif_aggregate_canon(arg),
+        };
         let arg = folded.as_ref().unwrap_or(arg);
         let params = Some(&self.module.parameters);
         let (lo, hi) = match dims.first()? {
@@ -2509,19 +2532,29 @@ impl Simulator {
                 return None;
             }
             let param = self.array_formal_key(port);
-            let suffixes =
-                if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&*caller) {
-                    self.module
-                        .arrays_2d
-                        .insert(param.clone(), ((a0, a1), (b0, b1), w));
-                    Self::nd_elem_suffixes(&[(a0, a1), (b0, b1)])
-                } else {
-                    let (shape, w) = self.module.arrays_nd.get(&*caller).cloned()?;
-                    self.module
-                        .arrays_nd
-                        .insert(param.clone(), (shape.clone(), w));
-                    Self::nd_elem_suffixes(&shape)
-                };
+            let callers = self.nd_formal_suffixes(&caller)?;
+            let declared = self.declared_fixed_dims(&dims)?;
+            let numeric: Vec<_> = declared
+                .iter()
+                .map(|&(l, r)| (l.min(r), l.max(r)))
+                .collect();
+            let suffixes = Self::nd_elem_suffixes(&declared);
+            let w = self
+                .module
+                .arrays_2d
+                .get(&*caller)
+                .map(|s| s.2)
+                .or_else(|| self.module.arrays_nd.get(&*caller).map(|s| s.1))?;
+            if numeric.len() == 2 {
+                self.module
+                    .arrays_2d
+                    .insert(param.clone(), (numeric[0], numeric[1], w));
+            } else {
+                self.module.arrays_nd.insert(param.clone(), (numeric, w));
+            }
+            self.module
+                .unpacked_decl_dims
+                .insert(param.clone(), declared);
             self.multi_dim_array_names.insert(param.clone());
             if param != caller {
                 let w = match self.module.arrays_2d.get(&param) {
@@ -2535,7 +2568,7 @@ impl Simulator {
                     .p_elem_type(&caller)
                     .or_else(|| self.p_elem_type(&param))
                     .and_then(|dt| self.unpacked_struct_of(&dt));
-                for sfx in &suffixes {
+                for (sfx, src) in suffixes.iter().zip(&callers) {
                     if let Some(su) = &elem_su {
                         let d = format!("{}{}", param, sfx);
                         if out_default.is_some() {
@@ -2545,14 +2578,14 @@ impl Simulator {
                                 self.signals.insert(k, dv);
                             }
                         } else {
-                            let s = format!("{}{}", caller, sfx);
+                            let s = format!("{}{}", caller, src);
                             self.copy_unpacked_struct(&d, &s, &su.clone());
                         }
                         continue;
                     }
                     let v = match &out_default {
                         Some(d) => Some(d.clone()),
-                        None => self.get_signal_value_by_name(&format!("{}{}", caller, sfx)),
+                        None => self.get_signal_value_by_name(&format!("{}{}", caller, src)),
                     };
                     if let Some(v) = v {
                         self.signals.insert(format!("{}{}", param, sfx), v);
@@ -2629,7 +2662,7 @@ impl Simulator {
         ) {
             return Some(Value::from_string(""));
         }
-        if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+        if self.dt_is_real(dt) {
             return Some(Value::from_f64(0.0));
         }
         if super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types) {
@@ -2648,7 +2681,8 @@ impl Simulator {
             let (lo, hi) = (d0.min(d1), d0.max(d1));
             let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1).max(0) as usize));
             for prefix in &out {
-                for i in lo..=hi {
+                for offset in 0..=(hi - lo) {
+                    let i = if d0 > d1 { d0 - offset } else { d0 + offset };
                     next.push(format!("{}[{}]", prefix, i));
                 }
             }
@@ -2657,13 +2691,46 @@ impl Simulator {
         out
     }
 
+    /// §7.6: storage bounds are normalized; positional operations start at the
+    /// declared left bound of each remaining dimension.
+    pub(super) fn nd_ordered_suffixes(
+        &self,
+        name: &str,
+        shape: &[(i64, i64)],
+        skip: usize,
+    ) -> Vec<String> {
+        let declared = self.unpacked_decl_dims_of(name);
+        let ordered = declared
+            .as_deref()
+            .filter(|dims| dims.len() == shape.len())
+            .unwrap_or(shape);
+        Self::nd_elem_suffixes(&ordered[skip..])
+    }
+
+    pub(super) fn declared_fixed_dims(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::UnpackedDimension as D;
+        let bound = |e: &Expression| {
+            super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters))
+        };
+        dims.iter()
+            .map(|dim| match dim {
+                D::Range { left, right, .. } => Some((bound(left)?, bound(right)?)),
+                D::Expression { expr, .. } => Some((0, bound(expr)? - 1)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Element suffixes of a name registered as a multi-dimensional array.
     pub(super) fn nd_formal_suffixes(&self, name: &str) -> Option<Vec<String>> {
         if let Some(&(a, b, _)) = self.module.arrays_2d.get(name) {
-            return Some(Self::nd_elem_suffixes(&[a, b]));
+            return Some(self.nd_ordered_suffixes(name, &[a, b], 0));
         }
         if let Some((shape, _)) = self.module.arrays_nd.get(name) {
-            return Some(Self::nd_elem_suffixes(shape));
+            return Some(self.nd_ordered_suffixes(name, shape, 0));
         }
         None
     }
@@ -2695,6 +2762,7 @@ impl Simulator {
         if self.module.arrays_2d.remove(param).is_some()
             | self.module.arrays_nd.remove(param).is_some()
         {
+            self.module.unpacked_decl_dims.remove(param);
             self.multi_dim_array_names.remove(param);
         }
     }
@@ -2777,20 +2845,20 @@ impl Simulator {
                     _ => return None,
                 };
                 let rest: Vec<(i64, i64)> =
-                    if let Some(&(_, b, _)) = self.module.arrays_2d.get(&*name) {
-                        vec![b]
+                    if let Some(&(a, b, _)) = self.module.arrays_2d.get(&*name) {
+                        vec![a, b]
                     } else if let Some((shape, _)) = self.module.arrays_nd.get(&*name) {
                         if shape.len() < 2 {
                             return None;
                         }
-                        shape[1..].to_vec()
+                        shape.clone()
                     } else {
                         return None;
                     };
                 let i = self.eval_expr(index).to_i64()?;
                 Some((
                     format!("{}[{}]", name, i),
-                    Self::nd_elem_suffixes(&rest),
+                    self.nd_ordered_suffixes(&name, &rest, 1),
                     true,
                 ))
             }
@@ -2904,6 +2972,9 @@ impl Simulator {
             if let Some(shape) = self.module.arrays_nd.get(param).cloned() {
                 self.module.arrays_nd.insert(tmp.clone(), shape);
             }
+            if let Some(bounds) = self.module.unpacked_decl_dims.get(param).cloned() {
+                self.module.unpacked_decl_dims.insert(tmp.clone(), bounds);
+            }
             if self.multi_dim_array_names.contains(param) {
                 self.multi_dim_array_names.insert(tmp.clone());
             }
@@ -2923,16 +2994,19 @@ impl Simulator {
                         .p_elem_type(param)
                         .or_else(|| self.p_elem_type(caller))
                         .and_then(|dt| self.unpacked_struct_of(&dt));
-                    for sfx in sfxs {
+                    let Some(destinations) = self.nd_formal_suffixes(caller) else {
+                        continue;
+                    };
+                    for (sfx, dst) in sfxs.iter().zip(destinations) {
                         if let Some(su) = &elem_su {
                             let (d, s) =
-                                (format!("{}{}", caller, sfx), format!("{}{}", param, sfx));
+                                (format!("{}{}", caller, dst), format!("{}{}", param, sfx));
                             self.copy_unpacked_struct(&d, &s, &su.clone());
                             continue;
                         }
                         if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", param, sfx))
                         {
-                            self.set_signal_value_by_name(&format!("{}{}", caller, sfx), v);
+                            self.set_signal_value_by_name(&format!("{}{}", caller, dst), v);
                         }
                     }
                 }

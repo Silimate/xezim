@@ -6480,7 +6480,7 @@ impl Simulator {
                             .render_p_var(&elem)
                             .unwrap_or_else(|| "'{}".to_string()),
                         (_, Some((lists, leaf))) => {
-                            self.render_p_fixed_row(&elem, lists, leaf.as_ref(), val_is_str)
+                            self.render_p_fixed_row(&elem, lists, leaf.as_deref(), val_is_str)
                         }
                         (Some(d), None) => self.render_p_typed(&elem, d),
                         (None, None) => {

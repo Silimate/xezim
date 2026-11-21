@@ -85,7 +85,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--no-toggle-enums`, `--toggle-enums` | Leave enum variables out of toggle coverage, or keep them (the default). See the [coverage guide](coverage-guide.md#counting-rules) |
 | `--no-toggle-generate`, `--toggle-generate` | Leave the signals declared in generate blocks out of toggle coverage, or keep them (the default) |
 | `--code-coverage-expressions=<all\|logical>` | Score every condition and expression item (`all`, the default), or only the conditions with a `&&` or `\|\|`, a term covered once it was 0 and 1 (`logical`) |
-| `--code-coverage-granularity=<statement\|block>` | Count statements (the default) or straight-line blocks, implicit `else` and `default` arms included and continuous assignments not |
+| `--code-coverage-granularity=<statement\|block>` | Count statements (the default) or straight-line blocks, without continuous assignments and without the implicit arm of an `if` with no `else` or a `case` with no `default` |
 | `--no-fsm-reset-transitions`, `--fsm-reset-transitions` | Leave out the FSM transitions only a reset makes, or keep them (the default) |
 | `--no-toggle-tied`, `--toggle-tied` | Leave the bits whose only drivers are constants (literal or parameter bits, through continuous assignments and port connections) out of toggle coverage, or keep them (the default) |
 | `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters) together with the `--verbose` engine lines. Same as `XEZIM_PROFILE_REPORT=1`. Adds overhead |

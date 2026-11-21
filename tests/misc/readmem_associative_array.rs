@@ -1,11 +1,11 @@
-//! Issue #301: `$readmemh`/`$readmemb` into an associative array loaded
+//! `$readmemh`/`$readmemb` into an associative array loaded
 //! nothing and reported `'mem' does not name an unpacked memory`. IEEE
 //! 1800-2023 §21.4 allows the memory to be an associative array whose index
 //! type is integral; each address is used as the key. §21.5 lets
 //! `$writememh`/`$writememb` dump one: the elements that exist, in index
 //! order. The VeeR EH1/EH2/EL2 testbenches load their program this way
 //! (`bit [7:0] mem [bit [31:0]]` in an instance, `$readmemh(.., lmem.mem)`).
-//! The reference simulator and Verilator load the reproducer.
+//! Verilator 5.046 loads the reproducer.
 
 use xezim::simulate;
 
@@ -344,7 +344,7 @@ fn readmem_writemem_unsigned_128_bit_index() {
     let f = |n: &str| dir.join(n).display().to_string();
     std::fs::write(
         dir.join("h.hex"),
-        "@ffffffffffffffffffffffffffffffff\naa bb\n",
+        "@ffffffffffffffffffffffffffffffff\naa bb\n@2 cc\n",
     )
     .unwrap();
     std::fs::write(dir.join("b.hex"), "aa bb\n").unwrap();
@@ -377,7 +377,7 @@ module t;
     $readmemh("@RG@", rg);
     $display("T|range num=%0d %h %h", rg.num(), rg[TOP], rg[MAX]);
     $readmemh("@H@", uh);
-    $display("T|top num=%0d %h", uh.num(), uh[MAX]);
+    $display("T|top num=%0d %h %h", uh.num(), uh[MAX], uh[2]);
     $readmemh("@B@", us, TOP - 1);
     $display("T|start num=%0d %h %h", us.num(), us[TOP - 1], us[TOP]);
     $readmemh("@M@", uf);
@@ -404,7 +404,7 @@ endmodule
             "T|one num=1 5a",
             "T|all num=3 11 22 33",
             "T|range num=2 22 33",
-            "T|top num=1 aa",
+            "T|top num=2 aa cc",
             "T|start num=2 aa bb",
             "T|file num=1 cc",
         ]

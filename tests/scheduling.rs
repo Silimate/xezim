@@ -241,6 +241,8 @@ mod shared_task_frames;
 mod specify_delays_and_event_list;
 #[path = "scheduling/star_sensitivity_and_implicit_port_net.rs"]
 mod star_sensitivity_and_implicit_port_net;
+#[path = "scheduling/star_suspending_body.rs"]
+mod star_suspending_body;
 #[path = "scheduling/static_local_nba_per_instance.rs"]
 mod static_local_nba_per_instance;
 #[path = "scheduling/struct_member_read_sensitivity.rs"]

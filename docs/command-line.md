@@ -72,6 +72,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--relax-macro-space` | Read white space between a backtick and a macro or directive name (`` ` NAME ``) as none (§22.5.1), with a warning — for sources written against tools that accept it |
 | `--relax-nul-bytes` | Read a NUL byte in the source as white space (§5.3), with a warning — for sources written against tools that accept it |
 | `--relax-cross-hier-item` | Accept a hierarchical reference as a cross item (`cross vif.mode, cp;`) and in `binsof(hier)` in a cross bin select (§19.6.1), with an implicit coverpoint (§19.6), with a warning — for sources written against tools that accept it |
+| `--relax-unconnected-interface-port` | Elaborate an instance that leaves an interface port unconnected (§25.3, §23.3.3), with a warning naming the port and the instance; the port's members are then signals of the instance that read x until written — for testbenches written against tools that accept it |
 | `--relax-use-before-decl` | Accept a reference to module data before its declaration (§6.5), including in call arguments, with a warning naming the module and data |
 | `--keywords <ver>` | Keyword set outside `` `begin_keywords `` regions (§22.14): `1364-1995`, `1364-2001`, `1364-2005`, `1800-2005` … `1800-2023`, each also with `-noconfig`; an explicit region still wins |
 | `--no-config-keywords` | Read the ten configuration keywords (`instance`, `cell`, `use`, `library`, …) as names outside `` `begin_keywords `` regions |
@@ -132,6 +133,7 @@ unless noted.
 | `XEZIM_RELAX_MACRO_SPACE=1` | Same as `--relax-macro-space` |
 | `XEZIM_RELAX_NUL_BYTES=1` | Same as `--relax-nul-bytes` |
 | `XEZIM_RELAX_CROSS_HIER_ITEM=1` | Same as `--relax-cross-hier-item` |
+| `XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT=1` | Same as `--relax-unconnected-interface-port` |
 | `XEZIM_RELAX_USE_BEFORE_DECL=1` | Same as `--relax-use-before-decl` |
 | `XEZIM_KEYWORDS=<ver>` | Same as `--keywords <ver>` |
 | `XEZIM_NO_CONFIG_KEYWORDS=1` | Same as `--no-config-keywords` |

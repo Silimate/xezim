@@ -1718,6 +1718,9 @@ impl Simulator {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
+        // silimate: a procedural assertion in an always process samples its time-0 defaults too
+        Self::sva_stmt_names(&ab.stmt, false, &mut self.always_sva_names);
+        // /silimate
         // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile

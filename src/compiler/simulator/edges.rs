@@ -833,6 +833,11 @@ impl Simulator {
         for body in self.module.property_decls.values() {
             Self::sva_expr_names(body, &mut names);
         }
+        // silimate: a procedural assertion in an always process samples its time-0 defaults too
+        // An always block with a delay or a nested wait in its body runs as a
+        // process, which none of the lists above holds.
+        names.extend(std::mem::take(&mut self.always_sva_names));
+        // /silimate
         if names.is_empty() {
             return;
         }

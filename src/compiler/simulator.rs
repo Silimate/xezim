@@ -11621,6 +11621,13 @@ pub struct Simulator {
     /// and call a sampled-value function: (body, scope, edge code, clock id),
     /// consumed by `register_sampled_watches` like the edge blocks.
     proc_sampled_blocks: Vec<(Statement, String, u8, usize)>,
+    // silimate: a procedural assertion in an always process samples its time-0 defaults too
+    /// The name segments the concurrent assertions in every always block
+    /// spell, taken as the blocks are classified: one that runs as a
+    /// process is in no list `capture_sampled_defaults` reads.
+    #[serde(skip)]
+    always_sva_names: HashSet<String>,
+    // /silimate
     /// True while `register_sampled_watches` pre-registers the sites.
     sampled_registering: bool,
 }

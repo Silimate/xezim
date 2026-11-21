@@ -5131,6 +5131,7 @@ impl Simulator {
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),
+            always_sva_names: HashSet::default(),
             sampled_registering: false,
             pending_t0_triggers: Vec::new(),
             time0_port_edges: Vec::new(),

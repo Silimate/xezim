@@ -4839,6 +4839,10 @@ impl Simulator {
             comb_level: Vec::new(),
             comb_has_nba: Vec::new(),
             comb_self_exempt: Vec::new(),
+            // silimate: a level-sensitive block that writes nothing runs once the settle converges
+            comb_observer: Vec::new(),
+            comb_observer_any: false,
+            // /silimate
             comb_par_safe: Vec::new(),
             bsp_buckets: Vec::new(),
             bsp_next_seed: Vec::new(),

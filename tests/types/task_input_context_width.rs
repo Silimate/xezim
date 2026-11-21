@@ -7,7 +7,7 @@
 //! out and the task bound 0. The Analog Devices JESD204 TX register-map
 //! testbench passes `({NUM_LINKS{1'b1}} << 4)` to such a task and failed.
 //!
-//! The expected values are the reference simulator's; Icarus Verilog 13
+//! The expected values follow the LRM; Icarus Verilog 13
 //! agrees except that it evaluates a default argument self-determined.
 
 fn lines(src: &str) -> Vec<String> {

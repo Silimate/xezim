@@ -264,6 +264,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   of a comparison or an arithmetic operator above the read, each evaluated it
   again, so `i++` ran up to thirteen times and the read returned another
   element's member. (#445)
+* A bare enum member that `$unit` or a module declares reads its own value
+  when a package that the scope does not import declares a member of the same
+  name (§26.3, §6.19). The package registered last won the name, so the Coral
+  NPU RVV backend decoder read its UVM testbench package's `EEW8 = 8`, which
+  the RTL's 3-bit `EEW_e` truncates to `EEW_NONE`, and discarded every
+  instruction. (#471)
 
 **Performance**
 

@@ -64,6 +64,7 @@ pub fn rss_trace(label: &str) {
 
 pub mod benchw;
 pub mod compiler;
+pub mod dpi_sources;
 pub mod env_vars;
 pub mod hier_ref_lint;
 pub mod intra_delay;
@@ -192,12 +193,24 @@ fn design_cache_key(
     // Re-elaborate designs validated before duplicate package/typedef/interface
     // diagnostics (§3.13, §6.18, §25.3, §26.2) were added.
     hash.text("qualified-package-array-storage-and-pr-validation-v3");
+    // §6.20.2, §27.5: preserve resolved parameter bounds and generated types.
+    hash.text("scoped-value-parameter-types-v2");
+    // §11.2.1/§27.5: validate folded indices in package parameter generate conditions.
+    hash.text("scoped-generate-constant-selects-v1");
+    // §6.8/§7.2.1: cached initial values include the state domain of packed members.
+    hash.text("packed-struct-member-array-defaults-v1");
+    // §6.10/§26.3: cached instance port connections retain their enum label binding.
+    hash.text("port-actual-enum-labels-v1");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
+    hash.bytes(&xezim_core::elaborate::max_packed_width().to_le_bytes());
     hash.text(top_module_name.unwrap_or(""));
     // An elaboration with unobserved-port elision on leaves nets out, so it
     // must not serve a run that may observe them.
     hash.bytes(&[xezim_core::elaborate::port_elision_requested() as u8]);
+    hash.bytes(&[xezim_core::elaborate::vpi_net_drivers() as u8]);
+    // Prepared gate entries bake in the structural delay mode.
+    hash.bytes(&[compiler::simulator::delay_mode()]);
     // A run that downgraded driver conflicts to warnings must not serve one
     // that reports them as errors.
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
@@ -271,6 +284,14 @@ fn design_cache_key(
     let mut dependencies = config.dependency_files.clone();
     dependencies.sort();
     dependencies.dedup();
+    if dependencies.is_empty() {
+        return (hash.finish(), preprocessed_texts, line_maps);
+    }
+    // A library can use macros that emitted no text in the primary files,
+    // including macros from a primary header and function-like definitions.
+    let inherited = pre
+        .map(|source| std::borrow::Cow::Borrowed(&source.macro_defines))
+        .unwrap_or_else(|| std::borrow::Cow::Owned(pp.snapshot_defines()));
     for path in dependencies {
         hash.text(&path.to_string_lossy());
         match std::fs::read(&path) {
@@ -280,15 +301,8 @@ fn design_cache_key(
                 for dir in include_dirs {
                     dep_pp.add_include_dir(std::path::PathBuf::from(dir));
                 }
-                for (name, value) in defines {
-                    dep_pp.define(
-                        name.clone(),
-                        preprocessor::MacroDef {
-                            name: name.clone(),
-                            params: None,
-                            body: value.clone().unwrap_or_default(),
-                        },
-                    );
+                for (name, definition) in inherited.iter() {
+                    dep_pp.define(name.clone(), definition.clone());
                 }
                 hash.text(&dep_pp.preprocess_file(&source, Some(&path)));
             }
@@ -419,6 +433,36 @@ mod design_cache_tests {
         let after = key(&config, "module top; endmodule", Some("top"));
         let _ = std::fs::remove_file(path);
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn design_cache_key_tracks_primary_macros_used_only_in_libraries() {
+        let dir = std::env::temp_dir().join(format!("xezim-library-header-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = dir.join("settings.svh");
+        let lib = dir.join("leaf.sv");
+        std::fs::write(&lib, "module leaf; localparam N = `SIZE(1); endmodule\n").unwrap();
+        let sources = vec!["`include \"settings.svh\"\nmodule top; leaf u(); endmodule".to_string()];
+        let paths = vec![dir.join("top.sv").display().to_string()];
+        let config = DesignCacheConfig {
+            directory: dir.clone(),
+            semantic_salt: String::new(),
+            dependency_files: vec![lib],
+        };
+        let keys = || {
+            let pre = xezim_core::preprocess_design(&sources, &paths, &[], &[]);
+            [None, Some(&pre)].map(|prepared| {
+                design_cache_key(&config, &sources, &paths, Some("top"), &[], &[], prepared).0
+            })
+        };
+        std::fs::write(&header, "`define SIZE(x) ((x) + 4)\n").unwrap();
+        let before = keys();
+        std::fs::write(&header, "`define SIZE(x) ((x) + 8)\n").unwrap();
+        let after = keys();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(before[0], before[1]);
+        assert_eq!(after[0], after[1]);
+        assert_ne!(before[0], after[0]);
     }
 
     #[test]
@@ -1037,6 +1081,7 @@ fn reinstall_ooc_constraint_bodies(
         let tokens = lexer::Lexer::new(&pre).tokenize();
         let mut parser = sv_parser::parse::Parser::new(tokens);
         let src_ast = parser.parse_source_text();
+        drop(parser);
         for d in &src_ast.descriptions {
             let ast::Description::OutOfClassConstraint {
                 class_name,
@@ -1335,6 +1380,7 @@ fn simulate_multi_inner(
     profile_input: Option<&str>,
     collapse_islands: bool,
 ) -> Result<compiler::Simulator, String> {
+    xezim_core::elaborate::set_vpi_net_drivers(compiler::simulator::foreign_libraries_configured());
     let _oom_trace = xezim_core::oom_trace::session();
     let total_start = WallTimer::now();
     let compilation_start = WallTimer::now();
@@ -1628,9 +1674,17 @@ fn simulate_multi_inner(
     sim.simulate();
     rss_trace("simulated");
     if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+        let (named_widths, width_ranges) = sim.widths.storage_counts();
         eprintln!(
-            "[MEM-CENSUS] end of run: runtime name->value map {} entries; {}",
+            "[MEM-CENSUS] signal widths: {} logical entries ({} named, {} fixed-array ranges)",
+            sim.widths.len(), named_widths, width_ranges
+        );
+        let named = sim.signals.map_entries().count();
+        eprintln!(
+            "[MEM-CENSUS] end of run: runtime name->value map {} entries ({} named, {} dense); {}",
             sim.signals.len(),
+            named,
+            sim.signals.len() - named,
             sim.class_heap_census()
         );
     }

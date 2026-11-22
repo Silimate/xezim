@@ -29,6 +29,11 @@ impl Simulator {
         if self.finished {
             return;
         }
+        // §9.2.2.2: an entry held for the time-0 start batch does not stay
+        // held past time zero, whichever loop moved the time on.
+        if !self.comb_time0_held.is_empty() && self.time != 0 {
+            self.release_time0_held();
+        }
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
         }
@@ -67,10 +72,17 @@ impl Simulator {
     }
 
     pub(super) fn settle_dispatch(&mut self) {
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // Only the serial settle holds such blocks until it converges.
+        self.refresh_comb_observer();
+        // /silimate
         if self.has_udp
             || self.has_timing_checks
             || self.proc_settle_defer
             || !self.deferred_proc_entries.is_empty()
+            // silimate: a level-sensitive block that writes nothing runs once the settle converges
+            || self.comb_observer_any
+            // /silimate
         {
             self.settle_combinatorial_inner();
         } else if self.bsp_shadow {
@@ -106,16 +118,49 @@ impl Simulator {
         self.mark_release_sources_dirty(id);
     }
 
+    /// The indices of the comb entries that write signal `id`, in table
+    /// order (§10.6.2). A release re-drives the net from them; looking them
+    /// up in `comb_writer_index` replaces a scan of every entry, which a
+    /// testbench releasing a signal each clock repeated every cycle. Empty
+    /// while a settle pass has the table taken out, as the scan was.
+    pub(super) fn comb_writers_of(&mut self, id: usize) -> Vec<usize> {
+        let n = self.comb_entries.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if self
+            .comb_writer_index
+            .as_ref()
+            .is_none_or(|(len, _)| *len != n)
+        {
+            let mut index: HashMap<usize, Vec<u32>> = HashMap::default();
+            for (eidx, entry) in self.comb_entries.iter().enumerate() {
+                for &w in &entry.cold.write_signal_ids {
+                    let writers = index.entry(w).or_default();
+                    // An entry that lists a signal twice is one writer.
+                    if writers.last() != Some(&(eidx as u32)) {
+                        writers.push(eidx as u32);
+                    }
+                }
+            }
+            self.comb_writer_index = Some((n, index));
+        }
+        self.comb_writer_index
+            .as_ref()
+            .and_then(|(_, index)| index.get(&id))
+            .map(|writers| writers.iter().map(|&e| e as usize).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
         let mut constant_drivers: Vec<CombEntry> = Vec::new();
-        for entry in self.comb_entries.iter() {
-            if entry.cold.write_signal_ids.contains(&id) {
-                if entry.cold.read_signal_ids.is_empty() {
-                    constant_drivers.push(entry.clone());
-                } else {
-                    sources.extend(entry.cold.read_signal_ids.iter().copied());
-                }
+        for eidx in self.comb_writers_of(id) {
+            let entry = &self.comb_entries[eidx];
+            if entry.cold.read_signal_ids.is_empty() {
+                constant_drivers.push(entry.clone());
+            } else {
+                sources.extend(entry.cold.read_signal_ids.iter().copied());
             }
         }
         for src_id in sources {
@@ -328,6 +373,7 @@ impl Simulator {
                         let view_len = view.len();
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
+                        let shortreal_signals = &self.shortreal_signals;
                         let two_state: &[bool] = &self.signal_two_state;
                         let gate_driven: &[bool] = &self.signal_gate_driven;
                         let n2id = &self.signal_name_to_id;
@@ -372,6 +418,7 @@ impl Simulator {
                                             &entries[eidx].item,
                                             widths,
                                             signed,
+                                            shortreal_signals,
                                             two_state,
                                             gate_driven,
                                             n2id,
@@ -640,6 +687,13 @@ impl Simulator {
         }
     }
 
+    /// The elaborator has already scaled each delay expression to global ticks.
+    pub(super) fn eval_driver_delays(&mut self, exprs: &[Option<Expression>; 3]) -> [Option<u64>; 3] {
+        exprs.each_ref().map(|expr| {
+            expr.as_ref().map(|e| apply_delay_mode(self.eval_delay_ticks(e)))
+        })
+    }
+
     /// AST comb-entry eval (`CombItem::ContAssign` / `AlwaysBlock`). These need
     /// the full `&mut self` interpreter (`eval_expr_ctx` / `exec_statement`), so
     /// they can't go through `eval_comb_entry_isolated`. Factored out of the
@@ -654,6 +708,7 @@ impl Simulator {
                 rhs,
                 delay: explicit_delay,
                 delay_target,
+                delay_exprs,
             } => {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
@@ -710,11 +765,23 @@ impl Simulator {
                 }
                 let w = self.infer_lhs_width(lhs);
                 // §10.8, §10.9: a pattern takes the net's declared type.
+                let saved_ts = self.timescale_scope_override.replace(
+                    entry
+                        .cold
+                        .rhs_time_scope
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
-                let delay = if *explicit_delay > 0 {
+                let runtime = delay_exprs.as_deref().map(|exprs| self.eval_driver_delays(exprs));
+                self.timescale_scope_override = saved_ts;
+                let delay = if let Some([Some(rise), _, _]) = runtime {
+                    rise
+                } else if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
                     lhs_id
@@ -745,7 +812,7 @@ impl Simulator {
                     }
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
-                if delay > 0
+                if runtime.is_some() || delay > 0
                     || delay_target.is_some_and(|t| t.select_delays.is_some())
                     || lhs_id.is_some_and(|id| {
                         self.gate_fall_delay_by_id.contains_key(&id)
@@ -755,7 +822,8 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_transition(id, val, delay, delay_target);
+                                self.schedule_delayed_transition(id, val, delay, delay_target,
+                                    runtime.map(|[_, fall, off]| (fall, off)));
                             }
                         } else {
                             self.cancel_delayed(id);
@@ -774,6 +842,7 @@ impl Simulator {
                                 select_delays: Some((fall, off)),
                                 ..
                             }) => {
+                                let (fall, off) = runtime.map_or((fall, off), |[_, f, o]| (f, o));
                                 let hi = (lo + sel_w - 1) as usize;
                                 let old = self.signal_table[base_id].range_select(hi, lo as usize);
                                 Self::transition_delay(
@@ -792,11 +861,7 @@ impl Simulator {
                 } else if let Some(id) = lhs_id {
                     let width = self.signal_widths[id];
                     let mut resized = if self.signal_real[id] {
-                        if val.is_real {
-                            val.clone()
-                        } else {
-                            Value::from_f64(val.to_f64())
-                        }
+                        self.fit_value_to_signal(id, &val)
                     } else if val.is_real {
                         Self::real_to_int(val.to_f64(), width)
                     } else {
@@ -880,6 +945,12 @@ impl Simulator {
                 };
                 // §20.3.1, §20.3.3: statement fallbacks in top blocks need the top unit.
                 let saved_ts = if compiled.has_fallback
+                    && matches!(entry.item, CombItem::CompiledContAssign { .. })
+                {
+                    Some(self.timescale_scope_override.replace(
+                        entry.cold.rhs_time_scope.as_deref().unwrap_or_default().to_owned(),
+                    ))
+                } else if compiled.has_fallback
                     && entry.cold.scope_hint.is_none()
                     && matches!(entry.item, CombItem::CompiledAlwaysBlock { .. })
                 {
@@ -1412,6 +1483,23 @@ impl Simulator {
         }
     }
 
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// Rebuild `comb_observer` when the entry table changed size. Not
+    /// during a settle, which has taken the table out (a blocking write in
+    /// an interpreted block settles again from inside it).
+    pub(super) fn refresh_comb_observer(&mut self) {
+        if self.settling {
+            return;
+        }
+        if self.comb_observer.len() != self.comb_entries.len() {
+            self.comb_observer = (self.comb_entries.iter())
+                .map(|e| u8::from(e.is_observer()))
+                .collect();
+            self.comb_observer_any = self.comb_observer.contains(&1);
+        }
+    }
+    // /silimate
+
     pub(super) fn settle_combinatorial_inner(&mut self) {
         if !self.ts_sleep.is_empty() {
             self.ts_wake_sleepers();
@@ -1447,6 +1535,9 @@ impl Simulator {
         if self.comb_self_exempt.len() != self.comb_entries.len() {
             self.build_comb_self_exempt();
         }
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        self.refresh_comb_observer();
+        // /silimate
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
         }
@@ -1583,6 +1674,24 @@ impl Simulator {
                 }
             };
         }
+        // silimate: always_comb / always @* blocks wait for the writer to yield too
+        // A deferring settle lists the signals that change in it: first its
+        // seeds (the signals the process wrote), noted before seeding
+        // consumes their dirty marks, then each output an eager entry
+        // changes (`trigger_deps!`). `defer_listed` of them are in
+        // `deferred_proc_entries` already.
+        let defer_mode = self.proc_settle_defer;
+        let mut defer_changed = std::mem::take(&mut self.defer_changed);
+        defer_changed.clear();
+        let mut defer_listed = 0usize;
+        if defer_mode {
+            for &id in &self.dirty_list[..seed_dirty_len] {
+                if self.dirty_signals.get(id).copied().unwrap_or(false) {
+                    defer_changed.push(id);
+                }
+            }
+        }
+        // /silimate
         if self.ctl_sig.is_empty() {
             seed_dirty!(|_id: usize| false);
         } else {
@@ -1625,6 +1734,11 @@ impl Simulator {
         // such as `assign a[i][v][j] = '0;` — never evaluated at all, leaving
         // its net x for the whole run. UVM's parameterized-class registry
         // makes that early static-init settle happen in any UVM testbench.
+        // silimate: always_comb / always @* blocks wait for the writer to yield too
+        // Nothing re-seeds the time-0 entries at the yield: one this settle
+        // seeds lists its reads if deferred.
+        let t0_seeded = self.time == 0 && !self.comb_time0_fired && num_entries > 0;
+        // /silimate
         if self.time == 0 && !self.comb_time0_fired && num_entries > 0 {
             for &eidx in self.comb_time0_idx.iter() {
                 if eidx < num_entries && !triggered[eidx] {
@@ -1645,6 +1759,7 @@ impl Simulator {
             self.is_clock_tree_entry = tree_entry;
             self.settle_triggered = triggered;
             self.settle_triggered_list = next_list;
+            self.defer_changed = defer_changed;
             self.gate_lane = gate_lane;
             if self.profile_report {
                 self.prof_cur.store(
@@ -1724,6 +1839,13 @@ impl Simulator {
             || trace_on
             || self.profile_report;
         let warn_x_on = self.warn_x && self.time > 0;
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // The held blocks (marked 2 in `comb_observer`), and whether this
+        // pass is the one that runs them.
+        let observe = self.comb_observer_any;
+        let mut held: Vec<usize> = Vec::new();
+        let mut release_pass = false;
+        // /silimate
         // Profiling counters accumulate in registers and fold back into `self`
         // once, instead of a read-modify-write per evaluation.
         // Dependents injected into the running pass, as a bitset plus the
@@ -1799,6 +1921,11 @@ impl Simulator {
                 let __tid: usize = $id;
                 let __chg: u64 = $chg;
                 n_writes += 1;
+                // silimate: always_comb / always @* blocks wait for the writer to yield too
+                if defer_mode && __chg != 0 {
+                    defer_changed.push(__tid);
+                }
+                // /silimate
                 if __tid + 1 < dep_offsets.len() {
                     // SAFETY: `__tid + 1 < dep_offsets.len()` was just tested;
                     // offsets are a CSR prefix sum into `dep_entries` and every
@@ -1909,7 +2036,14 @@ impl Simulator {
             }};
         }
 
-        for _iteration in 0..limit {
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // One pass past the limit is left for the held blocks, so a settle
+        // that converged (or gave up) on its last pass still runs them.
+        for _iteration in 0..=limit {
+            if _iteration == limit && !release_pass {
+                break;
+            }
+            // /silimate
             total_iters += 1;
             let mut evaluated_any = false;
             let capture_churn = _iteration + CHURN_TAIL >= limit;
@@ -2109,8 +2243,8 @@ impl Simulator {
                 // #35 §5.5/§10.3: while a PROCESS's post-write settle runs,
                 // cont-assign re-evaluation is a SEPARATE active-region event
                 // the process must not observe before yielding — defer these
-                // entries to the next full settle. UDP/gate/always entries
-                // (a synthesized netlist's cells) stay eager, which is the
+                // entries to the next full settle. UDP/gate entries (a
+                // synthesized netlist's cells) stay eager, which is the
                 // reference-measured split (c1b lazy vs dep eager).
                 // #t0-comb-defer: the optimizer lowers `assign p = a` (and
                 // port connects) to gate-shaped entries, which the variant
@@ -2120,6 +2254,15 @@ impl Simulator {
                 // `gate_entry_is_assign_origin` recovers the assign origin
                 // from `signal_gate_driven` so those entries defer too while
                 // true gate primitives stay eager.
+                // silimate: always_comb / always @* blocks wait for the writer to yield too
+                // §4.5, §9.2.2.2: a level-sensitive `always` (always_comb,
+                // always @*, always @(a or b)) is a process of its own, not a
+                // cell: the writer's change only schedules it, and it runs
+                // once the writer suspends, after the continuous assignments
+                // it reads have been updated (the settle walks entries in
+                // dependency order). Run inline, it saw each blocking write
+                // separately and before the assignments, so an immediate
+                // assertion in it failed on values that never coexist.
                 if self.proc_settle_defer
                     && (matches!(
                         entries[eidx].item,
@@ -2130,8 +2273,31 @@ impl Simulator {
                             | CombItem::FastDirectFanout { .. }
                             | CombItem::FusedBufFanout { .. }
                             | CombItem::FusedAndFanout { .. }
+                            | CombItem::AlwaysBlock { .. }
+                            | CombItem::CompiledAlwaysBlock { .. }
                     ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                 {
+                    // silimate: always_comb / always @* blocks wait for the writer to yield too
+                    // An `always` entry lists the signals that changed in this
+                    // settle, each once: re-dirtied at the yield, they wake
+                    // exactly the blocks they woke here. Its other reads did
+                    // not change, and would also wake blocks sensitive to them
+                    // alone. With nothing changed (an entry woken by an
+                    // unresolved read, which every settle re-seeds) or at the
+                    // time-0 seeding, it lists its reads as before.
+                    if matches!(
+                        entries[eidx].item,
+                        CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+                    ) && !t0_seeded
+                        && !defer_changed.is_empty()
+                    {
+                        if defer_listed < defer_changed.len() {
+                            self.defer_proc_reads(&defer_changed[defer_listed..], false);
+                            defer_listed = defer_changed.len();
+                        }
+                        continue;
+                    }
+                    // /silimate
                     // An entry with no resolvable read (one reading only
                     // memory cells without element names) has no id to
                     // re-dirty: an out-of-range marker still makes the next
@@ -2143,6 +2309,21 @@ impl Simulator {
                     );
                     continue;
                 }
+                // silimate: a level-sensitive block that writes nothing runs once the settle converges
+                // §4.5, §9.2.2.2: such a block (immediate assertions,
+                // `$display`) is a process of its own, and nothing obliges it
+                // to run before the continuous assignments it reads settle.
+                // Run as soon as an input changed, it saw every step of a
+                // carry chain and asserted on values that never coexist. It
+                // waits for the other entries to converge, then runs once.
+                if observe && !release_pass && self.comb_observer[eidx] != 0 {
+                    if self.comb_observer[eidx] == 1 {
+                        self.comb_observer[eidx] = 2;
+                        held.push(eidx);
+                    }
+                    continue;
+                }
+                // /silimate
                 evaluated_any = true;
                 let dirty_before = self.dirty_list.len();
 
@@ -2515,7 +2696,14 @@ impl Simulator {
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
                                         *self.name_resolve_hint.borrow_mut() = sc.clone();
-                                        self.timescale_scope_override = sc;
+                                        self.timescale_scope_override = Some(
+                                            entries[eidx]
+                                                .cold
+                                                .rhs_time_scope
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                                .to_owned(),
+                                        );
                                         Some((prev_hint, prev_ts))
                                     } else {
                                         None
@@ -2913,6 +3101,22 @@ impl Simulator {
                 n_dc += gate_queue.len() as u64;
                 gate_queue.clear();
             }
+            // silimate: a level-sensitive block that writes nothing runs once the settle converges
+            // Nothing else is queued, or this was the last pass the limit
+            // allows: the held blocks run in one more pass.
+            release_pass = !held.is_empty() && (next_list.is_empty() || _iteration + 1 >= limit);
+            if release_pass {
+                for &e in &held {
+                    self.comb_observer[e] = 1;
+                    if !triggered[e] {
+                        triggered[e] = true;
+                        next_list.push(e);
+                    }
+                }
+                held.clear();
+                evaluated_any = true;
+            }
+            // /silimate
             // After one full topo scan: if no entry was evaluated, fixpoint.
             if !evaluated_any {
                 converged = true;
@@ -2930,6 +3134,12 @@ impl Simulator {
             }
         }
 
+        // silimate: a level-sensitive block that writes nothing runs once the settle converges
+        // Only a settle that hit its limit leaves blocks held.
+        for &e in &held {
+            self.comb_observer[e] = 1;
+        }
+        // /silimate
         self.entry_evals += n_evals;
         self.prof_settle_dc_count += n_dc;
         self.prof_settle_ab_count += n_ab;
@@ -2947,6 +3157,7 @@ impl Simulator {
         self.settle_inject_sum = inject_sum;
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
+        self.defer_changed = defer_changed;
         self.gate_lane = gate_lane;
         if self.profile_report {
             self.prof_cur.store(

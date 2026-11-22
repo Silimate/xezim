@@ -1778,6 +1778,7 @@ impl Simulator {
         for m in &su.members {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mkey = format!("{}.{}", prefix, md.name.name);
                 let mw = resolve_type_width(
                     &m.data_type,
@@ -1785,7 +1786,7 @@ impl Simulator {
                     Some(&self.module.typedefs),
                 )
                 .max(1);
-                match self.member_elem_indices(&md.dimensions) {
+                match self.member_elem_indices(&dims) {
                     Some(tups) => {
                         // Element order, last dimension varying fastest —
                         // the enumeration order of `unpacked_struct_leaves`.
@@ -1864,8 +1865,9 @@ impl Simulator {
         // whole-member copy. (IEEE 1800-2023 §7.2)
         for m in &su.members {
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mname = md.name.name.as_str();
-                if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                if let Some(tups) = self.member_elem_indices(&dims) {
                     for tup in tups {
                         let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
                         let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
@@ -1875,7 +1877,7 @@ impl Simulator {
                 }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
-                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
+                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &dims);
             }
         }
         Some(())
@@ -1943,8 +1945,9 @@ impl Simulator {
             if let Some(inner) = self.unpacked_struct_of(dt) {
                 for m in &inner.members {
                     for md in &m.declarators {
+                        let dims = self.member_dims(&m.data_type, &md.dimensions);
                         let mname = md.name.name.as_str();
-                        if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                        if let Some(tups) = self.member_elem_indices(&dims) {
                             for tup in tups {
                                 let lhs_f = Self::append_elem_path(lhs, mname, &tup);
                                 let rhs_f = Self::append_elem_path(rhs, mname, &tup);
@@ -1954,7 +1957,7 @@ impl Simulator {
                         }
                         let lhs_f = Self::append_member_expr(lhs, mname);
                         let rhs_f = Self::append_member_expr(rhs, mname);
-                        self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
+                        self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &dims);
                     }
                 }
                 return;
@@ -2023,6 +2026,7 @@ impl Simulator {
         // every element of a copied-out array member read back 0.
         for m in &su.members {
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mname = md.name.name.as_str();
                 // §7.2.1: a dynamic member copies as a whole collection from
                 // the property's `<handle>#<prop>.<m>` store.
@@ -2050,7 +2054,7 @@ impl Simulator {
                         continue;
                     }
                 }
-                if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                if let Some(tups) = self.member_elem_indices(&dims) {
                     for tup in tups {
                         let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
                         let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
@@ -2060,7 +2064,7 @@ impl Simulator {
                 }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
-                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &md.dimensions);
+                self.assign_member_leaves(&lhs_f, &rhs_f, &m.data_type, &dims);
             }
         }
         Some(())
@@ -2318,6 +2322,159 @@ impl Simulator {
             }
         }
         Some(steps)
+    }
+
+    /// §7.2, §8.4: the class-handle member of an unpacked-struct class
+    /// property that `e` names (`r.h`, `o.r.h`, `r.in.h`, `r.hs[1]`): its
+    /// cell and the class its declaration names. `None` for any other
+    /// expression, a leaf of another type included.
+    pub(super) fn struct_handle_leaf(&mut self, e: &Expression) -> Option<(ClassAggRef, String)> {
+        if self.no_class_objects() || !self.chain_may_name_struct_prop(e) {
+            return None;
+        }
+        let r = self.class_unpacked_leaf(e)?;
+        let ClassAggRef::Unpacked { handle, key, .. } = &r else {
+            return None;
+        };
+        let cls = self.unpacked_leaf_class(*handle, key)?;
+        Some((r, cls))
+    }
+
+    /// The live object a class-handle member of an unpacked-struct class
+    /// property refers to (see `struct_handle_leaf`); `None` for a null
+    /// handle.
+    pub(super) fn struct_handle_leaf_object(&mut self, e: &Expression) -> Option<usize> {
+        let (r, _) = self.struct_handle_leaf(e)?;
+        let h = self.read_class_agg(&r).to_u64()? as usize;
+        (h != 0 && self.heap.get(h).is_some_and(|o| o.is_some())).then_some(h)
+    }
+
+    /// §7.2, §8.4: the value of `<leaf>.<member>` where `<leaf>` is a
+    /// class-handle member of an unpacked-struct class property and
+    /// `<member>` a property of the object it refers to (`o.r.h.k`).
+    pub(super) fn struct_handle_leaf_member(&mut self, e: &Expression) -> Option<Value> {
+        if self.no_class_objects() || !self.chain_may_name_struct_prop(e) {
+            return None;
+        }
+        let (recv, member) = Self::split_trailing_member(e)?;
+        let h = self.struct_handle_chain_object(&recv)?;
+        self.read_member_value(h, &member)
+    }
+
+    /// §7.2, §8.4: `segs` names an unpacked-struct property of `handle` and
+    /// then members down to a class-handle member (`r.h`, `r.in.h`, no
+    /// selects): the object that member refers to and how many segments
+    /// name it. `None` when `segs[0]` is no such property, the path ends
+    /// before a handle member, or the handle is null.
+    pub(super) fn struct_prop_handle_walk(
+        &self,
+        handle: usize,
+        segs: &[&str],
+    ) -> Option<(usize, usize)> {
+        let prop = *segs.first()?;
+        let su = self.class_prop_struct(handle, prop)?;
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        let mut level = (*su).clone();
+        let mut key = prop.to_string();
+        for (j, seg) in segs.iter().enumerate().skip(1) {
+            let (dt, dims) = Self::struct_member_decl(&level, seg)?;
+            if !dims.is_empty() {
+                return None;
+            }
+            key.push('.');
+            key.push_str(seg);
+            if let Some(inner) = self.unpacked_struct_of(&dt) {
+                level = inner;
+                continue;
+            }
+            if !Self::dt_is_class_handle(&dt, &self.module) {
+                return None;
+            }
+            let h = self
+                .read_class_agg(&ClassAggRef::Unpacked { handle, key, w: 32 })
+                .to_u64()? as usize;
+            return (h != 0 && self.heap.get(h).is_some_and(|o| o.is_some())).then_some((h, j + 1));
+        }
+        None
+    }
+
+    /// §18.4: the live objects behind the `rand` class-handle members of the
+    /// unpacked-struct property `prop` of `handle`, as (`prop.member`,
+    /// object). Array members and members of nested structs are not listed.
+    pub(super) fn struct_rand_handle_members(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Vec<(String, usize)> {
+        let Some(su) = self.class_prop_struct(handle, prop) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for m in &su.members {
+            if m.rand_qualifier.is_none() || !Self::dt_is_class_handle(&m.data_type, &self.module) {
+                continue;
+            }
+            for d in m.declarators.iter().filter(|d| d.dimensions.is_empty()) {
+                let key = format!("{}.{}", prop, d.name.name);
+                let cell = ClassAggRef::Unpacked {
+                    handle,
+                    key: key.clone(),
+                    w: 32,
+                };
+                let h = self.read_class_agg(&cell).to_u64().unwrap_or(0) as usize;
+                if h != 0 && h != handle && self.heap.get(h).is_some_and(|o| o.is_some()) {
+                    out.push((key, h));
+                }
+            }
+        }
+        out
+    }
+
+    /// The object the receiver chain `e` refers to when it passes through a
+    /// class-handle member of an unpacked-struct class property: the member
+    /// itself (`r.h`) or a handle property reached from it (`r.h.lf`,
+    /// `o.r.h.lf.next`).
+    pub(super) fn struct_handle_chain_object(&mut self, e: &Expression) -> Option<usize> {
+        if let Some(h) = self.struct_handle_leaf_object(e) {
+            return Some(h);
+        }
+        let (recv, member) = Self::split_trailing_member(e)?;
+        let h = self.struct_handle_chain_object(&recv)?;
+        let tn = self.class_prop_type_name(h, &member)?;
+        self.resolve_typeref_class_name_str(&tn)?;
+        self.member_handle(h, &member)
+            .filter(|&n| n != 0 && self.heap.get(n).is_some_and(|o| o.is_some()))
+    }
+
+    /// The declared class of the leaf cell `key` (`r.h`, `o.hs[1]`,
+    /// `ra[0].in.h`) of an unpacked-struct property of `handle`.
+    fn unpacked_leaf_class(&self, handle: usize, key: &str) -> Option<String> {
+        let (prop, suffix) = key.split_at(key.find(['.', '['])?);
+        let su = self.class_prop_struct(handle, prop)?;
+        let mut level = (*su).clone();
+        let mut dt: Option<DataType> = None;
+        for step in Self::member_suffix_steps(suffix)? {
+            match step {
+                MemberSel::Member(m) => {
+                    if let Some(d) = dt.take() {
+                        level = self.unpacked_struct_of(&d)?;
+                    }
+                    dt = Some(Self::struct_member_decl(&level, &m)?.0);
+                }
+                MemberSel::Index(_) => {}
+                MemberSel::Range { .. } => return None,
+            }
+        }
+        let dt = dt?;
+        if !Self::dt_is_class_handle(&dt, &self.module) {
+            return None;
+        }
+        match super::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types) {
+            DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+            _ => None,
+        }
     }
 
     /// One candidate split: `base` names the property, `suffix` addresses a
@@ -3726,27 +3883,33 @@ impl Simulator {
         h: &crate::ast::expr::HierarchicalIdentifier,
         span: crate::ast::Span,
     ) -> Expression {
-        let mut cur: Option<Expression> = None;
-        for seg in &h.path {
-            let mut e = match cur.take() {
-                None => {
-                    let mut root = h.clone();
-                    root.path = vec![crate::ast::expr::HierPathSegment {
-                        name: seg.name.clone(),
-                        selects: Vec::new(),
-                    }];
-                    root.cached_signal_id = crate::ast::cache::SignalCache::new(None);
-                    root.cached_resolved_name = crate::ast::cache::NameCache::new();
-                    Expression::new(ExprKind::Ident(root), span)
-                }
-                Some(b) => Expression::new(
+        Self::hier_select_chain_from(h, span, 0)
+    }
+
+    /// Preserve the hierarchy through the storage name. Only the remaining
+    /// selects and members are operations on the value (§23.6, §7.10).
+    pub(super) fn hier_select_chain_from(
+        h: &crate::ast::expr::HierarchicalIdentifier,
+        span: crate::ast::Span,
+        storage: usize,
+    ) -> Expression {
+        let mut root = h.clone();
+        root.path.truncate(storage + 1);
+        root.path[storage].selects.clear();
+        root.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+        root.cached_resolved_name = crate::ast::cache::NameCache::new();
+        root.bound = crate::ast::binding::Bound::UNSET;
+        let mut e = Expression::new(ExprKind::Ident(root), span);
+        for (i, seg) in h.path.iter().enumerate().skip(storage) {
+            if i != storage {
+                e = Expression::new(
                     ExprKind::MemberAccess {
-                        expr: Box::new(b),
+                        expr: Box::new(e),
                         member: seg.name.clone(),
                     },
                     span,
-                ),
-            };
+                );
+            }
             for sel in &seg.selects {
                 e = Expression::new(
                     ExprKind::Index {
@@ -3756,9 +3919,8 @@ impl Simulator {
                     span,
                 );
             }
-            cur = Some(e);
         }
-        cur.expect("non-empty hierarchical path")
+        e
     }
 
     /// §7.8.6: a write through a dynamic member of an associative-array
@@ -4407,16 +4569,16 @@ impl Simulator {
             }
             return;
         };
-        let member_names: Vec<String> = su
-            .members
-            .iter()
-            .flat_map(|m| m.declarators.iter().map(|md| md.name.name.clone()))
-            .collect();
+        let is_struct_member = |name: &str| {
+            su.members
+                .iter()
+                .any(|m| m.declarators.iter().any(|md| md.name.name == name))
+        };
         let mut combined_types: Vec<(DataType, Expression)> = its
             .iter()
             .filter_map(|item| {
                 if let AssignmentPatternItem::Named(id, _) = item
-                    && member_names.iter().any(|m| m == &id.name)
+                    && is_struct_member(&id.name)
                 {
                     return None;
                 }
@@ -4477,7 +4639,11 @@ impl Simulator {
             if let Some(inner) = self.unpacked_struct_of(&mdt) {
                 self.assign_class_unpacked_elem_with_types(&lhs_f, &rhs_f, &inner, rhs_outer);
             } else if !rhs_explicit && !rhs_outer.is_empty() {
-                if let Some(v) = self.eval_packed_with_outer_types(&rhs_f, &mdt, rhs_outer) {
+                if let Some(v) = self.eval_packed_with_outer_types(
+                    &rhs_f,
+                    &mdt,
+                    rhs_outer.iter().map(|(kt, v)| (kt, v)),
+                ) {
                     self.assign_value(&lhs_f, &v);
                 } else {
                     let v = self.eval_pattern_leaf_value(&mdt, &rhs_f, None);
@@ -4510,7 +4676,11 @@ impl Simulator {
             if let Some(inner) = self.unpacked_struct_of(elem_dt) {
                 self.assign_class_unpacked_elem_with_types(lhs, val, &inner, outer_types);
             } else if !outer_types.is_empty()
-                && let Some(v) = self.eval_packed_with_outer_types(val, elem_dt, outer_types)
+                && let Some(v) = self.eval_packed_with_outer_types(
+                    val,
+                    elem_dt,
+                    outer_types.iter().map(|(kt, v)| (kt, v)),
+                )
             {
                 self.assign_value(lhs, &v);
             } else {
@@ -4679,13 +4849,14 @@ impl Simulator {
         for m in &su.members {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mn = md.name.name.as_str();
                 let lhs_f = Self::append_member_expr(lvalue, mn);
                 let rhs_f = Self::append_member_expr(rvalue, mn);
-                let pairs: Vec<(Expression, Expression)> = if md.dimensions.is_empty() {
+                let pairs: Vec<(Expression, Expression)> = if dims.is_empty() {
                     vec![(lhs_f, rhs_f)]
                 } else {
-                    match self.member_elem_indices(&md.dimensions) {
+                    match self.member_elem_indices(&dims) {
                         Some(tups) => tups
                             .iter()
                             .map(|t| {
@@ -4827,6 +4998,143 @@ impl Simulator {
             off += w;
         }
         out
+    }
+
+    /// §13.4.1: the value of `return d[i];` (or `return d[i].inner;`) in a
+    /// function whose return type is an unpacked struct. The element of an
+    /// array formal, a local array or a module array has no container value:
+    /// its members are separate leaves, read here one by one. `None` when the
+    /// return type is not an unpacked struct or `e` is not such a reference.
+    pub(super) fn ret_struct_elem_value(&mut self, e: &Expression) -> Option<Value> {
+        let e = Self::peel_parens(e);
+        if !matches!(
+            e.kind,
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+        ) {
+            return None;
+        }
+        let aggregate =
+            |dt: &DataType| matches!(dt, DataType::TypeReference { .. } | DataType::Struct(_));
+        let may = match self.fn_ret_frames.last()? {
+            ReturnPatternType::NotPacked => false,
+            ReturnPatternType::Func(dt) => aggregate(dt),
+            ReturnPatternType::Method(m) => match &m.kind {
+                crate::ast::decl::ClassMethodKind::Function(f) => aggregate(&f.return_type),
+                _ => false,
+            },
+        };
+        if !may {
+            return None;
+        }
+        if Self::is_struct_elem_ref(e) {
+            let su = self.unpacked_struct_of(&self.return_frame_type()?)?;
+            return Some(self.pack_struct_elem_ref(e, &su));
+        }
+        // An index that is not a plain expression (`d[$]`, `d[d.size() - 1]`,
+        // `d[i++]`) is evaluated once and held, so every leaf reads the same
+        // element.
+        if !Self::has_index_select(e) {
+            return None;
+        }
+        let su = self.unpacked_struct_of(&self.return_frame_type()?)?;
+        let held = self.hold_elem_ref_indices(e)?;
+        Self::is_struct_elem_ref(&held).then(|| self.pack_struct_elem_ref(&held, &su))
+    }
+
+    /// §13.4.1: `f = rvalue;` where `f` is the running function's return
+    /// variable of an unpacked-struct type and `rvalue` is a whole struct
+    /// element. Returns whether it wrote the leaves.
+    pub(super) fn ret_var_struct_assign(&mut self, ret_name: &str, rvalue: &Expression) -> bool {
+        // The return variable's `<name>.` marker: one lookup rejects every
+        // function that does not return an unpacked struct.
+        if !self.any_struct_formal_markers {
+            return false;
+        }
+        let mut marker = std::mem::take(&mut self.marker_key_scratch);
+        marker.clear();
+        marker.push_str(ret_name);
+        marker.push('.');
+        let has = self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(marker.as_str()));
+        self.marker_key_scratch = marker;
+        if !has {
+            return false;
+        }
+        let Some(su) = self
+            .return_frame_type()
+            .and_then(|dt| self.unpacked_struct_of(&dt))
+        else {
+            return false;
+        };
+        let v = match &rvalue.kind {
+            ExprKind::Ident(_) => self.whole_struct_ident_value(rvalue, &su),
+            _ => self.ret_struct_elem_value(rvalue),
+        };
+        v.is_some_and(|v| self.spread_into_unpacked_struct(ret_name, &su, &v))
+    }
+
+    /// §13.4.1, §7.2: the packed value of the whole unpacked struct `e`
+    /// names, a local, a formal or a static or design variable of type `su`,
+    /// assembled from its leaves as `return e;` assembles it. None when `e`
+    /// names no such struct.
+    fn whole_struct_ident_value(
+        &mut self,
+        e: &Expression,
+        su: &crate::ast::types::StructUnionType,
+    ) -> Option<Value> {
+        if let Some((name, own)) = self.frame_struct_local(e) {
+            return self.pack_unpacked_struct(&name, &own);
+        }
+        let flat = self.flat_member_name(e)?;
+        if !self.struct_storage_exists(&flat, su) {
+            return None;
+        }
+        self.pack_unpacked_struct(&flat, su)
+    }
+
+    /// Whether the select chain of `e` holds an element select.
+    fn has_index_select(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { .. } => true,
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => {
+                Self::has_index_select(expr)
+            }
+            _ => false,
+        }
+    }
+
+    /// `e` (a chain of element and member selects on a plain name) with each
+    /// index replaced by the value it has now (§11.4.1: evaluated once).
+    /// `None`, with nothing evaluated, for any other root.
+    fn hold_elem_ref_indices(&mut self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let base = self.hold_elem_ref_indices(expr)?;
+                let index = match index.kind {
+                    ExprKind::Number(_) | ExprKind::StringLiteral(_) => (**index).clone(),
+                    _ => self.capture_index_literal(index, &base),
+                };
+                Some(Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(base),
+                        index: Box::new(index),
+                    },
+                    e.span,
+                ))
+            }
+            ExprKind::MemberAccess { expr, member } => Some(Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.hold_elem_ref_indices(expr)?),
+                    member: member.clone(),
+                },
+                e.span,
+            )),
+            ExprKind::Paren(x) => self.hold_elem_ref_indices(x),
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(e.clone()),
+            _ => None,
+        }
     }
 
     /// `class_agg_member` for an already-split `<base>.<field>`.
@@ -4976,10 +5284,11 @@ impl Simulator {
                 two_state,
                 ..
             } => {
-                let val = &if *two_state && val.has_xz() {
-                    val.to_two_state()
+                let fitted = val.resize_for_assign(*w);
+                let val = &if *two_state && fitted.has_xz() {
+                    fitted.to_two_state()
                 } else {
-                    val.clone()
+                    fitted
                 };
                 // A property stored at its full width takes the member's
                 // bits in place (§7.4.1): reading the whole value out,
@@ -5014,7 +5323,7 @@ impl Simulator {
                 changed
             }
             ClassAggRef::Unpacked { handle, key, w } => {
-                let nv = val.resize((*w).max(1));
+                let nv = val.resize_for_assign((*w).max(1));
                 if let Some(Some(inst)) = self.heap.get_mut(*handle) {
                     let changed = inst.properties.get(key) != Some(&nv);
                     inst.properties.insert(key.clone(), nv);
@@ -5029,6 +5338,13 @@ impl Simulator {
                 w,
                 cell_w,
             } => {
+                let fitted;
+                let val = if val.width < *w {
+                    fitted = val.resize_for_assign(*w);
+                    &fitted
+                } else {
+                    val
+                };
                 // Read-modify-write the one cell: the packed-array member (or
                 // the part-selected element) is a bit field of it. A cell
                 // already at its width is edited in place.

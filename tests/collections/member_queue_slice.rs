@@ -190,3 +190,29 @@ endmodule
     let t: Vec<_> = out.iter().filter(|l| l.starts_with("T|")).collect();
     assert_eq!(t, ["T|4 11 22 xx 99"]);
 }
+
+/// §11.3.2: capture the selected member value with its receiver, before
+/// evaluation of the next operand can change the same object.
+#[test]
+fn concat_captures_each_receiver_value() {
+    let out = lines(
+        r#"
+module tb;
+  class C; int v; endclass
+  C obj;
+  int q[$];
+  int unrelated[string];
+  function automatic C bump(); obj.v++; return obj; endfunction
+  initial begin
+    obj = new; unrelated["x"] = 10;
+    q = {bump().v, bump().v};
+    $display("values %0d %0d calls %0d", q[0], q[1], obj.v);
+  end
+endmodule
+"#,
+    );
+    assert!(
+        out.iter().any(|line| line == "values 1 2 calls 2"),
+        "{out:?}"
+    );
+}

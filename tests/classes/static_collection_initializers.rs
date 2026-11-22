@@ -185,3 +185,26 @@ endmodule
     expect(&out, "inst n=2 q='{2, 2}");
     expect(&out, "runtime n=3 q='{3, 3, 3}");
 }
+
+/// §10.9.2 and §10.10.3: a pattern item takes the element width, while a
+/// packed concatenation inside an unpacked concatenation is a single item.
+#[test]
+fn static_initializer_uses_element_context_and_packed_braces() {
+    let out = messages(
+        r#"
+module t;
+  class C;
+    static int q[$] = '{1'b1 + 1'b1};
+    static int rep[$] = '{2{1'b1 + 1'b1}};
+    static logic [15:0] words[$] = {{8'h12, 8'h34}, {8'hab, 8'hcd}};
+  endclass
+  initial begin
+    $display("q %0d %0d %0d %0d", C::q.size(), C::q[0], C::rep[0], C::rep[1]);
+    $display("words %0d %04h %04h", C::words.size(), C::words[0], C::words[1]);
+  end
+endmodule
+"#,
+    );
+    expect(&out, "q 1 2 2 2");
+    expect(&out, "words 2 1234 abcd");
+}

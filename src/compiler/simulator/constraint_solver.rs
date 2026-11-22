@@ -1505,6 +1505,20 @@ impl Simulator {
                     .then(|| (c.prop.clone(), tn))
             })
             .collect();
+        // §18.4: a `rand` class-handle member of a rand unpacked-struct
+        // property (`rand struct { rand C h; } r;`) names an object that is
+        // randomized with this one. It is solved first, under its own
+        // constraints and the items of this solve that read only its members
+        // (`r.h.k == 5`, §18.5.9); this object's solve then reads its
+        // members as state.
+        if self.randomize_subset.is_none() && self.randomize_depth < 8 {
+            for (p, _) in &unpacked_agg_props {
+                for (key, sub) in self.struct_rand_handle_members(handle, p) {
+                    let pushed = self.pushdown_items(&key, &constraints);
+                    self.randomize_nested_with(sub, &pushed);
+                }
+            }
+        }
         // §18.5.4/§18.5.10: a set whose DISTRIBUTION the per-variable trials
         // below cannot honour (see `rand_order_sensitive`) goes to the joint
         // solver first; the trials stay the fallback.
@@ -4317,10 +4331,13 @@ impl Simulator {
                 let su = self
                     .class_prop_struct(handle, prop)
                     .filter(|su| Self::spreads_member_wise(su));
+                let shared_width = self.widths.specialize_fixed(&scoped, lo, hi, w);
                 for i in lo..=hi {
                     let en = format!("{}[{}]", scoped, i);
-                    self.signals.insert(en.clone(), fill.clone());
-                    self.widths.insert(en, w);
+                    if !shared_width {
+                        self.widths.insert(en.clone(), w);
+                    }
+                    self.signals.insert(en, fill.clone());
                     if let Some(su) = &su {
                         self.seed_class_struct_cells(handle, &format!("{}[{}]", prop, i), su);
                     }

@@ -234,6 +234,7 @@ const NESTED: &str = r#"module top;
     assert (a || !a);
     lab2 : assert (a || !a);
   end
+  initial $assertvacuousoff(0);
 
   // Sampled at the 11 rising edges (5, 15, ..., 105), in order:
   //   rst 0 0 0 0 1 0 0 0 0 0 0
@@ -256,9 +257,12 @@ const NESTED: &str = r#"module top;
 endmodule
 "#;
 
+// silimate: vacuous successes run pass actions by default, so the design turns them off
 /// Nested implications, `not`, `or`, an in-flight `disable iff`, strong and
 /// weak obligations left at the end, procedural and unlabeled statements.
-/// A vacuous success of a nested implication runs no pass action.
+/// A vacuous success of a nested implication runs no pass action once
+/// `$assertvacuousoff` turns those off (IEEE 1800-2023 §20.11 runs them by
+/// default).
 #[test]
 fn nested_vacuity_disable_and_generated_names() {
     let (json, out) = run("nested", &[("b.sv", NESTED)]);

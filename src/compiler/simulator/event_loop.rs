@@ -273,6 +273,7 @@ impl Simulator {
     /// POST-NBA r (one cycle "early" vs the reference simulator; the exact
     /// checker/BFM divergence shape of the rptr race-through report).
     pub(super) fn drain_inactive_pre_nba(&mut self) {
+        self.drain_active_driver_updates();
         let mut fuel = 1000u32;
         // §9.2: a `#0` continuation's write happens AFTER this slot's edge
         // detection; without recording it for the rescan drain, the caller
@@ -298,6 +299,7 @@ impl Simulator {
             if self.dirty_any {
                 self.settle_combinatorial();
             }
+            self.drain_active_driver_updates();
         }
         self.in_edge_cont = __prev_edge_cont;
         // Re-detect the recorded positions NOW, against the still-pre-write
@@ -305,6 +307,68 @@ impl Simulator {
         // recorded.
         self.drain_edge_exec_rescan();
     }
+
+    // silimate: fork children an edge-woken process starts run before the NBA region
+    /// §9.3.2, §4.4.2: run the processes queued for the current time slot
+    /// INLINE, before the caller commits the NBA region. A process an edge
+    /// resumed inline queues the children it forks here; they start in the
+    /// Active region, so a child that waits for an edge this slot's NBAs make
+    /// is already waiting when they commit.
+    pub(super) fn drain_active_pre_nba(&mut self) {
+        if !self.active_pre_nba_allowed() || self.event_queue.next_time() != Some(self.time) {
+            return;
+        }
+        // Their writes come after this slot's edge detection: record them for
+        // the rescan drain, as `drain_inactive_pre_nba` does.
+        let prev = self.in_edge_cont;
+        self.in_edge_cont = true;
+        while self.event_queue.next_time() == Some(self.time)
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
+            let Some((pid, cont)) = self.event_queue.pop_front(self.time) else {
+                break;
+            };
+            self.run_scheduled_process(pid, &cont);
+            if !self.is_pid_suspended(pid) {
+                self.child_finished(pid);
+            }
+        }
+        if self.dirty_any {
+            self.settle_combinatorial();
+        }
+        self.in_edge_cont = prev;
+        self.drain_edge_exec_rescan();
+    }
+
+    /// Only the top-level scheduler runs Active work inline before the NBAs.
+    /// A nested scheduler (`run_nested_until`, under a process that waits on
+    /// its own stack) and a run with imported DPI tasks parked on their own
+    /// stacks leave it to their loops: running those processes here nested
+    /// them inside the waiting activation.
+    fn active_pre_nba_allowed(&self) -> bool {
+        self.stmts_depth == 0 && self.dpi_tasks.is_empty()
+    }
+
+    /// §4.5: the Active and Inactive regions alternate until both are empty,
+    /// and only then does the NBA region run. A `#0` continuation the
+    /// Inactive drain resumes may fork, which queues Active work again.
+    pub(super) fn drain_pre_nba_regions(&mut self) {
+        if !self.active_pre_nba_allowed() {
+            self.drain_inactive_pre_nba();
+            return;
+        }
+        let mut fuel = 1000u32;
+        loop {
+            self.drain_active_pre_nba();
+            self.drain_inactive_pre_nba();
+            fuel -= 1;
+            if fuel == 0 || self.finished || self.event_queue.next_time() != Some(self.time) {
+                break;
+            }
+        }
+    }
+    // /silimate
 
     pub(super) fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
@@ -335,7 +399,11 @@ impl Simulator {
             // Inactive region precedes the NBA region (§4.5): `#0`
             // continuations parked by this round's active-region work run
             // before its NBAs commit.
-            self.drain_inactive_pre_nba();
+            // silimate: fork children an edge-woken process starts run before the NBA region
+            // So do the processes it queued for this time (fork children), and
+            // the Active work those `#0` continuations queue in turn.
+            self.drain_pre_nba_regions();
+            // /silimate
             // §9.7.4: `wait(expr)` is a same-delta, same-timestep handoff. A
             // waiter whose condition an ACTIVE-region continuation just made
             // true (an inline edge resume above — e.g. a grant handshake
@@ -759,6 +827,7 @@ impl Simulator {
         // drain (a stuck counter would hold every cont-assign propagation
         // forever).
         self.t0_starts_remaining = 0;
+        self.release_time0_held();
         // Close out the slot being abandoned before the clock jumps. Every
         // other time advance services the postponed region first; this
         // recovery path is the last one that did not, and skipping it would
@@ -1907,6 +1976,7 @@ impl Simulator {
                 if self.t0_starts_remaining > 0 && !self.event_queue.last_pop_front {
                     self.t0_starts_remaining -= 1;
                     if self.t0_starts_remaining == 0 {
+                        self.release_time0_held();
                         self.drain_deferred_proc_settle();
                     }
                 }
@@ -1965,6 +2035,7 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
+            self.drain_active_driver_updates();
             self.drain_condition_waiters(true, false);
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
@@ -1996,6 +2067,11 @@ impl Simulator {
         // the end of the time-0 active region, once the initial blocks above
         // have run and suspended — so a same-time pre-delay read of the output
         // still observes X (matches a reference simulator).
+        // §9.2.2.2: with no start batch to close (no process at time 0)
+        // the held entries are released here.
+        if !self.comb_time0_held.is_empty() {
+            self.release_time0_held();
+        }
         if self.time == 0 && !self.comb_time0_deferred_done && !self.comb_time0_deferred.is_empty()
         {
             self.comb_time0_deferred_done = true;
@@ -2023,9 +2099,56 @@ impl Simulator {
             self.deliver_time0_port_edges();
         }
 
+        // silimate: the processes a clock edge wakes run before the slot's NBA region
+        // §4.4.2, §4.5: the NBA region comes once the Active region is empty,
+        // and the processes an Active-region write's edge wakes (a clock
+        // generator's toggle) run in that region. A process that resumed
+        // from a delay at the edge's time and wrote with `<=` (a testbench's
+        // `#20 d <= 1;` landing on a clock edge) must not be seen by the
+        // edge's flops and waiters: detect this region's edges before the
+        // NBAs commit. With no NBA pending the order below is the same.
+        // Time 0 rescans every edge (`check_edges_pass`), so it keeps the
+        // order below.
+        if self.time > 0
+            && (!self.nba_fast.is_empty()
+                || !self.nba_queue.is_empty()
+                || !self.packed_nba.is_empty()
+                || !self.pending_nba_triggers.is_empty()
+                || !self.pending_nba_instance_triggers.is_empty()
+                || self.delayed_nba_due())
+        {
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            if !non_clock_change && !self.toggled_clock_positions.is_empty() {
+                self.check_edges_clocks_only();
+            } else {
+                self.check_edges();
+            }
+            self.toggled_clock_positions.clear();
+            if self.finished {
+                return;
+            }
+            // §9.7.4: a `wait` the edge's processes made true resumes in this
+            // Active region too, before the NBAs commit (as in the cascade).
+            if !self.ready_condition_waiters.is_empty() {
+                let prev = self.in_edge_cont;
+                self.in_edge_cont = true;
+                self.drain_condition_waiters(true, false);
+                self.in_edge_cont = prev;
+                if self.finished {
+                    return;
+                }
+            }
+        }
+        // /silimate
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
-        self.drain_inactive_pre_nba();
+        // silimate: fork children an edge-woken process starts run before the NBA region
+        // So do the fork children of a process an edge woke before the NBAs
+        // (the edge pass above), and the Active work `#0` continuations queue.
+        self.drain_pre_nba_regions();
+        // /silimate
         if self.finished {
             return;
         }
@@ -2478,6 +2601,11 @@ impl Simulator {
         // `schedule_front` fork children are exempted at pop time.
         if !self.checkpoint_restored {
             self.t0_starts_remaining = self.event_queue.slot_len(0);
+            // §9.2.2.2: with no process to start, the entries held for the
+            // start batch run now.
+            if self.t0_starts_remaining == 0 {
+                self.release_time0_held();
+            }
         }
         while !self.finished && iters < max_iters {
             iters += 1;
@@ -2820,9 +2948,25 @@ impl Simulator {
             // same-time work, so look again.
             if next_time > self.time && self.t0_starts_remaining > 0 {
                 self.t0_starts_remaining = 0;
+                self.release_time0_held();
                 self.drain_deferred_proc_settle();
                 continue;
             }
+            // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+            // §4.5, §16.4.1: a report matures in the Observed region (or
+            // Postponed), which the slot reaches only once every region
+            // through Post-NBA is empty. A cbNBASynch or cbReadWriteSynch
+            // still due belongs before it: cocotb applies its queued writes
+            // there, and a block they re-run flushes the report it queued
+            // on the old values (an `always_comb`'s time-0 run on x inputs).
+            if next_time > self.time
+                && !self.deferred_asserts.is_empty()
+                && self.vpi_cb_mask != 0
+                && self.vpi_slot_post_nba()
+            {
+                continue;
+            }
+            // /silimate
             // §16.4: the time slot is over — deferred assertion reports
             // mature. Their actions may schedule same-time work, so look
             // again before advancing.
@@ -3861,11 +4005,9 @@ impl Simulator {
         // §16.12.2: strong properties still pending fail at the end of
         // simulation, before the summary counts them.
         self.sva_end_of_sim();
-        // silimate: count a deferred assertion when its report matures, not when it is queued
         // The assertion + coverage summary (and the JSON database) is written
         // by `run` after the last slot's deferred reports mature and the
         // `final` blocks run, which both count.
-        // /silimate
         if self.edge_block_stats_enabled {
             self.print_edge_block_stats();
         }

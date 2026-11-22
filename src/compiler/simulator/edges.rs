@@ -409,6 +409,7 @@ impl Simulator {
         let mut rank = 0u8;
         let mut moved = false;
         let mut deferred_ix = usize::MAX;
+        let mut last_check = None;
         let saved_hint = waiter
             .value_ctx
             .as_ref()
@@ -420,6 +421,13 @@ impl Simulator {
                 continue;
             }
             moved = true;
+            // §9.4.2: several changed leaves can name the same expression.
+            if let Some(e) = &sid.value_of {
+                if last_check == Some((e.span, sid.edge)) {
+                    continue;
+                }
+                last_check = Some((e.span, sid.edge));
+            }
             // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
             // guard `g` holds at edge time. A false guard re-arms the
             // waiter (it stays in event_waiters for the next edge)
@@ -455,10 +463,8 @@ impl Simulator {
             // (`@(posedge v[3])`) is judged on that value's LSB.
             let value_ok = match (&sid.value_of, waiter.guard_prev.get(i)) {
                 (Some(e), Some(Some(prev))) => {
-                    let e = e.clone();
-                    let prev = prev.clone();
-                    let cur = self.eval_expr(&e);
-                    value_event_fires(sid.edge, &prev, &cur)
+                    let cur = self.eval_expr(e);
+                    value_event_fires(sid.edge, prev, &cur)
                 }
                 _ => true,
             };
@@ -578,15 +584,7 @@ impl Simulator {
             let Some(e) = w.resolved_sensitivities[i].value_of.as_ref() else {
                 continue;
             };
-            let v = match &last {
-                Some((sp, v)) if *sp == e.span => v.clone(),
-                _ => {
-                    let v = self.eval_expr(e);
-                    last = Some((e.span, v.clone()));
-                    v
-                }
-            };
-            w.guard_prev[i] = Some(v);
+            w.guard_prev[i] = Some(self.event_value_snapshot(e, &mut last));
         }
     }
 
@@ -753,6 +751,11 @@ impl Simulator {
                 }
             }
         }
+        // silimate: sampled-value functions of a whole unpacked array track its cells
+        // The watch's operand: a whole array's is the concatenation of its
+        // cells, read the same way off the clock's tick.
+        let operand = self.sampled_watches[widx].expr.clone();
+        // /silimate
         Some(self.sampled_cur_and_past(widx, &operand, n))
     }
 
@@ -828,6 +831,11 @@ impl Simulator {
         for body in self.module.property_decls.values() {
             Self::sva_expr_names(body, &mut names);
         }
+        // silimate: a procedural assertion in an always process samples its time-0 defaults too
+        // An always block with a delay or a nested wait in its body runs as a
+        // process, which none of the lists above holds.
+        names.extend(std::mem::take(&mut self.always_sva_names));
+        // /silimate
         if names.is_empty() {
             return;
         }
@@ -1458,6 +1466,59 @@ impl Simulator {
         }
     }
 
+    // silimate: sampled-value functions of a whole unpacked array track its cells
+    /// §16.9.3: the operand of `$past`, `$stable` or `$changed` may be a
+    /// whole fixed-size unpacked array (`$stable(mem)`), whose name is no
+    /// signal. Its sampled value is the concatenation of its cells, the left
+    /// bound's first, with their signal ids. `None` for any other operand,
+    /// and for an array of the packed arena or with a negative bound.
+    pub(super) fn whole_array_cells(&self, e: &Expression) -> Option<(Expression, Vec<usize>)> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.resolve_hier_name(h);
+        let &(first, lo, hi) = self.array_first_id.get(name.as_ref())?;
+        if is_packed_id(first) || lo < 0 || hi < lo {
+            return None;
+        }
+        let desc = self.module.descending_arrays.contains(name.as_ref());
+        let order: Vec<i64> = if desc {
+            (lo..=hi).rev().collect()
+        } else {
+            (lo..=hi).collect()
+        };
+        let cells = order
+            .iter()
+            .map(|&i| {
+                let index = Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: NumberBase::Decimal,
+                        value: i.to_string(),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
+                    }),
+                    e.span,
+                );
+                Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(e.clone()),
+                        index: Box::new(index),
+                    },
+                    e.span,
+                )
+            })
+            .collect();
+        let ids = (first..=first + (hi - lo) as usize)
+            .filter(|&id| id < self.signal_table.len())
+            .collect();
+        Some((Expression::new(ExprKind::Concatenation(cells), e.span), ids))
+    }
+    // /silimate
+
     /// Get-or-create the sampled watch for a call site. Registers the clock
     /// (and a simple-signal operand) into `edge_signal_ids` so the snapshot
     /// pass keeps their preponed values fresh.
@@ -1481,6 +1542,10 @@ impl Simulator {
             }
             return Some(i);
         }
+        // silimate: sampled-value functions of a whole unpacked array track its cells
+        let cells = self.whole_array_cells(operand);
+        let operand = cells.as_ref().map_or(operand, |(e, _)| e);
+        // /silimate
         let edge = match edge_code {
             1 => EdgeKind::Posedge,
             2 => EdgeKind::Negedge,
@@ -1543,6 +1608,9 @@ impl Simulator {
                 None => {
                     let mut ids = Vec::new();
                     self.collect_sva_signal_ids(operand, &mut ids);
+                    // silimate: sampled-value functions of a whole unpacked array track its cells
+                    ids.extend(cells.iter().flat_map(|(_, c)| c.iter().copied()));
+                    // /silimate
                     if !self.time0_settled {
                         for &id in &ids {
                             if !self.sampled_defaults.contains_key(&id)
@@ -1591,6 +1659,9 @@ impl Simulator {
         });
         let mut sample_ids = Vec::new();
         self.collect_sva_signal_ids(operand, &mut sample_ids);
+        // silimate: sampled-value functions of a whole unpacked array track its cells
+        sample_ids.extend(cells.iter().flat_map(|(_, c)| c.iter().copied()));
+        // /silimate
         self.add_sampled_watch_ids(i, &sample_ids);
         let scope = self.sampled_scope();
         self.sampled_watch_site

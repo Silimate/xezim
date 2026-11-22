@@ -3860,8 +3860,23 @@ impl Simulator {
         init: &Expression,
         elem_type: Option<DataType>,
     ) {
-        let w = self.module.arrays.get(scoped_q).map_or(32, |a| a.2);
-        let pattern_value = |sim: &mut Self, expr: &Expression| match &elem_type {
+        let width = self.module.arrays.get(scoped_q).map_or(32, |a| a.2);
+        let expand_rows = self.concat_has_non_array_elements(scoped_q)
+            && !elem_type
+                .as_ref()
+                .is_some_and(|dt| self.concat_element_type_is_array(dt));
+        self.store_queue_literal(scoped_q, init, elem_type.as_ref(), width, expand_rows);
+    }
+
+    pub(super) fn store_queue_literal(
+        &mut self,
+        scoped_q: &str,
+        init: &Expression,
+        elem_type: Option<&DataType>,
+        w: u32,
+        expand_rows: bool,
+    ) {
+        let pattern_value = |sim: &mut Self, expr: &Expression| match elem_type {
             Some(dt) => sim.eval_pattern_leaf_value(dt, expr, Some(w)),
             None => sim.eval_expr(expr),
         };
@@ -3895,10 +3910,6 @@ impl Simulator {
             }
             // §10.10.3: a nested packed concatenation contributes one element.
             ExprKind::Concatenation(parts) => {
-                let expand_rows = self.concat_has_non_array_elements(scoped_q)
-                    && !elem_type
-                        .as_ref()
-                        .is_some_and(|dt| self.concat_element_type_is_array(dt));
                 let mut operands = Vec::with_capacity(parts.len());
                 if expand_rows {
                     self.splice_array_braces(parts, &mut operands);

@@ -125,3 +125,44 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn return_pattern_width_follows_the_current_function_and_method() {
+    if !super::compiled_method_test_env::policies(&[("0", "1000"), ("1", "0")]) {
+        return;
+    }
+    let src = r#"
+module top;
+  typedef byte byte_q[$];
+  typedef int int_q[$];
+  function automatic byte_q bytes(); return '{8'h34}; endfunction
+  function automatic int_q words(); return '{32'h1234, 1'b1 + 1'b1}; endfunction
+  function automatic int first_byte(); byte_q q; q = {bytes()}; return q[0]; endfunction
+  function automatic int_q nested(); return '{32'h3456, first_byte(), 32'h789a}; endfunction
+  class C;
+    function int_q more(); return '{32'h5678, 1'b1 + 1'b1}; endfunction
+  endclass
+  initial begin
+    C c = new;
+    byte b[$];
+    int w[$];
+    b = {bytes()};
+    w = {words()};
+    $display("T|free=%h,%0d", w[0],w[1]);
+    b = {bytes()};
+    w = {c.more()};
+    $display("T|method=%h,%0d", w[0],w[1]);
+    w = {nested()};
+    $display("T|nested=%h,%0d,%h", w[0],w[1],w[2]);
+  end
+endmodule
+"#;
+    assert_eq!(
+        lines(src),
+        [
+            "T|free=00001234,2",
+            "T|method=00005678,2",
+            "T|nested=00003456,52,0000789a"
+        ]
+    );
+}

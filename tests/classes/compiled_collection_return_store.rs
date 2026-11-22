@@ -166,3 +166,29 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn returned_concatenations_convert_each_element_before_the_caller_consumes_it() {
+    if !super::compiled_method_test_env::policies(&[("0", "1000"), ("1", "0")]) {
+        return;
+    }
+    let src = r#"
+module top;
+  typedef bit [7:0] q8[$];
+  typedef byte sq8[$];
+  typedef int q32[$];
+  function automatic q8 trunc(); return {32'h1234, 8'hxx}; endfunction
+  function automatic sq8 sign_ext(); return {32'hffff00ff}; endfunction
+  function automatic q32 full(); return '{32'h3456}; endfunction
+  initial begin
+    int q[$];
+    for (int i=0; i<2; i++) begin
+      q={full(),trunc(),sign_ext()};
+      $display("T|rows=%h,%h,%h,%h",q[0],q[1],q[2],q[3]);
+    end
+  end
+endmodule
+"#;
+    let expected = "T|rows=00003456,00000034,00000000,ffffffff";
+    assert_eq!(lines(src), [expected, expected]);
+}

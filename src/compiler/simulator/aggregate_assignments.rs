@@ -3920,8 +3920,12 @@ impl Simulator {
             }
             _ => return,
         };
+        // Concatenation operands are self-determined, then assigned to the
+        // destination element type. A return snapshot has no type of its own.
+        let integral = elem_type.and_then(|dt| self.integral_queue_type(dt, w));
         let n = vals.len();
-        for (i, mut v) in vals.into_iter().enumerate() {
+        for (i, v) in vals.into_iter().enumerate() {
+            let mut v = Self::fit_queue_elem_to(integral, v);
             // §5.7.1: an unsized fill element takes the element width.
             if v.is_fill && !v.is_real {
                 v = v.resize(w.max(1));
@@ -4944,17 +4948,12 @@ impl Simulator {
         else {
             return self.static_integral_queue_elem(coll);
         };
-        if !integral(self.resolve_dt_ref(dt)) {
-            return None;
-        }
-        let w = self
-            .module
-            .arrays
-            .get(coll)
-            .map(|t| t.2)
-            .filter(|w| *w > 0)?;
-        Some((
-            w,
+        self.integral_queue_type(dt, self.module.arrays.get(coll)?.2)
+    }
+
+    fn integral_queue_type(&self, dt: &DataType, width: u32) -> Option<(u32, bool, bool)> {
+        (width > 0 && Self::integral_dt(self.resolve_dt_ref(dt))).then(|| (
+            width,
             self.type_is_signed_concrete(dt),
             super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types),
         ))

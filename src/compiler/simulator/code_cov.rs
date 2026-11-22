@@ -4256,6 +4256,18 @@ impl Simulator {
         if kinds & KIND_CODE != 0 {
             let mut program = std::mem::take(&mut self.module.program_initial_blocks);
             let mut fin = std::mem::take(&mut self.module.final_blocks);
+            // Materialize any deferred instance-scoped callable bodies before
+            // instrumenting so per-instance signal references are in place.
+            let deferred_fns: Vec<String> =
+                self.module.deferred_function_bodies.keys().cloned().collect();
+            for key in deferred_fns {
+                Self::materialize_deferred_fn_in_place(&mut self.module, &key);
+            }
+            let deferred_tasks: Vec<String> =
+                self.module.deferred_task_bodies.keys().cloned().collect();
+            for key in deferred_tasks {
+                Self::materialize_deferred_task_in_place(&mut self.module, &key);
+            }
             let mut functions = std::mem::take(&mut self.module.functions).into_map();
             let mut tasks = std::mem::take(&mut self.module.tasks);
             {

@@ -588,12 +588,10 @@ impl Simulator {
                 // reads the driven value in the statement after `release`.
                 if !self.settling && !self.in_edge_block {
                     let drivers: Vec<CombEntry> = self
-                        .comb_entries
-                        .iter()
-                        .filter(|e| {
-                            e.cold.write_signal_ids.contains(&id)
-                                && !e.cold.read_signal_ids.is_empty()
-                        })
+                        .comb_writers_of(id)
+                        .into_iter()
+                        .map(|eidx| &self.comb_entries[eidx])
+                        .filter(|e| !e.cold.read_signal_ids.is_empty())
                         .cloned()
                         .collect();
                     for entry in &drivers {
@@ -750,11 +748,12 @@ impl Simulator {
             return;
         };
         self.active_force_exprs.retain(|entry| entry.key != key);
+        // §10.6.2: the net's drivers from the writers index, as the release
+        // paths find them; a scan of every entry here ran on each force of
+        // part of the net.
         let mut ids: Vec<usize> = Vec::new();
-        for e in self.comb_entries.iter() {
-            if e.cold.write_signal_ids.contains(&id) {
-                ids.extend(e.cold.read_signal_ids.iter().copied());
-            }
+        for eidx in self.comb_writers_of(id) {
+            ids.extend(self.comb_entries[eidx].cold.read_signal_ids.iter().copied());
         }
         let mut reads: HashSet<String> = HashSet::default();
         if let Some(pf) = self.partial_forces.get(&id) {
@@ -827,10 +826,9 @@ impl Simulator {
         self.forced_signals.remove(&id);
         if !self.settling && !self.in_edge_block {
             let drivers: Vec<CombEntry> = self
-                .comb_entries
-                .iter()
-                .filter(|e| e.cold.write_signal_ids.contains(&id))
-                .cloned()
+                .comb_writers_of(id)
+                .into_iter()
+                .map(|eidx| self.comb_entries[eidx].clone())
                 .collect();
             for entry in &drivers {
                 self.eval_comb_entry_full(entry);
@@ -2972,29 +2970,7 @@ impl Simulator {
                 cur = inner_e.as_ref();
             }
             if let ExprKind::Ident(hier) = &cur.kind {
-                let mut base_name = self.resolve_hier_name(hier);
-                // Bare class-member N-D array inside a method:
-                // resolve to its per-instance `<handle>#<member>`.
-                // A member shadows a module array of the same name (§8.10).
-                if !self.module.arrays_nd.contains_key(&*base_name)
-                    || (hier.path.len() == 1
-                        && hier.path[0].selects.is_empty()
-                        && *base_name == *hier.path[0].name.name)
-                {
-                    if let Some(s) = self.instance_assoc_member(&base_name) {
-                        base_name = std::borrow::Cow::Owned(s);
-                    }
-                }
-                // `o.m[i][j][k]` on an object's member: its store is
-                // `<handle>#m` (§7.4.5).
-                if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2 {
-                    if let Some(s) = self
-                        .expr_assoc_name(cur)
-                        .filter(|s| self.module.arrays_nd.contains_key(s))
-                    {
-                        base_name = std::borrow::Cow::Owned(s);
-                    }
-                }
+                let base_name = self.multidim_array_store(hier, cur, |s, n| s.module.arrays_nd.contains_key(n));
                 if let Some((shape, _w)) = self.module.arrays_nd.get(&*base_name).cloned() {
                     if rev_idxs.len() == shape.len() {
                         let mut name = base_name.clone();
@@ -3155,29 +3131,7 @@ impl Simulator {
         } = &expr.kind
         {
             if let ExprKind::Ident(hier) = &inner_expr.kind {
-                let mut name = self.resolve_hier_name(hier);
-                // Bare class-member 2D array inside a method: resolve to its
-                // per-instance `<handle>#<member>`. The member shadows a
-                // module array of the same name (§8.10); taking the module's
-                // first sent the write to it and left the member at 0 (#597).
-                let bare_member = hier.path.len() == 1
-                    && hier.path[0].selects.is_empty()
-                    && *name == *hier.path[0].name.name;
-                if !self.module.arrays_2d.contains_key(&*name) || bare_member {
-                    if let Some(s) = self.instance_assoc_member(&name) {
-                        name = std::borrow::Cow::Owned(s);
-                    }
-                }
-                // `o.m[i][j] = v` on an object's member: its store is
-                // `<handle>#m` (§7.4.5).
-                if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
-                    if let Some(s) = self
-                        .expr_assoc_name(inner_expr)
-                        .filter(|s| self.module.arrays_2d.contains_key(s))
-                    {
-                        name = std::borrow::Cow::Owned(s);
-                    }
-                }
+                let mut name = self.multidim_array_store(hier, inner_expr, |s, n| s.module.arrays_2d.contains_key(n));
                 // A bare name written from inside a SUBMODULE — e.g. the
                 // body of a `foreach` in an `always_comb`, evaluated from
                 // the settle path where no scope hint is installed and the
@@ -4667,8 +4621,18 @@ impl Simulator {
                         && let Some(cur) = self.get_signal_value_by_name(&base)
                     {
                         let mut next = cur.clone();
-                        let rhs =
-                            self.packed_member_piece(&base, name, val.resize_for_assign(width));
+                        // §7.3: a real union member stores real bits.
+                        let real_member = width == 64
+                            && !val.is_real
+                            && name
+                                .strip_prefix(&format!("{base}."))
+                                .is_some_and(|f| self.union_real_member(&base, f));
+                        let fitted = if real_member {
+                            Value::from_f64(val.to_f64())
+                        } else {
+                            val.resize_for_assign(width)
+                        };
+                        let rhs = self.packed_member_piece(&base, name, fitted);
                         for bit in 0..width as usize {
                             next.set_bit(off as usize + bit, rhs.get_bit(bit));
                         }
@@ -4811,7 +4775,11 @@ impl Simulator {
                             // locals are exempt (1024-bit internal packed
                             // text).
                             let is_str = self.p_local_is_string(name);
-                            let fitted = if prev_is_real && !val.is_real && !is_str {
+                            let fitted = if prev_is_real && self.module.var_decl_types.get(name).is_some_and(|dt| matches!(
+                                self.resolve_dt_ref(dt), DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
+                            )) {
+                                Value::from_f64(val.to_f64() as f32 as f64)
+                            } else if prev_is_real && !val.is_real && !is_str {
                                 // §6.12.2: an integral value assigned to a REAL
                                 // local converts; stored as integral bits, a
                                 // `real t; t = k; h = t / 2;` divided as integers.
@@ -6896,7 +6864,15 @@ impl Simulator {
                             if let Some(cur_sig) = self.get_signal_value_by_name(&name) {
                                 let total_w = cur_sig.width;
                                 let mut cur = cur_sig.resize(total_w);
-                                let piece = val.resize_for_assign(w);
+                                // §7.3: a real union member stores real bits.
+                                let piece = if w == 64
+                                    && !val.is_real
+                                    && self.union_real_member(&name, &member.name)
+                                {
+                                    Value::from_f64(val.to_f64()).resize(w)
+                                } else {
+                                    val.resize_for_assign(w)
+                                };
                                 for i in 0..w {
                                     let bit = piece.get_bit(i as usize);
                                     cur.set_bit((off + i) as usize, bit);

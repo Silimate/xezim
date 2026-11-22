@@ -6,8 +6,9 @@
 //! While a level-sensitive `wait` was pending anywhere, the condition-waiter
 //! drain settled the copy early in the slot. The edge pass then scanned only
 //! the toggled clocks, so `@(posedge c2)` ran in the cascade, after the NBAs,
-//! and read their new values. A waiter the drain released, and the edges of
-//! its writes, were missed the same way.
+//! and read their new values. A `wait` on the copy itself rechecked its
+//! condition before the drain settled the copy, so it stayed parked until
+//! after the NBAs, and the edges of its writes came after them too.
 
 use xezim::simulate;
 

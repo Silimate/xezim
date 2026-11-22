@@ -545,3 +545,6 @@ mod intra_delay_array_items;
 mod review_intra_delay_array_items;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
+// silimate: fork children an edge-woken process starts run before the NBA region
+#[path = "scheduling/fork_children_before_nba.rs"]
+mod fork_children_before_nba;

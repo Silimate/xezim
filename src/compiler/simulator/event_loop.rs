@@ -306,6 +306,40 @@ impl Simulator {
         self.drain_edge_exec_rescan();
     }
 
+    // silimate: fork children an edge-woken process starts run before the NBA region
+    /// §9.3.2, §4.4.2: run the processes queued for the current time slot
+    /// INLINE, before the caller commits the NBA region. A process an edge
+    /// resumed inline queues the children it forks here; they start in the
+    /// Active region, so a child that waits for an edge this slot's NBAs make
+    /// is already waiting when they commit.
+    pub(super) fn drain_active_pre_nba(&mut self) {
+        if self.event_queue.next_time() != Some(self.time) {
+            return;
+        }
+        // Their writes come after this slot's edge detection: record them for
+        // the rescan drain, as `drain_inactive_pre_nba` does.
+        let prev = self.in_edge_cont;
+        self.in_edge_cont = true;
+        while self.event_queue.next_time() == Some(self.time)
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
+            let Some((pid, cont)) = self.event_queue.pop_front(self.time) else {
+                break;
+            };
+            self.run_scheduled_process(pid, &cont);
+            if !self.is_pid_suspended(pid) {
+                self.child_finished(pid);
+            }
+        }
+        if self.dirty_any {
+            self.settle_combinatorial();
+        }
+        self.in_edge_cont = prev;
+        self.drain_edge_exec_rescan();
+    }
+    // /silimate
+
     pub(super) fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
         let mut cascade_iter = 0u32;
@@ -332,6 +366,9 @@ impl Simulator {
                     break;
                 }
             }
+            // silimate: fork children an edge-woken process starts run before the NBA region
+            self.drain_active_pre_nba();
+            // /silimate
             // Inactive region precedes the NBA region (§4.5): `#0`
             // continuations parked by this round's active-region work run
             // before its NBAs commit.

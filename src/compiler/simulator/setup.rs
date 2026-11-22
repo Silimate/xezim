@@ -1633,9 +1633,9 @@ impl Simulator {
             }
             for c in &cands {
                 if let Some(td) = self.module.tasks.get(c.as_str()) {
-                    return td.items.iter().any(|st| self.stmt_is_blocking(st))
-                        || td
-                            .items
+                    let items = self.module.resolved_task_items(c, td);
+                    return items.iter().any(|st| self.stmt_is_blocking(st))
+                        || items
                             .iter()
                             .any(|st| self.stmt_calls_blocking_task(st, scope, depth - 1));
                 }
@@ -1716,6 +1716,9 @@ impl Simulator {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
+        // silimate: a procedural assertion in an always process samples its time-0 defaults too
+        Self::sva_stmt_names(&ab.stmt, false, &mut self.always_sva_names);
+        // /silimate
         // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile
@@ -2367,6 +2370,11 @@ impl Simulator {
         compiler.set_scope_hint(scope_hint);
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
+        compiler.set_deferred_callables(
+            &self.module.deferred_function_bodies,
+            &self.module.deferred_task_bodies,
+            &self.module.packages,
+        );
         compiler.set_params(&self.module.parameters);
         compiler.set_param_leaf_idx(self.param_leaf_index());
         compiler.set_cast_widths(&self.cast_widths);

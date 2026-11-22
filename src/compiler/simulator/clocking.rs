@@ -37,13 +37,21 @@ impl Simulator {
         // the current time), so it moves into the nonblocking queue ahead of
         // this drive. This drive is recorded so a whole drive issued after
         // it queues behind it (`schedule_clocking_update`).
+        let mut again = None;
         if let Some(id) = self.clocking_select_signal(target) {
             let when = self.time.saturating_add(skew);
+            // silimate: overlapping and whole drives of one output that mature together merge per bit
+            let mut moved = false;
             for value in self.take_clocking_whole_drives(id, when) {
                 self.queue_clocking_whole_nba(id, value, skew);
+                moved = true;
             }
             let now = self.time;
             self.clocking_select_due.retain(|&(t, _)| t >= now);
+            if moved || self.clocking_select_due.contains(&(when, id)) {
+                again = Some(id);
+            }
+            // /silimate
             self.clocking_select_due.push((when, id));
         }
         let rvalue = self.make_intra_saved_expr(val, span);
@@ -67,7 +75,145 @@ impl Simulator {
             },
             span,
         ));
+        if let Some(id) = again {
+            self.supersede_clocking_drives(id, skew);
+        }
     }
+
+    // silimate: overlapping and whole drives of one output that mature together merge per bit
+    /// §14.16.2: when synchronous drives of one output mature in the same
+    /// time step, "the last value is the only value driven". Each drive is a
+    /// nonblocking update of the bits it selects, or of the whole output, so
+    /// two drives that select some of the same bits (`cb.e[0] <= 1;
+    /// cb.e[0] <= 0;`, `cb.e[1:0] <= 2'b01; cb.e[0] <= 0;`, `cb.e[0] <= 1;
+    /// cb.e <= 0;`) changed those bits twice in that step and woke `@(e)`
+    /// with the value unchanged. In the earlier updates of signal `id` that
+    /// mature with the last one queued, each bit the last one writes takes
+    /// its value, so every bit changes at most once, to its last value, and
+    /// the bits that no later drive selects keep the earlier drives' values.
+    /// Only reached when another drive of the output is due at the same time.
+    pub(super) fn supersede_clocking_drives(&mut self, id: usize, skew: u64) {
+        let when = self.time.saturating_add(skew);
+        let delayed = skew > 0;
+        // The updates of signal `id` that commit in that step, in commit
+        // order: with no skew, its whole-signal updates (`nba_fast`, which
+        // a bit select merges into) commit before the nonblocking queue. Indices
+        // only: the targets stay in the queue and are lent to
+        // `queued_drive_range` (a drive runs this on every clock edge).
+        let mut picked: Vec<NbaSlot> = Vec::new();
+        if delayed {
+            for i in 0..self.delayed_nba_queue.len() {
+                let (t, e) = &self.delayed_nba_queue[i];
+                if *t == when && self.nba_entry_writes(e, id) {
+                    picked.push(NbaSlot::Delayed(i));
+                }
+            }
+        } else {
+            for (i, e) in self.nba_fast.iter().enumerate() {
+                if e.signal_id == id {
+                    picked.push(NbaSlot::Fast(i));
+                }
+            }
+            for i in 0..self.nba_queue.len() {
+                if self.nba_entry_writes(&self.nba_queue[i], id) {
+                    picked.push(NbaSlot::Queue(i));
+                }
+            }
+        }
+        let Some((&last, earlier)) = picked.split_last() else {
+            return;
+        };
+        if earlier.is_empty() {
+            return;
+        }
+        let Some((last_id, last_lo, last_w)) = self.queued_drive_range(last) else {
+            return;
+        };
+        if last_id != id {
+            return;
+        }
+        let last_value = self.nba_slot_value(last).resize(last_w);
+        let last_hi = last_lo + last_w;
+        for &slot in earlier {
+            let Some((eid, lo, w)) = self.queued_drive_range(slot) else {
+                continue;
+            };
+            let (from, to) = (lo.max(last_lo), (lo + w).min(last_hi));
+            if eid != id || from >= to {
+                continue;
+            }
+            let value = self.nba_slot_value(slot);
+            let mut merged = value.resize(w);
+            for bit in from..to {
+                merged.set_bit(
+                    (bit - lo) as usize,
+                    last_value.get_bit((bit - last_lo) as usize),
+                );
+            }
+            *value = merged;
+        }
+    }
+
+    /// The value queued update `slot` writes.
+    fn nba_slot_value(&mut self, slot: NbaSlot) -> &mut Value {
+        match slot {
+            NbaSlot::Fast(i) => &mut self.nba_fast[i].value,
+            NbaSlot::Queue(i) => &mut self.nba_queue[i].value,
+            NbaSlot::Delayed(i) => &mut self.delayed_nba_queue[i].1.value,
+        }
+    }
+
+    /// Whether queued update `e` writes bits of signal `id` as a plain
+    /// vector: a select of it or the whole of it, outside any class object,
+    /// call frame, static local or element list.
+    fn nba_entry_writes(&self, e: &NbaEntry, id: usize) -> bool {
+        if e.elements.is_some()
+            || e.static_key.is_some()
+            || e.static_slice.is_some()
+            || e.this_handle.is_some()
+            || e.root_frame.is_some()
+        {
+            return false;
+        }
+        match &e.lhs {
+            None => e.resolved_id == Some(id),
+            Some(l) => {
+                let base = Self::select_chain_base(l).unwrap_or(l);
+                self.get_lhs_signal_id(base) == Some(id)
+            }
+        }
+    }
+
+    /// The signal, low bit and width that queued update `slot` writes: its
+    /// select's (`delayed_lhs_select_range`), or the whole signal's. The
+    /// target is read in place: it is taken out of the entry for the call
+    /// and put back.
+    fn queued_drive_range(&mut self, slot: NbaSlot) -> Option<(usize, u32, u32)> {
+        let whole = |sim: &Self, id: usize| Some((id, 0, sim.signal_widths[id] as u32));
+        let entry = match slot {
+            NbaSlot::Fast(i) => {
+                let id = self.nba_fast[i].signal_id;
+                return whole(self, id);
+            }
+            NbaSlot::Queue(i) => &mut self.nba_queue[i],
+            NbaSlot::Delayed(i) => &mut self.delayed_nba_queue[i].1,
+        };
+        let (lhs, resolved) = (entry.lhs.take(), entry.resolved_id);
+        let range = match &lhs {
+            None => resolved.and_then(|id| whole(self, id)),
+            Some(l) if matches!(l.kind, ExprKind::Ident(_)) => {
+                self.get_lhs_signal_id(l).and_then(|id| whole(self, id))
+            }
+            Some(l) => self.delayed_lhs_select_range(l),
+        };
+        match slot {
+            NbaSlot::Queue(i) => self.nba_queue[i].lhs = lhs,
+            NbaSlot::Delayed(i) => self.delayed_nba_queue[i].1.lhs = lhs,
+            NbaSlot::Fast(_) => {}
+        }
+        range
+    }
+    // /silimate
 
     /// §14.3: the element signals (`net[i]`, with `i`) of clockvar net `net`
     /// when it is a one-dimensional unpacked array, which has no signal under
@@ -155,6 +301,9 @@ impl Simulator {
             .any(|&(t, sid)| t == when && sid == id)
         {
             self.queue_clocking_whole_nba(id, value, delay);
+            // silimate: overlapping and whole drives of one output that mature together merge per bit
+            self.supersede_clocking_drives(id, delay);
+            // /silimate
             return;
         }
         self.delayed_updates.push((when, id, value, None));
@@ -1060,6 +1209,23 @@ impl Simulator {
         // /silimate
     }
 
+    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+    /// The pending `#0` reports alone (Observed region), counted before any
+    /// of their actions run; the `final` ones wait for the Postponed region.
+    pub(super) fn mature_deferred_observed(&mut self) {
+        let (zero, finals): (Vec<_>, Vec<_>) = std::mem::take(&mut self.deferred_asserts)
+            .into_iter()
+            .partition(|d| d.kind != crate::ast::stmt::DeferredAssertion::Final);
+        self.deferred_asserts = finals;
+        if !self.finished {
+            for d in &zero {
+                self.imm_assert_count(d.inst, d.tag, d.passed);
+            }
+        }
+        self.run_deferred_actions(zero);
+    }
+    // /silimate
+
     /// The actions of matured deferred reports (see `mature_deferred_asserts`).
     fn run_deferred_actions(&mut self, group: Vec<DeferredReport>) {
         for d in group {
@@ -1149,7 +1315,15 @@ impl Simulator {
     /// `$time`, `$stime`, `$realtime` change every step (LRM §21.2.3).
     pub(super) fn is_monitor_time_arg(e: &Expression) -> bool {
         matches!(&e.kind, ExprKind::SystemCall { name, .. }
-            if matches!(name.as_str(), "$time" | "$stime" | "$realtime"))
+        if matches!(
+            name.as_str(),
+            "$time"
+                | "$stime"
+                | "$realtime"
+                | "$__xz_time_at"
+                | "$__xz_stime_at"
+                | "$__xz_realtime_at"
+        ))
     }
 
     /// The design root is the synthetic multi-top wrapper (§23.3.3): its
@@ -1516,3 +1690,14 @@ impl Simulator {
         out
     }
 }
+
+// silimate: overlapping and whole drives of one output that mature together merge per bit
+/// A queued update of a signal: an entry of `nba_fast`, `nba_queue` or
+/// `delayed_nba_queue` (`Simulator::supersede_clocking_drives`).
+#[derive(Clone, Copy)]
+enum NbaSlot {
+    Fast(usize),
+    Queue(usize),
+    Delayed(usize),
+}
+// /silimate

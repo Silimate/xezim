@@ -25,6 +25,8 @@ mod compiled_sformatf_native;
 mod display_only_always;
 #[path = "strings/dpi_actual_context_width.rs"]
 mod dpi_actual_context_width;
+#[path = "strings/dpi_c_sources.rs"]
+mod dpi_c_sources;
 #[path = "strings/dpi_child_module_import.rs"]
 mod dpi_child_module_import;
 #[path = "strings/dpi_export_task_waits.rs"]
@@ -188,3 +190,6 @@ mod format_backslash_literal;
 mod scan_zero_width;
 #[path = "strings/review_vpi_scoped_callee_deposit.rs"]
 mod review_vpi_scoped_callee_deposit;
+// silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+#[path = "strings/vpi_deferred_rw_writes.rs"]
+mod vpi_deferred_rw_writes;

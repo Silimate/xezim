@@ -165,6 +165,19 @@ impl Simulator {
         }
     }
 
+    /// §12.5: a `case` item matches its expression bit for bit (`===`),
+    /// which Table 11-1 does not define for a real operand. When either is
+    /// real the pair compares numerically, an integral one converted to real
+    /// (§11.8.2), so `case (r) 1:` matches `r = 1.0`, as `==` would.
+    #[inline]
+    pub(super) fn case_values_match(val: &Value, item: &Value) -> bool {
+        if val.is_real || item.is_real {
+            val.is_equal(item).is_true()
+        } else {
+            val.case_eq(item).is_true()
+        }
+    }
+
     /// IEEE 1800-2017 §12.5.4 `case (e) inside`: an item is a range, a value or
     /// an array, matched with the same rules as the `inside` OPERATOR — ranges
     /// are inclusive and x/z in an item are wildcards for integral operands.
@@ -239,6 +252,7 @@ impl Simulator {
     /// unresolved type) keeps its value.
     pub(super) fn ret_conv_of(ty: &DataType, typedef_types: &HashMap<String, DataType>) -> RetConv {
         match ty {
+            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. } => RetConv::ShortReal,
             DataType::Real { .. } => RetConv::Real,
             DataType::IntegerVector { .. }
             | DataType::IntegerAtom { .. }
@@ -289,7 +303,10 @@ impl Simulator {
 
     /// `ret_conv_of` for a concrete type-parameter binding, given by name.
     pub(super) fn concrete_ret_conv(&self, name: &str) -> RetConv {
-        if matches!(name, "real" | "realtime" | "shortreal") {
+        if name == "shortreal" {
+            return RetConv::ShortReal;
+        }
+        if matches!(name, "real" | "realtime") {
             return RetConv::Real;
         }
         if let Some(dt) = self.module.typedef_types.get(name) {
@@ -328,6 +345,7 @@ impl Simulator {
                 }
                 r
             }
+            RetConv::ShortReal => Value::from_f64(v.to_f64() as f32 as f64),
             RetConv::Real if !v.is_real && !v.is_fill => Value::from_f64(v.to_f64()),
             _ => v,
         }
@@ -385,6 +403,7 @@ impl Simulator {
     pub(super) fn ret_needs_convert(v: &Value, conv: RetConv) -> bool {
         match conv {
             RetConv::Keep => false,
+            RetConv::ShortReal => true,
             RetConv::Real => !v.is_real && !v.is_fill,
             RetConv::Int { .. } => v.is_real,
         }
@@ -497,6 +516,71 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §6.24.1: a cast whose casting type is a constant primary is a SIZE
+    /// cast. A field of a struct parameter (`pt.DEPTH'(x)`, also written
+    /// `(pt.DEPTH)'(x)`) parses like a scoped type name and arrives as a
+    /// named cast, but it names a value: its root is a parameter in scope.
+    /// The field's value, or None for any other target.
+    pub(super) fn member_cast_size(&mut self, target: &Expression) -> Option<u32> {
+        // Walk to the root identifier; a bare `N'(x)` is not a field and
+        // keeps the parameter arm of the caller.
+        let mut root = target;
+        let mut field = false;
+        let h = loop {
+            match &root.kind {
+                ExprKind::Paren(inner) => root = inner,
+                ExprKind::MemberAccess { expr, .. } => {
+                    field = true;
+                    root = expr;
+                }
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        // Shape first: every named cast comes through here, and a bare
+        // `T'(x)` must not pay for the scoped parameter lookup.
+        if !field && h.path.len() < 2 {
+            return None;
+        }
+        // The parameter is a prefix of the path. An instance's names arrive
+        // with the instance folded into the first segment (`u.pt` . `DEPTH`),
+        // which no scoped lookup of a bare name finds, and a `$root`-rooted
+        // path spells the instance out (`$root.u.pt.DEPTH`).
+        let mut key = String::new();
+        let mut is_param = match h.root.as_deref() {
+            None => self.scoped_param_value(&h.path[0].name.name).is_some(),
+            Some("$root") => false,
+            Some(_) => return None,
+        };
+        let prefixes = if field { h.path.len() } else { h.path.len() - 1 };
+        for seg in &h.path[..prefixes] {
+            if !key.is_empty() {
+                key.push('.');
+            }
+            key.push_str(&seg.name.name);
+            is_param = is_param || self.module.parameters.contains_key(key.as_str());
+        }
+        if !is_param {
+            return None;
+        }
+        // Elaboration also keys each member of a struct parameter by its
+        // whole path (`u.pt.DEPTH`); take that value when there is one.
+        let member_value = (!field)
+            .then(|| {
+                key.push('.');
+                key.push_str(&h.path.last()?.name.name);
+                self.module.parameters.get(key.as_str()).cloned()
+            })
+            .flatten();
+        let v = member_value.unwrap_or_else(|| self.eval_expr(target));
+        if v.has_xz() || v.is_real {
+            return None;
+        }
+        v.to_u64()
+            .filter(|&n| n > 0)
+            .and_then(|n| u32::try_from(n).ok())
     }
 
     /// The table key of a parser-lowered named cast's target (`T'(v)`,
@@ -1007,6 +1091,76 @@ impl Simulator {
         (!earlier.iter().any(|p| p.name.name == name)).then_some(name)
     }
 
+    /// §6.18, §7.4: the unpacked dimensions of a structure member: its own,
+    /// then those of a dimensioned typedef it is declared with (`typedef
+    /// real A[2]; struct { A m; }` has `m[0]` and `m[1]`), as the elaborator
+    /// registers a module-scope variable's members.
+    pub(super) fn member_decl_dims(
+        &self,
+        m_dt: &DataType,
+        own: &[crate::ast::types::UnpackedDimension],
+    ) -> Vec<crate::ast::types::UnpackedDimension> {
+        let mut dims = own.to_vec();
+        if let DataType::TypeReference {
+            name, dimensions, ..
+        } = m_dt
+            && dimensions.is_empty()
+            && let Some(td) = self.typedef_unpacked_dims_of(&name.name.name)
+        {
+            dims.extend(td.iter().cloned());
+        }
+        dims
+    }
+
+    /// §7.2, §7.4: the shape of each fixed one-dimensional unpacked array
+    /// member of the procedural-block unpacked structure `base`, whose leaves
+    /// live by name, as a module-scope variable's members get theirs at
+    /// elaboration: a whole-array write (`s.m = '{default: 2.5}`) finds its
+    /// elements through it.
+    pub(super) fn register_local_struct_member_arrays(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        for m in &su.members {
+            let nested = self.unpacked_struct_of(&m.data_type);
+            for md in &m.declarators {
+                let key = format!("{}.{}", base, md.name.name);
+                let dims = self.member_decl_dims(&m.data_type, &md.dimensions);
+                match (&nested, dims.as_slice()) {
+                    (Some(inner), []) => {
+                        let inner = inner.clone();
+                        self.register_local_struct_member_arrays(&key, &inner, depth + 1);
+                    }
+                    (None, [_]) => {
+                        let Some(lists) = self.member_dim_indices(&dims) else {
+                            continue;
+                        };
+                        let (Some(&lo), Some(&hi)) = (lists[0].iter().min(), lists[0].iter().max())
+                        else {
+                            continue;
+                        };
+                        let w = super::elaborate::resolve_type_width(
+                            &m.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        if !self.module.arrays.contains_key(&key) {
+                            self.meta_note(&key);
+                            self.module.arrays.insert(key, (lo, hi, w));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// §7.2: every storage LEAF of an unpacked struct, as
     /// `(key_suffix, caller_expr, width, is_real)`. Recurses into nested
     /// unpacked structs and expands fixed member dimensions, matching the
@@ -1048,8 +1202,9 @@ impl Simulator {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mexpr = mk_member(base, &md.name.name);
-                match self.member_elem_indices(&md.dimensions) {
+                match self.member_elem_indices(&dims) {
                     Some(tups) => {
                         // Every element, last dimension varying fastest —
                         // `m[2][3]` addresses elements `m[i][j]`.
@@ -1122,7 +1277,7 @@ impl Simulator {
             );
             // §6.18: a typedef preserves the member's real type.
             let is_real = self.dt_is_real(&m.data_type);
-            let dv = if is_real {
+            let mut dv = if is_real {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
@@ -1134,11 +1289,18 @@ impl Simulator {
             } else {
                 Value::new(mw)
             };
+            // §6.11.3: the leaf carries its member's signedness, which a
+            // store into it keeps (a real rounds into it, §6.12.1: `-1.5`
+            // into an `int` member reads -2, not 4294967294).
+            if !is_real && self.type_is_signed_concrete(&m.data_type) {
+                dv.is_signed = true;
+            }
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 // Same keys as `unpacked_struct_leaves`.
-                let keys = match self.member_elem_indices(&md.dimensions) {
+                let keys = match self.member_elem_indices(&dims) {
                     Some(tups) => tups
                         .iter()
                         .map(|t| format!("{}{}", mkey, Self::index_suffix(t)))
@@ -1151,7 +1313,7 @@ impl Simulator {
                 // assignments). Scalar members only; the default is an
                 // assignment to the member's type.
                 let member_default = match (&md.init, &nested) {
-                    (Some(init), None) if md.dimensions.is_empty() => {
+                    (Some(init), None) if dims.is_empty() => {
                         let raw = self.eval_expr_ctx(init, mw.max(1));
                         let two_state = super::elaborate::is_type_two_state_resolved(
                             &m.data_type,
@@ -1428,6 +1590,14 @@ impl Simulator {
             }
         }
         Some(lv)
+    }
+
+    pub(super) fn member_dims<'a>(
+        &self,
+        dt: &DataType,
+        declared: &'a [crate::ast::types::UnpackedDimension],
+    ) -> std::borrow::Cow<'a, [crate::ast::types::UnpackedDimension]> {
+        super::elaborate::struct_member_dims(dt, declared, &self.module.typedef_unpacked_dims)
     }
 
     /// The resolved struct type when `dt` is an UNPACKED struct whose members
@@ -1835,7 +2005,10 @@ impl Simulator {
             self.unpacked_struct_of(&m.data_type).is_some()
                 || m.declarators
                     .iter()
-                    .any(|md| self.member_dim_indices(&md.dimensions).is_some())
+                    .any(|md| {
+                        self.member_dim_indices(&self.member_dims(&m.data_type, &md.dimensions))
+                            .is_some()
+                    })
         });
         if nested_leaves {
             let mut leaves = Vec::new();
@@ -2335,20 +2508,6 @@ impl Simulator {
         let dt = &port.data_type;
         let key = self.formal_dyn_key(&port.name.name, dt);
         self.module.var_decl_types.insert(key.clone(), dt.clone());
-        if let Some(dims) = super::elaborate::packed_full_dims_chained(
-            dt,
-            &self.module.parameters,
-            &self.module.typedef_types,
-        )
-        .filter(|dims| dims.len() > 1)
-        {
-            self.module.packed_full_dims.insert(key.clone(), dims);
-            if let Some(width) = self.ast_decl_elem_width(dt) {
-                self.module
-                    .packed_signal_elem_widths
-                    .insert(key.clone(), width);
-            }
-        }
         key
     }
 
@@ -2366,18 +2525,15 @@ impl Simulator {
         arg: &Expression,
     ) -> Option<(String, String, i64, i64)> {
         use crate::ast::types::UnpackedDimension as UD;
-        if port.dimensions.is_empty() {
-            if let Some(dims) = self.fn_ret_coll_dims(&port.data_type)
-                && matches!(dims.first(), Some(UD::Range { .. } | UD::Expression { .. }))
-            {
-                let mut expanded = port.clone();
-                expanded.dimensions = dims;
-                return self.bind_array_arg(&expanded, arg);
-            }
-            return None;
-        }
+        let typedef_dims;
+        let declared_dims = if port.dimensions.is_empty() {
+            typedef_dims = self.fn_ret_coll_dims(&port.data_type)?;
+            &typedef_dims
+        } else {
+            &port.dimensions
+        };
         let dims = super::elaborate::normalize_unpacked_dims(
-            &port.dimensions,
+            declared_dims,
             &self.module.parameters,
             &self.module.typedef_types,
         );
@@ -2439,7 +2595,10 @@ impl Simulator {
             if self.assign_struct_concat(&param, parts.iter().collect()) {
                 return Some((param, String::new(), lo, hi));
             }
-            let vals = self.unpacked_concat_operand_values(parts.iter().collect());
+            let expand_rows =
+                port.dimensions.is_empty() || !self.concat_element_type_is_array(&port.data_type);
+            let vals =
+                self.unpacked_concat_operand_values(parts.iter().collect(), expand_rows, None);
             for (j, v) in vals.into_iter().take((hi - lo + 1) as usize).enumerate() {
                 let idx = if descending {
                     hi - j as i64
@@ -2468,6 +2627,7 @@ impl Simulator {
             .max(1);
             let param = self.array_formal_key(port);
             self.module.arrays.insert(param.clone(), (lo, hi, w));
+            self.note_formal_direction(&param, descending);
             let indices: Vec<i64> = if descending {
                 (lo..=hi).rev().collect()
             } else {
@@ -2635,7 +2795,20 @@ impl Simulator {
             }
         }
         self.module.arrays.insert(param.clone(), (lo, hi, w));
+        // §7.6: a store to a descending formal (`output int o[5:3]`) starts
+        // at its left bound, as for any other descending array.
+        self.note_formal_direction(&param, descending);
         Some((param, caller.to_string(), lo, hi))
+    }
+
+    /// Record whether the one-dimensional array formal `param` is declared
+    /// descending, for the stores of the body (§7.6).
+    fn note_formal_direction(&mut self, param: &str, descending: bool) {
+        if descending {
+            self.module.descending_arrays.insert(param.to_string());
+        } else {
+            self.module.descending_arrays.remove(param);
+        }
     }
 
     /// §13.5.1: an `output` formal is not copied in: it starts at its type's

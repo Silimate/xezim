@@ -233,6 +233,8 @@ mod compiled_method_collection_calls;
 mod compiled_method_enum_formals;
 #[path = "classes/compiled_method_ref_formals.rs"]
 mod compiled_method_ref_formals;
+#[path = "classes/class_member_ref_alias.rs"]
+mod class_member_ref_alias;
 #[path = "classes/ref_formal_array_of_collections_row.rs"]
 mod ref_formal_array_of_collections_row;
 #[path = "classes/compiled_method_string_members.rs"]
@@ -384,6 +386,8 @@ mod covergroup_options;
 mod covergroup_placement;
 #[path = "classes/covergroup_queries.rs"]
 mod covergroup_queries;
+#[path = "classes/covergroup_real_bins.rs"]
+mod covergroup_real_bins;
 #[path = "classes/covergroup_sample_args.rs"]
 mod covergroup_sample_args;
 #[path = "classes/covergroup_sampling_event.rs"]
@@ -1358,3 +1362,16 @@ mod class_constraint_sharing_721;
 // silimate: compares of method-local collection elements keep the element width
 #[path = "classes/compiled_method_local_coll_compare.rs"]
 mod compiled_method_local_coll_compare;
+#[path = "classes/class_struct_array_member_patterns.rs"]
+mod class_struct_array_member_patterns;
+#[path = "classes/multidim_property_pattern_init.rs"]
+mod multidim_property_pattern_init;
+#[path = "classes/static_string_queue_percent_p.rs"]
+mod static_string_queue_percent_p;
+#[path = "classes/typename_specialized_property.rs"]
+mod typename_specialized_property;
+#[path = "classes/queue_row_name_collision.rs"]
+mod queue_row_name_collision;
+// silimate: a replicated item with a side effect is evaluated once in a class row store
+#[path = "classes/class_row_replication_once.rs"]
+mod class_row_replication_once;

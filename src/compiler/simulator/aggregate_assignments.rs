@@ -140,36 +140,47 @@ impl Simulator {
         if left > right {
             positions.reverse();
         }
-        // silimate: a replicated item with a side effect is evaluated once in a class row store
-        // §11.4.12.1: the operands of a replication are evaluated once,
-        // however many elements the copies fill, so `k.a[0] = '{2{f()}}`
-        // calls `f` once. The store below evaluates each element's item, so
-        // the pattern is captured first, as the blocking store captures it
-        // for other targets (`exec_stmt_blocking_assign_body`), and the
-        // captured values are stored.
-        let pattern = self.unpacked_pattern(rhs);
-        if matches!(pattern.kind, ExprKind::AssignmentPattern(_))
-            && Self::pattern_replicates_effect(pattern)
-        {
-            let (saved, release) = self.capture_intra_rhs(lhs, pattern, rhs.span);
-            let stored = self.assign_class_scalar_row(lhs, &saved);
-            if let Some(release) = release
-                && let StatementKind::Expr(e) = &release.kind
-                && let ExprKind::SystemCall { name, args } = &e.kind
-            {
-                self.exec_system_task(name, args);
-            }
-            return stored;
-        }
-        // /silimate
         let values: Vec<(i64, Value)> = match &self.unpacked_pattern(rhs).kind {
             ExprKind::AssignmentPattern(items) => {
+                // silimate: a replicated item is evaluated once in a class row store
+                // §11.4.12.1: the operands of a replication are evaluated
+                // once, however many elements the copies fill, so
+                // `k.a[0] = '{2{f()}}` calls `f` once. The copies are the
+                // operand itself, so each operand is evaluated at its first
+                // element, in the row's element type, and that value is
+                // stored in the others.
+                let replicated: Vec<*const Expression> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        AssignmentPatternItem::Ordered(e) => match &e.kind {
+                            ExprKind::Replication { exprs, .. } => Some(exprs),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .flatten()
+                    .map(|e| e as *const Expression)
+                    .collect();
+                let mut once: Vec<(*const Expression, Value)> = Vec::new();
+                // /silimate
                 let items = self.pattern_elems_for_type(items, &positions, &dt);
                 positions
                     .into_iter()
                     .zip(items)
                     .filter_map(|(j, item)| {
-                        Some((j, self.eval_pattern_leaf_value(&dt, item?, Some(width))))
+                        let item = item?;
+                        // silimate: a replicated item is evaluated once in a class row store
+                        let key = item as *const Expression;
+                        if !replicated.contains(&key) {
+                            return Some((j, self.eval_pattern_leaf_value(&dt, item, Some(width))));
+                        }
+                        if let Some((_, v)) = once.iter().find(|(k, _)| *k == key) {
+                            return Some((j, v.clone()));
+                        }
+                        let v = self.eval_pattern_leaf_value(&dt, item, Some(width));
+                        once.push((key, v.clone()));
+                        Some((j, v))
+                        // /silimate
                     })
                     .collect()
             }

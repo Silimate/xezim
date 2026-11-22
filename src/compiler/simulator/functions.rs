@@ -43,7 +43,23 @@ impl Simulator {
         // §13.4/§23.6: only called declarations materialize a private body.
         // This cache has one lexical name, so memoized widths and resolved
         // signals can be enabled without contaminating shared elaboration ASTs.
-        fd.items = crate::ast::cache::with_fresh_scope_caches(|| fd.items.to_vec()).into();
+        fd.items = crate::ast::cache::with_fresh_scope_caches(|| {
+            let mut items = match self.module.materialize_function_body(name, &fd) {
+                Some(mat) => mat.into_vec(),
+                None => fd.items.to_vec(),
+            };
+            if self.module.deferred_function_bodies.contains_key(name)
+                && !self.module.packages.is_empty()
+            {
+                let pkgs: std::collections::HashSet<String> =
+                    self.module.packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
         let rc = std::rc::Rc::new(fd);
         self.fn_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
@@ -79,7 +95,23 @@ impl Simulator {
             return Some(rc.clone());
         }
         let mut td = self.module.tasks.get(name)?.clone();
-        td.items = crate::ast::cache::with_fresh_scope_caches(|| td.items.to_vec()).into();
+        td.items = crate::ast::cache::with_fresh_scope_caches(|| {
+            let mut items = match self.module.materialize_task_body(name, &td) {
+                Some(mat) => mat.into_vec(),
+                None => td.items.to_vec(),
+            };
+            if self.module.deferred_task_bodies.contains_key(name)
+                && !self.module.packages.is_empty()
+            {
+                let pkgs: std::collections::HashSet<String> =
+                    self.module.packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
         let rc = std::rc::Rc::new(td);
         self.task_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
@@ -376,6 +408,7 @@ impl Simulator {
                 if let Some((store, caller)) = self.bind_queue_param(
                     &port.name.name,
                     &eff_dims,
+                    port.dimensions.is_empty(),
                     actual,
                     &port.data_type,
                     port.direction,
@@ -434,7 +467,7 @@ impl Simulator {
                 // already dropped.
                 let value = match self.formal_pattern_value(port, &args[i]) {
                     Some(v) => v,
-                    None => match self.actual_context_width(port) {
+                    None => match self.free_actual_context_width(port) {
                         Some(w) => self.eval_expr_ctx(&args[i], w),
                         None => self.eval_expr(&args[i]),
                     },
@@ -572,7 +605,7 @@ impl Simulator {
         // initial value is the type default: x for a 4-state type, 0 for a
         // 2-state one. An empty `function integer y(); endfunction` returns
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
-        let mut ret_init = if super::elaborate::is_type_real(&fd.return_type) {
+        let mut ret_init = if self.dt_is_real(&fd.return_type) {
             Value::from_f64(0.0)
         } else if match &ret_tp {
             Some((_, c)) => self.concrete_type_two_state(c),
@@ -932,8 +965,8 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            if w > 0 && w != result.width {
-                result = result.resize(w);
+            if w > 0 && (w != result.width || result.is_fill) {
+                result = result.resize_for_assign(w);
             }
             // §13.4.1, §6.18: the result has the return type's sign, through
             // a typedef too.
@@ -2697,6 +2730,7 @@ impl Simulator {
                 if let Some((store, caller)) = self.bind_queue_param(
                     &port.name.name,
                     &eff_dims,
+                    port.dimensions.is_empty(),
                     actual,
                     &port.data_type,
                     port.direction,
@@ -2816,7 +2850,9 @@ impl Simulator {
                         continue;
                     }
                     let val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                        let value = scope_aliases.get(i).and_then(Option::as_deref)
+                            .and_then(|key| self.ref_alias_peek(key))
+                            .unwrap_or_else(|| self.eval_expr(&args[i]));
                         self.vif_argument_value(port, &args[i], value)
                     } else {
                         Value::zero(32)
@@ -2831,9 +2867,16 @@ impl Simulator {
                         // §13.5, §11.6.1: as a function's (`exec_function_call`),
                         // a task's input actual is context-determined by its
                         // formal; `t(x + y)` over 8-bit operands lost the carry.
+                        // A module- or package-scope task's formal sized by a
+                        // parameter (`input [W-1:0] v`) gives its width too.
+                        let width = if method_ctx.is_none() {
+                            self.free_actual_context_width(port)
+                        } else {
+                            self.actual_context_width(port)
+                        };
                         let value = match self.formal_pattern_value(port, &args[i]) {
                             Some(v) => v,
-                            None => match self.actual_context_width(port) {
+                            None => match width {
                                 Some(w) => self.eval_expr_ctx(&args[i], w),
                                 None => self.eval_expr(&args[i]),
                             },

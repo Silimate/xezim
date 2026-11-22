@@ -649,7 +649,9 @@ impl Simulator {
             for (i, v) in vals.iter().enumerate() {
                 let name = format!("{RET_SNAP}[{i}]");
                 self.set_signal_value_by_name(&name, v.clone());
-                self.widths.entry(name).or_insert(32);
+                if !self.widths.contains_key(&name) {
+                    self.widths.insert(name, 32);
+                }
             }
             self.set_queue_size(RET_SNAP, vals.len() as u64);
         }
@@ -746,6 +748,104 @@ impl Simulator {
                 .filter(|an| !self.is_associative_array(an))
         })
     }
+    /// Snapshot the operands before replacing any destination elements (§10.10).
+    fn assign_unpacked_concat<'e>(
+        &mut self,
+        lname: &str,
+        exprs: &'e [Expression],
+        check_rows: bool,
+        first_row: Option<(&'e Expression, super::unpacked_slices::UnpackedLayout<'e>)>,
+    ) {
+        let is_dyn = self.module.dynamic_arrays.contains(lname) || self.class_queue_prop(lname);
+        // IEEE 1800 §10.10.1: in an unpacked-array
+        // concatenation each item is read in the context of
+        // the ELEMENT type, so a nested plain-brace concat
+        // is itself an array value whose elements SPLICE
+        // into the outer one — `a = {1, {2, 3}}` assigns
+        // `{1, 2, 3}` — i.e. nested braces flatten. Only
+        // flatten when the element type is not itself an
+        // array (for a multi-dimensional target an inner
+        // brace denotes one whole sub-array element).
+        // Assignment patterns `'{...}` never flatten; they
+        // are handled separately.
+        fn flatten_unpacked_concat<'a>(
+            exprs: &'a [Expression],
+            out: &mut Vec<&'a Expression>,
+        ) {
+            for e in exprs {
+                if let ExprKind::Concatenation(inner) = &e.kind {
+                    flatten_unpacked_concat(inner, out);
+                } else {
+                    out.push(e);
+                }
+            }
+        }
+        let elem_is_scalar = self.foreach_dims(lname).is_none_or(|d| d.len() == 1);
+        let items: Vec<&Expression> = if elem_is_scalar {
+            let mut v = Vec::new();
+            flatten_unpacked_concat(exprs, &mut v);
+            v
+        } else {
+            exprs.iter().collect()
+        };
+        // §10.10 / §7.8: in a queue (or array) of ASSOCIATIVE
+        // arrays, an associative operand (`q = {src}`) is one
+        // whole element: its entries are copied into it.
+        // Evaluated as one value, the element kept no entries.
+        let assoc_srcs: Vec<Option<String>> =
+            if self.module.associative_arrays.is_empty() {
+                Vec::new()
+            } else {
+                items.iter().map(|e| self.assoc_value_operand(e)).collect()
+            };
+        if assoc_srcs.iter().any(Option::is_some) {
+            let lo = self.module.arrays.get(lname).map_or(0, |t| t.0);
+            for (i, (e, src)) in items.iter().zip(assoc_srcs).enumerate() {
+                let elem = format!("{}[{}]", lname, lo + i as i64);
+                match src {
+                    Some(src) => self.store_assoc_elem(&elem, &src),
+                    None => {
+                        let v = self.eval_expr(e);
+                        self.set_signal_value_by_name(&elem, v);
+                    }
+                }
+            }
+            if is_dyn {
+                self.set_queue_size(lname, items.len() as u64);
+            }
+            return;
+        }
+        // Expand queue/array elements in concat (e.g. q = {q, 4})
+        let expand_rows = check_rows && elem_is_scalar && self.concat_has_non_array_elements(lname);
+        let all_vals = self.unpacked_concat_operand_values(items, expand_rows, first_row);
+        let (lo, hi, _w) = self
+            .module
+            .arrays
+            .get(lname)
+            .copied()
+            .unwrap_or((0, -1, 32));
+        let n_vals = all_vals.len();
+        let descending = self.module.descending_arrays.contains(lname);
+        for (i, v) in all_vals.into_iter().enumerate() {
+            let idx = if descending { hi - i as i64 } else { lo + i as i64 };
+            // Dynamic arrays/queues grow to fit; only fixed
+            // arrays are bounded by their declared range.
+            if !is_dyn && (idx < lo || idx > hi) {
+                break;
+            }
+            // §10.10: each item is an element-typed value.
+            let v = if is_dyn {
+                self.fit_queue_push_elem(lname, v)
+            } else {
+                v
+            };
+            self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v);
+        }
+        if is_dyn {
+            self.set_queue_size(lname, n_vals as u64);
+        }
+    }
+
     /// The extra conditions for `n = r` (both bare names) to reduce to a
     /// plain evaluate + assign: no `new`, no vif binding to carry, no
     /// struct copy or spread, and no collection / array / associative copy
@@ -1571,6 +1671,48 @@ impl Simulator {
         reads(rvalue, var)
     }
 
+    /// §11.4.12.1, §10.9.1: whether the pattern `rvalue` replicates an item
+    /// with a side effect (`'{2{f()}}`). The replicated items are evaluated
+    /// exactly once; the store matches each copy to an element and would
+    /// evaluate it once per element.
+    fn pattern_replicates_effect(rvalue: &Expression) -> bool {
+        let ExprKind::AssignmentPattern(items) = &rvalue.kind else {
+            return false;
+        };
+        items.iter().any(|item| {
+            let x = Self::unparen(item.expr());
+            match &x.kind {
+                ExprKind::Replication { exprs, .. } => {
+                    exprs.iter().any(Self::pattern_item_has_effect)
+                }
+                ExprKind::AssignmentPattern(_) => Self::pattern_replicates_effect(x),
+                _ => false,
+            }
+        })
+    }
+
+    /// Whether evaluating the pattern item `e` has a side effect. An item
+    /// already captured (`$__xz_intra_kept(k)`) only reads its slot.
+    fn pattern_item_has_effect(e: &Expression) -> bool {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        match &Self::unparen(e).kind {
+            ExprKind::SystemCall { name, .. }
+                if name == INTRA_KEPT_MARKER || name == INTRA_SAVED_MARKER =>
+            {
+                false
+            }
+            ExprKind::AssignmentPattern(items) => items.iter().any(|item| match item {
+                Item::Ordered(x)
+                | Item::Named(_, x)
+                | Item::Typed(_, x)
+                | Item::Default(x)
+                | Item::Keyed(_, x) => Self::pattern_item_has_effect(x),
+            }),
+            ExprKind::Replication { exprs, .. } => exprs.iter().any(Self::pattern_item_has_effect),
+            _ => !Self::cond_expr_is_effect_free(e, false),
+        }
+    }
+
     pub(super) fn exec_stmt_blocking_assign_body(
         &mut self,
         stmt: &Statement,
@@ -1611,6 +1753,10 @@ impl Simulator {
                 return;
             }
         }
+        if self.assign_class_scalar_row(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
         // #1108: a whole array member of an instance-array element on either
         // side (`w = lane[0].payload`, `lane[1].payload = '{...}`).
         // An element select is folded where it is read or written.
@@ -1630,6 +1776,23 @@ impl Simulator {
                 return;
             }
         }
+        // #1311, §25.9, §7.6: a whole unpacked variable of an interface
+        // reached through a virtual interface on either side
+        // (`vif.arr = w`, `w = cfg.vif.arr`) is the bound instance's variable.
+        if whole(lvalue) || whole(rvalue) {
+            let l = whole(lvalue)
+                .then(|| self.vif_aggregate_canon(lvalue))
+                .flatten();
+            let r = whole(rvalue)
+                .then(|| self.vif_aggregate_canon(rvalue))
+                .flatten();
+            if l.is_some() || r.is_some() {
+                let lvalue = l.as_ref().unwrap_or(lvalue);
+                let rvalue = r.as_ref().unwrap_or(rvalue);
+                self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+                return;
+            }
+        }
         if let Some(pattern) = self.unpacked_typed_pattern(rvalue) {
             self.exec_stmt_blocking_assign_body(stmt, lvalue, pattern);
             return;
@@ -1640,8 +1803,11 @@ impl Simulator {
         // target (`a = '{a[1], a[0]}`) read elements it had already written.
         // Capture every item first, as an intra-assignment delay does (keys,
         // nesting and element types kept), then store the captured values.
+        // A replicated item with a side effect (`'{2{f()}}`) is captured the
+        // same way, so it is evaluated once (§11.4.12.1), not per element.
         if matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
-            && Self::pattern_reads_target(lvalue, rvalue)
+            && (Self::pattern_reads_target(lvalue, rvalue)
+                || Self::pattern_replicates_effect(rvalue))
         {
             let (saved, release) = self.capture_intra_rhs(lvalue, rvalue, rvalue.span);
             self.exec_stmt_blocking_assign_body(stmt, lvalue, &saved);
@@ -1711,6 +1877,22 @@ impl Simulator {
         }
         // §15.5.5: a class-member event takes the other event's object.
         self.bind_instance_event_assign(lvalue, rvalue);
+        // §13.4.1, §7.2: `f = t;` in the function `f`, with `t` a whole
+        // unpacked struct, spreads `t` over the return variable's leaves.
+        // The plain copy below stored it as one value nobody reads.
+        if let ExprKind::Ident(h) = &lvalue.kind
+            && let ExprKind::Ident(_) = &rvalue.kind
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self
+                .func_call_stack
+                .last()
+                .is_some_and(|f| *f == h.path[0].name.name)
+            && self.ret_var_struct_assign(&h.path[0].name.name, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
         {
             return;
@@ -1878,6 +2060,14 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §10.10, §7.6: so does an unpacked concatenation written to a row or
+        // to a fixed-array structure member, from the target's left bound.
+        if matches!(rvalue.kind, ExprKind::Concatenation(_))
+            && self.assign_unpacked_concat_elems(lvalue, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         // §10.8, §10.9: a pattern written to a packed target takes the
         // target's declared type. The element-wise
         // spread below is for unpacked targets.
@@ -2003,6 +2193,25 @@ impl Simulator {
                 self.settle_after_proc_write();
                 return;
             }
+        }
+        // §13.4.1: `f = d[i];` in the function `f` — the return variable of
+        // an unpacked-struct type is a set of leaves in the frame, so a whole
+        // element is spread over them.
+        if let ExprKind::Ident(h) = &lvalue.kind
+            && matches!(
+                rvalue.kind,
+                ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+            )
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self
+                .func_call_stack
+                .last()
+                .is_some_and(|f| *f == h.path[0].name.name)
+            && self.ret_var_struct_assign(&h.path[0].name.name, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
         }
         // §7.2.1: `b = a` between unpacked-struct VARS whose type has
         // a DYNAMIC member (queue/dynamic/assoc) — the pack/scatter
@@ -3073,6 +3282,7 @@ impl Simulator {
                     Some(w) => self.eval_expr_ctx(rvalue, w),
                     None => self.eval_expr(rvalue),
                 };
+                let v = self.fill_into_real_target(lvalue, v);
                 self.assign_value(lvalue, &v);
                 self.settle_after_proc_write();
                 return;
@@ -3250,36 +3460,17 @@ impl Simulator {
                             l_prefix = std::borrow::Cow::Owned(format!("{}[{}]", l_prefix, lv));
                             r_prefix = std::borrow::Cow::Owned(format!("{}[{}]", r_prefix, rv));
                         }
-                        let remaining: Vec<(i64, i64)> = ls[given..].to_vec();
-                        let rem_r: Vec<(i64, i64)> = rs[given..].to_vec();
-                        if remaining == rem_r {
-                            fn enum_idx(
-                                dims: &[(i64, i64)],
-                                lp: String,
-                                rp: String,
-                                out: &mut Vec<(String, String)>,
-                            ) {
-                                if dims.is_empty() {
-                                    out.push((lp, rp));
-                                    return;
-                                }
-                                let (lo, hi) = dims[0];
-                                for i in lo..=hi {
-                                    enum_idx(
-                                        &dims[1..],
-                                        format!("{}[{}]", lp, i),
-                                        format!("{}[{}]", rp, i),
-                                        out,
-                                    );
-                                }
-                            }
-                            let mut pairs = Vec::new();
-                            enum_idx(
-                                &remaining,
-                                l_prefix.into_owned(),
-                                r_prefix.into_owned(),
-                                &mut pairs,
-                            );
+                        if ls[given..]
+                            .iter()
+                            .zip(&rs[given..])
+                            .all(|(&(l, h), &(r, t))| h - l == t - r)
+                        {
+                            let left = self.nd_ordered_suffixes(&lname, &ls, given);
+                            let right = self.nd_ordered_suffixes(&rname, &rs, given);
+                            let pairs = left
+                                .into_iter()
+                                .zip(right)
+                                .map(|(l, r)| (format!("{l_prefix}{l}"), format!("{r_prefix}{r}")));
                             // §7.2: an element of an unpacked-struct array is
                             // its member leaves.
                             let elem_su = self
@@ -3776,6 +3967,23 @@ impl Simulator {
         // `new src` is a distinct `ShallowCopy` node (LRM 8.8 fn 23) and
         // never reaches here — so a parenthesized `new(args)` is ALWAYS
         // a constructor call, even a single class-handle argument.
+        // §7.2, §8.4: a class-handle member of an unpacked-struct class
+        // property (`r.h = new();` with `struct { C h; } r;`). The property's
+        // type names a struct, not a class, so the lookups below found no
+        // class to construct and stored a handle to nothing.
+        let rv_is_new = match &rvalue.kind {
+            ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == "new",
+            ExprKind::Call { func, .. } => matches!(
+                &func.kind,
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new"
+            ),
+            _ => false,
+        };
+        let struct_member_cls = if rv_is_new {
+            self.struct_handle_leaf(lvalue).map(|(_, c)| c)
+        } else {
+            None
+        };
         let (is_new_call, ctor_args): (bool, &[Expression]) = match &rvalue.kind {
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" => (true, &[]),
             ExprKind::Call { func, args }
@@ -3786,8 +3994,9 @@ impl Simulator {
                     // Non-empty args: only treat as class instantiation when
                     // the lvalue's type is a class AND it's NOT a single-arg
                     // class-handle (shallow copy).
-                    let is_class = self
-                        .get_expr_type_name(lvalue)
+                    let is_class = struct_member_cls
+                        .clone()
+                        .or_else(|| self.get_expr_type_name(lvalue))
                         .and_then(|tn| self.resolve_type_param_binding(&tn).or(Some(tn)))
                         .map(|tn| {
                             self.resolve_simple_typedef_class(&tn)
@@ -3835,7 +4044,7 @@ impl Simulator {
                 self.settle_after_proc_write();
                 return;
             }
-            let type_name = self.get_expr_type_name(lvalue);
+            let type_name = struct_member_cls.or_else(|| self.get_expr_type_name(lvalue));
             // §6.20.3 type-parameter construction: if the declared
             // type is a class type parameter (e.g. `T obj = new;`),
             // resolve it through the current instance's bindings to
@@ -3966,7 +4175,7 @@ impl Simulator {
                         .and_then(|tn| self.module.typedef_types.get(tn.as_str()))
                         .and_then(|dt| {
                             let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                            Self::struct_field_layout(&resolved)
+                            self.struct_field_layout(&resolved)
                         });
                     if let Some(members) = struct_members {
                         // Declaration order = reverse of struct_field_layout
@@ -4088,12 +4297,68 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §10.10: the element-wise store below reads a fixed row itself.
+        // A speculative packed evaluation would also execute its selectors.
+        let mut check_remaining_rows = true;
+        let first_row = match (&lvalue.kind, &rvalue.kind) {
+            (ExprKind::Ident(h), ExprKind::Concatenation(parts)) => {
+                let mut nested = false;
+                let first = parts.iter().find_map(|part| {
+                    // A conditional or cast item can stand for a row too.
+                    nested |= matches!(
+                        Self::unparen(part).kind,
+                        ExprKind::Concatenation(_)
+                            | ExprKind::Conditional { .. }
+                            | ExprKind::SystemCall { .. }
+                    );
+                    self.fixed_row_concat_shape(part).map(|row| (part, row))
+                });
+                check_remaining_rows = nested || first.is_some();
+                first.filter(|_| {
+                    !self.ident_shadowed_by_non_collection(h)
+                        && self.array_operand_name(lvalue).is_some_and(|dst| {
+                            (self.module.arrays.contains_key(&dst) || self.class_queue_prop(&dst))
+                                && !self.names_nd_subarray(&dst)
+                                && self.concat_has_non_array_elements(&dst)
+                        })
+                })
+            }
+            _ => None,
+        };
+        if let ExprKind::Concatenation(parts) = &rvalue.kind
+            && let ExprKind::Ident(hier) = &lvalue.kind
+            && hier.path.iter().all(|part| part.selects.is_empty())
+        {
+            // §10.10, §8.9: a name rooted at a class handle (`h.q`, `h.fu`)
+            // is shadowed for the module-scope lookup but is still an
+            // unpacked array of the object (`<handle>#q`), or a static
+            // collection of its class.
+            let name = (!self.ident_shadowed_by_non_collection(hier))
+                .then(|| {
+                    let name = self.resolve_hier_name(hier);
+                    self.instance_assoc_member(&name)
+                        .unwrap_or_else(|| name.into_owned())
+                })
+                .filter(|name| self.module.arrays.contains_key(name));
+            let target = name.or_else(|| {
+                self.expr_assoc_name(lvalue).filter(|n| {
+                    self.class_queue_prop(n) || self.module.arrays.contains_key(n)
+                })
+            });
+            if let Some(name) = target {
+                self.assign_unpacked_concat(&name, parts, check_remaining_rows, first_row);
+                self.settle_after_proc_write();
+                return;
+            }
+        }
         // §8.8: `lhs = C::new(...)` builds a `C`, not the class `lhs` is
         // declared with (the `new` branch below), and the bare `C::new`
         // constructs too rather than reading a name.
         let typed_ctor = Self::typed_ctor_call(rvalue)
             .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
-        let val = if let Some(v) = typed_ctor {
+        let val = if first_row.is_some() {
+            Value::zero(w)
+        } else if let Some(v) = typed_ctor {
             v
         } else if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
@@ -4301,6 +4566,7 @@ impl Simulator {
         } else {
             self.eval_assign_rhs(lvalue, rvalue, w)
         };
+        let val = self.fill_into_real_target(lvalue, val);
         // A collection RETURNED by the call in `rvalue` (recorded at
         // its `return` statement): copy it into a collection lvalue.
         if matches!(&rvalue.kind, ExprKind::Call { .. }) {
@@ -4469,6 +4735,25 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §7.6: a subarray the copies above do not name (`v[1][0]` of a
+        // three-dimensional array, a row into a queue or dynamic array, a
+        // row of a class property) is read element by element and stored as
+        // the pattern of those values. It was read as one scalar. Only a
+        // design with multidimensional storage has one.
+        if r_dyn.is_none()
+            && (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+            && matches!(
+                rvalue.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            )
+            && let Some((pattern, release)) = self.unpacked_array_snapshot(rvalue, rvalue.span)
+        {
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, &pattern);
+            if let Some(release) = release {
+                self.exec_statement(&release);
+            }
+            return;
+        }
         if let (Some((dst, lo, hi)), Some(src)) = (l_fix, r_dyn.clone()) {
             let desc = self.module.descending_arrays.contains(&dst);
             let cap = (hi - lo + 1) as u64;
@@ -4610,7 +4895,7 @@ impl Simulator {
             }
         }
         if let ExprKind::Ident(lhier) = &lvalue.kind {
-            let mut lname = if self.ident_shadowed_by_non_collection(lhier) {
+            let lname = if self.ident_shadowed_by_non_collection(lhier) {
                 std::borrow::Cow::Borrowed("")
             } else {
                 let mut n = self.resolve_hier_name(lhier);
@@ -4621,25 +4906,7 @@ impl Simulator {
                 }
                 n
             };
-            // §10.10: a class queue / dynamic-array member (`<handle>#q`)
-            // has no `arrays` row, but `obj.q = {obj.q, v}` is the same
-            // unpacked-array concatenation.
-            let mut class_dyn = false;
-            if matches!(rvalue.kind, ExprKind::Concatenation(_))
-                && !self.module.arrays.contains_key(&*lname)
-                && let Some(n) = self.expr_assoc_name(lvalue)
-            {
-                if self.class_queue_prop(&n) {
-                    lname = std::borrow::Cow::Owned(n);
-                    class_dyn = true;
-                } else if self.module.arrays.contains_key(&n) {
-                    // §8.9: a static queue or dynamic array reached
-                    // through an object (`h.sq = {h.sq, v}`) is the
-                    // class's store.
-                    lname = std::borrow::Cow::Owned(n);
-                }
-            }
-            if self.module.arrays.contains_key(&*lname) || class_dyn {
+            if self.module.arrays.contains_key(&*lname) {
                 // Queue/array slice assignment: lq = rq[a:b]
                 if let ExprKind::RangeSelect {
                     expr: rbase,
@@ -4740,94 +5007,7 @@ impl Simulator {
                     return;
                 }
                 if let ExprKind::Concatenation(exprs) = &rvalue.kind {
-                    // IEEE 1800 §10.10.1: in an unpacked-array
-                    // concatenation each item is read in the context of
-                    // the ELEMENT type, so a nested plain-brace concat
-                    // is itself an array value whose elements SPLICE
-                    // into the outer one — `a = {1, {2, 3}}` assigns
-                    // `{1, 2, 3}` — i.e. nested braces flatten. Only
-                    // flatten when the element type is not itself an
-                    // array (for a multi-dimensional target an inner
-                    // brace denotes one whole sub-array element).
-                    // Assignment patterns `'{...}` never flatten; they
-                    // take the AssignmentPattern branch above.
-                    fn flatten_unpacked_concat<'a>(
-                        exprs: &'a [Expression],
-                        out: &mut Vec<&'a Expression>,
-                    ) {
-                        for e in exprs {
-                            if let ExprKind::Concatenation(inner) = &e.kind {
-                                flatten_unpacked_concat(inner, out);
-                            } else {
-                                out.push(e);
-                            }
-                        }
-                    }
-                    let elem_is_scalar = self.foreach_dims(&lname).is_none_or(|d| d.len() == 1);
-                    let items: Vec<&Expression> = if elem_is_scalar {
-                        let mut v = Vec::new();
-                        flatten_unpacked_concat(exprs, &mut v);
-                        v
-                    } else {
-                        exprs.iter().collect()
-                    };
-                    // §10.10 / §7.8: in a queue (or array) of ASSOCIATIVE
-                    // arrays, an associative operand (`q = {src}`) is one
-                    // whole element: its entries are copied into it.
-                    // Evaluated as one value, the element kept no entries.
-                    let assoc_srcs: Vec<Option<String>> =
-                        if self.module.associative_arrays.is_empty() {
-                            Vec::new()
-                        } else {
-                            items.iter().map(|e| self.assoc_value_operand(e)).collect()
-                        };
-                    if assoc_srcs.iter().any(Option::is_some) {
-                        let is_dyn = class_dyn || self.module.dynamic_arrays.contains(&*lname);
-                        let lo = self.module.arrays.get(&*lname).map_or(0, |t| t.0);
-                        for (i, (e, src)) in items.iter().zip(assoc_srcs).enumerate() {
-                            let elem = format!("{}[{}]", lname, lo + i as i64);
-                            match src {
-                                Some(src) => self.store_assoc_elem(&elem, &src),
-                                None => {
-                                    let v = self.eval_expr(e);
-                                    self.set_signal_value_by_name(&elem, v);
-                                }
-                            }
-                        }
-                        if is_dyn {
-                            self.set_queue_size(&lname, items.len() as u64);
-                        }
-                        self.settle_after_proc_write();
-                        return;
-                    }
-                    // Expand queue/array elements in concat (e.g. q = {q, 4})
-                    let all_vals = self.unpacked_concat_operand_values(items);
-                    let is_dyn = class_dyn || self.module.dynamic_arrays.contains(&*lname);
-                    let (lo, hi, _w) = self
-                        .module
-                        .arrays
-                        .get(&*lname)
-                        .copied()
-                        .unwrap_or((0, -1, 32));
-                    let n_vals = all_vals.len();
-                    for (i, v) in all_vals.into_iter().enumerate() {
-                        let idx = lo + i as i64;
-                        // Dynamic arrays/queues grow to fit; only fixed
-                        // arrays are bounded by their declared range.
-                        if !is_dyn && idx > hi {
-                            break;
-                        }
-                        // §10.10: each item is an element-typed value.
-                        let v = if is_dyn {
-                            self.fit_queue_push_elem(&lname, v)
-                        } else {
-                            v
-                        };
-                        self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v);
-                    }
-                    if is_dyn {
-                        self.set_queue_size(&lname, n_vals as u64);
-                    }
+                    self.assign_unpacked_concat(&lname, exprs, check_remaining_rows, first_row);
                     self.settle_after_proc_write();
                     return;
                 }

@@ -43,13 +43,14 @@ endmodule
 /// The testbench writes `a`, then `b`, then waits. Run inline after each
 /// write, the blocks saw `a` new with `b` and `s` old, then `a` and `b` new
 /// with `s` old, and their assertions failed twice per step. Only
-/// `always_comb`'s time-0 run (§9.2.2.2.2), before the testbench has
-/// written anything, sees `s == a + b` unknown.
+/// `always_comb`'s time-0 run (§9.2.2.2.2) can see `s == a + b` unknown.
 #[test]
 fn level_always_runs_after_the_writer_and_the_assignments() {
     let out = lines(ADDER);
     let failed: Vec<&String> = out.iter().filter(|l| l.contains("failed")).collect();
-    assert_eq!(failed, ["comb failed at 0"], "{out:#?}");
+    // silimate: always_comb's time-0 run may come before or after the testbench's first writes
+    // §9.2.2.2.2 only puts it after every procedure has started.
+    assert!(failed.is_empty() || failed == ["comb failed at 0"], "{out:#?}");
     for kind in ["comb", "star"] {
         for t in 1..20 {
             let ran = out.iter().filter(|l| **l == format!("{kind} ran at {t}")).count();

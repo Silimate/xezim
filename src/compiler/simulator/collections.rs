@@ -3161,6 +3161,9 @@ impl Simulator {
                 // member's DECLARED signedness (`int s` in a packed struct
                 // printed as unsigned without this).
                 if let Some(field) = name.strip_prefix(&format!("{}.", base)) {
+                    if w == 64 && self.union_real_member(&base, field) {
+                        return Some(Self::union_real_read(v));
+                    }
                     if self.struct_member_signed(&base, field) {
                         v.is_signed = true;
                     }
@@ -3235,7 +3238,12 @@ impl Simulator {
             {
                 let fitted = match self.frame_get(name) {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
-                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    // §6.11.3: the leaf keeps its member's signedness.
+                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => {
+                        let mut v = val.resize(p.width);
+                        v.is_signed = p.is_signed;
+                        v
+                    }
                     // §6.12.2: a real into an integral leaf rounds.
                     Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val,
@@ -3279,7 +3287,11 @@ impl Simulator {
             }
             let w = self.signal_widths[id];
             let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-            let mut resized = if is_str { val } else { val.resize(w) };
+            let mut resized = if is_str {
+                val
+            } else {
+                self.cell_real_fit(id, val).resize(w)
+            };
             if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
                 resized = resized.to_two_state();
             }
@@ -3306,6 +3318,16 @@ impl Simulator {
             let through_alias = aliased.is_some();
             if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut next = cur.clone();
+                // §7.3: a real member of an untagged union stores the real's
+                // bits; an integral value converts to real first (§6.12.1).
+                let val = match name.strip_prefix(&format!("{base}.")) {
+                    Some(field)
+                        if w == 64 && !val.is_real && self.union_real_member(&base, field) =>
+                    {
+                        Value::from_f64(val.to_f64())
+                    }
+                    _ => val,
+                };
                 let mut piece = val.resize(w);
                 if !self.mixed_packed_vars.is_empty() {
                     piece = self.packed_member_piece(&base, name, piece);
@@ -3388,6 +3410,23 @@ impl Simulator {
     /// Store `val` in table cell `id` as a by-name write of the cell's name
     /// does: fitted to the cell's width, value set and signedness, and marked
     /// dirty when it changed. Returns whether it changed.
+    /// §6.12.1, §10.7: a value written into table cell `id` takes the cell's
+    /// real or integral type before its width: a real into an integral cell
+    /// rounds (`Resize` to 64 bits would keep the real), and an integral or
+    /// unbased unsized value into a real cell converts at its own width
+    /// (§5.7.1: `'1` is one bit there, not 2**64-1).
+    #[inline]
+    fn cell_real_fit(&self, id: usize, val: Value) -> Value {
+        let cell_real = self.signal_real.get(id).copied().unwrap_or(false);
+        if val.is_real == cell_real {
+            val
+        } else if cell_real {
+            Value::from_f64(val.to_f64())
+        } else {
+            Self::real_to_int(val.to_f64(), self.signal_widths[id].max(1))
+        }
+    }
+
     pub(super) fn store_named_cell(&mut self, id: usize, val: Value) -> bool {
         let w = self.signal_widths[id];
         // A width-0 signal (e.g. an untracked module-scope class handle)
@@ -3399,7 +3438,11 @@ impl Simulator {
         // it a `string q[$]` element was still clamped to 128 characters
         // after scalar strings had been fixed.
         let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-        let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
+        let mut resized = if w == 0 || is_str {
+            val
+        } else {
+            self.cell_real_fit(id, val).resize(w)
+        };
         // §6.11.1: a 2-state destination drops x/z.
         if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
             resized = resized.to_two_state();

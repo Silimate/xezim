@@ -93,6 +93,8 @@ mod comb_result_clobbered_by_process;
 mod computed_edge_expressions;
 #[path = "scheduling/condition_waiter_name_gate.rs"]
 mod condition_waiter_name_gate;
+#[path = "scheduling/continuous_assign_time_unit.rs"]
+mod continuous_assign_time_unit;
 #[path = "scheduling/dead_clock_watchdog.rs"]
 mod dead_clock_watchdog;
 #[path = "scheduling/decl_init_time_literal_scaling.rs"]
@@ -101,6 +103,9 @@ mod decl_init_time_literal_scaling;
 mod assertion_control;
 #[path = "scheduling/deferred_immediate_assertions.rs"]
 mod deferred_immediate_assertions;
+// silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+#[path = "scheduling/procedural_assert_after_delay.rs"]
+mod procedural_assert_after_delay;
 #[path = "scheduling/delay_lands_on_clock_edge.rs"]
 mod delay_lands_on_clock_edge;
 #[path = "scheduling/delay_spike_warning.rs"]
@@ -111,6 +116,8 @@ mod determinism_and_stall;
 mod disable_loop_label;
 #[path = "scheduling/disable_own_block_and_loop_jumps.rs"]
 mod disable_own_block_and_loop_jumps;
+#[path = "scheduling/disable_same_named_blocks.rs"]
+mod disable_same_named_blocks;
 #[path = "scheduling/edge_delivery.rs"]
 mod edge_delivery;
 #[path = "scheduling/edge_event_lsb.rs"]
@@ -191,6 +198,8 @@ mod nba_fast_vs_queue_order;
 mod nba_index_freeze_and_elem_selects;
 #[path = "scheduling/nba_intra_event_control.rs"]
 mod nba_intra_event_control;
+#[path = "scheduling/nonblocking_update_rewakes_star_block.rs"]
+mod nonblocking_update_rewakes_star_block;
 #[path = "scheduling/nba_leak_waiter_active_region.rs"]
 mod nba_leak_waiter_active_region;
 #[path = "scheduling/nba_region_join_none_order.rs"]
@@ -269,6 +278,8 @@ mod waiter_edge_ordering;
 mod xtrace_conformance;
 #[path = "scheduling/zero_delay_inactive_region.rs"]
 mod zero_delay_inactive_region;
+#[path = "scheduling/zero_delay_task_recursion.rs"]
+mod zero_delay_task_recursion;
 
 #[path = "scheduling/compiled_for_loops.rs"]
 mod compiled_for_loops;
@@ -291,10 +302,13 @@ mod clock_gen_fifo_rank;
 mod clocking_cont_trigger_same_step;
 #[path = "scheduling/comb_packed_element_sensitivity.rs"]
 mod comb_packed_element_sensitivity;
+#[path = "scheduling/comb_sens_param_range.rs"]
+mod comb_sens_param_range;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
 #[path = "scheduling/delay_always_compound_body.rs"]
 mod delay_always_compound_body;
+#[path = "scheduling/delayed_struct_array_member.rs"] mod delayed_struct_array_member;
 #[path = "scheduling/delayed_write_pending_semantics.rs"]
 mod delayed_write_pending_semantics;
 #[path = "scheduling/edge_skip_shared_output.rs"]
@@ -500,6 +514,9 @@ mod hierarchical_subroutine_static;
 mod review_loop_jumps_and_block_disables;
 #[path = "scheduling/nba_partial_commit_order.rs"]
 mod nba_partial_commit_order;
+// silimate: a wait's statement that suspends runs as the process's next statement
+#[path = "scheduling/wait_then_event_control.rs"]
+mod wait_then_event_control;
 #[path = "scheduling/finished_process_metadata.rs"]
 mod finished_process_metadata;
 #[path = "scheduling/review_intra_delay_capture_1162.rs"]
@@ -512,6 +529,9 @@ mod review_sva_property_operators_220;
 mod review_sva_abort_first_tick_1155;
 #[path = "scheduling/deferred_assign_reads_1149.rs"]
 mod deferred_assign_reads_1149;
+// silimate: the processes a clock edge wakes run before the slot's NBA region
+#[path = "scheduling/edge_before_slot_nba.rs"]
+mod edge_before_slot_nba;
 #[path = "scheduling/function_call_assign_reads_1126.rs"]
 mod function_call_assign_reads_1126;
 #[path = "scheduling/instance_array_member_reads_1108.rs"]
@@ -525,11 +545,16 @@ mod struct_array_actual_paths_1110;
 mod pattern_nba_1199;
 #[path = "scheduling/event_call_operands_1205.rs"]
 mod event_call_operands_1205;
+#[path = "scheduling/event_call_struct_arguments.rs"]
+mod event_call_struct_arguments;
 
 #[path = "scheduling/array_capture_1217.rs"]
 mod array_capture_1217;
 #[path = "scheduling/intra_delay_pattern_item_width.rs"]
 mod intra_delay_pattern_item_width;
+// silimate: sampled-value functions of a whole unpacked array track its cells
+#[path = "scheduling/sva_array_sampled_fns.rs"]
+mod sva_array_sampled_fns;
 
 #[path = "scheduling/parked_waiter_signal_index.rs"]
 mod parked_waiter_signal_index;
@@ -537,14 +562,27 @@ mod parked_waiter_signal_index;
 mod replication_pattern_capture;
 #[path = "scheduling/nettype_relay_chain_1239.rs"]
 mod nettype_relay_chain_1239;
+// silimate: a whole unpacked array a concurrent assertion reads is sampled
+#[path = "scheduling/sva_whole_array_sampled.rs"]
+mod sva_whole_array_sampled;
 #[path = "scheduling/time_literal_exact_1299.rs"]
 mod time_literal_exact_1299;
+// silimate: a for-init variable hides the subroutine's same-named static local
+#[path = "scheduling/for_init_hides_static.rs"]
+mod for_init_hides_static;
 #[path = "scheduling/intra_delay_array_items.rs"]
 mod intra_delay_array_items;
 #[path = "scheduling/review_intra_delay_array_items.rs"]
 mod review_intra_delay_array_items;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
+// silimate: a level-sensitive block that writes nothing runs once the settle converges
+#[path = "scheduling/observer_runs_after_settle.rs"]
+mod observer_runs_after_settle;
+#[path = "scheduling/time0_effect_entries_1314.rs"]
+mod time0_effect_entries_1314;
+#[path = "scheduling/sva_default_actuals_1309.rs"]
+mod sva_default_actuals_1309;
 // silimate: a condition-waiter drain's settle and writes reach the full edge pass
 #[path = "scheduling/settle_edges_before_nba.rs"]
 mod settle_edges_before_nba;

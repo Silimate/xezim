@@ -227,6 +227,47 @@ impl Simulator {
         Some(info.continuation)
     }
 
+    /// §9.6.2: a named fork belongs to a lexical declaration. Concurrent
+    /// activations of that declaration share a target, sibling instances do not.
+    pub(super) fn register_named_fork(&mut self, label: &str, children: &HashSet<usize>) {
+        let key = format!("{}.{label}", self.m_path());
+        let mut all = self.fork_block_children.remove(&key).unwrap_or_default();
+        all.retain(|pid| {
+            !self.killed_pids.contains(pid) && (!self.finished_pids.contains(pid)
+                || self.process_parents.values().any(|parent| parent == pid))
+        });
+        all.extend(children.iter().copied());
+        self.fork_block_children.insert(key, all);
+    }
+
+    pub(super) fn named_fork_target(
+        &self,
+        target: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<String> {
+        let mut path = String::new();
+        for segment in &target.path {
+            if !path.is_empty() { path.push('.'); }
+            path.push_str(&segment.name.name);
+            for index in &segment.selects {
+                use std::fmt::Write;
+                write!(path, "[{}]", Self::try_const_u64(index)?).ok()?;
+            }
+        }
+        if let Some(path) = path.strip_prefix("$root.") {
+            return self.fork_block_children.contains_key(path).then(|| path.to_owned());
+        }
+        if self.fork_block_children.contains_key(&path) {
+            return Some(path);
+        }
+        let current = self.m_path();
+        let mut scope = if target.root.is_some() { self.module.name.as_str() } else { &current };
+        loop {
+            let key = format!("{scope}.{path}");
+            if self.fork_block_children.contains_key(&key) { return Some(key); }
+            scope = scope.rsplit_once('.')?.0;
+        }
+    }
+
     /// IEEE 1800-2023 §9.6.2: `disable x` where `x` is a block (or task)
     /// that ANOTHER process is executing — an ancestor the disabling process
     /// was forked inside, or any process parked inside it. That process
@@ -1300,7 +1341,10 @@ impl Simulator {
                     }
                 ) {
                     Expression::new(ExprKind::StringLiteral(String::new()), port.span)
-                } else if super::elaborate::is_type_real(&port.data_type) {
+                } else if super::elaborate::is_type_real_resolved(
+                    &port.data_type,
+                    &module.typedef_types,
+                ) {
                     Expression::new(
                         ExprKind::Number(crate::ast::expr::NumberLiteral::Real(0.0)),
                         port.span,
@@ -1882,7 +1926,9 @@ impl Simulator {
                             sv.static_hidden
                                 .get_or_insert_with(|| (depth, Vec::new()))
                                 .1
-                                .push(hidden);
+                                // silimate: a for-init variable hides the subroutine's same-named static local
+                                // Kept with its position, where `unhide_statics` puts it back.
+                                .push((i, hidden));
                         }
                     }
                 }
@@ -2018,12 +2064,9 @@ impl Simulator {
             }
         }
         // The statics the block's variables hid are visible again.
-        if let Some((depth, hidden)) = sv.static_hidden.take()
-            && self.static_local_syncs.len() == depth
-            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
-        {
-            syncs.extend(hidden);
-        }
+        // silimate: a for-init variable hides the subroutine's same-named static local
+        // Each goes back at its position, which `static_mark` relies on.
+        self.unhide_statics(sv.static_hidden.take());
         let forked = self.next_pid != sv.pid_mark;
         for s in stmts {
             let (data_type, declarators) = match &s.kind {
@@ -2114,6 +2157,52 @@ impl Simulator {
         }
         self.restore_loop_vars(&sv.loop_vars);
     }
+
+    // silimate: a for-init variable hides the subroutine's same-named static local
+    /// §6.21, §12.7.1: a variable a for-init declares is automatic and local
+    /// to the loop, so it hides the subroutine's same-named `static` local:
+    /// its reads and writes must not reach the static's shared cell. Takes
+    /// the static's `static_local_syncs` entry out until the loop ends, as a
+    /// block declaration does (`BlockScopeSave::static_hidden`). Called as
+    /// each variable is declared, so a later initializer
+    /// (`for (integer j = 0, k = j; ...)`) reads the loop's variable.
+    pub(super) fn hide_loop_static(
+        &mut self,
+        nm: &str,
+        hidden: &mut Option<(usize, Vec<(usize, (String, String))>)>,
+    ) {
+        if !self.static_local_names.contains(nm) {
+            return;
+        }
+        let depth = self.static_local_syncs.len();
+        if let Some((_, syncs)) = self.static_local_syncs.last_mut()
+            && let Some(i) = syncs.iter().position(|(n, _)| n == nm)
+        {
+            let entry = syncs.remove(i);
+            hidden
+                .get_or_insert_with(|| (depth, Vec::new()))
+                .1
+                .push((i, entry));
+        }
+    }
+
+    /// The statics a block or a loop hid are visible again, each back at the
+    /// position it was taken from: `BlockScopeSave::static_mark` tells an
+    /// enclosing block's own statics by position.
+    pub(super) fn unhide_statics(
+        &mut self,
+        hidden: Option<(usize, Vec<(usize, (String, String))>)>,
+    ) {
+        if let Some((depth, hidden)) = hidden
+            && self.static_local_syncs.len() == depth
+            && let Some((_, syncs)) = self.static_local_syncs.last_mut()
+        {
+            for (i, entry) in hidden.into_iter().rev() {
+                syncs.insert(i.min(syncs.len()), entry);
+            }
+        }
+    }
+    // /silimate
 
     /// §6.21 for a synchronous loop: open the body block's scope once for
     /// the whole loop rather than once per iteration (each iteration's
@@ -3067,6 +3156,8 @@ impl Simulator {
                             return;
                         }
                         let cont = self.forever_cont(pid, body, body_stmts, i, 0, tbody);
+                        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+                        self.delay_pids.insert(pid, delay > 0);
                         if delay == 0 {
                             // `forever begin ... #0 ... end` — same §4.4.2.3
                             // Inactive-region parking as the run_process_stmts

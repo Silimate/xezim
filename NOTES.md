@@ -10,11 +10,75 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A deferred assertion (`assert #0`, `assert final`) counts its outcome in
+  the results file when its report matures. A report flushed because its
+  process resumed in the same time slot, or because its `always_comb` ran
+  again, ran no action and now counts as no attempt (§16.4.2); it counted as
+  a failure, so an assertion that never reported one read as failing.
+* The `always_comb` copies of a generate loop keep their own deferred
+  reports. A report replaced the pending report of another copy with the
+  same assertion statement, so that copy's action did not run, and a
+  failure there printed nothing.
+* A deferred assertion (`assert #0`, `assert final`) report matures only
+  after the time slot's leftover cbNBASynch and cbReadWriteSynch routines
+  have run (§4.5, §16.4.1). cocotb applies its writes from a
+  cbReadWriteSynch it registers inside another one, so an `always_comb`'s
+  time-0 failure on x inputs matured before the writes re-ran the block and
+  flushed it. (#432)
+* An `always_comb` or `always @*` block woken by another process's blocking
+  writes runs once that process suspends, after the continuous assignments it
+  reads have been updated, as the continuous assignments themselves already
+  did (§4.5, §9.2.2.2). It ran after each write instead, seeing values that
+  never coexist (the first write new, the second and the assignment's output
+  old), so an immediate assertion in it failed up to twice per time step.
+* A level-sensitive `always` block that writes no signal (an immediate
+  assertion, a `$display`) runs once the settle has converged, on the
+  settled values (§4.5, §9.2.2.2). Inside a carry chain that the settle
+  orders as a cycle, it had run once per carry step and asserted on
+  intermediate sums. (#433)
+* The processes a clock edge wakes run before the slot's NBA region
+  (§4.4.2, §4.5). A testbench process that resumed from a delay at the
+  edge's time and wrote with `<=` (`#20 x <= v;` landing on a posedge), or
+  an intra-assignment delay maturing then, had its value seen by that
+  edge's flops and waiters, so a DUT captured its input one cycle early.
+  (#436)
+* `wait (c) @(posedge clk);` resumes the process at the edge after `c`
+  holds (§9.7.4). The event control the `wait` guards had been run where it
+  could not suspend, so the process never resumed. (#437)
+* A variable declared in a for-init hides the task's or function's own
+  variable of the same name (§6.21, §12.7.1). In a task with an unassigned
+  `integer j;`, `for (integer j = 0; j < n; j++)` read the task's `j` (x)
+  and ran no iteration, with or without a timing control in the body. A
+  later initializer (`k = j`) also reads the loop's `j` now. (#438)
+* A task's static variable keeps its value across calls when a nested block
+  hides it inside a block that declares its own static. The hidden variable
+  had been put back out of order, and the outer block's exit dropped it.
+  (#438)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick
   read, as on the reference simulator (§16.5.1, §38.36.3). A write to some
   bits of a vector sets only those bits' defaults.
+* A concurrent assertion reads a whole unpacked array it names
+  (`v inside {m}`, `m == '{...}`) at its cells' sampled values, as it does
+  the operands of an assignment pattern (§16.5.1). It had read them after
+  the edge's NBA region. (#434)
+* `$past`, `$stable` and `$changed` track every cell of a whole
+  fixed-size unpacked-array operand (§16.9.3). `$stable(mem)` had always
+  held, `$changed(mem)` never had, and `mem == $past(mem)` compared against
+  a constant. That is still so for an array with a negative bound
+  (`mem[-2:-1]`) and for a large memory in the packed arena (more than
+  100,000 cells; see `XEZIM_PACKED_MEM`). (#435)
+* A procedural concurrent assertion, or a deferred assertion, that an
+  `always` procedure reaches after a delay or an event control reports
+  (§16.4.2, §16.14.6). Its process had dropped its pending instances on
+  every interpreter entry, including same-time continuations and the loop
+  back to its event control. They are now flushed only where the process
+  resumes. An instance's attempt starts at its clock's event in the time
+  step where it matures, if there is one, and otherwise at the next event.
+  A delay that moves time on waits for the next tick, and a `#0` keeps the
+  tick of the edge that woke the procedure. At the time-0 edge, such an
+  attempt reads the default sampled values (§16.5.1). (#450)
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the
@@ -81,6 +145,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* In a compiled method, a compare of two elements of a method-local queue or
+  dynamic array (`a[0] == a[1]`, a sort's `a[j] > a[j+1]`) compares the whole
+  elements. The element read counted as one bit wide, so the compare saw only
+  the lowest bits: `'{3, 1}` compared equal, and a bubble sort in a function
+  left its array unsorted (#421).
 
 **Usability**
 
@@ -111,21 +180,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
   to be read as source files or top names, and `-licqueue` as `-l icqueue`,
   which sent the transcript to a file named `icqueue`.
-* Code coverage counting rules, each its own option and off by default.
-  Five follow the code coverage defaults the reference simulator documents:
-  `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
-  signals declared in generate blocks out of toggle coverage;
-  `--code-coverage-expressions=logical` scores only the conditions with a
-  `&&` or `||`, a term covered once it has been 0 and 1;
-  `--code-coverage-granularity=block` counts straight-line blocks, implicit
-  `else` and `default` arms included and continuous assignments not; and
-  `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
-  makes, an asynchronous reset's included. FSM coverage skips the code a
-  constant condition rules out, as statement and branch coverage do, also
-  where the rest of the condition can't change it (`if (EN && go)` with `EN`
-  0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of bits whose
-  only drivers are constants (`{4'b0, x}`, a port tied to `1'b0` and the
-  ports wired to it). Each has an `XEZIM_*` variable. See
+* Code coverage counting rules, each its own option and off by default,
+  inferred from CVDP's coverage targets. On its target-100 designs, enum
+  toggles, generate-block toggles and a constant expression term were bins
+  no stimulus can reach: `--no-toggle-enums` and `--no-toggle-generate`
+  leave enum variables and the signals declared in generate blocks out of
+  toggle coverage, and `--code-coverage-expressions=logical` scores only the
+  conditions with a `&&` or `||`, a term covered once it has been 0 and 1.
+  `--code-coverage-granularity=block` counts straight-line blocks, not
+  continuous assignments, and not the implicit arm of an `if` without an
+  `else` or a `case` without a `default`, where no statement runs (Verilator
+  5.038's line coverage has no line for one either; the arm stays in branch
+  coverage). `--no-fsm-reset-transitions` leaves out the FSM transitions
+  only a reset makes, an asynchronous reset's included. FSM coverage skips
+  the code a constant condition rules out, as statement and branch coverage
+  do, also where the rest of the condition can't change it (`if (EN && go)`
+  with `EN` 0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of
+  bits whose only drivers are constants (`{4'b0, x}`, a port tied to `1'b0`
+  and the ports wired to it). Each has an `XEZIM_*` variable. See
   docs/coverage-guide.md, "Counting rules".
 * `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
   an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of
@@ -149,6 +221,32 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased
 
+- **Correctness:** Check type names in selected generate branches, retain instance-specific sensitivity widths, and preserve cross-top waveform selections (#1374, #1375, #1378).
+- **Correctness:** Read four-state digits in integer scan conversions, store unpacked concatenations in fixed queue rows, and resolve rooted queue-element members (#1377, #1379, #1380).
+- **Correctness:** Evaluate continuous-assignment time queries in their declaring instance, retain VPI deposits until a driver changes, and sample input-net defaults on clock edges (#1381, #1382, #1356).
+- **Correctness:** Evaluate integral operands at their declared width before a real comparison and apply the real default to an ambiguous conditional result (#1344, #1345).
+- **Performance:** Compile supported whole unpacked-structure constructor assignments. On a 2,000-iteration reproducer, the median instruction count across three Callgrind runs fell from 760,750,106 to 216,426,263. The scalar control used 65,620,020 and 65,804,112 instructions respectively (#1394).
+- **Correctness:** Bind whole interface-array ports by position, fold header array parameters in the declaring instance, honor inferred pull net types, and size fill literals through comparisons (#1402, #1404, #1400, #1399).
+- **Correctness:** Drive nested unpacked leaves at their declared widths, copy fixed rows in declaration order, resolve drivers per wire-array element and delay whole unpacked structures (#1403, #1398, #1395, #1393).
+- **Correctness:** Resolve named fork activations in their declaring scope, describe types in declared dimension order, and apply packed assignment-pattern defaults recursively (#1396, #1348, #1343).
+- **Correctness:** Use the declared clocking edge for bare clocking block waits and default clocking cycle delays (§14.10–11, #1332).
+- Store contiguous fixed class-array elements in dense runs while retaining their declared widths and typed values (#1053).
+
+- **Correctness:** A trailing whitespace directive in `$fscanf` sets EOF when it reads to the end of the file (§21.3.4.3, #1376).
+
+- **Correctness:** Queue element writes append at the current size and warn when an invalid index is ignored (§7.10.1, #1353).
+
+- **Correctness:** Preserve every unknown and high-impedance digit in minimum-width binary, octal and hexadecimal output (§21.2.1.2–3, #1347).
+
+- **Correctness:** Resolve class method return widths in declaration scope when callers shadow a typedef (§6.18, §23.9, #1366).
+- **Correctness:** Concurrent assertions run their pass action on vacuous success by default. Assertion control tasks can disable it (§20.11, #1339).
+
+- **Correctness:** Resolve an unadorned parameterized class name in a typedef type argument to its default specialization (§8.25, #1357).
+- **Correctness:** Use all case items to determine signedness for `case`, `casez`, and `casex` comparisons (§12.5, #1355).
+
+- **Correctness:** Schedule delayed nonblocking updates even when the target already holds the captured value (§4.9.4, #1354).
+
+- **Correctness:** Compare strings by unsigned character values so `compare()` agrees with the relational operators (§6.16.6, #1361).
 - **Correctness:** Reject duplicate package definitions (§3.13, §26.2).
 - **Correctness:** Reject differing duplicate typedef definitions and warn on identical cross-file typedefs (§3.13, §6.18).
 - **Correctness:** Warn on redefined interfaces, programs and primitives (§3.13, §25.3).
@@ -180,6 +278,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 - **Correctness:** Preserve input-port indices around UDP instances, schedule fixed-array and record assignment-pattern leaves in the NBA region, and combine root and descendant waveform scopes with independent depth limits (#1201, #1199, #1195).
 
 **Performance**
+
+- Inline literal default inputs on positional function calls and compile process locals overwritten by a function output before their first read (#1453).
 
 * Module bodies containing only declarations and continuous assignments reuse
   their prepared syntax across value-parameter overrides, avoiding repeated
@@ -446,6 +546,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   children by their paths instead of by a copy of the instance name and of the
   definition name. 66,560 instances with 256-character names peak at 206 MiB
   instead of 309 MiB (§23.8, #721, suggested by amal-khailtash).
+
+* Join alias groups and the ports that reach them with an index union-find, in
+  one pass instead of one pass per level of ports (§10.11, #1302, contributed
+  by Thomasb81).
+
+* Classify each key of an array pattern once and build nested element names in
+  place: a loop of keyed patterns on the interpreted store takes 5.5 % fewer
+  instructions (#1290, contributed by Thomasb81).
+
+* A `for` loop that stores `q.pop_front()` or `q.pop_back()` into a variable
+  or array element is compiled; it used to run whole in the AST interpreter.
+  The reporter's stream collector runs in 83.4 G instead of 108.7 G
+  instructions (§7.10.2, §12.7.1, #1210, reported by Ganesh-TNL).
 
 **Command line**
 
@@ -1145,6 +1258,142 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   default:99}}` on a nettype structure member gave 99. A type key of an outer
   level takes precedence over a `default:` row pattern, as the standard's
   recursive descent gives (§10.9.1, §10.9.2, #1290, contributed by Thomasb81).
+
+* Wake an event control whose expression calls a function with a whole
+  unpacked structure, a fixed array of structures or one of its elements when
+  a member write changes the result, with the edge and `iff` terms judged once
+  per waiter (§9.4.2, §9.4.2.3, #1317, contributed by ds54e).
+
+* Match every string with an empty UVM regex on a BSD libc host, as on glibc,
+  so `uvm_config_db::set(null, "", ...)` under UVM 1.1d and 1.2 is found on
+  macOS (#1306, contributed by auty1395).
+
+* Resolve aliased nets of a user-defined nettype as one net with all their
+  drivers, through `alias` lists, chained `alias` statements, `inout` ports,
+  nettype arrays and generate blocks, and count the single driver of an
+  unresolved nettype over the aliased names (§10.11, §6.6.7, #1302,
+  contributed by Thomasb81).
+
+* Match `real` and `realtime` type keys of an assignment pattern as one type
+  (§6.12, §10.9.1, #1290, contributed by ds54e).
+
+* Resolve assignment pattern type keys that name a typedef of a parameterized
+  class scope, of a generate block or of a package imported at that point of
+  the module, and keep a member name of the structure from also acting as a
+  type key (§10.9.1, §10.9.2, §8.25.1, §26.3, #1290, contributed by
+  Thomasb81).
+
+* Return a whole unpacked-struct element of an array argument, a local array
+  or a design array from a function (`return d[0];`, `f = d[i];`), with the
+  index evaluated once, instead of zeros; a nettype resolver that returns one
+  of its drivers now resolves (§13.4.1, §13.5.1, §11.4.1, #1310, reported by
+  ds54e).
+
+* A typedef'd `real` member of an unpacked struct (`typedef real t_real;
+  struct { t_real m[2]; }`) keeps real values: the member cells of a function
+  local, a nettype resolver's result and a class struct property were created
+  as integers and rounded every write (§6.18, §7.2, #1304, contributed by
+  ds54e).
+
+* A typedef that names `real`, `shortreal` or `realtime` declares real objects
+  everywhere a type is classified: block, function and task variables, class
+  properties (also of an alias the class declares, or of a type parameter
+  bound to `real`), function return variables, task and method formals, typed
+  parameters and localparams, and casts to the alias (`r_t'(i) / 2` is a real
+  division). Before, `typedef real r_t; r_t v; v = 3.14;` stored 3. A
+  class-method formal declared `real` now also converts an integral actual
+  (§6.18, §6.12.1, §8.25, #1313, reported by Dragon-Git; #1304, reported by
+  ds54e).
+
+* A constant element select of a packed array of packed structures or unions
+  reads the element its index labels: the left bound of the range is the most
+  significant element, so `S[0]` of `localparam s_t [0:2] S` is the first one
+  (it read the last). Ranges that do not start at 0 (`s_t [1:3]`, `[3:1]`), a
+  second packed dimension (`M[0][1]`), dimensions carried by a typedef and the
+  package form `p::ENC[fmt].field` in a package function are right too
+  (§7.4.1, xezim-core #248, reported by auty1395).
+
+* The delays of a UDP instance count the time unit of the module that holds
+  the instance: `udp #(4) u(q, a);` under `` `timescale 1ns/1ps `` waits 4 ns
+  instead of 4 ps. Real and time-literal values, `#(rise, fall)` pairs, and
+  expressions over package, class and instance parameters are scaled as a
+  whole (§3.14.2, §28.16, §29.8, #1308, reported by ds54e).
+
+* An element of a packed array of a named signed type is signed in every
+  declaration context, so a widening cast, assignment or arithmetic use of
+  `lanes[1]` sign-extends: non-ANSI ports (`input lane_t [0:1] p;`), ports
+  whose packed dimensions come from a typedef, subroutine and class-method
+  formals and locals, block variables, and packed-array members reached
+  through nested structures, packed arrays of structures, class properties and
+  instance names. Before, -1887 read as 129185 (§7.4.1, §11.8.1, #1312,
+  reported by Ganesh-TNL).
+
+* An `always_comb` procedure or a continuous assignment whose evaluation is
+  observable beyond its outputs now waits for the time-0 processes: it is left
+  out of the settle that runs before they start and is evaluated once when
+  every `initial` and `always` procedure has started. This covers a body or
+  right-hand side that calls an output, control, file or random system task or
+  function, contains an immediate assertion, calls a class method or a DPI
+  import that is not `pure`, reads a property through a class handle, steps a
+  variable it never plainly assigns (`n++`), or calls a function or task that
+  does any of these or writes a variable outside its own frame. Before, such
+  an entry was also evaluated on the declaration-time state: an assertion
+  failed on the type defaults, a method ran on a null handle, `always_comb c =
+  h.v;` ended the run with a null dereference, and counters counted an
+  evaluation too many. Entries that only compute their outputs still settle
+  before the processes start (§9.2.2.2, §4.9.1, §10.3, #1314, reported by
+  Ganesh-TNL).
+
+* A variable that a called function writes is no longer part of its caller's
+  sensitivity. A continuous assignment or `always_comb` whose function counts
+  its calls in a module variable it also reads re-ran on its own write until
+  the settle limit (§9.2.2.2.1, §10.3, #1314, reported by Ganesh-TNL).
+
+* A formal argument of a named sequence or property takes its default actual
+  argument when an instance leaves it out: `p()`, `p(a)`, `p` without an
+  argument list. The defaults were dropped by the parser, so the formal stayed
+  unbound in the expanded body. Arguments bound by name (`p(.y(b))`) and empty
+  positional arguments (`p(, b)`), which were not bound either, are bound too;
+  a default may name an earlier formal; a default of a declaration in an
+  instantiated module or interface names that instance's variables; and the
+  default of an untyped formal is cast to its self-determined type before it
+  is substituted (§16.8, §16.12, #1309, reported by ds54e).
+
+* A whole unpacked variable of an interface (an array, a structure, a queue, a
+  dynamic or associative array, an unpacked member of a structure) is copied,
+  read and compared through a virtual interface as it is through a
+  hierarchical name. With the handle in a class property, a static property, a
+  package variable, an array element, a subroutine formal or a function local,
+  or used from a class method, `vif.arr = w;` and `w = vif.arr;` did nothing,
+  `vif.arr == w` was 0 or x, and the array passed as a subroutine actual
+  arrived empty; element, slice and packed accesses were not affected (§25.9,
+  §7.6, §11.4.5, #1311, reported by rharikrishna25).
+
+* A class-handle member of an unpacked-struct class property is a handle like
+  any other: `r.h = new();` constructs the member's class, and the object's
+  properties are read and written through the member in a method and from
+  outside the class (`o.r.h.k`), also through a nested struct, an array of
+  handles and an array of structs. The constructor did not run and a write
+  through the member was dropped (§7.2, §8.4, §8.7, #1192, reported by
+  Ganesh-TNL).
+
+* The object behind a `rand` class-handle member of a rand unpacked struct is
+  randomized with the object that holds the struct, under its own constraints
+  and the holder's constraints that read only its members (`r.h.k == 5`);
+  `randomize()` returned 0 for such a constraint (§18.4, §18.5.9, #1192,
+  reported by Ganesh-TNL).
+
+* A type written inside a class method is sized in the class scope:
+  `$bits(logic [W-1:0])` and a method-local `typedef logic [W-1:0] lt;` see
+  the class's own and inherited body constants and the parameters of the
+  active specialization, instead of coming out one bit wide (§8.5, §6.20.4,
+  #1273, reported by Ganesh-TNL).
+
+* `$bits` of a typedef named through a class specialization follows that
+  specialization's parameters through a nested class and through a typedef of
+  the specialization or of the nested class (`box #(6)::pay::wide_t`,
+  `p6_t::wide_t`, `b9_t::pay::wide_t`), with named arguments bound by name
+  (§8.23, §8.25.1, §20.6.2, #1273, reported by Ganesh-TNL).
 
 ### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
 

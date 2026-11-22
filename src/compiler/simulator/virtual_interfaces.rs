@@ -1192,25 +1192,46 @@ impl Simulator {
                     // virtual-interface element is an independent alias to the
                     // corresponding structural interface instance.
                     if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
-                        if let ExprKind::Ident(rhs_h) = &rvalue.kind {
-                            if rhs_h.path.len() == 1 && rhs_h.path[0].selects.is_empty() {
-                                let rhs_base = &rhs_h.path[0].name.name;
-                                let targets: Vec<String> = (lo..=hi)
-                                    .map(|idx| format!("{}[{}]", rhs_base, idx))
-                                    .collect();
-                                if targets
-                                    .iter()
-                                    .all(|target| self.is_interface_instance(target))
+                        let lhs_dims = self.module.unpacked_decl_dims.get(name)
+                            .and_then(|dims| dims.first()).copied()
+                            .unwrap_or_else(|| if self.module.descending_arrays.contains(name) {
+                                (hi, lo)
+                            } else { (lo, hi) });
+                        let rhs = match &rvalue.kind {
+                            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                                let base = &h.path[0].name.name;
+                                let bounds = self.module.unpacked_decl_dims.get(base)
+                                    .and_then(|dims| dims.first()).copied().unwrap_or(lhs_dims);
+                                Some((base, bounds))
+                            }
+                            ExprKind::RangeSelect { expr, kind: RangeKind::Constant, left, right } => {
+                                if let ExprKind::Ident(h) = &expr.kind
+                                    && h.path.len() == 1 && h.path[0].selects.is_empty()
                                 {
-                                    for (idx, target) in (lo..=hi).zip(targets) {
-                                        self.vif_tokens_stored = true;
-                                        self.set_signal_value_by_name(
-                                            &format!("{}[{}]", name, idx),
-                                            Value::from_u64(Self::iface_handle_token(&target), 32),
-                                        );
-                                    }
-                                    return true;
+                                    let l = self.eval_expr(left).to_i64();
+                                    let r = self.eval_expr(right).to_i64();
+                                    l.zip(r).map(|dims| (&h.path[0].name.name, dims))
+                                } else { None }
+                            }
+                            _ => None,
+                        };
+                        if let Some((base, (left, right))) = rhs
+                            && left.abs_diff(right) == lo.abs_diff(hi)
+                        {
+                            let targets: Vec<_> = (lo..=hi).map(|idx| {
+                                let offset = idx.abs_diff(lhs_dims.0) as i64;
+                                let actual = if left <= right { left + offset } else { left - offset };
+                                format!("{base}[{actual}]")
+                            }).collect();
+                            if targets.iter().all(|target| self.is_interface_instance(target)) {
+                                for (idx, target) in (lo..=hi).zip(targets) {
+                                    self.vif_tokens_stored = true;
+                                    self.set_signal_value_by_name(
+                                        &format!("{name}[{idx}]"),
+                                        Value::from_u64(Self::iface_handle_token(&target), 32),
+                                    );
                                 }
+                                return true;
                             }
                         }
                     }
@@ -3612,6 +3633,131 @@ impl Simulator {
             return None;
         }
         self.vif_rebase_chain(e)
+    }
+
+    /// The last name of every unpacked variable (array, queue, dynamic or
+    /// associative array, unpacked structure) declared below a scope.
+    fn scoped_unpacked_leaves(&self) -> &HashSet<String> {
+        self.scoped_unpacked_leaves.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            let mut add = |name: &str| {
+                if let Some((_, leaf)) = name.rsplit_once('.') {
+                    let leaf = leaf.split('[').next().unwrap_or(leaf);
+                    if !set.contains(leaf) {
+                        set.insert(leaf.to_string());
+                    }
+                }
+            };
+            let m = &self.module;
+            m.arrays.keys().for_each(|n| add(n));
+            m.arrays_2d.keys().for_each(|n| add(n));
+            m.arrays_nd.keys().for_each(|n| add(n));
+            m.dynamic_arrays.iter().for_each(|n| add(n));
+            m.queue_vars.iter().for_each(|n| add(n));
+            m.associative_arrays.keys().for_each(|n| add(n));
+            for (name, dt) in m.var_decl_types.as_map() {
+                if name.contains('.') && self.unpacked_struct_of(dt).is_some() {
+                    add(name);
+                }
+            }
+            set
+        })
+    }
+
+    /// §25.9, §7.6: the bound instance's variable for a member chain through
+    /// a virtual interface that names an unpacked aggregate (an array, a
+    /// queue, a dynamic or associative array, an unpacked structure), so the
+    /// whole-aggregate copy, read and comparison paths, which resolve their
+    /// operands by name, take the same variable a hierarchical reference
+    /// does. `None` for any other expression, a scalar member included.
+    pub(super) fn vif_aggregate_canon(&mut self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => {}
+            ExprKind::MemberAccess { .. } => {}
+            _ => return None,
+        }
+        // No virtual interface is bound (the gate of `vif_rebase_expr`), or
+        // no name in the chain is an unpacked variable of any scope: the
+        // common scalar access (`vif.valid = 1`) stops here.
+        if !self.iface_alias_possible()
+            && self.virtual_iface_bindings.is_empty()
+            && self.static_vif_bindings.is_empty()
+            && !self.vif_tokens_stored
+            && self.recv_call_memo.is_empty()
+        {
+            return None;
+        }
+        let leaves = self.scoped_unpacked_leaves();
+        let mut cur = e;
+        let mut possible = false;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    possible |= leaves.contains(member.name.as_str());
+                    cur = expr;
+                }
+                ExprKind::Index { expr, .. } | ExprKind::Paren(expr) => cur = expr,
+                ExprKind::Ident(h) => {
+                    possible |= h.path[1..]
+                        .iter()
+                        .any(|s| leaves.contains(s.name.name.as_str()));
+                    break;
+                }
+                _ => break,
+            }
+            if possible {
+                break;
+            }
+        }
+        if !possible {
+            return None;
+        }
+        // §26.3: a handle held in a package (`pkg::vh.arr`) is stored under
+        // its own name, as `vif_recv_target` reads it.
+        let unqualified = if self.module.packages.is_empty() {
+            None
+        } else {
+            self.strip_package_lvalue(e).or_else(|| match &e.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    let recv = self.strip_package_lvalue(expr)?;
+                    Some(Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(recv),
+                            member: member.clone(),
+                        },
+                        e.span,
+                    ))
+                }
+                _ => None,
+            })
+        };
+        let rebased = self.vif_rebase_expr(unqualified.as_ref().unwrap_or(e))?;
+        // An array or collection of the instance under its stored name, one
+        // flat identifier: the whole-array paths look their operand up by
+        // it, and a one-segment name is not rebound through a property
+        // again. (An associative array is none of the shapes
+        // `is_unpacked_aggregate_operand` probes.)
+        if let ExprKind::Ident(h) = &rebased.kind
+            && h.path.iter().all(|s| s.selects.is_empty())
+        {
+            let flat = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if self.module.associative_arrays.contains_key(&flat)
+                || self.module.dynamic_arrays.contains(&flat)
+                || self.module.queue_vars.contains(&flat)
+                || self.module.arrays.contains_key(&flat)
+                || self.module.arrays_2d.contains_key(&flat)
+                || self.module.arrays_nd.contains_key(&flat)
+            {
+                return Some(Self::flat_name_ident(flat, rebased.span));
+            }
+        }
+        self.is_unpacked_aggregate_operand(&rebased)
+            .then_some(rebased)
     }
 
     /// A flattened path: the first prefix `path[..=i]` (with at least one

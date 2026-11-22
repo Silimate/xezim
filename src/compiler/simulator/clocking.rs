@@ -945,9 +945,11 @@ impl Simulator {
         // An `always_comb` / `always @*` the settle runs as a comb entry is
         // not the process that happens to be current (whose resumption, a
         // §16.4.2 flush point, would drop the report): its reports belong to
-        // no process, keyed by the block's scope instead.
-        let (pid, comb_scope) = if self.settling {
-            (usize::MAX, self.name_resolve_hint.borrow().clone())
+        // no process, keyed by the scope `%m` names instead. The copies of a
+        // generate loop share the statement, and can share the settle's
+        // name hint, but each has its own `%m` path.
+        let (pid, comb_scope) = if self.settling || self.comb_direct_eval {
+            (usize::MAX, Some(self.m_path()))
         } else {
             (self.current_pid, None)
         };
@@ -966,7 +968,7 @@ impl Simulator {
         // has no failure action).
         let default_error_scope =
             (action.is_none() && !passed && kind_tag != 2).then(|| self.m_path());
-        // silimate: a report with no action still matures, to be counted then
+        // A report with no action still matures, to be counted then.
         let ctl = self.imm_assert_ident(a);
         self.deferred_asserts.push(DeferredReport {
             pid,
@@ -1058,16 +1060,30 @@ impl Simulator {
         // /silimate
     }
 
+    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+    /// The pending `#0` reports alone (Observed region), counted before any
+    /// of their actions run; the `final` ones wait for the Postponed region.
+    pub(super) fn mature_deferred_observed(&mut self) {
+        let (zero, finals): (Vec<_>, Vec<_>) = std::mem::take(&mut self.deferred_asserts)
+            .into_iter()
+            .partition(|d| d.kind != crate::ast::stmt::DeferredAssertion::Final);
+        self.deferred_asserts = finals;
+        if !self.finished {
+            for d in &zero {
+                self.imm_assert_count(d.inst, d.tag, d.passed);
+            }
+        }
+        self.run_deferred_actions(zero);
+    }
+    // /silimate
+
     /// The actions of matured deferred reports (see `mature_deferred_asserts`).
     fn run_deferred_actions(&mut self, group: Vec<DeferredReport>) {
         for d in group {
             if self.finished {
-                // silimate: count a deferred assertion when its report matures, not when it is queued
                 // Only a report with a failure action left to run is noted:
                 // a cover that did not match has none (§16.14.3).
-                let unrun = !d.passed && (d.action.is_some() || d.default_error_scope.is_some());
-                // /silimate
-                if unrun {
+                if !d.passed && (d.action.is_some() || d.default_error_scope.is_some()) {
                     let loc = self
                         .span_file_line_in(d.span, None)
                         .unwrap_or_else(|| "?".to_string());

@@ -5453,7 +5453,7 @@ impl Simulator {
                         }
                         let is_star = matches!(event, EventControl::Star | EventControl::ParenStar);
                         let sens = if is_star {
-                            self.star_sens_from_body(body)
+                            self.star_sens_from_body(body, true)
                         } else {
                             self.event_to_sens(event)
                         };

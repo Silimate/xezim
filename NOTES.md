@@ -91,6 +91,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   those NBAs, and read their new values, while a level-sensitive `wait` was
   pending anywhere or when a delayed nonblocking assignment fell due at the
   edge. A `wait` on the copy itself resumed only after them too. (#458)
+* A write to a member of a packed struct nested in an element of an
+  unpacked-array class property (`inst[i].arch.vl = v`) lands in the element,
+  as a write to a member of the element itself (`inst[i].op = v`) did
+  (§7.2.1). The nested write was dropped, so the element kept its old value,
+  also through `this`, an object handle, a queue or a dynamic array. (#468)
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the

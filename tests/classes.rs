@@ -25,6 +25,8 @@ mod block_local_shadows_enclosing;
 mod blocking_task_super_dispatch;
 #[path = "classes/blocking_task_super_nested_module.rs"]
 mod blocking_task_super_nested_module;
+#[path = "classes/static_collection_initializers.rs"]
+mod static_collection_initializers;
 #[path = "classes/global_class_assert_else_block_local.rs"]
 mod global_class_assert_else_block_local;
 #[path = "classes/assert_action_block_local_visibility.rs"]

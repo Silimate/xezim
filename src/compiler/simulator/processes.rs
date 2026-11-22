@@ -3347,7 +3347,15 @@ impl Simulator {
         Some(truth)
     }
 
+    // silimate: the activation depth the pre-NBA Active drain guard reads (counter only, from main)
     pub(super) fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
+        self.stmts_depth += 1;
+        self.run_process_stmts_scoped(pid, pc);
+        self.stmts_depth -= 1;
+    }
+    // /silimate
+
+    fn run_process_stmts_scoped(&mut self, pid: usize, pc: &ProcCont) {
         // Install this activation's own scope (see `activation_scope`) —
         // the ratchet-proof twin of the hint reset performed inside. A
         // mid-block hierarchical reference (`u_child.x = 1` right before

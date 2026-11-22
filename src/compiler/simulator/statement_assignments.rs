@@ -1675,7 +1675,7 @@ impl Simulator {
     /// with a side effect (`'{2{f()}}`). The replicated items are evaluated
     /// exactly once; the store matches each copy to an element and would
     /// evaluate it once per element.
-    fn pattern_replicates_effect(rvalue: &Expression) -> bool {
+    pub(super) fn pattern_replicates_effect(rvalue: &Expression) -> bool {
         let ExprKind::AssignmentPattern(items) = &rvalue.kind else {
             return false;
         };

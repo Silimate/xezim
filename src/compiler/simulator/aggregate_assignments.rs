@@ -140,6 +140,28 @@ impl Simulator {
         if left > right {
             positions.reverse();
         }
+        // silimate: a replicated item with a side effect is evaluated once in a class row store
+        // §11.4.12.1: the operands of a replication are evaluated once,
+        // however many elements the copies fill, so `k.a[0] = '{2{f()}}`
+        // calls `f` once. The store below evaluates each element's item, so
+        // the pattern is captured first, as the blocking store captures it
+        // for other targets (`exec_stmt_blocking_assign_body`), and the
+        // captured values are stored.
+        let pattern = self.unpacked_pattern(rhs);
+        if matches!(pattern.kind, ExprKind::AssignmentPattern(_))
+            && Self::pattern_replicates_effect(pattern)
+        {
+            let (saved, release) = self.capture_intra_rhs(lhs, pattern, rhs.span);
+            let stored = self.assign_class_scalar_row(lhs, &saved);
+            if let Some(release) = release
+                && let StatementKind::Expr(e) = &release.kind
+                && let ExprKind::SystemCall { name, args } = &e.kind
+            {
+                self.exec_system_task(name, args);
+            }
+            return stored;
+        }
+        // /silimate
         let values: Vec<(i64, Value)> = match &self.unpacked_pattern(rhs).kind {
             ExprKind::AssignmentPattern(items) => {
                 let items = self.pattern_elems_for_type(items, &positions, &dt);

@@ -154,6 +154,9 @@ mod fork_join_none_await_context;
 mod fork_var_activation_isolation;
 #[path = "scheduling/fork_var_sharing.rs"]
 mod fork_var_sharing;
+// silimate: fork children an edge-woken process starts run before the NBA region
+#[path = "scheduling/fork_children_before_nba.rs"]
+mod fork_children_before_nba;
 #[path = "scheduling/forked_package_task_suspends.rs"]
 mod forked_package_task_suspends;
 #[path = "scheduling/gap_fixes_scoping_and_nba.rs"]

@@ -4,6 +4,11 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+enum ConcatElement {
+    Scalar(Value),
+    Assoc(Box<super::aggregate_assignments::AssocElement>),
+}
+
 impl Simulator {
     pub(super) fn eval_number(&self, num: &NumberLiteral) -> Value {
         match num {
@@ -781,76 +786,79 @@ impl Simulator {
         } else {
             exprs.iter().collect()
         };
-        // §11.3.2: an operand whose indices have side effects (`aa[i++].ql`),
-        // or whose object a call returns (`get_obj().data`), has them
-        // evaluated once, here, before the lookups below would run them again.
-        let frozen: Vec<Option<Expression>> = items
-            .iter()
-            .map(|e| {
-                if Self::cond_expr_is_effect_free(e, false) {
+        let expand_rows = check_rows && elem_is_scalar && self.concat_has_non_array_elements(lname);
+        let may_hold_assoc = !self.module.associative_arrays.is_empty()
+            && self.coll_shape_at(lname).is_none_or(|(shape, depth)| {
+                matches!(shape.dims.get(depth + 1), Some(Dim::Assoc(_)))
+            });
+        // §10.10 / §11.3.2: capture each operand before evaluating the next.
+        // Two receivers can return the same handle and change its fields, and
+        // an associative source can alias a row that the destination replaces.
+        if may_hold_assoc {
+            let mut values = Vec::new();
+            for e in items {
+                let frozen = if Self::cond_expr_is_effect_free(e, false) {
                     None
                 } else {
                     self.freeze_side_effect_indices(e)
-                }
-            })
-            .collect();
-        let items: Vec<&Expression> = items
-            .iter()
-            .zip(&frozen)
-            .map(|(e, f)| f.as_ref().unwrap_or(*e))
-            .collect();
-        // §10.10 / §7.8: in a queue (or array) of ASSOCIATIVE
-        // arrays, an associative operand (`q = {src}`) is one
-        // whole element: its entries are copied into it.
-        // Evaluated as one value, the element kept no entries.
-        let assoc_srcs: Vec<Option<String>> =
-            if self.module.associative_arrays.is_empty() {
-                Vec::new()
-            } else {
-                items.iter().map(|e| self.assoc_value_operand(e)).collect()
-            };
-        if assoc_srcs.iter().any(Option::is_some) {
-            let lo = self.module.arrays.get(lname).map_or(0, |t| t.0);
-            for (i, (e, src)) in items.iter().zip(assoc_srcs).enumerate() {
-                let elem = format!("{}[{}]", lname, lo + i as i64);
-                match src {
-                    Some(src) => self.store_assoc_elem(&elem, &src),
-                    None => {
-                        let v = self.eval_expr(e);
-                        self.set_signal_value_by_name(&elem, v);
-                    }
+                };
+                let expr = frozen.as_ref().unwrap_or(e);
+                if let Some(src) = self.assoc_value_operand(expr) {
+                    values.push(ConcatElement::Assoc(Box::new(
+                        self.read_assoc_element(&src),
+                    )));
+                } else {
+                    values.extend(
+                        self.unpacked_concat_operand_values(vec![expr], expand_rows, None)
+                            .into_iter()
+                            .map(ConcatElement::Scalar),
+                    );
                 }
             }
-            if is_dyn {
-                self.set_queue_size(lname, items.len() as u64);
-            }
-            return;
+            self.store_concat_elements(lname, is_dyn, values.into_iter());
+        } else {
+            let values = self.unpacked_concat_operand_values(items, expand_rows, first_row);
+            self.store_concat_elements(
+                lname,
+                is_dyn,
+                values.into_iter().map(ConcatElement::Scalar),
+            );
         }
-        // Expand queue/array elements in concat (e.g. q = {q, 4})
-        let expand_rows = check_rows && elem_is_scalar && self.concat_has_non_array_elements(lname);
-        let all_vals = self.unpacked_concat_operand_values(items, expand_rows, first_row);
+    }
+
+    fn store_concat_elements(
+        &mut self,
+        lname: &str,
+        is_dyn: bool,
+        values: impl ExactSizeIterator<Item = ConcatElement>,
+    ) {
         let (lo, hi, _w) = self
             .module
             .arrays
             .get(lname)
             .copied()
             .unwrap_or((0, -1, 32));
-        let n_vals = all_vals.len();
+        let n_vals = values.len();
         let descending = self.module.descending_arrays.contains(lname);
-        for (i, v) in all_vals.into_iter().enumerate() {
+        for (i, v) in values.enumerate() {
             let idx = if descending { hi - i as i64 } else { lo + i as i64 };
             // Dynamic arrays/queues grow to fit; only fixed
             // arrays are bounded by their declared range.
             if !is_dyn && (idx < lo || idx > hi) {
                 break;
             }
-            // §10.10: each item is an element-typed value.
-            let v = if is_dyn {
-                self.fit_queue_push_elem(lname, v)
-            } else {
-                v
-            };
-            self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v);
+            let dst = format!("{lname}[{idx}]");
+            match v {
+                ConcatElement::Assoc(snapshot) => self.write_assoc_element(&dst, *snapshot),
+                ConcatElement::Scalar(value) => {
+                    let value = if is_dyn {
+                        self.fit_queue_push_elem(lname, value)
+                    } else {
+                        value
+                    };
+                    self.set_signal_value_by_name(&dst, value);
+                }
+            }
         }
         if is_dyn {
             self.set_queue_size(lname, n_vals as u64);

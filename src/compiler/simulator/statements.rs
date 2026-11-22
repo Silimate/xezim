@@ -6240,7 +6240,7 @@ impl Simulator {
                             ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                         ) {
                             const RET_SNAP: &str = "__xz_ret_coll__";
-                            self.populate_queue_from_init(RET_SNAP, e);
+                            self.populate_queue_from_init(RET_SNAP, e, self.p_elem_type(RET_SNAP));
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
                         }
                     }

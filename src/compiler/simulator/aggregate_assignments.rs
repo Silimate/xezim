@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Owned contents of an associative operand before another operand or a
+/// destination write can change its source.
+pub(super) struct AssocElement {
+    string_keys: bool,
+    width: Option<u32>,
+    entries: Vec<(String, Value)>,
+    default: Option<Expression>,
+}
+
 impl Simulator {
     /// Spread a whole-value pattern over a fixed unpacked array property.
     /// Per-instance array elements live under an instance-scoped storage name,
@@ -1015,19 +1024,36 @@ impl Simulator {
         self.is_associative_array(&name).then_some(name)
     }
 
-    pub(super) fn copy_assoc_entries(&mut self, dst: &str, src: &str) {
-        self.eval_builtin_method(dst, "delete", &[]);
-        // §7.9.9: every element, including the member leaves of an
-        // unpacked-struct element (`src[k].x`), which do not end in `]`.
-        let prefix = format!("{}[", src);
-        let entries: Vec<(String, Value)> = self
+    pub(super) fn read_assoc_element(&self, src: &str) -> AssocElement {
+        // §7.9.9: a member leaf such as src[k].x belongs to the entry too.
+        let entries = self
             .signals
-            .keys_with_elem_prefix(&prefix)
+            .keys_with_elem_prefix(&format!("{src}["))
             .into_iter()
-            .filter_map(|k| {
-                let v = self.signals.get(&k)?.clone();
-                Some((format!("{}{}", dst, &k[src.len()..]), v))
+            .filter_map(|key| {
+                let value = self.signals.get(&key)?.clone();
+                Some((key[src.len()..].to_string(), value))
             })
+            .collect();
+        AssocElement {
+            string_keys: self.is_string_keyed_array(src),
+            width: self.module.assoc_elem_widths.get(src).copied(),
+            entries,
+            default: self.module.assoc_defaults.get(src).cloned(),
+        }
+    }
+
+    pub(super) fn copy_assoc_entries(&mut self, dst: &str, src: &str) {
+        let snapshot = self.read_assoc_element(src);
+        self.write_assoc_entries(dst, snapshot);
+    }
+
+    fn write_assoc_entries(&mut self, dst: &str, snapshot: AssocElement) {
+        self.eval_builtin_method(dst, "delete", &[]);
+        let entries: Vec<_> = snapshot
+            .entries
+            .into_iter()
+            .map(|(suffix, value)| (format!("{dst}{suffix}"), value))
             .collect();
         let any = !entries.is_empty();
         // §7.4.5: each copied row is a collection of its own; create it as
@@ -1042,7 +1068,7 @@ impl Simulator {
         for (k, v) in entries {
             self.signals.insert(k, v);
         }
-        if let Some(d) = self.module.assoc_defaults.get(src).cloned() {
+        if let Some(d) = snapshot.default {
             self.module.assoc_defaults.insert(dst.to_string(), d);
         }
         if any {
@@ -2931,14 +2957,20 @@ impl Simulator {
     /// §7.8: make collection element `elem` an associative array holding
     /// exactly the entries of associative array `src`.
     pub(super) fn store_assoc_elem(&mut self, elem: &str, src: &str) {
-        let is_str = self.is_string_keyed_array(src);
+        let snapshot = self.read_assoc_element(src);
+        self.write_assoc_element(elem, snapshot);
+    }
+
+    pub(super) fn write_assoc_element(&mut self, elem: &str, snapshot: AssocElement) {
         self.module
             .associative_arrays
-            .insert(elem.to_string(), is_str);
-        if let Some(w) = self.module.assoc_elem_widths.get(src).copied() {
-            self.module.assoc_elem_widths.insert(elem.to_string(), w);
+            .insert(elem.to_string(), snapshot.string_keys);
+        if let Some(width) = snapshot.width {
+            self.module
+                .assoc_elem_widths
+                .insert(elem.to_string(), width);
         }
-        self.copy_assoc_entries(elem, src);
+        self.write_assoc_entries(elem, snapshot);
     }
 
     /// §7.2.1: copy the unpacked struct class property `key` of object `h`
@@ -3822,7 +3854,17 @@ impl Simulator {
     /// instance context and written to `<queue>[i]`, then the queue size is
     /// set to the number of items. Mirrors the AssignmentPattern assignment
     /// path in `assign_value`.
-    pub(super) fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
+    pub(super) fn populate_queue_from_init(
+        &mut self,
+        scoped_q: &str,
+        init: &Expression,
+        elem_type: Option<DataType>,
+    ) {
+        let w = self.module.arrays.get(scoped_q).map_or(32, |a| a.2);
+        let pattern_value = |sim: &mut Self, expr: &Expression| match &elem_type {
+            Some(dt) => sim.eval_pattern_leaf_value(dt, expr, Some(w)),
+            None => sim.eval_expr(expr),
+        };
         // §7.10.1: both the pattern form `'{1,2,3}` and the queue
         // concatenation form `{1,2,3}` initialize element-wise.
         let vals: Vec<Value> = match &self.unpacked_pattern(init).kind {
@@ -3839,42 +3881,34 @@ impl Simulator {
                             ExprKind::Replication { count, exprs } => {
                                 let n = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
                                 let once: Vec<Value> =
-                                    exprs.iter().map(|x| self.eval_expr(x)).collect();
+                                    exprs.iter().map(|x| pattern_value(self, x)).collect();
                                 for _ in 0..n {
                                     vals.extend(once.iter().cloned());
                                 }
                             }
-                            _ => vals.push(self.eval_expr(e)),
+                            _ => vals.push(pattern_value(self, e)),
                         },
-                        _ => vals.push(self.eval_expr(it.expr())),
+                        _ => vals.push(pattern_value(self, it.expr())),
                     }
                 }
                 vals
             }
-            // §10.10: an array operand of the concatenation (`{w, 5}`, a
-            // row `m[1]`, a slice `a[0 +: 2]`) contributes all its elements,
-            // and a nested concatenation splices its own.
+            // §10.10.3: a nested packed concatenation contributes one element.
             ExprKind::Concatenation(parts) => {
-                let mut flat: Vec<&Expression> = parts.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
-                    }
+                let expand_rows = self.concat_has_non_array_elements(scoped_q)
+                    && !elem_type
+                        .as_ref()
+                        .is_some_and(|dt| self.concat_element_type_is_array(dt));
+                let mut operands = Vec::with_capacity(parts.len());
+                if expand_rows {
+                    self.splice_array_braces(parts, &mut operands);
+                } else {
+                    operands.extend(parts);
                 }
-                let expand_rows = self.concat_has_non_array_elements(scoped_q);
-                self.unpacked_concat_operand_values(flat, expand_rows, None)
+                self.unpacked_concat_operand_values(operands, expand_rows, None)
             }
             _ => return,
         };
-        let (_lo, _hi, w) = self
-            .module
-            .arrays
-            .get(scoped_q)
-            .copied()
-            .unwrap_or((0, 63, 32));
         let n = vals.len();
         for (i, mut v) in vals.into_iter().enumerate() {
             // §5.7.1: an unsized fill element takes the element width.

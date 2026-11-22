@@ -245,6 +245,8 @@ mod t_nested_value_param_in_type_arg;
 mod t_no_parens_static_method;
 #[path = "hierarchy/typedef_array_ports_in_children.rs"]
 mod typedef_array_ports_in_children;
+#[path = "hierarchy/unconnected_interface_port.rs"]
+mod unconnected_interface_port;
 #[path = "hierarchy/undeclared_names_by_binding.rs"]
 mod undeclared_names_by_binding;
 #[path = "hierarchy/undefined_call_in_instance.rs"]
@@ -366,6 +368,8 @@ mod bind_generate_paths;
 
 #[path = "hierarchy/signed_generate_instances.rs"]
 mod signed_generate_instances;
+#[path = "hierarchy/signed_port_unsigned_actual.rs"]
+mod signed_port_unsigned_actual;
 
 #[path = "hierarchy/vif_sibling_regressions.rs"]
 mod vif_sibling_regressions;
@@ -516,6 +520,8 @@ mod bind_instance_lists_core_200;
 mod bind_instance_names_core_201;
 #[path = "hierarchy/instance_struct_members_root_1046.rs"]
 mod instance_struct_members_root_1046;
+#[path = "hierarchy/root_member_after_element_select.rs"]
+mod root_member_after_element_select;
 #[path = "hierarchy/shared_net_initializer_targets.rs"]
 mod shared_net_initializer_targets;
 #[path = "hierarchy/negative_genvar_cached.rs"]

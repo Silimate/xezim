@@ -122,6 +122,19 @@ struct PackedSelection {
     total_width: u64,
     dims: Vec<(i64, i64)>,
     dynamic: bool,
+    /// The packed struct or union a member select (§7.2.1) of this selection
+    /// reads: one element of it, packed dimensions taken off.
+    elem: PackedElem,
+}
+
+/// The element type of a `PackedSelection`, for a member select below it.
+enum PackedElem {
+    /// The declared type of the selected variable, resolved on first use.
+    Declared,
+    /// A packed struct or union and its width.
+    Known(DataType, u64),
+    /// Not a packed aggregate whose layout reads no parameter.
+    None,
 }
 
 /// Record `name` as read whole, when `collect_stmt_reads_whole` is collecting.
@@ -235,6 +248,7 @@ impl Simulator {
                     total_width: width,
                     dims,
                     dynamic: false,
+                    elem: PackedElem::Declared,
                 })
             }
             ExprKind::Index { expr: base, index } => {
@@ -305,7 +319,281 @@ impl Simulator {
                 selection.dims[0] = (a, b);
                 Some(selection)
             }
+            // §7.2.1, §7.3.1: a member of one element of a packed struct or
+            // union is a fixed bit range of it (`r[1].data.id`), so it is a
+            // longest static prefix of its own. Below a non-constant index
+            // the prefix stays the indexed variable, as above.
+            ExprKind::MemberAccess { expr: base, member } => {
+                let mut selection = Self::packed_sensitivity_selection(base, module)?;
+                if selection.dynamic {
+                    return Some(selection);
+                }
+                let (elem, elem_width) =
+                    match std::mem::replace(&mut selection.elem, PackedElem::None) {
+                        PackedElem::Declared => Self::packed_aggregate_elem(
+                            module.var_decl_types.get(&selection.name)?,
+                            module,
+                        )?,
+                        PackedElem::Known(dt, width) => (dt, width),
+                        PackedElem::None => return None,
+                    };
+                if selection.width != elem_width {
+                    return None;
+                }
+                let (member_type, lsb, width) =
+                    Self::packed_member_slot(&elem, &member.name, elem_width, module)?;
+                selection.offset += lsb;
+                selection.width = width;
+                selection.dims = Self::packed_member_dims(&member_type, width, module)?;
+                selection.elem = match Self::packed_aggregate_elem(&member_type, module) {
+                    Some((dt, width)) => PackedElem::Known(dt, width),
+                    None => PackedElem::None,
+                };
+                Some(selection)
+            }
             _ => None,
+        }
+    }
+
+    /// One element of the packed struct or union `dt` (its packed dimensions
+    /// taken off) and that element's width, when no width in its layout
+    /// reads an identifier: the design-wide parameter table then sizes it as
+    /// every instance does.
+    fn packed_aggregate_elem(dt: &DataType, module: &ElaboratedModule) -> Option<(DataType, u64)> {
+        if !Self::packed_layout_is_literal(dt, module, 0) {
+            return None;
+        }
+        let DataType::Struct(su) =
+            super::elaborate::resolve_typedef_chain(dt, &module.typedef_types)
+        else {
+            return None;
+        };
+        if !su.packed || su.tagged {
+            return None;
+        }
+        let mut su = su.clone();
+        su.dimensions.clear();
+        let elem = DataType::Struct(su);
+        let width = super::elaborate::resolve_type_width(
+            &elem,
+            Some(&module.parameters),
+            Some(&module.typedefs),
+        );
+        (width > 0).then_some((elem, u64::from(width)))
+    }
+
+    /// Whether every width in the packed type `dt` is a constant expression of
+    /// literals (`[7:0]`, `[$clog2(8)-1:0]`).
+    fn packed_layout_is_literal(dt: &DataType, module: &ElaboratedModule, depth: u32) -> bool {
+        use crate::ast::types::PackedDimension;
+        fn literal(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Number(_) => true,
+                ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => literal(x),
+                ExprKind::Binary { left, right, .. } => literal(left) && literal(right),
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => literal(condition) && literal(then_expr) && literal(else_expr),
+                ExprKind::SystemCall { args, .. } => args.iter().all(literal),
+                _ => false,
+            }
+        }
+        let dims = |dims: &[PackedDimension]| {
+            dims.iter().all(|d| {
+                matches!(d, PackedDimension::Range { left, right, .. }
+                    if literal(left) && literal(right))
+            })
+        };
+        if depth > 16 {
+            return false;
+        }
+        match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dims(dimensions)
+            }
+            DataType::IntegerAtom { .. } => true,
+            DataType::Enum(en) => {
+                dims(&en.dimensions)
+                    && en
+                        .base_type
+                        .as_deref()
+                        .is_none_or(|b| Self::packed_layout_is_literal(b, module, depth + 1))
+            }
+            DataType::TypeReference { dimensions, .. } => {
+                let resolved = super::elaborate::resolve_typedef_chain(dt, &module.typedef_types);
+                dims(dimensions)
+                    && !matches!(resolved, DataType::TypeReference { .. })
+                    && Self::packed_layout_is_literal(resolved, module, depth + 1)
+            }
+            DataType::Struct(su) => {
+                su.packed
+                    && dims(&su.dimensions)
+                    && su.members.iter().all(|m| {
+                        m.declarators.iter().all(|d| d.dimensions.is_empty())
+                            && Self::packed_layout_is_literal(&m.data_type, module, depth + 1)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// The type, least significant bit and width of member `member` of the
+    /// packed struct or union `elem`, `width` bits wide. The first declared
+    /// member is the most significant (§7.2.1); every member of a union
+    /// starts at bit 0 (§7.3.1).
+    fn packed_member_slot(
+        elem: &DataType,
+        member: &str,
+        width: u64,
+        module: &ElaboratedModule,
+    ) -> Option<(DataType, u64, u64)> {
+        let DataType::Struct(su) = elem else {
+            return None;
+        };
+        let union = su.kind == crate::ast::types::StructUnionKind::Union;
+        let mut slots: Vec<(&str, &DataType, u64)> = Vec::new();
+        for m in &su.members {
+            let w = u64::from(super::elaborate::resolve_type_width(
+                &m.data_type,
+                Some(&module.parameters),
+                Some(&module.typedefs),
+            ));
+            if w == 0 {
+                return None;
+            }
+            for d in &m.declarators {
+                slots.push((d.name.name.as_str(), &m.data_type, w));
+            }
+        }
+        let total = if union {
+            slots.iter().map(|s| s.2).max()?
+        } else {
+            slots.iter().map(|s| s.2).sum()
+        };
+        if total != width {
+            return None;
+        }
+        let mut lsb = 0u64;
+        for &(name, dt, w) in slots.iter().rev() {
+            let at = if union { 0 } else { lsb };
+            if name == member {
+                return Some((dt.clone(), at, w));
+            }
+            lsb += w;
+        }
+        None
+    }
+
+    /// The packed dimensions of a member of type `dt`, `width` bits wide,
+    /// as `packed_sensitivity_selection` indexes them: the ranges written on
+    /// a typedef reference, then those of the type it names
+    /// (`typedef logic [1:0][3:0] lanes_t;` gives `lanes_t` both), or one
+    /// `[width-1:0]` range for a type without any. `None` unless the ranges
+    /// times the width of one element of the type make up `width`, which is
+    /// not so when a typedef between the two carries ranges of its own.
+    fn packed_member_dims(
+        dt: &DataType,
+        width: u64,
+        module: &ElaboratedModule,
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::PackedDimension;
+        let outer: &[PackedDimension] = match dt {
+            DataType::TypeReference { dimensions, .. } => dimensions,
+            _ => &[],
+        };
+        let resolved = super::elaborate::resolve_typedef_chain(dt, &module.typedef_types);
+        let type_width = |t: &DataType| {
+            u64::from(super::elaborate::resolve_type_width(
+                t,
+                Some(&module.parameters),
+                Some(&module.typedefs),
+            ))
+        };
+        let (inner, element): (&[PackedDimension], u64) = match resolved {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                (dimensions, 1)
+            }
+            DataType::IntegerAtom { .. } => (&[], type_width(resolved)),
+            DataType::Enum(en) if en.dimensions.is_empty() => (&[], type_width(resolved)),
+            DataType::Struct(su) => {
+                let mut one = su.clone();
+                one.dimensions.clear();
+                (&su.dimensions, type_width(&DataType::Struct(one)))
+            }
+            _ => return None,
+        };
+        let mut dims = Vec::with_capacity(outer.len() + inner.len() + 1);
+        let mut count = 1u64;
+        for d in outer.iter().chain(inner) {
+            let PackedDimension::Range { left, right, .. } = d else {
+                return None;
+            };
+            let l = super::elaborate::const_eval_i64_with_params(left, Some(&module.parameters))?;
+            let r = super::elaborate::const_eval_i64_with_params(right, Some(&module.parameters))?;
+            count = count.checked_mul(l.abs_diff(r).checked_add(1)?)?;
+            dims.push((l, r));
+        }
+        if element == 0 || count.checked_mul(element)? != width {
+            return None;
+        }
+        if dims.is_empty() && width > 1 {
+            dims.push((i64::try_from(width).ok()? - 1, 0));
+        }
+        Some(dims)
+    }
+
+    /// §9.2.2.2.1: whether `expr` reads or writes through a member of an
+    /// indexed packed element (`r[1].f`, `r[1].s.f[2]`), the selects that
+    /// take the member arm of `packed_sensitivity_selection`. A member of a
+    /// plain variable (`s.f`) keeps its dotted name.
+    fn member_of_indexed_element(expr: &Expression) -> bool {
+        let mut cur = expr;
+        loop {
+            match &cur.kind {
+                ExprKind::Paren(e)
+                | ExprKind::Index { expr: e, .. }
+                | ExprKind::RangeSelect { expr: e, .. } => cur = e,
+                ExprKind::MemberAccess { expr: e, .. } => {
+                    if matches!(
+                        e.kind,
+                        ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                    ) {
+                        return true;
+                    }
+                    cur = e;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether the select chain of `expr` has a member access in it.
+    fn select_chain_has_member(expr: &Expression) -> bool {
+        let mut cur = expr;
+        loop {
+            match &cur.kind {
+                ExprKind::Paren(e)
+                | ExprKind::Index { expr: e, .. }
+                | ExprKind::RangeSelect { expr: e, .. } => cur = e,
+                ExprKind::MemberAccess { .. } => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether a read or write of `expr` is recorded as a packed region of
+    /// its variable (#844): an index or part-select chain, or one through a
+    /// member of an indexed element.
+    fn packed_region_select(expr: &Expression) -> bool {
+        if Self::select_chain_has_member(expr) {
+            Self::member_of_indexed_element(expr)
+        } else {
+            matches!(
+                expr.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            )
         }
     }
 
@@ -1229,10 +1517,8 @@ impl Simulator {
         module: &ElaboratedModule,
         reads: &mut HashSet<String>,
     ) {
-        if matches!(
-            expr.kind,
-            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
-        ) && WHOLE_READS.with(|c| c.borrow().is_some())
+        if Self::packed_region_select(expr)
+            && WHOLE_READS.with(|c| c.borrow().is_some())
             && let Some(selection) = Self::packed_sensitivity_selection(expr, module)
         {
             note_packed_access(&selection, false);
@@ -1698,10 +1984,8 @@ impl Simulator {
         writes: &mut HashSet<String>,
         mut arrays: Option<&mut HashSet<String>>,
     ) {
-        if matches!(
-            lhs.kind,
-            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
-        ) && WHOLE_READS.with(|c| c.borrow().is_some())
+        if Self::packed_region_select(lhs)
+            && WHOLE_READS.with(|c| c.borrow().is_some())
             && let Some(selection) = Self::packed_sensitivity_selection(lhs, module)
         {
             note_packed_access(&selection, true);
@@ -2024,6 +2308,24 @@ impl Simulator {
                     arrays.as_deref_mut(),
                 );
             }
+            // §9.4.2.2: a statement behind a procedural timing control
+            // (`#10 clk <= ~clk;`, `@(e) q = d;`, `wait (c) y = a;`) is still
+            // part of the block, and `@*` adds what it reads. Skipping it left
+            // the inferred list of `always @(*) #10 clk <= ~clk;` empty, so the
+            // block went to the comb-settle path, which drops the event
+            // control and re-ran the body every delta. The control's own
+            // operands (the delay, the event, the condition) are not among the
+            // §9.4.2.2 contexts and stay out, as in the reference simulator.
+            StatementKind::TimingControl { stmt: inner, .. }
+            | StatementKind::Wait { stmt: inner, .. } => {
+                Self::collect_stmt_rw(
+                    inner,
+                    module,
+                    reads.as_deref_mut(),
+                    writes,
+                    arrays.as_deref_mut(),
+                );
+            }
             // §9.2.2.2: a function body reached through `collect_function_reads`
             // usually ends in `return <expr>` — dropping it hid every module
             // variable the function reads only there, so an always_comb calling
@@ -2090,6 +2392,10 @@ impl Simulator {
                 Self::collect_expr_reads(left, module, reads);
                 Self::collect_expr_reads(right, module, reads);
                 Self::collect_lhs_index_reads(base, module, reads);
+            }
+            // The indices below a member select (`r[k].f[i]` reads `k`).
+            ExprKind::MemberAccess { expr: base, .. } | ExprKind::Paren(base) => {
+                Self::collect_lhs_index_reads(base, module, reads)
             }
             _ => {}
         }
@@ -2444,7 +2750,7 @@ impl Simulator {
             } => {
                 if let TimingControl::Event(event) = control {
                     let sens = if matches!(event, EventControl::Star | EventControl::ParenStar) {
-                        self.star_sens_from_body(body)
+                        self.star_sens_from_body(body, self.stmt_is_blocking(body))
                     } else {
                         self.event_to_sens(event)
                     };
@@ -2475,7 +2781,7 @@ impl Simulator {
                                         },
                                         stmt.span,
                                     );
-                                    self.star_sens_from_body(&rest)
+                                    self.star_sens_from_body(&rest, self.stmt_is_blocking(&rest))
                                 } else {
                                     self.event_to_sens(event)
                                 };
@@ -2593,8 +2899,8 @@ impl Simulator {
     }
 
     /// §9.4.2.2 — the inferred sensitivity of `@*` / `@(*)`: every signal READ
-    /// by the statement it guards, minus the ones that statement writes (a
-    /// variable assigned by the block is not part of its own sensitivity).
+    /// by the statement it guards, minus, unless `suspends`, the ones that
+    /// statement writes.
     ///
     /// `event_to_sens` yields an EMPTY list for Star, and the process path
     /// then took the "just execute body" fallthrough — so an `always @(*)`
@@ -2602,7 +2908,16 @@ impl Simulator {
     /// combinational body (it re-runs and settles), but with any timing
     /// control in the body (`always @(*) begin #0; ... end`) it became an
     /// infinite delta-cycle loop that never let time advance.
-    pub(super) fn star_sens_from_body(&self, body: &Statement) -> Vec<Sensitivity> {
+    ///
+    /// `suspends`: the statement runs as a process, which waits at `@*` only
+    /// between activations. Its own blocking writes happen while it runs and
+    /// cannot wake it (a waiter compares against its value at arm time), so
+    /// the whole §9.4.2.2 list applies, written variables included: the
+    /// nonblocking update of `always @(*) #10 clk <= ~clk;` lands after the
+    /// block re-arms and is what wakes it for the next half period. The
+    /// comb-settle path re-runs a block on any change of its inputs, its own
+    /// writes included, so for that path they stay out.
+    pub(super) fn star_sens_from_body(&self, body: &Statement, suspends: bool) -> Vec<Sensitivity> {
         let mut reads: HashSet<String> = HashSet::default();
         let mut writes: HashSet<String> = HashSet::default();
         // §9.2.2.2: `@*` sensitivity excludes called-function CONTENTS.
@@ -2626,7 +2941,7 @@ impl Simulator {
             // §9.2.2.2.1: exclude reads of variables this block writes —
             // at MEMBER granularity too (same rule as the comb-entry path),
             // or the base fallback below would re-introduce the self-dep.
-            if Self::self_written_read(r, &reads, &writes, &whole) {
+            if !suspends && Self::self_written_read(r, &reads, &writes, &whole) {
                 continue;
             }
             // Prefer the instance-scoped name when one exists, mirroring the
@@ -2860,6 +3175,8 @@ impl Simulator {
                     Self::collect_select_operands(index, out);
                 }
             }
+            // A member name is no operand; the element it is read from is.
+            ExprKind::MemberAccess { expr, .. } => Self::collect_select_operands(expr, out),
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
@@ -3384,7 +3701,11 @@ impl Simulator {
                     // Not inside a class method: there the operands are
                     // reached through handles (`vif.data[0]`), which only
                     // the waiting process can evaluate.
-                    let selects = Self::event_expr_needs_value_wait(&ee.expr)
+                    // A term that reads a member of an array element
+                    // (`@(sa[1].a)`, `@(sa[1].a ^ b)`) is one too
+                    // (`unpacked_elem_member_term`).
+                    let selects = (Self::event_expr_needs_value_wait(&ee.expr)
+                        || self.unpacked_elem_member_term(&ee.expr))
                         && self.this_stack.last().copied().flatten().is_none()
                         && !self.event_member_of_class_handle(&ee.expr);
                     let value_expr = Self::peel_parens(&ee.expr);
@@ -4305,9 +4626,9 @@ impl Simulator {
     pub(super) fn expr_reads_frame_local(&self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Ident(h) => self.frame_bound_bare_name(h).is_some(),
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
-                self.expr_reads_frame_local(x)
-            }
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. } => self.expr_reads_frame_local(x),
             ExprKind::Index { expr, index } => {
                 self.expr_reads_frame_local(expr) || self.expr_reads_frame_local(index)
             }
@@ -4355,7 +4676,9 @@ impl Simulator {
             return;
         }
         match &mut e.kind {
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.freeze_frame_locals(x),
+            ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. }
+            | ExprKind::MemberAccess { expr: x, .. } => self.freeze_frame_locals(x),
             ExprKind::Index { expr, index } => {
                 self.freeze_frame_locals(expr);
                 self.freeze_frame_locals(index);
@@ -4475,6 +4798,65 @@ impl Simulator {
         };
         idx.reverse();
         Some((h, idx))
+    }
+
+    /// §9.4.2, §7.2.1: whether event term `e` reads, anywhere in it, a
+    /// member of an element of a fixed-size unpacked array (`@(sa[1].a)`,
+    /// `@(posedge sa[i].in.clk)`, `@(m[1][0].hi[1])`, `@(sa[1].a ^ b)`). The
+    /// element is one signal, and a packed-struct member is some of its bits,
+    /// so like a select the term is an event on its value: it watches the
+    /// element the index names now, and fires only when the value moves.
+    /// Without this the member access collected no operand: a procedural
+    /// wait armed on nothing and never woke, and an `always` block on it
+    /// missed changes or woke on another member's.
+    pub(super) fn unpacked_elem_member_term(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut base = &**expr;
+                while let ExprKind::Paren(x) | ExprKind::MemberAccess { expr: x, .. } = &base.kind
+                {
+                    base = x;
+                }
+                if let Some((h, idx)) = Self::index_chain(base) {
+                    let d = self.unpacked_dims_of(&self.resolve_hier_name(h));
+                    if d > 0 && idx.len() >= d {
+                        return true;
+                    }
+                }
+                self.unpacked_elem_member_term(expr)
+            }
+            ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. } => self.unpacked_elem_member_term(x),
+            ExprKind::Index { expr, index } => {
+                self.unpacked_elem_member_term(expr) || self.unpacked_elem_member_term(index)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.unpacked_elem_member_term(expr)
+                    || self.unpacked_elem_member_term(left)
+                    || self.unpacked_elem_member_term(right)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.unpacked_elem_member_term(left) || self.unpacked_elem_member_term(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.unpacked_elem_member_term(condition)
+                    || self.unpacked_elem_member_term(then_expr)
+                    || self.unpacked_elem_member_term(else_expr)
+            }
+            ExprKind::Call { args: parts, .. }
+            | ExprKind::SystemCall { args: parts, .. }
+            | ExprKind::Concatenation(parts) => {
+                parts.iter().any(|p| self.unpacked_elem_member_term(p))
+            }
+            _ => false,
+        }
     }
 
     /// Does `e` select an element of an unpacked array (at any depth)?
@@ -5111,5 +5493,91 @@ impl Simulator {
                 .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::Span;
+
+    fn ident(name: &str) -> Expression {
+        let span = Span::new(0, 0);
+        Simulator::hier_ident_expr(Simulator::iface_path_segs(name, span), span)
+    }
+
+    fn index(base: Expression, i: u32) -> Expression {
+        let span = Span::new(0, 0);
+        let number = crate::ast::expr::NumberLiteral::Integer {
+            size: None,
+            signed: false,
+            base: crate::ast::expr::NumberBase::Decimal,
+            value: i.to_string(),
+            cached_val: Default::default(),
+        };
+        let index = Expression::new(ExprKind::Number(number), span);
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(base),
+                index: Box::new(index),
+            },
+            span,
+        )
+    }
+
+    fn member(base: Expression, name: &str) -> Expression {
+        let span = Span::new(0, 0);
+        Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(base),
+                member: crate::ast::Identifier {
+                    name: name.to_string(),
+                    span,
+                },
+            },
+            span,
+        )
+    }
+
+    /// §7.2.1, §7.4.5, §9.2.2.2.1: a member of an indexed packed struct
+    /// element is its own bit region, and a member typed by a typedef with
+    /// packed ranges of its own (`lanes_t f`) is indexed by those ranges:
+    /// `r[0].f[0]` is four bits, not bit 0. A region one bit wide there let
+    /// a write of `r[0].f[0][0]` cover a read of all of `r[0].f[0]`.
+    #[test]
+    fn indexed_member_region_uses_typedef_ranges() {
+        let sim = crate::simulate(
+            r#"module test;
+  typedef logic [1:0][3:0] lanes_t;
+  typedef struct packed { logic [3:0] tag; lanes_t f; } e_t;
+  e_t [1:0] r;
+endmodule"#,
+            1,
+        )
+        .expect("simulate");
+        let region = |e: &Expression| {
+            Simulator::packed_sensitivity_selection(e, &sim.module)
+                .map(|s| (s.name, s.offset, s.width, s.dynamic))
+        };
+        let r0 = || index(ident("r"), 0);
+        // `r` is 24 bits: r[1] is 23:12 and r[0] 11:0. In an element, `tag`
+        // is 11:8 and `f` 7:0, so `f[1]` is 7:4 and `f[0]` 3:0.
+        assert_eq!(
+            region(&member(r0(), "tag")),
+            Some(("r".into(), 8, 4, false))
+        );
+        assert_eq!(region(&member(r0(), "f")), Some(("r".into(), 0, 8, false)));
+        assert_eq!(
+            region(&index(member(r0(), "f"), 1)),
+            Some(("r".into(), 4, 4, false))
+        );
+        assert_eq!(
+            region(&index(member(r0(), "f"), 0)),
+            Some(("r".into(), 0, 4, false))
+        );
+        assert_eq!(
+            region(&index(index(member(index(ident("r"), 1), "f"), 0), 2)),
+            Some(("r".into(), 14, 1, false))
+        );
     }
 }

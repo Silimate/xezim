@@ -608,6 +608,19 @@ impl Simulator {
             }
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
+                // §23.6: sized as the select chain it reads as.
+                if h.path.len() >= 3 && h.path[0].name.name == "$root" {
+                    if let Some(w) = expr.cached_width.get() {
+                        return Some(w);
+                    }
+                    if let Some((by, holds)) = self.root_member_size(h, expr.span) {
+                        let w = self.lrm_self_width(&by);
+                        if holds && let Some(w) = w {
+                            expr.cached_width.set(Some(w));
+                        }
+                        return w;
+                    }
+                }
                 let n = self.resolve_hier_name(h);
                 if let Some(w) = self
                     .lookup_signal_width(&n)
@@ -759,6 +772,12 @@ impl Simulator {
             ExprKind::Index { .. }
             | ExprKind::RangeSelect { .. }
             | ExprKind::MemberAccess { .. } => {
+                // §11.4.2: a member read through a side-effect select is sized
+                // by a copy that runs none (`member_read_width_probe`).
+                if Self::is_effect_member_read(expr) {
+                    let probe = self.member_read_width_probe(expr);
+                    return self.lrm_self_width(&probe);
+                }
                 if let Some(w) = self.select_width(expr) {
                     return Some(w);
                 }
@@ -1579,6 +1598,11 @@ impl Simulator {
             return (w, None);
         }
         let evaluates = match &expr.kind {
+            // §23.6: a `$root` name that reads as a select chain is sized by
+            // reading it, once, as the chain's member read is.
+            ExprKind::Ident(h) if h.path.len() >= 3 && h.path[0].name.name == "$root" => {
+                self.root_member_select_shape(h)
+            }
             ExprKind::Ident(_)
             | ExprKind::Number(NumberLiteral::Integer { .. })
             | ExprKind::Concatenation(_)
@@ -1601,6 +1625,13 @@ impl Simulator {
             // A streaming concatenation pads to the CONTEXT width on the
             // right; a value taken here would be extended on the left.
             ExprKind::StreamOp { .. } => false,
+            // §11.4.2: a member read through a side-effect select is sized
+            // without evaluating it, and then evaluated in its operand order:
+            // taken here, `objs[i++].v * 10 + objs[i++].v` read its right
+            // operand first.
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. } => {
+                !Self::is_effect_member_read(expr)
+            }
             _ => true,
         };
         if evaluates {
@@ -1667,6 +1698,13 @@ impl Simulator {
                     let keep = self.frame_var_width_static(name)
                         && self.frame_vector_range(name).is_some();
                     return (w, keep);
+                }
+                // §23.6: sized as the select chain it reads as.
+                if h.path.len() >= 3
+                    && h.path[0].name.name == "$root"
+                    && let Some((by, holds)) = self.root_member_size(h, expr.span)
+                {
+                    return (self.infer_width_walk(&by).0, holds);
                 }
                 let n = self.resolve_hier_name(h);
                 // The resolution is node-stable only once the resolver has
@@ -1796,6 +1834,14 @@ impl Simulator {
                 } else {
                     (self.eval_expr(expr).width, false)
                 }
+            }
+            // §11.4.2: a member read through a side-effect select is sized by
+            // a copy that runs none (`member_read_width_probe`).
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
+                if Self::is_effect_member_read(expr) =>
+            {
+                let probe = self.member_read_width_probe(expr);
+                (self.infer_width_walk(&probe).0, false)
             }
             // §11.5.1, §11.6.1: a select of a vector is as wide as the select
             // says, never as its value. Sized by evaluating it, a select kept

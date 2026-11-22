@@ -256,6 +256,8 @@ mod shared_task_frames;
 mod specify_delays_and_event_list;
 #[path = "scheduling/star_sensitivity_and_implicit_port_net.rs"]
 mod star_sensitivity_and_implicit_port_net;
+#[path = "scheduling/star_suspending_body.rs"]
+mod star_suspending_body;
 #[path = "scheduling/static_local_nba_per_instance.rs"]
 mod static_local_nba_per_instance;
 #[path = "scheduling/struct_member_read_sensitivity.rs"]
@@ -272,6 +274,8 @@ mod sva_time0_default_samples;
 mod task_body_delay_scaling;
 #[path = "scheduling/time0_process_order.rs"]
 mod time0_process_order;
+#[path = "scheduling/time0_startup.rs"]
+mod time0_startup;
 #[path = "scheduling/timing_check_delayed_nets_singlelimit.rs"]
 mod timing_check_delayed_nets_singlelimit;
 #[path = "scheduling/typeparam_pool_wait.rs"]
@@ -322,6 +326,8 @@ mod comb_packed_element_sensitivity;
 mod comb_sens_param_range;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
+#[path = "scheduling/comb_indexed_member_writes.rs"]
+mod comb_indexed_member_writes;
 #[path = "scheduling/delay_always_compound_body.rs"]
 mod delay_always_compound_body;
 #[path = "scheduling/delayed_struct_array_member.rs"] mod delayed_struct_array_member;
@@ -523,6 +529,8 @@ mod fork_child_hidden_locals_943;
 mod unpacked_struct_copy_chain;
 #[path = "scheduling/unpacked_struct_array_sens.rs"]
 mod unpacked_struct_array_sens;
+#[path = "scheduling/packed_struct_elem_member_event.rs"]
+mod packed_struct_elem_member_event;
 
 #[path = "scheduling/clocking_edge_regressions.rs"]
 mod clocking_edge_regressions;

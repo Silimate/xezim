@@ -3360,7 +3360,11 @@ impl Simulator {
                 // §6.11.1: an element of a signed-element class collection
                 // keeps the element type's width and signedness, not the
                 // rvalue's (`p.dyn[1] = 8'hff` stores the byte -1).
-                let val = if !self.signed_class_colls.is_empty()
+                let val = if base == "__xz_ret_coll__" {
+                    // A return snapshot carries the callee's values. Its registered
+                    // consumer type may still belong to the preceding call.
+                    val
+                } else if !self.signed_class_colls.is_empty()
                     && !val.is_real
                     && !val.is_signed
                     && self.signed_class_colls.contains(base)

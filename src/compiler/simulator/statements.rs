@@ -66,6 +66,24 @@ impl Simulator {
             // scoped member (`obj.q`, `arr[i].q`), or a nested
             // assoc-of-queue element (`assoc[key]`) —
             // contributes each of its elements in order.
+            // Looking an operand up as a collection evaluates its index
+            // expressions and receivers, and so does reading it. An operand
+            // whose indices have side effects (`m[i++]`, `aa[i++].ql`), or
+            // whose object a call returns (`get_obj().data`), has them
+            // evaluated once, first, so it selects the same element either
+            // way.
+            let frozen;
+            let expr: &Expression = if Self::cond_expr_is_effect_free(expr, false) {
+                expr
+            } else {
+                match self.freeze_side_effect_indices(expr) {
+                    Some(f) => {
+                        frozen = f;
+                        &frozen
+                    }
+                    None => expr,
+                }
+            };
             let qn = self.array_operand_name(expr).or_else(|| {
                 self.nested_index_name(expr)
                     .filter(|cn| self.module.dynamic_arrays.contains(cn))
@@ -81,6 +99,19 @@ impl Simulator {
                         all_vals.push(v);
                     }
                 }
+                continue;
+            }
+            // A slice of a queue or array, however it is reached (`q[a:b]`,
+            // `obj.q[1:$]`, `this.q[i+:2]`, `get_obj().q[0:1]`), contributes
+            // the elements it selects (§7.4.6, §7.10.1). A slice of a
+            // fixed-size array named directly (`a1[i+:2]`) is left to the
+            // branches below, which read an element past either end as the
+            // element default (§7.4.6) where this would drop it.
+            if let ExprKind::RangeSelect { expr: sbase, .. } = &expr.kind
+                && !self.names_fixed_array(sbase)
+                && let Some((vals, _)) = self.collection_slice_values(expr)
+            {
+                all_vals.extend(vals);
                 continue;
             }
             // Slice of a queue: q[a:b]
@@ -157,6 +188,169 @@ impl Simulator {
             all_vals.push(self.eval_expr(expr));
         }
         all_vals
+    }
+
+    /// `e` with each index expression that has a side effect evaluated now,
+    /// once, left to right, and replaced by a literal of its value, so the
+    /// operand selects the same element however often it is then looked up
+    /// and read (§11.3.2: an operand is evaluated once). A call that returns
+    /// the object a member is read from (`get_obj().data`) is made now too,
+    /// and replaced by a literal of the handle it returns. `None` when a side
+    /// effect sits anywhere else (another call, an increment of its own), an
+    /// index value is real, or an index names `$` of a collection whose last
+    /// index is not known here.
+    /// Whether `base` is a name of a fixed-size unpacked array (`a1`, a row
+    /// `s3[1]`): no queue or dynamic array, and nothing reached through a
+    /// handle or a call. Decided without evaluating anything.
+    fn names_fixed_array(&mut self, base: &Expression) -> bool {
+        let ExprKind::Ident(h) = &Self::unparen(base).kind else {
+            return false;
+        };
+        if self.ident_shadowed_by_non_collection(h) {
+            return false;
+        }
+        let n = self.resolve_hier_name(h).into_owned();
+        let n = n.split('[').next().unwrap_or(&n).to_string();
+        self.module.arrays.contains_key(&n) && !self.module.dynamic_arrays.contains(&n)
+    }
+
+    pub(super) fn freeze_side_effect_indices(&mut self, e: &Expression) -> Option<Expression> {
+        if Self::cond_expr_is_effect_free(e, false) {
+            return Some(e.clone());
+        }
+        let mut out = e.clone();
+        match &mut out.kind {
+            ExprKind::Index { expr, index } => {
+                **expr = self.freeze_side_effect_indices(expr)?;
+                if !Self::cond_expr_is_effect_free(index, false) {
+                    **index = self.freeze_index_literal(index, expr)?;
+                }
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                **expr = match self.freeze_side_effect_indices(expr) {
+                    Some(f) => f,
+                    None => self.freeze_handle_receiver(expr)?,
+                };
+            }
+            ExprKind::Paren(expr) => {
+                **expr = self.freeze_side_effect_indices(expr)?;
+            }
+            // A slice's receiver is frozen like any other (`get_obj().q[0:1]`);
+            // its bounds, which `$` may name, are left to the slice's reader,
+            // so a bound with a side effect of its own is not frozen.
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                if !Self::cond_expr_is_effect_free(left, false)
+                    || !Self::cond_expr_is_effect_free(right, false)
+                {
+                    return None;
+                }
+                **expr = self.freeze_side_effect_indices(expr)?;
+            }
+            ExprKind::Ident(h) => {
+                for si in 0..h.path.len() {
+                    for k in 0..h.path[si].selects.len() {
+                        let sel = &h.path[si].selects[k];
+                        if Self::cond_expr_is_effect_free(sel, false) {
+                            continue;
+                        }
+                        // The collection this select indexes: the path up to
+                        // its segment, with the segment's earlier selects
+                        // (`objs[$].v` indexes `objs`).
+                        let mut path = h.path[..=si].to_vec();
+                        path[si].selects.truncate(k);
+                        let base = Expression::new(
+                            ExprKind::Ident(HierarchicalIdentifier {
+                                root: h.root.clone(),
+                                path,
+                                span: h.span,
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
+                            }),
+                            h.span,
+                        );
+                        let sel = sel.clone();
+                        h.path[si].selects[k] = self.freeze_index_literal(&sel, &base)?;
+                    }
+                }
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+
+    /// A literal of the index `index` of `base`, evaluated now. A `$` in it
+    /// is the last index of the collection `base` names (§7.10.1, §7.4.6),
+    /// as `capture_index_literal` binds it. `None` when that collection's
+    /// last index is not known here, which leaves the operand to its readers,
+    /// or when the value is real.
+    fn freeze_index_literal(&mut self, index: &Expression, base: &Expression) -> Option<Expression> {
+        let bound = if Self::expr_contains_dollar(index) {
+            Some(self.dollar_bound_for_base(base)?)
+        } else {
+            None
+        };
+        if let Some(b) = bound {
+            self.dollar_bound.push(b);
+        }
+        let v = self.eval_expr(index);
+        if bound.is_some() {
+            self.dollar_bound.pop();
+        }
+        Self::value_literal(&v, index.span)
+    }
+
+    /// The receiver `e` of a member access when it is a call whose declared
+    /// return type is a class or a typedef of one (`get_obj()` of
+    /// `get_obj().data`): the call is made now and replaced by a literal of
+    /// the handle it returns, which `expr_assoc_name` and the member read
+    /// take as that object. `None` for any other receiver, which is left to
+    /// run where it stands.
+    fn freeze_handle_receiver(&mut self, e: &Expression) -> Option<Expression> {
+        let mut call = e;
+        while let ExprKind::Paren(inner) = &call.kind {
+            call = inner;
+        }
+        let ExprKind::Call { func, .. } = &call.kind else {
+            return None;
+        };
+        let DataType::TypeReference { name, .. } = self.call_return_type(func)? else {
+            return None;
+        };
+        let tn = self
+            .resolve_type_param_binding(&name.name.name)
+            .unwrap_or_else(|| name.name.name.clone());
+        self.resolved_class_key(&tn)?;
+        let h = self.eval_expr(call);
+        Self::value_literal(&h, e.span)
+    }
+
+    /// A sized literal of `v`'s bits, width and signedness (x and z digits
+    /// included). `None` for a real value.
+    fn value_literal(v: &Value, span: crate::ast::Span) -> Option<Expression> {
+        if v.is_real || v.width == 0 {
+            return None;
+        }
+        // Binary digits carry x and z bit by bit; hex is shorter otherwise.
+        let (base, value) = if v.has_xz() {
+            (NumberBase::Binary, v.to_bin_string())
+        } else {
+            (NumberBase::Hex, v.to_hex_string())
+        };
+        Some(Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: Some(v.width),
+                signed: v.is_signed,
+                base,
+                value,
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        ))
     }
 
     /// The array operand that a conditional or an unpacked-array cast item
@@ -1352,8 +1546,15 @@ impl Simulator {
                 // single-var fallbacks below sized it wrong (one
                 // iteration on a 2-D fixed array).
                 if vars.len() == 1 {
-                    if let Some(dims) = self.foreach_dims(&an) {
+                    if let Some(mut dims) = self.foreach_dims(&an) {
                         if dims.len() >= 2 {
+                            // §12.7.3: a dynamic outer dimension (`T q[$][N]`
+                            // of an object) iterates its current size, as in
+                            // the multi-variable loop above, not the 64-slot
+                            // buffer.
+                            if self.module.dynamic_arrays.contains(&an) {
+                                dims[0] = (0, self.get_queue_size(&an) as i64 - 1);
+                            }
                             let descs = self.foreach_unpacked_descs(&an, 1);
                             self.exec_foreach_nested_dir(
                                 &dims[..1],
@@ -6039,9 +6240,35 @@ impl Simulator {
                             ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
                         ) {
                             const RET_SNAP: &str = "__xz_ret_coll__";
-                            self.populate_queue_from_init(RET_SNAP, e);
+                            // The shared snapshot can still describe an earlier call.
+                            // The literal takes the active function's declared return type.
+                            let dt = self.return_frame_type();
+                            let width = dt.as_ref().map_or(32, |dt| {
+                                resolve_type_width(
+                                    dt,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
+                            });
+                            let expand_rows = dt
+                                .as_ref()
+                                .and_then(|dt| self.fn_ret_coll_dims(dt))
+                                .is_none_or(|dims| dims.len() == 1);
+                            self.store_queue_literal(RET_SNAP, e, dt.as_ref(), width, expand_rows);
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
                         }
+                    }
+                    // §7.10.2.4, §7.10.2.5: `return q.pop_front()` on a queue
+                    // of fixed-size rows hands back the removed row.
+                    if self.pending_ret_collection.is_none()
+                        && self
+                            .fn_ret_collection_stack
+                            .last()
+                            .copied()
+                            .unwrap_or(false)
+                        && let Some(src) = self.pop_row_operand(e)
+                    {
+                        self.pending_ret_collection = Some(src);
                     }
                     // §13.4.1: an unpacked struct that is an ELEMENT of a
                     // class-property collection (`return q[i];`) or a

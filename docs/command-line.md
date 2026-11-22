@@ -73,8 +73,11 @@ how to use them together, see the [user guide](user-guide.md).
 | `--relax-casex-inside` | Read `casex (e) inside` and `casez (e) inside` as `case (e) inside` (§12.5.4), with a warning — for sources written against tools that accept it |
 | `--relax-macro-space` | Read white space between a backtick and a macro or directive name (`` ` NAME ``) as none (§22.5.1), with a warning — for sources written against tools that accept it |
 | `--relax-nul-bytes` | Read a NUL byte in the source as white space (§5.3), with a warning — for sources written against tools that accept it |
+| `--relax-untyped-output-port` | Accept a procedural assignment to an ANSI output port declared with no data type (`output q`, `output [3:0] c`), which §23.2.2.3 makes a net and §6.5 forbids, taking the port as a variable (`output logic q`), with a warning naming the port and module. A port declared as a net (`output wire q`) stays an error. Not part of `--compat`: the reference simulator rejects the construct too |
 | `--relax-cross-hier-item` | Accept a hierarchical reference as a cross item (`cross vif.mode, cp;`) and in `binsof(hier)` in a cross bin select (§19.6.1), with an implicit coverpoint (§19.6), with a warning — for sources written against tools that accept it |
+| `--relax-unconnected-interface-port` | Elaborate an instance that leaves an interface port unconnected (§25.3, §23.3.3), with a warning naming the port and the instance; the port's members are then signals of the instance that read x until written — for testbenches written against tools that accept it |
 | `--relax-use-before-decl` | Accept a reference to module data before its declaration (§6.5), including in call arguments, with a warning naming the module and data |
+| `--relax-wildcard-import-conflict` | Resolve a name that two wildcard-imported packages both declare, which §26.3 makes invisible, to the first of those imports in source order, with a warning naming both packages — for sources written against tools that accept it |
 | `--keywords <ver>` | Keyword set outside `` `begin_keywords `` regions (§22.14): `1364-1995`, `1364-2001`, `1364-2005`, `1800-2005` … `1800-2023`, each also with `-noconfig`; an explicit region still wins |
 | `--no-config-keywords` | Read the ten configuration keywords (`instance`, `cell`, `use`, `library`, …) as names outside `` `begin_keywords `` regions |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
@@ -133,8 +136,11 @@ unless noted.
 | `XEZIM_RELAX_CASEX_INSIDE=1` | Same as `--relax-casex-inside` |
 | `XEZIM_RELAX_MACRO_SPACE=1` | Same as `--relax-macro-space` |
 | `XEZIM_RELAX_NUL_BYTES=1` | Same as `--relax-nul-bytes` |
+| `XEZIM_RELAX_UNTYPED_OUTPUT_PORT=1` | Same as `--relax-untyped-output-port` |
 | `XEZIM_RELAX_CROSS_HIER_ITEM=1` | Same as `--relax-cross-hier-item` |
+| `XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT=1` | Same as `--relax-unconnected-interface-port` |
 | `XEZIM_RELAX_USE_BEFORE_DECL=1` | Same as `--relax-use-before-decl` |
+| `XEZIM_RELAX_WILDCARD_IMPORT_CONFLICT=1` | Same as `--relax-wildcard-import-conflict` |
 | `XEZIM_KEYWORDS=<ver>` | Same as `--keywords <ver>` |
 | `XEZIM_NO_CONFIG_KEYWORDS=1` | Same as `--no-config-keywords` |
 | `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
@@ -194,7 +200,8 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `+cover`, `+cover=<letters>`, `-coverage` | Code coverage (`--code-coverage`): `s`, `b`, `c`, `e`, `t` and `f` select statement, branch, condition, expression, toggle and FSM coverage; the bare forms select all six. Other letters (`x`) are ignored with one warning |
 | `-coverage <types>` | Code coverage of the types listed: `all` (or `A`), or `B` (block: statement and branch), `T` (toggle), `U` (functional: covergroups and assertions, always collected), `E` (expression: condition and expression coverage) and `F` (FSM) joined by `:`, in either case. The value is taken only when it is such a list and not a file; a `+cover=<letters>` wins |
 | `-covworkdir <dir>`, `-covscope <name>`, `-covtest <name>` | The results file goes in `<dir>/<scope>/<test>/xezim_cov.json` (defaults `cov_work`, `scope`, `test`), created if missing, instead of `./xezim_cov.json`. `XEZIM_COV_DB` still wins |
-| `-sv`, `-mfcu`, `-quiet`, `-64`, `-32`, `-batch`, `-nologo`, `+acc[=…]`, `-access <spec>`, `+access+<spec>`, `-<step>args=…` (arguments for a separate optimization step), `-suppress <ids>`, `-nowarn <id>`, `+fcover`, `-sva`, `-assertdebug` | Accepted, no effect: SystemVerilog is always on, all files share one compilation unit, every object stays visible, assertions and covergroups are always evaluated |
+| `-sv` | Read `.v` files as SystemVerilog too. Every file is parsed as SystemVerilog either way; the one difference is a variable declaration assignment such as `reg clk = 1'b0;` in a `.v` file. Without `-sv` it is a Verilog `initial` assignment (IEEE 1364-2005 §6.2.1), so `clk` changes from x at time 0 and the processes waiting on it wake; with `-sv` it sets the value before time 0 with no event (IEEE 1800-2023 §6.8), as in a `.sv` file. This applies to module-level `reg`, `integer` and `time` variables |
+| `-mfcu`, `-quiet`, `-64`, `-32`, `-batch`, `-nologo`, `+acc[=…]`, `-access <spec>`, `+access+<spec>`, `-<step>args=…` (arguments for a separate optimization step), `-suppress <ids>`, `-nowarn <id>`, `+fcover`, `-sva`, `-assertdebug` | Accepted, no effect: all files share one compilation unit, every object stays visible, assertions and covergroups are always evaluated |
 | `-covoverwrite`, `-licqueue`, `-R`, `-errormax <n>`, `-xmlibdirname <dir>`, `-cds_implicit_tmpdir <dir>` | Accepted, no effect: xezim always replaces its results file, needs no license, keeps no snapshot, library or scratch directory (every run compiles its sources) and never stops a simulation on an error count |
 | `-sfcu`, `-t <res>`, `-wlf <file>` | Accepted with a warning: xezim always uses one compilation unit and the finest precision declared in the design, and does not write that waveform file (`--fst` / `--wave` dump waveforms) |
 

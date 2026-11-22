@@ -23,6 +23,8 @@ mod front_end_levers;
 mod loop_block_counters;
 #[path = "perf/packed_record_edge_loop.rs"]
 mod packed_record_edge_loop;
+#[path = "perf/packed_member_path_store.rs"]
+mod packed_member_path_store;
 #[path = "perf/wide_block_counters.rs"]
 mod wide_block_counters;
 #[path = "perf/x_plane_executor.rs"]
@@ -82,3 +84,7 @@ mod local_select_width_chain;
 mod fallback_hotspots;
 #[path = "perf/process_memory_paths.rs"]
 mod process_memory_paths;
+#[path = "perf/packed_member_path_read.rs"]
+mod packed_member_path_read;
+#[path = "perf/decl_param_scope_scaling.rs"]
+mod decl_param_scope_scaling;

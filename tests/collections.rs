@@ -74,6 +74,8 @@ mod mailbox_bounded;
 mod mailbox_handle_named_like_struct;
 #[path = "collections/member_off_handle_collection_elem.rs"]
 mod member_off_handle_collection_elem;
+#[path = "collections/member_read_effect_select.rs"]
+mod member_read_effect_select;
 #[path = "classes/compiled_method_test_env.rs"]
 mod compiled_method_test_env;
 #[path = "collections/bits_dynamic_operand.rs"]
@@ -96,6 +98,8 @@ mod nested_assoc_under_outer_dim;
 mod noparen_array_methods;
 #[path = "collections/pp_queue_slice.rs"]
 mod pp_queue_slice;
+#[path = "collections/member_queue_slice.rs"]
+mod member_queue_slice;
 #[path = "collections/packed_pattern_compare.rs"]
 mod packed_pattern_compare;
 #[path = "collections/property_queue_and_context.rs"]
@@ -162,6 +166,8 @@ mod queue_concat_index_prefilled_prefix;
 mod std_randomize_multidim;
 #[path = "collections/queue_struct_pop.rs"]
 mod queue_struct_pop;
+#[path = "collections/queue_of_fixed_rows_pop.rs"]
+mod queue_of_fixed_rows_pop;
 #[path = "collections/deferred_retsnap_slow_path.rs"]
 mod deferred_retsnap_slow_path;
 #[path = "collections/assoc_locator_methods.rs"]
@@ -383,6 +389,8 @@ mod review_queue_of_queues_push_1086;
 mod assoc_struct_delete_1124;
 #[path = "collections/review_typedef_row_class_properties_216.rs"]
 mod review_typedef_row_class_properties_216;
+#[path = "collections/queue_of_fixed_rows_dollar_foreach.rs"]
+mod queue_of_fixed_rows_dollar_foreach;
 
 #[path = "collections/dyn_array_of_dyn_array_rows.rs"]
 mod dyn_array_of_dyn_array_rows;

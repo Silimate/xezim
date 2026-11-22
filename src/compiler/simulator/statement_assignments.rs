@@ -4,6 +4,11 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+enum ConcatElement {
+    Scalar(Value),
+    Assoc(Box<super::aggregate_assignments::AssocElement>),
+}
+
 impl Simulator {
     pub(super) fn eval_number(&self, num: &NumberLiteral) -> Value {
         match num {
@@ -673,6 +678,10 @@ impl Simulator {
         let ExprKind::Call { func, .. } = &arg.kind else {
             return None;
         };
+        // §7.10.2.4, §7.10.2.5: a pop of a queue of fixed-size rows.
+        if let Some(src) = self.pop_row_operand(arg) {
+            return Some(Some(src));
+        }
         if !self.call_returns_collection(func) {
             return None;
         }
@@ -757,89 +766,99 @@ impl Simulator {
         first_row: Option<(&'e Expression, super::unpacked_slices::UnpackedLayout<'e>)>,
     ) {
         let is_dyn = self.module.dynamic_arrays.contains(lname) || self.class_queue_prop(lname);
-        // IEEE 1800 §10.10.1: in an unpacked-array
-        // concatenation each item is read in the context of
-        // the ELEMENT type, so a nested plain-brace concat
-        // is itself an array value whose elements SPLICE
-        // into the outer one — `a = {1, {2, 3}}` assigns
-        // `{1, 2, 3}` — i.e. nested braces flatten. Only
-        // flatten when the element type is not itself an
-        // array (for a multi-dimensional target an inner
-        // brace denotes one whole sub-array element).
-        // Assignment patterns `'{...}` never flatten; they
-        // are handled separately.
-        fn flatten_unpacked_concat<'a>(
-            exprs: &'a [Expression],
-            out: &mut Vec<&'a Expression>,
-        ) {
-            for e in exprs {
-                if let ExprKind::Concatenation(inner) = &e.kind {
-                    flatten_unpacked_concat(inner, out);
-                } else {
-                    out.push(e);
-                }
-            }
-        }
+        // §10.10.3: every item of an unpacked array concatenation has a
+        // self-determined type and the concatenation as a whole has none, so
+        // they do not nest. A braced item is a vector or string concatenation
+        // (§11.4.12), one element of its own type: `q = {q, {pc, insn}}` on a
+        // queue of 64-bit elements appends ONE element, and
+        // `SQ = {S1, SQ, {"element 3 is ", S2}}` appends the string
+        // "element 3 is S2" (the §10.10.3 example). A braced item that holds a
+        // queue or unpacked array is no vector concatenation (illegal either
+        // way); it still splices its operands, as it always has, when the
+        // element type is not itself an array (for a multi-dimensional target
+        // an inner brace is one sub-array element). Assignment patterns
+        // `'{...}` are handled separately.
         let elem_is_scalar = self.foreach_dims(lname).is_none_or(|d| d.len() == 1);
         let items: Vec<&Expression> = if elem_is_scalar {
             let mut v = Vec::new();
-            flatten_unpacked_concat(exprs, &mut v);
+            self.splice_array_braces(exprs, &mut v);
             v
         } else {
             exprs.iter().collect()
         };
-        // §10.10 / §7.8: in a queue (or array) of ASSOCIATIVE
-        // arrays, an associative operand (`q = {src}`) is one
-        // whole element: its entries are copied into it.
-        // Evaluated as one value, the element kept no entries.
-        let assoc_srcs: Vec<Option<String>> =
-            if self.module.associative_arrays.is_empty() {
-                Vec::new()
-            } else {
-                items.iter().map(|e| self.assoc_value_operand(e)).collect()
-            };
-        if assoc_srcs.iter().any(Option::is_some) {
-            let lo = self.module.arrays.get(lname).map_or(0, |t| t.0);
-            for (i, (e, src)) in items.iter().zip(assoc_srcs).enumerate() {
-                let elem = format!("{}[{}]", lname, lo + i as i64);
-                match src {
-                    Some(src) => self.store_assoc_elem(&elem, &src),
-                    None => {
-                        let v = self.eval_expr(e);
-                        self.set_signal_value_by_name(&elem, v);
-                    }
+        let expand_rows = check_rows && elem_is_scalar && self.concat_has_non_array_elements(lname);
+        let may_hold_assoc = !self.module.associative_arrays.is_empty()
+            && self.coll_shape_at(lname).is_none_or(|(shape, depth)| {
+                matches!(shape.dims.get(depth + 1), Some(Dim::Assoc(_)))
+            });
+        // §10.10 / §11.3.2: capture each operand before evaluating the next.
+        // Two receivers can return the same handle and change its fields, and
+        // an associative source can alias a row that the destination replaces.
+        if may_hold_assoc {
+            let mut values = Vec::new();
+            for e in items {
+                let frozen = if Self::cond_expr_is_effect_free(e, false) {
+                    None
+                } else {
+                    self.freeze_side_effect_indices(e)
+                };
+                let expr = frozen.as_ref().unwrap_or(e);
+                if let Some(src) = self.assoc_value_operand(expr) {
+                    values.push(ConcatElement::Assoc(Box::new(
+                        self.read_assoc_element(&src),
+                    )));
+                } else {
+                    values.extend(
+                        self.unpacked_concat_operand_values(vec![expr], expand_rows, None)
+                            .into_iter()
+                            .map(ConcatElement::Scalar),
+                    );
                 }
             }
-            if is_dyn {
-                self.set_queue_size(lname, items.len() as u64);
-            }
-            return;
+            self.store_concat_elements(lname, is_dyn, values.into_iter());
+        } else {
+            let values = self.unpacked_concat_operand_values(items, expand_rows, first_row);
+            self.store_concat_elements(
+                lname,
+                is_dyn,
+                values.into_iter().map(ConcatElement::Scalar),
+            );
         }
-        // Expand queue/array elements in concat (e.g. q = {q, 4})
-        let expand_rows = check_rows && elem_is_scalar && self.concat_has_non_array_elements(lname);
-        let all_vals = self.unpacked_concat_operand_values(items, expand_rows, first_row);
+    }
+
+    fn store_concat_elements(
+        &mut self,
+        lname: &str,
+        is_dyn: bool,
+        values: impl ExactSizeIterator<Item = ConcatElement>,
+    ) {
         let (lo, hi, _w) = self
             .module
             .arrays
             .get(lname)
             .copied()
             .unwrap_or((0, -1, 32));
-        let n_vals = all_vals.len();
+        let n_vals = values.len();
         let descending = self.module.descending_arrays.contains(lname);
-        for (i, v) in all_vals.into_iter().enumerate() {
+        for (i, v) in values.enumerate() {
             let idx = if descending { hi - i as i64 } else { lo + i as i64 };
             // Dynamic arrays/queues grow to fit; only fixed
             // arrays are bounded by their declared range.
             if !is_dyn && (idx < lo || idx > hi) {
                 break;
             }
-            // §10.10: each item is an element-typed value.
-            let v = if is_dyn {
-                self.fit_queue_push_elem(lname, v)
-            } else {
-                v
-            };
-            self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v);
+            let dst = format!("{lname}[{idx}]");
+            match v {
+                ConcatElement::Assoc(snapshot) => self.write_assoc_element(&dst, *snapshot),
+                ConcatElement::Scalar(value) => {
+                    let value = if is_dyn {
+                        self.fit_queue_push_elem(lname, value)
+                    } else {
+                        value
+                    };
+                    self.set_signal_value_by_name(&dst, value);
+                }
+            }
         }
         if is_dyn {
             self.set_queue_size(lname, n_vals as u64);
@@ -2302,6 +2321,17 @@ impl Simulator {
         }
         if !l_pure && l_probe_safe {
             lflat = self.flat_member_name(lvalue);
+        }
+        // §7.10.2.4, §7.10.2.5: `r = q.pop_front()` on a queue of fixed-size
+        // rows copies the removed row, as from a call returning an array.
+        if let Some(src) = self.pop_row_operand(rvalue) {
+            self.pending_ret_collection = Some(src.clone());
+            if !self.assign_pending_ret_collection(lvalue) {
+                // A slice or a row of a fixed array takes it element-wise.
+                self.copy_ret_row_to_part(lvalue, &src);
+                self.settle_after_proc_write();
+            }
+            return;
         }
         // `s = q.pop_front()` on a queue of unpacked structs: the popped
         // element's members must reach `s` before the queue shifts — a
@@ -4297,6 +4327,19 @@ impl Simulator {
             self.settle_after_proc_write();
             return;
         }
+        // §7.4.6, §7.10.1: a slice of a queue or array (`obj.q[1:$]`,
+        // `get_obj().q[0:1]`) assigned to a queue or dynamic array copies the
+        // elements it selects, finding the collection with one evaluation of
+        // its receiver, before the right side would run as a value.
+        if let ExprKind::RangeSelect { .. } = &rvalue.kind
+            && let Some(n) = self
+                .pending_coll_dst(lvalue)
+                .filter(|n| self.module.dynamic_arrays.contains(n) || self.class_queue_prop(n))
+            && self.assign_whole_coll(&n, None, rvalue)
+        {
+            self.settle_after_proc_write();
+            return;
+        }
         // §10.10: the element-wise store below reads a fixed row itself.
         // A speculative packed evaluation would also execute its selectors.
         let mut check_remaining_rows = true;
@@ -4356,10 +4399,16 @@ impl Simulator {
         // constructs too rather than reading a name.
         let typed_ctor = Self::typed_ctor_call(rvalue)
             .and_then(|(prefix, args)| self.construct_typed_ctor(prefix, args));
+        // §10.10: an unpacked array concatenation assigned to a queue or
+        // array is evaluated item by item below. Evaluating it here as one
+        // value first ran every operand an extra time: a call twice,
+        // `m[i++]` twice.
         let val = if first_row.is_some() {
             Value::zero(w)
         } else if let Some(v) = typed_ctor {
             v
+        } else if self.is_unpacked_concat_assign(lvalue, rvalue) {
+            Value::zero(1)
         } else if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
                 let method_name = hier.path.last().unwrap().name.name.as_str();
@@ -4907,7 +4956,37 @@ impl Simulator {
                 n
             };
             if self.module.arrays.contains_key(&*lname) {
-                // Queue/array slice assignment: lq = rq[a:b]
+                // Queue/array slice assignment: lq = rq[a:b]. A slice of a
+                // member (`lq = obj.q[1:$]`, `lq = this.q[i+:2]`) or an
+                // indexed slice (§7.4.6, §7.10.1); the bare-name form below
+                // keeps the shapes this does not model (a descending array,
+                // struct elements).
+                if matches!(rvalue.kind, ExprKind::RangeSelect { .. })
+                    && let Some((results, _)) = self.collection_slice_values(rvalue)
+                {
+                    let (l_lo, l_hi, _) = self.module.arrays[&*lname];
+                    let is_dyn = self.module.dynamic_arrays.contains(&*lname);
+                    // §7.6: the first element goes to the target's left
+                    // bound, its high index when it is declared descending.
+                    let descending = self.module.descending_arrays.contains(&*lname);
+                    for (i, v) in results.iter().enumerate() {
+                        let idx = if descending {
+                            l_hi - i as i64
+                        } else {
+                            l_lo + i as i64
+                        };
+                        // A dynamic target grows to fit; a fixed one clips.
+                        if !is_dyn && (idx < l_lo || idx > l_hi) {
+                            break;
+                        }
+                        self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v.clone());
+                    }
+                    if is_dyn {
+                        self.set_queue_size(&lname, results.len() as u64);
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
                 if let ExprKind::RangeSelect {
                     expr: rbase,
                     left,
@@ -4956,13 +5035,18 @@ impl Simulator {
                             };
                             let (l_lo, l_hi, _) = self.module.arrays[&*lname];
                             let is_dyn = self.module.dynamic_arrays.contains(&*lname);
+                            let descending = self.module.descending_arrays.contains(&*lname);
                             for (i, v) in results.iter().enumerate() {
-                                let idx = l_lo + i as i64;
+                                let idx = if descending {
+                                    l_hi - i as i64
+                                } else {
+                                    l_lo + i as i64
+                                };
                                 // Dynamic arrays / queues start
                                 // with `l_hi = -1` (empty). Skip
                                 // the bound check there — the
                                 // assignment is what GROWS them.
-                                if !is_dyn && idx > l_hi {
+                                if !is_dyn && (idx < l_lo || idx > l_hi) {
                                     break;
                                 }
                                 self.set_signal_value_by_name(
@@ -5051,5 +5135,75 @@ impl Simulator {
         }
         self.assign_value(lvalue, &val);
         self.settle_after_proc_write();
+    }
+
+    /// §10.10.3: the items of an unpacked array concatenation, with each
+    /// braced item that holds a queue or unpacked array operand replaced by
+    /// its operands. Every other braced item is a vector or string
+    /// concatenation, one element.
+    pub(super) fn splice_array_braces<'a>(
+        &mut self,
+        exprs: &'a [Expression],
+        out: &mut Vec<&'a Expression>,
+    ) {
+        for e in exprs {
+            match &e.kind {
+                ExprKind::Concatenation(inner) if self.braces_hold_array(inner) => {
+                    self.splice_array_braces(inner, out)
+                }
+                _ => out.push(e),
+            }
+        }
+    }
+
+    /// Whether `lvalue = rvalue` is an unpacked array concatenation assigned
+    /// to a queue or array: a concatenation whose target the whole-array
+    /// branch of [`exec_stmt_blocking_assign_body`] takes (a variable in
+    /// `module.arrays`, or a class queue or dynamic-array member). Mirrors
+    /// that branch's target lookup.
+    fn is_unpacked_concat_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        if !matches!(rvalue.kind, ExprKind::Concatenation(_)) {
+            return false;
+        }
+        let ExprKind::Ident(lhier) = &lvalue.kind else {
+            return false;
+        };
+        if !self.ident_shadowed_by_non_collection(lhier) {
+            let n = self.resolve_hier_name(lhier).into_owned();
+            let n = self.instance_assoc_member(&n).unwrap_or(n);
+            if self.module.arrays.contains_key(&n) {
+                return true;
+            }
+        }
+        self.expr_assoc_name(lvalue)
+            .is_some_and(|n| self.class_queue_prop(&n))
+    }
+
+    /// Whether a braced list holds, at any depth, an operand that is a
+    /// queue or unpacked array, a slice of one, or a call returning one:
+    /// an operand no vector concatenation can take (§11.4.12). Decided
+    /// without running anything: an operand with a side effect
+    /// (`m[i++]`, a call that is not a collection) is taken for a vector
+    /// operand, so it is evaluated once, with the braces.
+    fn braces_hold_array(&mut self, exprs: &[Expression]) -> bool {
+        exprs.iter().any(|e| match &e.kind {
+            ExprKind::Concatenation(inner) => self.braces_hold_array(inner),
+            ExprKind::Call { func, .. } => self.call_returns_collection(func),
+            ExprKind::RangeSelect { expr: base, .. } => match &base.kind {
+                ExprKind::Ident(h) => {
+                    let n = self.resolve_hier_name(h).into_owned();
+                    let n = self.instance_assoc_member(&n).unwrap_or(n);
+                    self.module.arrays.contains_key(&n)
+                }
+                _ => false,
+            },
+            _ if !Self::cond_expr_is_effect_free(e, false) => false,
+            _ => {
+                self.array_operand_name(e).is_some()
+                    || self
+                        .nested_index_name(e)
+                        .is_some_and(|n| self.module.dynamic_arrays.contains(&n))
+            }
+        })
     }
 }

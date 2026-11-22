@@ -742,7 +742,9 @@ impl Simulator {
                 .is_some_and(|d| d.len() == 1 && !matches!(d[0], UD::Associative { .. })),
             _ => false,
         };
-        let (lc, rc) = (seq_call(self, left), seq_call(self, right));
+        // §7.10.2.4: a pop of a queue of fixed-size rows returns a row too.
+        let lc = seq_call(self, left) || self.is_pop_row_call(left);
+        let rc = seq_call(self, right) || self.is_pop_row_call(right);
         if !lc && !rc {
             return None;
         }
@@ -2905,6 +2907,14 @@ impl Simulator {
         else {
             return None;
         };
+        // Finding a member's store evaluates its receiver (`get_obj().q`);
+        // a member no class holds as a collection names none, and is left
+        // for the caller to read as a part-select, evaluating it once.
+        if let ExprKind::MemberAccess { member, .. } = &Self::unparen(base).kind
+            && !self.coll_member_possible(&member.name)
+        {
+            return None;
+        }
         let name = self.queue_actual_storage(base)?;
         if self.module.descending_arrays.contains(&*name) || self.queue_elem_struct(&name).is_some()
         {

@@ -683,6 +683,88 @@ impl Simulator {
             self.initialize_class_fixed_array(&cn, &prop, &init);
         }
 
+        // §8.9, §6.8: a static dynamic array, queue or associative array
+        // with an initializer (`static sew_e set[] = '{SEW8, SEW16};`,
+        // `static int q[$] = {1, 2};`, `static int m[string] = '{"a": 1};`)
+        // has the one store registered empty above, and nothing ran its
+        // initializer: `Cls::set.size()` read 0 and a constraint
+        // `v inside {set}` had no solution. Run each initializer once, in
+        // its declaring class's static context, into that store (the
+        // `Class::name` key when two classes declare the name): a pattern
+        // or queue concatenation element by element, as the per-instance
+        // path does (`N{expr}` items expanded, §10.9.1), an associative-
+        // array pattern with its `default:` (§7.9.11), and any other
+        // expression, such as a call that returns the whole collection, as
+        // the assignment `name = init;`.
+        // Parameterized classes are skipped, as for the fixed arrays above.
+        let mut seen_coll_inits: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let static_coll_inits: Vec<(String, String, bool, u32, Expression)> = self
+            .module
+            .classes
+            .iter()
+            .filter(|(cn, _)| !self.class_is_parameterized(cn))
+            .flat_map(|(_, cd)| {
+                cd.static_collections
+                    .iter()
+                    .filter_map(|(name, is_assoc, width)| {
+                        cd.property_inits.get(name).map(|init| {
+                            (
+                                cd.name.clone(),
+                                name.clone(),
+                                *is_assoc,
+                                *width,
+                                init.clone(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            // A module class is listed under its instance-qualified name and
+            // an alias; both are one declaration.
+            .filter(|(cn, name, ..)| seen_coll_inits.insert((cn.clone(), name.clone())))
+            .collect();
+        for (cn, name, is_assoc, width, init) in static_coll_inits {
+            let store = if colliding_names.contains(name.as_str()) {
+                format!("{}::{}", cn, name)
+            } else {
+                name.clone()
+            };
+            let signature = self.canonicalize_spec_sig(&cn, "");
+            let saved_spec = self.current_spec.replace((cn.clone(), signature));
+            let elem_type = self
+                .module
+                .classes
+                .get(&cn)
+                .and_then(|class| self.class_prop_elem_type(class, &name))
+                .cloned();
+            self.class_context_stack.push(Some(cn));
+            self.this_stack.push(None);
+            let (pattern, assoc_items) = match &self.unpacked_pattern(&init).kind {
+                ExprKind::AssignmentPattern(items) if is_assoc => (true, Some(items.clone())),
+                ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_) => (true, None),
+                _ => (false, None),
+            };
+            if let Some(items) = assoc_items {
+                self.assign_class_assoc_pattern(&store, width, &items);
+            } else if pattern && !is_assoc {
+                self.populate_queue_from_init(&store, &init, elem_type);
+            } else {
+                let lhs = super::property_initialization::prop_ident_expr(&name);
+                let stmt = Statement::new(
+                    StatementKind::BlockingAssign {
+                        lvalue: lhs.clone(),
+                        rvalue: init.clone(),
+                    },
+                    init.span,
+                );
+                self.exec_stmt_blocking_assign(&stmt, &lhs, &init);
+            }
+            self.this_stack.pop();
+            self.class_context_stack.pop();
+            self.current_spec = saved_spec;
+        }
+
         // Run static property initializers that call functions, e.g. riscv-dv's
         // per-instruction `static bit _ = riscv_instr::register(NAME)` (the
         // DEFINE_INSTR registration). The lazy static-init path only stores the
@@ -711,6 +793,9 @@ impl Simulator {
                     .iter()
                     .filter(|(p, e)| {
                         cd.static_properties.contains(*p)
+                            // A static collection's initializer ran above,
+                            // element by element, into its store.
+                            && !cd.static_collections.iter().any(|(n, ..)| n == *p)
                             && (Self::expr_contains_call(e)
                                 // bare `= new` (no parens) parses as an Ident,
                                 // not a Call — `static C inst = new;` must
@@ -1709,7 +1794,12 @@ impl Simulator {
         // block (and the lazy-prefix pending ones) so package globals are
         // populated before user code reads them. Schedule them first so they
         // receive the lowest pids (the time-0 queue runs lower pids first).
+        let mut decl_blocks: Vec<super::elaborate::InitialBlock> = Vec::new();
         for ib in std::mem::take(&mut self.module.static_init_blocks) {
+            if Self::verilog_decl_block(&ib.stmt).is_some() {
+                decl_blocks.push(ib);
+                continue;
+            }
             let span = ib.stmt.span;
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
@@ -1726,6 +1816,32 @@ impl Simulator {
             }
             self.process_origin
                 .insert(pid, (span, "static initializer"));
+            self.event_queue.schedule(0, pid, stmts.into_vec().into());
+        }
+        // IEEE 1364-2005 §6.2.1: the declaration assignments of Verilog
+        // variables (see `seal_verilog_decl_inits`): the literal values as
+        // one process, then each runtime initializer in its order. They run
+        // after the `always` processes that arm first (`t0_decl_init_pids`).
+        decl_blocks.sort_by_key(|ib| {
+            Self::verilog_decl_block(&ib.stmt) != Some(super::VERILOG_DECL_INIT_MARKER)
+        });
+        for ib in decl_blocks {
+            let span = ib.stmt.span;
+            let StatementKind::SeqBlock { mut stmts, .. } = ib.stmt.kind else {
+                continue;
+            };
+            stmts.remove(0);
+            if stmts.is_empty() {
+                continue;
+            }
+            let pid = self.next_pid;
+            self.next_pid += 1;
+            if !ib.scope.is_empty() {
+                self.process_scope_hint.insert(pid, ib.scope);
+            }
+            self.process_origin
+                .insert(pid, (span, "declaration assignment"));
+            self.t0_decl_init_pids.insert(pid);
             self.event_queue.schedule(0, pid, stmts.into_vec().into());
         }
         // §16.5/§16.14: declarative concurrent assertions exist before

@@ -64,6 +64,9 @@ static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 const COND_AUDIT_EVALS: u8 = 4;
 /// `--dump-timescales`: print every module's timescale before the run starts.
 static DUMP_TIMESCALES: AtomicBool = AtomicBool::new(false);
+/// `-sv`: compile every source file as SystemVerilog, `.v` files included
+/// (see `Simulator::seal_verilog_decl_inits`).
+static SV_ALL_FILES: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 /// Opaque handle base for `process::self()` (IEEE 1800-2023 §9.7). The token is
@@ -414,7 +417,10 @@ fn method_boost_enabled() -> bool {
 // §11.6.1, §7.10: an element read of a method-local queue or dynamic array has its element's
 // width, so a compare of two of them no longer resizes both to one bit. On an upstream bump,
 // take upstream's value and bump it once more.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317a;
+// §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
+// §23.9: a frame local that hides a parameter is not a constant element select.
+// §7.2: reads of nested packed-struct members (`s.inner.f`) compile to a range select.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317c;
 // /silimate
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
@@ -646,6 +652,13 @@ const VIF_VALUE_MARKER: &str = "$__xz_vif_value";
 /// Ends a deferred declaration initializer: `(<target>, ...)` records the
 /// values it gave as their default sampled values (see `sampled_defaults`).
 const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
+/// Opens a static initializer that holds Verilog declaration assignments
+/// (IEEE 1364-2005 §6.2.1), which `compile` runs at time 0 after the
+/// `always` processes have armed (see `Simulator::seal_verilog_decl_inits`).
+/// The literal values' block opens with this marker; a runtime
+/// initializer's block opens with `VERILOG_DECL_RUNTIME_MARKER`.
+const VERILOG_DECL_INIT_MARKER: &str = "$__xz_verilog_decl_init";
+const VERILOG_DECL_RUNTIME_MARKER: &str = "$__xz_verilog_decl_runtime";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
@@ -675,6 +688,18 @@ pub fn set_dump_timescales(enabled: bool) {
 #[inline]
 fn dump_timescales_enabled() -> bool {
     DUMP_TIMESCALES.load(Ordering::Relaxed)
+}
+
+/// `-sv`: read `.v` files as SystemVerilog too. Without it a `.v` file is
+/// Verilog (IEEE 1364-2005), where a variable declaration assignment is an
+/// `initial` assignment (§6.2.1), as in the reference simulator.
+pub fn set_sv_all_files(enabled: bool) {
+    SV_ALL_FILES.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+fn sv_all_files() -> bool {
+    SV_ALL_FILES.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -1923,7 +1948,11 @@ struct CombEntryCold {
 // §9.4.2: a selected member can require a value waiter instead of a comb block.
 // §6.24.1, §9.4.2: integer atom casts keep their operand, and a packed-struct member event
 // tries every scope spelling for its alias net.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB079";
+// §7.2, §7.4.2: a member select through constant element selects of a packed
+// struct is a compiled store.
+// §23.9: an index naming a frame local that hides a parameter is not constant.
+// §7.2: a read of a nested packed-struct member (`s.inner.f`) compiles to a range select.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB081";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -5517,42 +5546,49 @@ struct DeclShadow {
 /// `Simulator::decl_param_scope`'s state (§23.10).
 #[derive(Default)]
 struct DeclParamScopeCache {
-    /// The prefix asked for last, and whether it owns parameters (when it
-    /// does, the last of `tables` holds its overlay).
-    last: Option<(String, bool)>,
-    /// Per scope: the parameters declared in it or below it, by their name
-    /// relative to the scope (`u.g.L` is `g.L` for `u`), in table order.
-    groups: HashMap<String, std::rc::Rc<[(String, Value)]>>,
-    /// Overlaid copies of the design-wide table, least recently used first,
-    /// at most `DECL_PARAM_TABLES`. Lookups that alternate between hierarchies
-    /// with different outermost scopes (a testbench component and the design
-    /// under test) each keep a copy, instead of taking one hierarchy's groups
-    /// off a single copy and putting the other's on at every move.
-    tables: Vec<DeclParamTable>,
+    /// Every scope that has a parameter at or below it: each dot-prefix of
+    /// a key of the design-wide table (`u` and `u.g` for `u.g.L`). Built on
+    /// first use, in one pass over the table.
+    owners: Option<HashSet<String>>,
+    /// The prefix asked for last, and its scope.
+    last: Option<(String, Option<DeclScope>)>,
 }
 
-/// How many overlaid parameter tables `decl_param_scope` keeps.
-const DECL_PARAM_TABLES: usize = 4;
+impl DeclParamScopeCache {
+    /// Note a key added to the design-wide table after `owners` was built.
+    fn note_param(&mut self, key: &str) {
+        if let Some(owners) = &mut self.owners {
+            for (i, _) in key.match_indices('.') {
+                if !owners.contains(&key[..i]) {
+                    owners.insert(key[..i].to_string());
+                }
+            }
+        }
+        self.last = None;
+    }
+}
 
-/// One overlaid copy of the design-wide parameter table (§23.10).
-struct DeclParamTable {
-    /// The design-wide parameter table with the groups of `applied` on it.
-    table: std::rc::Rc<HashMap<String, Value>>,
-    /// The scopes whose groups `table` holds, outermost first, each with the
-    /// length `undo` had before its group went on.
-    applied: Vec<(String, usize)>,
-    /// What each group write replaced in `table`, in write order, so a group
-    /// comes off again in reverse.
-    undo: Vec<(String, Option<Value>)>,
+/// §23.10: the instance scope a declaration stored under `<prefix>.<name>`
+/// is sized in (see `DeclScopeParams`). Cheap to clone.
+#[derive(Clone)]
+pub(super) struct DeclScope {
+    /// The declaration's instance path (`u.g` for `u.g.par`).
+    prefix: std::rc::Rc<str>,
+    /// The lengths of the enclosing scopes of `prefix` (`u`, `u.g`) that
+    /// have parameters, innermost first.
+    owners: std::rc::Rc<[usize]>,
+    /// The bindings as one table, for the rare whole-table reads
+    /// (`ParamLookup::rows`), built on the first.
+    flat: std::rc::Rc<std::cell::OnceCell<HashMap<String, Value>>>,
 }
 
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
 struct DeclaredPackedAccess {
     storage: String,
-    /// §23.10: the parameter table the declaration is sized against — the
-    /// instance's own parameters overlaid on the design-wide table when the
-    /// storage lives in an instantiated module; `None` for the top scope.
-    params: Option<std::rc::Rc<HashMap<String, Value>>>,
+    /// §23.10: the instance scope the declaration is sized in when the
+    /// storage lives in an instantiated module whose scopes have parameters;
+    /// `None` for the top scope (the design-wide table).
+    params: Option<DeclScope>,
     is_signed: bool,
     static_target: Option<(String, Option<(String, String)>, String)>,
     offset: u32,
@@ -7861,6 +7897,10 @@ pub struct Simulator {
     class_packed_layout_cache: std::cell::RefCell<HashMap<usize, ClassPackedLayouts>>,
     #[serde(skip)]
     aggregate_type_work: [std::cell::Cell<u64>; 2],
+    /// Parameter-table rows `decl_param_scope` and its lookups have read or
+    /// copied (`Simulator::decl_param_rows`).
+    #[serde(skip)]
+    decl_param_rows: std::cell::Cell<u64>,
     #[serde(skip)]
     aggregate_type_generation: std::cell::Cell<u64>,
     /// Immutable class parameter names; values are always read from the object.
@@ -9830,6 +9870,13 @@ pub struct Simulator {
     /// Pids of `initial` blocks that cannot suspend (no timing control,
     /// no blocking call); see `order_time0_processes`.
     t0_timing_free: HashSet<usize>,
+    /// Pids of `always` processes whose statement starts with an event
+    /// control: they wait there before any `initial` block runs (see
+    /// `order_time0_processes`).
+    t0_event_led: HashSet<usize>,
+    /// The time-0 processes of the Verilog variable declaration assignments
+    /// (`seal_verilog_decl_inits`).
+    t0_decl_init_pids: HashSet<usize>,
     /// Time-0 activation index of each process queued at time 0, consulted
     /// by `clock_rank_on_pop` until the first drain settles the generators.
     t0_pid_ord: HashMap<usize, usize>,
@@ -10059,11 +10106,8 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
-    /// `decl_param_scope`'s state: the parameters under each scope, and the
-    /// overlaid parameter tables it hands out. A select loop over one
-    /// instance's signal rebuilds nothing, and a move to another instance
-    /// changes only the scopes the two do not share instead of copying the
-    /// table.
+    /// `decl_param_scope`'s state: which scopes have parameters, and the
+    /// scope asked for last.
     #[serde(skip)]
     decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
     /// Reused buffer for the `__vif_local__` key probes (`&self` paths).

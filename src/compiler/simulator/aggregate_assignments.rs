@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Owned contents of an associative operand before another operand or a
+/// destination write can change its source.
+pub(super) struct AssocElement {
+    string_keys: bool,
+    width: Option<u32>,
+    entries: Vec<(String, Value)>,
+    default: Option<Expression>,
+}
+
 impl Simulator {
     /// Spread a whole-value pattern over a fixed unpacked array property.
     /// Per-instance array elements live under an instance-scoped storage name,
@@ -783,17 +792,39 @@ impl Simulator {
                 if self.assign_struct_concat(name, exprs.iter().collect()) {
                     return true;
                 }
-                let mut flat: Vec<&Expression> = exprs.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
+                // §10.10.3: braces nested in the concatenation are a vector
+                // or string concatenation, one element, unless they hold a
+                // collection operand (see `splice_array_braces`), when the
+                // elements are not themselves arrays.
+                let mut flat: Vec<&Expression> = Vec::new();
+                if self.foreach_dims(name).is_none_or(|d| d.len() == 1) {
+                    self.splice_array_braces(exprs, &mut flat);
+                } else {
+                    flat.extend(exprs.iter());
+                    while let Some(i) = flat
+                        .iter()
+                        .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
+                    {
+                        if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
+                            flat.splice(i..i, c);
+                        }
                     }
                 }
                 let expand_rows = self.concat_has_non_array_elements(name);
                 let vals = self.unpacked_concat_operand_values(flat, expand_rows, None);
+                self.set_queue_size(name, vals.len() as u64);
+                for (i, v) in vals.into_iter().enumerate() {
+                    let v = self.fit_queue_push_elem(name, v);
+                    self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
+                }
+                true
+            }
+            // §7.4.6, §7.10.1: a slice of a queue or array (`obj.q[1:$]`),
+            // read in full before the target is written.
+            ExprKind::RangeSelect { .. } if !is_assoc => {
+                let Some((vals, _)) = self.collection_slice_values(e) else {
+                    return false;
+                };
                 self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
                     let v = self.fit_queue_push_elem(name, v);
@@ -993,19 +1024,36 @@ impl Simulator {
         self.is_associative_array(&name).then_some(name)
     }
 
-    pub(super) fn copy_assoc_entries(&mut self, dst: &str, src: &str) {
-        self.eval_builtin_method(dst, "delete", &[]);
-        // §7.9.9: every element, including the member leaves of an
-        // unpacked-struct element (`src[k].x`), which do not end in `]`.
-        let prefix = format!("{}[", src);
-        let entries: Vec<(String, Value)> = self
+    pub(super) fn read_assoc_element(&self, src: &str) -> AssocElement {
+        // §7.9.9: a member leaf such as src[k].x belongs to the entry too.
+        let entries = self
             .signals
-            .keys_with_elem_prefix(&prefix)
+            .keys_with_elem_prefix(&format!("{src}["))
             .into_iter()
-            .filter_map(|k| {
-                let v = self.signals.get(&k)?.clone();
-                Some((format!("{}{}", dst, &k[src.len()..]), v))
+            .filter_map(|key| {
+                let value = self.signals.get(&key)?.clone();
+                Some((key[src.len()..].to_string(), value))
             })
+            .collect();
+        AssocElement {
+            string_keys: self.is_string_keyed_array(src),
+            width: self.module.assoc_elem_widths.get(src).copied(),
+            entries,
+            default: self.module.assoc_defaults.get(src).cloned(),
+        }
+    }
+
+    pub(super) fn copy_assoc_entries(&mut self, dst: &str, src: &str) {
+        let snapshot = self.read_assoc_element(src);
+        self.write_assoc_entries(dst, snapshot);
+    }
+
+    fn write_assoc_entries(&mut self, dst: &str, snapshot: AssocElement) {
+        self.eval_builtin_method(dst, "delete", &[]);
+        let entries: Vec<_> = snapshot
+            .entries
+            .into_iter()
+            .map(|(suffix, value)| (format!("{dst}{suffix}"), value))
             .collect();
         let any = !entries.is_empty();
         // §7.4.5: each copied row is a collection of its own; create it as
@@ -1020,7 +1068,7 @@ impl Simulator {
         for (k, v) in entries {
             self.signals.insert(k, v);
         }
-        if let Some(d) = self.module.assoc_defaults.get(src).cloned() {
+        if let Some(d) = snapshot.default {
             self.module.assoc_defaults.insert(dst.to_string(), d);
         }
         if any {
@@ -2909,14 +2957,20 @@ impl Simulator {
     /// §7.8: make collection element `elem` an associative array holding
     /// exactly the entries of associative array `src`.
     pub(super) fn store_assoc_elem(&mut self, elem: &str, src: &str) {
-        let is_str = self.is_string_keyed_array(src);
+        let snapshot = self.read_assoc_element(src);
+        self.write_assoc_element(elem, snapshot);
+    }
+
+    pub(super) fn write_assoc_element(&mut self, elem: &str, snapshot: AssocElement) {
         self.module
             .associative_arrays
-            .insert(elem.to_string(), is_str);
-        if let Some(w) = self.module.assoc_elem_widths.get(src).copied() {
-            self.module.assoc_elem_widths.insert(elem.to_string(), w);
+            .insert(elem.to_string(), snapshot.string_keys);
+        if let Some(width) = snapshot.width {
+            self.module
+                .assoc_elem_widths
+                .insert(elem.to_string(), width);
         }
-        self.copy_assoc_entries(elem, src);
+        self.write_assoc_entries(elem, snapshot);
     }
 
     /// §7.2.1: copy the unpacked struct class property `key` of object `h`
@@ -3800,39 +3854,78 @@ impl Simulator {
     /// instance context and written to `<queue>[i]`, then the queue size is
     /// set to the number of items. Mirrors the AssignmentPattern assignment
     /// path in `assign_value`.
-    pub(super) fn populate_queue_from_init(&mut self, scoped_q: &str, init: &Expression) {
+    pub(super) fn populate_queue_from_init(
+        &mut self,
+        scoped_q: &str,
+        init: &Expression,
+        elem_type: Option<DataType>,
+    ) {
+        let width = self.module.arrays.get(scoped_q).map_or(32, |a| a.2);
+        let expand_rows = self.concat_has_non_array_elements(scoped_q)
+            && !elem_type
+                .as_ref()
+                .is_some_and(|dt| self.concat_element_type_is_array(dt));
+        self.store_queue_literal(scoped_q, init, elem_type.as_ref(), width, expand_rows);
+    }
+
+    pub(super) fn store_queue_literal(
+        &mut self,
+        scoped_q: &str,
+        init: &Expression,
+        elem_type: Option<&DataType>,
+        w: u32,
+        expand_rows: bool,
+    ) {
+        let pattern_value = |sim: &mut Self, expr: &Expression| match elem_type {
+            Some(dt) => sim.eval_pattern_leaf_value(dt, expr, Some(w)),
+            None => sim.eval_expr(expr),
+        };
         // §7.10.1: both the pattern form `'{1,2,3}` and the queue
         // concatenation form `{1,2,3}` initialize element-wise.
         let vals: Vec<Value> = match &self.unpacked_pattern(init).kind {
+            // §10.9.1: a positional `N{...}` item stands for its items
+            // repeated N times (`'{3{5}}` is three elements). §11.4.12.1:
+            // each operand is evaluated exactly once, even for N = 0, and
+            // its value is copied, as a runtime assignment of the pattern
+            // does (`'{3{f()}}` calls `f` once).
             ExprKind::AssignmentPattern(items) => {
-                items.iter().map(|it| self.eval_expr(it.expr())).collect()
-            }
-            // §10.10: an array operand of the concatenation (`{w, 5}`, a
-            // row `m[1]`, a slice `a[0 +: 2]`) contributes all its elements,
-            // and a nested concatenation splices its own.
-            ExprKind::Concatenation(parts) => {
-                let mut flat: Vec<&Expression> = parts.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
+                let mut vals = Vec::with_capacity(items.len());
+                for it in items {
+                    match it {
+                        AssignmentPatternItem::Ordered(e) => match &e.kind {
+                            ExprKind::Replication { count, exprs } => {
+                                let n = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                                let once: Vec<Value> =
+                                    exprs.iter().map(|x| pattern_value(self, x)).collect();
+                                for _ in 0..n {
+                                    vals.extend(once.iter().cloned());
+                                }
+                            }
+                            _ => vals.push(pattern_value(self, e)),
+                        },
+                        _ => vals.push(pattern_value(self, it.expr())),
                     }
                 }
-                let expand_rows = self.concat_has_non_array_elements(scoped_q);
-                self.unpacked_concat_operand_values(flat, expand_rows, None)
+                vals
+            }
+            // §10.10.3: a nested packed concatenation contributes one element.
+            ExprKind::Concatenation(parts) => {
+                let mut operands = Vec::with_capacity(parts.len());
+                if expand_rows {
+                    self.splice_array_braces(parts, &mut operands);
+                } else {
+                    operands.extend(parts);
+                }
+                self.unpacked_concat_operand_values(operands, expand_rows, None)
             }
             _ => return,
         };
-        let (_lo, _hi, w) = self
-            .module
-            .arrays
-            .get(scoped_q)
-            .copied()
-            .unwrap_or((0, 63, 32));
+        // Concatenation operands are self-determined, then assigned to the
+        // destination element type. A return snapshot has no type of its own.
+        let integral = elem_type.and_then(|dt| self.integral_queue_type(dt, w));
         let n = vals.len();
-        for (i, mut v) in vals.into_iter().enumerate() {
+        for (i, v) in vals.into_iter().enumerate() {
+            let mut v = Self::fit_queue_elem_to(integral, v);
             // §5.7.1: an unsized fill element takes the element width.
             if v.is_fill && !v.is_real {
                 v = v.resize(w.max(1));
@@ -4208,6 +4301,155 @@ impl Simulator {
             .unwrap_or_else(|| Value::zero(32))
     }
 
+    /// §7.10.2.4, §7.10.2.5: `q.pop_front()` / `q.pop_back()` on a queue whose
+    /// elements are fixed-size arrays (`int q[$][2]`, `pair_t q[$]`) returns
+    /// the removed row. A row has no packed cell of its own, only its
+    /// elements, so it travels as a call returning an unpacked array does:
+    /// copied in declared order to the return store, which the caller reads
+    /// by name (`%p`, a whole-array assignment, an unpacked concatenation).
+    /// An empty queue returns a row of the element type's default (§7.10.2).
+    /// The call is evaluated once. `None`, with nothing evaluated, when `e`
+    /// is no such pop.
+    pub(super) fn pop_row_operand(&mut self, e: &Expression) -> Option<String> {
+        const RET_SNAP: &str = "__xz_ret_coll__";
+        let (obj, pop) = self.queue_pop_call(e)?;
+        let &(_, (jlo, jhi), w) = self.module.arrays_2d.get(&obj)?;
+        let dt = self.module.var_decl_types.get(&obj).cloned()?;
+        let order: Vec<i64> = match self
+            .unpacked_decl_dims_of(&obj)
+            .and_then(|d| d.get(1).copied())
+        {
+            Some((l, r)) if l > r => (r..=l).rev().collect(),
+            _ => (jlo..=jhi).collect(),
+        };
+        let size = self.get_queue_size(&obj);
+        let idx = if pop == "pop_front" {
+            0
+        } else {
+            size.saturating_sub(1)
+        };
+        let default =
+            if super::elaborate::is_type_two_state_resolved(&dt, &self.module.typedef_types) {
+                Value::zero(w)
+            } else {
+                Value::new(w)
+            };
+        let row: Vec<Value> = order
+            .iter()
+            .map(|j| {
+                (size > 0)
+                    .then(|| self.get_signal_value_by_name(&format!("{obj}[{idx}][{j}]")))
+                    .flatten()
+                    .unwrap_or_else(|| default.clone())
+            })
+            .collect();
+        self.eval_builtin_method(&obj, &pop, &[]);
+        for (pos, v) in row.iter().enumerate() {
+            self.set_signal_value_by_name(&format!("{RET_SNAP}[{pos}]"), v.clone());
+        }
+        self.set_queue_size(RET_SNAP, row.len() as u64);
+        self.module.arrays.insert(RET_SNAP.to_string(), (0, -1, w));
+        self.module.dynamic_arrays.insert(RET_SNAP.to_string());
+        self.module.var_decl_types.insert(RET_SNAP.to_string(), dt);
+        Some(RET_SNAP.to_string())
+    }
+
+    /// §7.6, §7.4.6: copy the row in the return store `src` (zero-based) to a
+    /// part of an unpacked array that `assign_pending_ret_collection` does not
+    /// take: a slice (`d[1:2]`) or a row of a fixed multi-dimensional array
+    /// (`m[1]`), pairing elements left to right. False, with nothing
+    /// written, when `lvalue` is neither or the element counts differ.
+    pub(super) fn copy_ret_row_to_part(&mut self, lvalue: &Expression, src: &str) -> bool {
+        // The selects are read once, before any element is written: a write
+        // may change what an index reads (`m[m[0][0]] = q.pop_front()`).
+        let lvalue = &self.freeze_index_chain(lvalue);
+        let targets: Vec<Expression> = match &lvalue.kind {
+            ExprKind::RangeSelect {
+                expr,
+                kind: crate::ast::expr::RangeKind::Constant,
+                left,
+                right,
+            } if self.fixed_array_operand(expr).is_some() => {
+                let (l, r) = (self.eval_expr(left), self.eval_expr(right));
+                let (Some(l), Some(r)) = (
+                    l.to_i64().filter(|_| !l.has_xz()),
+                    r.to_i64().filter(|_| !r.has_xz()),
+                ) else {
+                    return false;
+                };
+                let idx: Vec<i64> = if l <= r {
+                    (l..=r).collect()
+                } else {
+                    (r..=l).rev().collect()
+                };
+                idx.into_iter()
+                    .map(|i| {
+                        Expression::new(
+                            ExprKind::Index {
+                                expr: expr.clone(),
+                                index: Box::new(
+                                    self.value_method_arg_expr(&Self::signed_loop_val(i)),
+                                ),
+                            },
+                            lvalue.span,
+                        )
+                    })
+                    .collect()
+            }
+            ExprKind::Index { .. } => match self.unpacked_row_suffixes(lvalue) {
+                Some(sfx) => sfx
+                    .iter()
+                    .map(|s| Self::append_leaf_path(lvalue, s))
+                    .collect(),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if targets.len() as u64 != self.get_queue_size(src) {
+            return false;
+        }
+        for (k, t) in targets.iter().enumerate() {
+            let v = self
+                .get_signal_value_by_name(&format!("{src}[{k}]"))
+                .unwrap_or_else(|| Value::zero(32));
+            self.assign_value(t, &v);
+        }
+        true
+    }
+
+    /// `e` with the index of each element select along its chain, and the
+    /// base of a slice, replaced by a literal of its value now, so writes
+    /// through it select the same elements however they change what an
+    /// index reads.
+    fn freeze_index_chain(&mut self, e: &Expression) -> Expression {
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index } => ExprKind::Index {
+                expr: Box::new(self.freeze_index_chain(expr)),
+                index: Box::new(self.capture_index_literal(index, expr)),
+            },
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.freeze_index_chain(expr)),
+                kind: *kind,
+                left: left.clone(),
+                right: right.clone(),
+            },
+            _ => return e.clone(),
+        };
+        Expression::new(kind, e.span)
+    }
+
+    /// Whether `e` is a pop that [`Self::pop_row_operand`] returns a row for.
+    /// Nothing is evaluated.
+    pub(super) fn is_pop_row_call(&mut self, e: &Expression) -> bool {
+        self.queue_pop_call(e)
+            .is_some_and(|(obj, _)| self.module.arrays_2d.contains_key(&obj))
+    }
+
     /// `q.pop_front()` / `q.pop_back()` — the queue name and which end.
     pub(super) fn queue_pop_call(&mut self, e: &Expression) -> Option<(String, String)> {
         let ExprKind::Call { func, .. } = &e.kind else {
@@ -4234,10 +4476,15 @@ impl Simulator {
             return None;
         }
         if self.module.dynamic_arrays.contains(&obj) {
-            Some((obj, mname))
-        } else {
-            None
+            return Some((obj, mname));
         }
+        // A subroutine-local queue named in the two-segment form is stored
+        // under its per-call key (`@q#3`), which the pop itself resolves to.
+        let local = self.dyn_name_lookup(&obj)?;
+        self.module
+            .dynamic_arrays
+            .contains(local)
+            .then(|| (local.to_string(), mname))
     }
 
     /// Whether `name` is a row of a declared collection whose row kind is a
@@ -4701,17 +4948,12 @@ impl Simulator {
         else {
             return self.static_integral_queue_elem(coll);
         };
-        if !integral(self.resolve_dt_ref(dt)) {
-            return None;
-        }
-        let w = self
-            .module
-            .arrays
-            .get(coll)
-            .map(|t| t.2)
-            .filter(|w| *w > 0)?;
-        Some((
-            w,
+        self.integral_queue_type(dt, self.module.arrays.get(coll)?.2)
+    }
+
+    fn integral_queue_type(&self, dt: &DataType, width: u32) -> Option<(u32, bool, bool)> {
+        (width > 0 && Self::integral_dt(self.resolve_dt_ref(dt))).then(|| (
+            width,
             self.type_is_signed_concrete(dt),
             super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types),
         ))

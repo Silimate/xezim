@@ -29,10 +29,30 @@ use xezim_core::elaborate::{ElaboratedModule, ParamEnv, ParamLookup};
 /// The elaboration's parameter table type (`ElaboratedModule::parameters`).
 type ParamMap = xezim_core::hasher::HashMap<String, Value>;
 
-/// Run the second-pass lint over every top-level definition. Returns a list of
-/// error messages (empty == clean).
+/// What the second-pass lint found: the errors that reject the design, and the
+/// warnings for what a `--relax-*` switch accepted instead.
+#[derive(Debug, Default)]
+pub struct LintReport {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Run the second-pass lint over every top-level definition and print its
+/// warnings. Returns a list of error messages (empty == clean).
 pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
+    let report = lint_design(defs, elab);
+    for w in &report.warnings {
+        eprintln!("{w}");
+    }
+    report.errors
+}
+
+/// Run the second-pass lint over every top-level definition. The caller
+/// prints the warnings, so it can also keep them for a warm design-cache hit
+/// to replay.
+pub fn lint_design(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> LintReport {
     let mut errs = Vec::new();
+    let mut warns = Vec::new();
     // §23.3.2: map every module/interface/program to its declared port names,
     // so a named port connection to a non-existent port can be rejected.
     let port_map = build_port_map(defs);
@@ -87,7 +107,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     &local_types,
                     &mut errs,
                 );
-                check_proc_net_assign(&m.ports, &m.items, &mut errs);
+                check_proc_net_assign(&m.name.name, &m.ports, &m.items, &mut errs, &mut warns);
                 check_monitor_automatic(&m.items, &mut errs);
                 check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, scope, &mut errs);
@@ -194,7 +214,10 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
         // §23.8: a hierarchical name that does not resolve is an error.
         errs.extend(crate::hier_ref_lint::check(defs, elab));
     }
-    errs
+    LintReport {
+        errors: errs,
+        warnings: warns,
+    }
 }
 
 /// A module, interface or program, as the scope checks see it.
@@ -230,7 +253,7 @@ fn check_unit<'a>(
     }
     check_generate_block_names(u.items, errs);
     check_system_task_values(u.items, errs);
-    check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
+    check_wildcard_import_conflicts(u, pkg_decls, errs);
     check_imported_hier_refs(defs, u.items, pkg_decls, errs);
     let classes = visible_classes(global, u.items);
     check_inherited_local_access(&classes, u.items, errs);
@@ -481,6 +504,23 @@ fn check_array_flat_init(d: &VarDeclarator, scope: ConstScope, errs: &mut Vec<St
     }
 }
 
+/// `--relax-untyped-output-port` (`XEZIM_RELAX_UNTYPED_OUTPUT_PORT`): an ANSI
+/// output port declared with no data type (`output q`, `output [3:0] c`) is a
+/// net (§23.2.2.3), so a procedural assignment to it is illegal (§6.5). Some
+/// tools take such a port as a variable; with this relaxation xezim does too,
+/// with a warning. A port declared as a net (`output wire q`) stays an error.
+pub static RELAX_UNTYPED_OUTPUT_PORT: xezim_core::sv_parser::RelaxFlag =
+    xezim_core::sv_parser::RelaxFlag::new(
+        "untyped-output-port",
+        "XEZIM_RELAX_UNTYPED_OUTPUT_PORT",
+        "take an output port declared with no data type (`output q`), which is a net, as a \
+         variable when a procedural block assigns it (§23.2.2.3, §6.5)",
+    );
+
+/// The relaxations this lint owns. `crate::relax_flags` adds them to the
+/// parser's for the command line, `--help` and the design-cache key.
+pub static LINT_RELAX_FLAGS: [&xezim_core::sv_parser::RelaxFlag; 1] = [&RELAX_UNTYPED_OUTPUT_PORT];
+
 /// §6.5: a net (an explicit `wire`/`tri`/... declaration) may not be the target
 /// of a procedural assignment (`=`/`<=` inside always/initial) — only a
 /// continuous assignment or `force`. Catches `wire w; initial w = ...;`.
@@ -488,10 +528,113 @@ fn check_array_flat_init(d: &VarDeclarator, scope: ConstScope, errs: &mut Vec<St
 /// §23.2.2.3 makes nets (`output b`, `output [3:0] c`, `output wire d`, and
 /// the ports inheriting from one); `output logic q` / `output reg q` are
 /// variables. Only `=`/`<=` targets are checked (force/release/assign are
-/// separate statement kinds).
-fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<String>) {
+/// separate statement kinds). An output port that is a net only because its
+/// declaration has no data type (`output b`, `output [3:0] c`) gets a message
+/// that says so, and `--relax-untyped-output-port` takes it as a variable.
+fn check_proc_net_assign(
+    module: &str,
+    ports: &PortList,
+    items: &[ModuleItem],
+    errs: &mut Vec<String>,
+    warns: &mut Vec<String>,
+) {
+    use std::collections::HashSet;
+    let (nets, untyped) = proc_net_targets(ports, items);
+    if nets.is_empty() {
+        return;
+    }
+    let mut flagged: HashSet<String> = HashSet::new();
+    for_each_proc_stmt(items, &mut |stmt| {
+        for_each_proc_assign_lhs(stmt, &mut |lv| {
+            if let Some(b) = base_ident(lv) {
+                if nets.contains(&b) && flagged.insert(b.clone()) {
+                    if !untyped.contains(&b) {
+                        errs.push(format!(
+                            "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
+                             §6.5 — nets need a continuous assignment)",
+                            b
+                        ));
+                    } else if RELAX_UNTYPED_OUTPUT_PORT.get() {
+                        warns.push(format!(
+                            "[xezim][warning] output port '{b}' of module '{module}' has no data \
+                             type, so it is a net (IEEE 1800-2023 §23.2.2.3), and a procedural \
+                             block assigns it (§6.5); taking it as a variable, as if it were \
+                             declared `output logic` (--relax-untyped-output-port)"
+                        ));
+                    } else {
+                        errs.push(format!(
+                            "output port '{b}' of module '{module}' is the target of a \
+                             procedural assignment, but it is a net: its declaration has no \
+                             data type (IEEE 1800-2023 §23.2.2.3), and a net cannot be assigned \
+                             procedurally (§6.5). Declare it `output logic` rather than \
+                             `output`, or pass --relax-untyped-output-port to take it as a \
+                             variable"
+                        ));
+                    }
+                }
+            }
+        });
+    });
+}
+
+/// The ANSI output ports of a module that `--relax-untyped-output-port`
+/// takes as variables: the ports that are nets only because their
+/// declaration has no data type and no net kind (§23.2.2.3), and that a
+/// procedural block assigns (§6.5). Empty when the relaxation is off. The VPI
+/// object model declares these ports as variables, as the warning says
+/// (`output logic`), so `vpiVariables` lists them and `vpiNet` does not.
+pub fn relaxed_untyped_output_ports(
+    ports: &PortList,
+    items: &[ModuleItem],
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if !RELAX_UNTYPED_OUTPUT_PORT.get() {
+        return out;
+    }
+    let (_, untyped) = proc_net_targets(ports, items);
+    if untyped.is_empty() {
+        return out;
+    }
+    for_each_proc_stmt(items, &mut |stmt| {
+        for_each_proc_assign_lhs(stmt, &mut |lv| {
+            if let Some(b) = base_ident(lv) {
+                if untyped.contains(&b) {
+                    out.insert(b);
+                }
+            }
+        });
+    });
+    out
+}
+
+/// Call `f` on the statement of each `always` and `initial` construct, the
+/// procedural blocks whose assignments `check_proc_net_assign` checks.
+fn for_each_proc_stmt(items: &[ModuleItem], f: &mut dyn FnMut(&Statement)) {
+    for it in items {
+        match it {
+            ModuleItem::AlwaysConstruct(a) => f(&a.stmt),
+            ModuleItem::InitialConstruct(i) => f(&i.stmt),
+            _ => {}
+        }
+    }
+}
+
+/// The nets `check_proc_net_assign` checks, and of those the output ports
+/// that are nets only because they have no data type and no net kind.
+/// Nets are the explicit NetDeclarations and the ANSI output ports that
+/// §23.2.2.3 makes nets, less any name a body data declaration redeclares.
+fn proc_net_targets(
+    ports: &PortList,
+    items: &[ModuleItem],
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
     use std::collections::HashSet;
     let mut nets: HashSet<String> = HashSet::new();
+    // The output ports that are nets because they have no data type and no
+    // net kind.
+    let mut untyped: HashSet<String> = HashSet::new();
     for it in items {
         if let ModuleItem::NetDeclaration(nd) = it {
             for d in &nd.declarators {
@@ -515,8 +658,17 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
                     && !p.var_kw
                     && matches!(p.data_type, None | Some(DataType::Implicit { .. }))
             };
+            // The parser has already copied an omitted direction, kind and
+            // data type from the port before (§23.2.2.3), so in `output q, r`
+            // the port `r` arrives declared like `q`, and its own fields
+            // decide. A port that still omits all of them has no declaration
+            // to point at, so it keeps the plain net message.
+            let no_type = net && !omitted && p.net_type.is_none();
             if net {
                 nets.insert(p.name.name.clone());
+                if no_type {
+                    untyped.insert(p.name.name.clone());
+                }
             }
             prev_net = net;
         }
@@ -526,33 +678,12 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
             if let ModuleItem::DataDeclaration(d) = it {
                 for dc in &d.declarators {
                     nets.remove(&dc.name.name);
+                    untyped.remove(&dc.name.name);
                 }
             }
         }
     }
-    if nets.is_empty() {
-        return;
-    }
-    let mut flagged: HashSet<String> = HashSet::new();
-    for it in items {
-        let stmt = match it {
-            ModuleItem::AlwaysConstruct(a) => &a.stmt,
-            ModuleItem::InitialConstruct(i) => &i.stmt,
-            ModuleItem::FinalConstruct(_) => continue,
-            _ => continue,
-        };
-        for_each_proc_assign_lhs(stmt, &mut |lv| {
-            if let Some(b) = base_ident(lv) {
-                if nets.contains(&b) && flagged.insert(b.clone()) {
-                    errs.push(format!(
-                        "net '{}' is the target of a procedural assignment (LRM 1800-2017 \
-                         §6.5 — nets need a continuous assignment)",
-                        b
-                    ));
-                }
-            }
-        });
-    }
+    (nets, untyped)
 }
 
 /// Call `f(lvalue, rvalue)` for each procedural blocking/nonblocking assignment.
@@ -4920,28 +5051,29 @@ fn collect_stmt_exprs<'a>(st: &'a Statement, f: &mut dyn FnMut(&'a Expression)) 
 /// visible through either import; referencing it without a local declaration
 /// or an explicit import is an error.
 fn check_wildcard_import_conflicts(
-    ports: &PortList,
-    params: &[xezim_core::ast::decl::ParameterDeclaration],
-    items: &[ModuleItem],
+    u: &Unit,
     pkgs: &HashMap<String, HashSet<String>>,
     errs: &mut Vec<String>,
 ) {
+    let items = u.items;
     let (wild, explicit) = module_imports(items);
     if wild.len() < 2 {
         return;
     }
-    let own = module_own_names(ports, params, items);
-    let mut count: HashMap<&str, usize> = HashMap::new();
-    let mut uniq: Vec<&str> = wild.clone();
-    uniq.sort();
-    uniq.dedup();
-    for p in uniq {
-        for n in pkgs.get(p).into_iter().flatten() {
-            *count.entry(n.as_str()).or_default() += 1;
+    let own = module_own_names(u.ports, u.params, items);
+    // Each name's packages, in the order of the imports.
+    let mut providers: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (i, p) in wild.iter().enumerate() {
+        if wild[..i].contains(p) {
+            continue;
+        }
+        for n in pkgs.get(*p).into_iter().flatten() {
+            providers.entry(n.as_str()).or_default().push(*p);
         }
     }
-    let ambiguous =
-        |n: &str| count.get(n).is_some_and(|&c| c > 1) && !own.contains(n) && !explicit.contains(n);
+    let ambiguous = |n: &str| {
+        providers.get(n).is_some_and(|ps| ps.len() > 1) && !own.contains(n) && !explicit.contains(n)
+    };
     let mut hits: Vec<String> = Vec::new();
     for it in items {
         if let ModuleItem::DataDeclaration(d) = it
@@ -4981,9 +5113,17 @@ fn check_wildcard_import_conflicts(
     hits.sort();
     hits.dedup();
     for n in hits {
+        let ps = &providers[n.as_str()];
+        let list: Vec<String> = ps.iter().map(|p| format!("'{p}'")).collect();
+        let (last, rest) = list.split_last().expect("two or more packages");
         errs.push(format!(
-            "'{n}' is declared by more than one wildcard-imported package, so it is not \
-             visible here (LRM 1800-2017 §26.3)"
+            "'{n}' is declared by more than one wildcard-imported package ({} and {last}, all \
+             imported into '{}'), so it is not visible here (IEEE 1800-2023 §26.3); import it \
+             explicitly or qualify it (`{}::{n}`), or pass --relax-wildcard-import-conflict to \
+             use the first import",
+            rest.join(", "),
+            u.name,
+            ps[0],
         ));
     }
 }

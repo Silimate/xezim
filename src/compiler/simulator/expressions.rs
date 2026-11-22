@@ -1387,6 +1387,272 @@ impl Simulator {
         }
     }
 
+    /// §23.6: whether `h` is `$root.top.a[i].m`, a name that selects a member
+    /// after an element select, whose flat key names no storage. A generate
+    /// block or instance-array element (`$root.top.g[1].x`) is a scope whose
+    /// constant index is part of that key, and keeps the name resolver's path.
+    /// Nothing is evaluated or built.
+    pub(super) fn root_member_select_shape(&self, h: &HierarchicalIdentifier) -> bool {
+        h.path.len() >= 3
+            && h.path[0].name.name == "$root"
+            && h.path[..h.path.len() - 1]
+                .iter()
+                .any(|s| !s.selects.is_empty())
+            && !self.unit_scope_decl_exists(&self.resolve_hier_name(h))
+    }
+
+    /// Whether any select of `h` has a side effect (`i++`, a call).
+    fn hier_has_effect_select(h: &HierarchicalIdentifier) -> bool {
+        h.path.iter().any(|s| {
+            s.selects
+                .iter()
+                .any(|e| !Self::cond_expr_is_effect_free(e, false))
+        })
+    }
+
+    /// The dotted names of `h` (without `$root`) up to its first select as
+    /// one identifier, that segment's selects, and the segments after it.
+    fn root_member_parts(
+        h: &HierarchicalIdentifier,
+    ) -> Option<(
+        HierarchicalIdentifier,
+        Vec<Expression>,
+        Vec<crate::ast::expr::HierPathSegment>,
+    )> {
+        let first = h.path.iter().position(|s| !s.selects.is_empty())?;
+        let mut base = h.clone();
+        let rest = base.path.split_off(first + 1);
+        base.path.remove(0);
+        let selects = std::mem::take(&mut base.path.last_mut()?.selects);
+        base.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+        base.cached_resolved_name = crate::ast::cache::NameCache::new();
+        base.bound = crate::ast::binding::Bound::UNSET;
+        Some((base, selects, rest))
+    }
+
+    /// A name of `root_member_select_shape` in the shape its relative
+    /// spelling `top.a[i].m` has after elaboration: the dotted names up to
+    /// the first select as one identifier (`top.a`), then the selects and the
+    /// later members (`MemberAccess { Index { Ident, i }, m }`). The member
+    /// and select arms read a class property through a queue or array element
+    /// (§7.10, §8.4) and a field of a packed-struct element (§7.2.1) from
+    /// that shape only; as one identifier its flat key named no storage and
+    /// the read was 0.
+    ///
+    /// The chain's readers may look its selects up more than once. For a
+    /// `read`, a select with a side effect (`objs[i++]`, `objs[next()]`) is
+    /// made a literal of its value, evaluated here once, left to right
+    /// (§11.4.2, §13.4.1). For sizing it is not evaluated: the first select
+    /// of the collection becomes `probe`, any other 0.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn root_member_select_chain(
+        &mut self,
+        h: &HierarchicalIdentifier,
+        span: crate::ast::Span,
+        read: bool,
+        probe: i64,
+    ) -> Option<Expression> {
+        if !self.root_member_select_shape(h) {
+            return None;
+        }
+        let (base, selects, rest) = Self::root_member_parts(h)?;
+        let mut chain = Expression::new(ExprKind::Ident(base), span);
+        let index = |me: &mut Self, chain: Expression, sel: &Expression, probe: i64| {
+            let sel = if Self::cond_expr_is_effect_free(sel, false) {
+                sel.clone()
+            } else if read {
+                me.capture_index_literal(sel, &chain)
+            } else {
+                Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: true,
+                        base: NumberBase::Decimal,
+                        value: probe.to_string(),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
+                    }),
+                    sel.span,
+                )
+            };
+            Expression::new(
+                ExprKind::Index {
+                    expr: Box::new(chain),
+                    index: Box::new(sel),
+                },
+                span,
+            )
+        };
+        for (k, sel) in selects.iter().enumerate() {
+            chain = index(self, chain, sel, if k == 0 { probe } else { 0 });
+        }
+        for seg in &rest {
+            chain = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(chain),
+                    member: seg.name.clone(),
+                },
+                span,
+            );
+            for sel in &seg.selects {
+                chain = index(self, chain, sel, 0);
+            }
+        }
+        Some(chain)
+    }
+
+    /// What the width probes size a name of `root_member_select_shape` by,
+    /// and whether that width holds for every evaluation of the name, so it
+    /// may be kept on the node. A name whose selects are free of side effects
+    /// is sized as its chain reads, from the element it selects. For one with
+    /// a side-effect select nothing is evaluated: the expression is a literal
+    /// as wide as the member's declared type (`root_member_declared_width`),
+    /// which holds; else the chain through the collection's first element
+    /// that holds an object (`root_member_probe_index`). The width of that
+    /// object's own property holds too, since every element has the declared
+    /// type; a member deeper than that is reached through handles it may
+    /// hold null, so its width does not.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn root_member_size(
+        &mut self,
+        h: &HierarchicalIdentifier,
+        span: crate::ast::Span,
+    ) -> Option<(Expression, bool)> {
+        if !self.root_member_select_shape(h) {
+            return None;
+        }
+        if !Self::hier_has_effect_select(h) {
+            return Some((self.root_member_select_chain(h, span, false, 0)?, false));
+        }
+        let (base, _, rest) = Self::root_member_parts(h)?;
+        if let Some(w) = self.root_member_declared_width(&base, &rest) {
+            let lit = Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(w),
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: "0".to_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            );
+            return Some((lit, true));
+        }
+        let probe = self.root_member_probe_index(&base);
+        let chain = self.root_member_select_chain(h, span, false, probe.unwrap_or(0))?;
+        // The probed object's own property sizes the member; a deeper member
+        // is reached through handles that object may hold null, so its
+        // width is not kept.
+        Some((chain, probe.is_some() && rest.len() == 1))
+    }
+
+    /// The first index of the collection `base` names whose element is a
+    /// live object, when its elements are class handles: the element the
+    /// width probes read for a select they must not evaluate. `None` when
+    /// there is none, or the elements are not handles.
+    fn root_member_probe_index(&self, base: &HierarchicalIdentifier) -> Option<i64> {
+        let name = self.resolve_hier_name(base);
+        let name = name.as_ref();
+        let holds_objects = self.module.var_decl_types.get(name).is_some_and(|dt| {
+            matches!(self.resolve_dt_ref(dt),
+                DataType::TypeReference { name: t, .. } if self.module.classes.contains_key(&t.name.name))
+        });
+        if !holds_objects {
+            return None;
+        }
+        let (lo, n) = if self.module.dynamic_arrays.contains(name) {
+            (0, self.get_queue_size(name) as i64)
+        } else if let Some(&(l, r, _)) = self.module.arrays.get(name) {
+            (l.min(r), l.abs_diff(r) as i64 + 1)
+        } else {
+            return None;
+        };
+        (lo..lo + n).find(|k| {
+            self.get_signal_value_by_name(&format!("{name}[{k}]"))
+                .and_then(|v| v.to_u64())
+                .is_some_and(|h| h != 0)
+        })
+    }
+
+    /// The declared width of the member `rest` names below an element of the
+    /// collection `base` (`objs` of `$root.tb.objs[k].v`, with `rest` the
+    /// segments from `v`), walked from the collection's declared element type
+    /// through struct members and class properties (§7.2, §8.4). No element
+    /// is read, so a null handle at any level does not hide the width.
+    ///
+    /// A member declared in a parameterized class may be sized by the
+    /// object's own parameters (§8.25): there only a type whose ranges are
+    /// literals is accepted, and a type-parameter property ends the walk.
+    /// Elsewhere a range must fold with the design's parameters, since
+    /// `resolve_type_width` skips one it cannot fold and would hand back 1.
+    /// `None` when a later segment selects or the walk meets another type.
+    fn root_member_declared_width(
+        &self,
+        base: &HierarchicalIdentifier,
+        rest: &[crate::ast::expr::HierPathSegment],
+    ) -> Option<u32> {
+        if rest.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.resolve_hier_name(base);
+        let mut dt = self.module.var_decl_types.get(name.as_ref())?.clone();
+        // Whether the current type was declared in a parameterized class.
+        let mut in_param_class = false;
+        for seg in rest {
+            let member = seg.name.name.as_str();
+            dt = match self.resolve_dt_ref(&dt) {
+                DataType::Struct(su) => su
+                    .members
+                    .iter()
+                    .find(|m| m.declarators.iter().any(|d| d.name.name == member))?
+                    .data_type
+                    .clone(),
+                DataType::TypeReference { name, .. }
+                    if self.module.classes.contains_key(&name.name.name) =>
+                {
+                    let owners = self.prop_owners(&name.name.name);
+                    let (owner, cd) = owners.get(member)?;
+                    let pt = cd.property_types.get(member)?.clone();
+                    if let DataType::TypeReference { name: t, .. } = &pt
+                        && cd.type_param_names.contains(&t.name.name)
+                    {
+                        return None;
+                    }
+                    in_param_class = self.class_is_parameterized(owner)
+                        || self.class_is_parameterized(&name.name.name);
+                    pt
+                }
+                _ => return None,
+            };
+        }
+        let params = (!in_param_class).then_some(&self.module.parameters);
+        let folds = |dims: &[crate::ast::types::PackedDimension]| {
+            dims.iter().all(|d| match d {
+                crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                    crate::elaborate::const_eval_i64_with_params(left, params).is_some()
+                        && crate::elaborate::const_eval_i64_with_params(right, params).is_some()
+                }
+                crate::ast::types::PackedDimension::Unsized(_) => false,
+            })
+        };
+        let sized = match &dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                folds(dimensions)
+            }
+            DataType::IntegerAtom { .. } => true,
+            // A named type in a parameterized class may be one of its own
+            // typedefs over its parameters.
+            DataType::TypeReference { dimensions, .. } => !in_param_class && folds(dimensions),
+            _ => !in_param_class,
+        };
+        if !sized {
+            return None;
+        }
+        let w = super::elaborate::resolve_type_width(&dt, params, Some(&self.module.typedefs));
+        (w > 0).then_some(w)
+    }
+
     /// Read fast path for a select-free single-segment identifier: the frame
     /// local of that name, else the plain property of `this`. Everything the
     /// full path checks before those two reads is keyed on multi-segment or
@@ -1890,6 +2156,205 @@ impl Simulator {
             BinaryOp::Gt => l.greater_than(&r),
             _ => l.geq(&r),
         })
+    }
+
+    /// Whether the member/select chain `e` reads a member (`objs[k].v`,
+    /// `objs[k].arr[j]`), not only selects of a variable.
+    fn chain_reads_member(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { .. } => return true,
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::Paren(expr) => cur = expr,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether `e` reads a member through a select whose index has a side
+    /// effect (`objs[i++].v`, `qs[next()].a`, `objs[i++].arr[j++]`), in a
+    /// chain not rooted at a call. A call-rooted chain (`f().objs[i++].v`)
+    /// keeps its own path: its statement may hold the call's value by node
+    /// (`recv_call_memo`), which a copy of the chain would not find.
+    pub(super) fn is_effect_member_read(e: &Expression) -> bool {
+        Self::chain_reads_member(e)
+            && Self::lvalue_has_incdec_index(e)
+            && Self::recv_chain_call(e).is_none()
+    }
+
+    /// §11.4.2, §13.4: a member read of `is_effect_member_read`'s shape
+    /// evaluates each side-effect index once. The member and select arms
+    /// resolve the element several times as they try each storage shape (a
+    /// handle, a packed or an unpacked struct element), so the index ran once
+    /// per try and the read returned another element's member. As for a
+    /// method call's receiver (`eval_call_inner`), each such index becomes the
+    /// literal of its value, evaluated once, left to right.
+    pub(super) fn freeze_member_read_selects(&mut self, e: &Expression) -> Option<Expression> {
+        if !Self::is_effect_member_read(e) {
+            return None;
+        }
+        self.rewrite_lvalue_index_side_effects(e)
+    }
+
+    /// What the width probes size a member read of `is_effect_member_read`'s
+    /// shape by, without running its side effects (§11.4.2, §13.4): a copy in
+    /// which each side-effect index is the literal of an element the select
+    /// may name (`probe_select`). Every element has the collection's
+    /// declared type, so the copy is as wide as the read, and evaluating it
+    /// evaluates no side effect. Sized by evaluating the read itself, an
+    /// operand of a comparison or of an arithmetic operator ran its index
+    /// once more for each probe.
+    pub(super) fn member_read_width_probe(&mut self, e: &Expression) -> Expression {
+        let kind = match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let base = self.member_read_width_probe(expr);
+                let index = if Self::cond_expr_is_effect_free(index, false) {
+                    (**index).clone()
+                } else {
+                    self.probe_select(&base, index.span)
+                };
+                ExprKind::Index {
+                    expr: Box::new(base),
+                    index: Box::new(index),
+                }
+            }
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
+                let base = self.member_read_width_probe(expr);
+                let bound = |me: &mut Self, b: &Expression| {
+                    if Self::cond_expr_is_effect_free(b, false) {
+                        b.clone()
+                    } else {
+                        me.probe_select(&base, b.span)
+                    }
+                };
+                let (left, right) = (bound(self, left), bound(self, right));
+                ExprKind::RangeSelect {
+                    expr: Box::new(base),
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    kind: *kind,
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => ExprKind::MemberAccess {
+                expr: Box::new(self.member_read_width_probe(expr)),
+                member: member.clone(),
+            },
+            ExprKind::Paren(inner) => ExprKind::Paren(Box::new(self.member_read_width_probe(inner))),
+            _ => return e.clone(),
+        };
+        Expression::new(kind, e.span)
+    }
+
+    /// A select the width probes may read through `base` in place of a
+    /// side-effect select: the first index or key of the collection `base`
+    /// names. When its elements are class handles, the first that holds an
+    /// object instead, however far back: a null element has no object to
+    /// size a property by, and sized through one a byte property read as 32
+    /// bits. With no object anywhere, the read itself is through a null
+    /// handle. `base` has no side-effect select left, so naming it evaluates
+    /// none.
+    fn probe_select(&mut self, base: &Expression, span: crate::ast::Span) -> Expression {
+        let zero = || Self::probe_index_literal(0, span);
+        // An object's collection property (`h.items`, `items` in a method)
+        // is stored as `<handle>#items`.
+        let Some(name) = self
+            .expr_assoc_name(base)
+            .or_else(|| self.flat_member_name(base))
+        else {
+            return zero();
+        };
+        let handles = self.probe_coll_holds_handles(&name);
+        let live = |me: &Self, elem: &str| {
+            me.get_signal_value_by_name(elem)
+                .and_then(|v| v.to_u64())
+                .is_some_and(|h| h != 0 && me.heap.get(h as usize).is_some_and(|o| o.is_some()))
+        };
+        if self.is_associative_array(&name) {
+            let keys = self.assoc_top_level_keys_shared(&name);
+            let found = handles
+                .then(|| keys.iter().find(|k| live(self, &format!("{name}[{k}]"))))
+                .flatten();
+            let Some(key) = found.or(keys.first()) else {
+                return zero();
+            };
+            if self.is_string_keyed_array(&name) {
+                let key = decode_name_key(key).to_string();
+                return Expression::new(ExprKind::StringLiteral(key), span);
+            }
+            return key
+                .parse::<i64>()
+                .map_or_else(|_| zero(), |k| Self::probe_index_literal(k, span));
+        }
+        // A queue or dynamic array by its live size: the fixed-array table
+        // can hold a placeholder shape for it.
+        let (lo, n) = match self.module.arrays.get(&name) {
+            Some(&(l, r, _)) if !self.module.dynamic_arrays.contains(&name) => {
+                (l.min(r), l.abs_diff(r) + 1)
+            }
+            _ => (0, self.get_queue_size(&name)),
+        };
+        let k = handles
+            .then(|| (lo..lo + n as i64).find(|k| live(self, &format!("{name}[{k}]"))))
+            .flatten()
+            .unwrap_or(lo);
+        Self::probe_index_literal(k, span)
+    }
+
+    /// Whether the elements of the collection stored as `name` are class
+    /// handles: a design collection (`coll_elem_is_class_handle`), or an
+    /// object's property (`<h>#items`) declared with a class element type.
+    fn probe_coll_holds_handles(&self, name: &str) -> bool {
+        if self.coll_elem_is_class_handle(name) {
+            return true;
+        }
+        let Some((h, prop)) = name.split_once('#') else {
+            return false;
+        };
+        let Some(class) = h
+            .parse::<usize>()
+            .ok()
+            .and_then(|h| self.heap.get(h)?.as_ref())
+            .map(|o| o.class_name.clone())
+        else {
+            return false;
+        };
+        let class = class.split('#').next().unwrap_or(&class).trim();
+        let owners = self.prop_owners(class);
+        owners
+            .get(prop)
+            .and_then(|(_, cd)| cd.properties.get(prop))
+            .and_then(|sig| sig.type_name.as_deref())
+            .is_some_and(|t| self.resolve_typeref_class_name_str(t.trim()).is_some())
+    }
+
+    fn probe_index_literal(k: i64, span: crate::ast::Span) -> Expression {
+        let lit = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: NumberBase::Decimal,
+                value: k.unsigned_abs().to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        );
+        if k >= 0 {
+            return lit;
+        }
+        Expression::new(
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand: Box::new(lit),
+            },
+            span,
+        )
     }
 
     /// The outermost CALL in receiver position of the member/select chain
@@ -2653,6 +3118,17 @@ impl Simulator {
                     let rewritten = Expression::new(ExprKind::Ident(abs), expr.span);
                     return self.eval_expr_ctx_inner(&rewritten, ctx_width, unsigned_context);
                 }
+                // §23.6: a member after an element select
+                // (`$root.top.objs[1].v`, `$root.top.qs[i].a`) reads as the
+                // relative name's select chain.
+                if h.path.len() >= 3
+                    && h.path[0].name.name == "$root"
+                    && let Some(chain) = self.root_member_select_chain(h, expr.span, true, 0)
+                {
+                    return self.eval_expr_ctx_inner(&chain, ctx_width, unsigned_context);
+                }
+                // A queue element's member that the rewrite above does not cover
+                // reads through the queue's storage.
                 if h.path.len() >= 4 && h.path[0].name.name == "$root" {
                     for i in 2..h.path.len() - 1 {
                         if h.path[i].selects.is_empty() {
@@ -2684,6 +3160,9 @@ impl Simulator {
             ExprKind::MemberAccess { expr: base, member } => {
                 if let Some(v) = self.plain_member_read(base, member) {
                     return v;
+                }
+                if let Some(frozen) = self.freeze_member_read_selects(expr) {
+                    return self.eval_expr_ctx_inner(&frozen, ctx_width, unsigned_context);
                 }
                 if !self.local_stack.is_empty()
                     && let Some(v) = self.frame_handle_path_read(expr)
@@ -2731,6 +3210,9 @@ impl Simulator {
                 ) && let Some(v) = self.recv_call_once_eval(expr, ctx_width)
                 {
                     return v;
+                }
+                if let Some(frozen) = self.freeze_member_read_selects(expr) {
+                    return self.eval_expr_ctx_inner(&frozen, ctx_width, unsigned_context);
                 }
                 if (self.needs_declared_packed_access(expr)
                     || self.needs_static_packed_access(expr))
@@ -6050,11 +6532,20 @@ impl Simulator {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
                         let name = self.multidim_array_store(hier, inner_expr, |s, n| s.module.arrays_2d.contains_key(n));
                         if self.module.arrays_2d.contains_key(&*name) {
+                            // §7.10.1: in the row select of a queue of
+                            // fixed-size rows (`q[$][1]`), `$` is the queue's
+                            // last index.
+                            let queue_rows = self.module.dynamic_arrays.contains(&*name);
+                            if queue_rows {
+                                self.dollar_bound
+                                    .push(self.get_queue_size(&name) as i64 - 1);
+                            }
+                            let row = self.eval_expr(inner_idx).to_index();
+                            if queue_rows {
+                                self.dollar_bound.pop();
+                            }
                             // §11.5.1: an x/z index reads an all-x element.
-                            let (Some(i), Some(j)) = (
-                                self.eval_expr(inner_idx).to_index(),
-                                self.eval_expr(index).to_index(),
-                            ) else {
+                            let (Some(i), Some(j)) = (row, self.eval_expr(index).to_index()) else {
                                 let ew = self
                                     .module
                                     .arrays_2d

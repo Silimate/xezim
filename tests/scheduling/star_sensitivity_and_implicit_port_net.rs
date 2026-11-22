@@ -47,7 +47,10 @@ module tb;
   logic p, q;
   integer bumps;
   integer ticks;
-  initial begin bumps = 0; ticks = 0; p = 1'b0; q = 1'b1; end
+  // p and q change at time 1, once the blocks below wait at `@(*)`. At time
+  // 0 the writes would race with the blocks' start (§4.7): the reference
+  // simulator starts the blocks first, xezim starts this `initial` first.
+  initial begin bumps = 0; ticks = 0; #1 p = 1'b0; q = 1'b1; end
   // Reads nothing that ever changes again -> must fire once, then park.
   always @(*) begin
     #0;

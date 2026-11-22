@@ -569,3 +569,6 @@ mod wait_then_event_control;
 // silimate: fork children an edge-woken process starts run before the NBA region
 #[path = "scheduling/fork_children_before_nba.rs"]
 mod fork_children_before_nba;
+// silimate: a condition-waiter drain's settle and writes reach the full edge pass
+#[path = "scheduling/settle_edges_before_nba.rs"]
+mod settle_edges_before_nba;

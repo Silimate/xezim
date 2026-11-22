@@ -1597,6 +1597,25 @@ impl Simulator {
         true
     }
 
+    // silimate: a settle that moves a copied clock widens the pre-NBA edge pass
+    /// Whether an edge signal other than a clock generator's output was
+    /// written since the last edge scan: an `assign c2 = clk;` copy the settle
+    /// just moved, which the clocks-only pass would miss (§10.3). The dirty-edge
+    /// log records those writes. Without it (`XEZIM_DIRTY_EDGE=0`), any settle
+    /// counts.
+    fn non_clock_edge_changed(&self) -> bool {
+        if !self.dirty_edge && !self.dirty_edge_shadow {
+            return true;
+        }
+        self.changed_edge_pos.iter().any(|&p| {
+            self.is_edge_signal_non_clock
+                .get(self.edge_signal_ids[p])
+                .copied()
+                .unwrap_or(false)
+        })
+    }
+    // /silimate
+
     /// Resume level-sensitive `wait(expr)` waiters parked in
     /// `condition_waiters` whose condition has just become true. IEEE
     /// 1800-2023 §9.7.4: `wait(cond)` is level-sensitive — the process
@@ -2074,6 +2093,10 @@ impl Simulator {
         {
             if self.dirty_any {
                 self.settle_combinatorial();
+                // silimate: a settle that moves a copied clock widens the pre-NBA edge pass
+                if self.non_clock_edge_changed() {
+                    non_clock_change = true;
+                }
             }
             if !non_clock_change && !self.toggled_clock_positions.is_empty() {
                 self.check_edges_clocks_only();

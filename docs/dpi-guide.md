@@ -28,6 +28,50 @@ before `-o`).
 
 ---
 
+## C and C++ sources in the file list
+
+xezim can also build the library itself. Name the C/C++ sources with the
+SystemVerilog files, on the command line or in a `-f` file:
+
+```
+add.c
+t.sv
+```
+
+```bash
+xezim -f files.f -s t
+```
+
+Every `.c`, `.cc`, `.cpp`, `.cxx`, `.c++` and `.C` file of the run is
+compiled with `$CC` (C) or `$CXX` (C++), else `clang`/`clang++`, else
+`cc`/`c++`, as `-fPIC -O2 -I<xezim's headers>`, so `#include "svdpi.h"`
+and `#include "vpi_user.h"` work without an `-I`. The objects, and any
+`.o` or `.a` file named among the sources, are linked into one shared
+library (with `$CXX` when there is C++), which is loaded like `--dpi-lib`.
+A `.so`/`.dylib`/`.dll` named among the sources is loaded as it is.
+
+`-CFLAGS "<args>"` and `-LDFLAGS "<args>"` add compiler and linker
+arguments (`-CFLAGS "-I csrc -DMODEL=2"`, `-LDFLAGS -lm`); they come after
+xezim's own, so `-CFLAGS "-O0 -g"` builds a debuggable library.
+
+The build is cached in `xezim/dpi` under `$XEZIM_CACHE_DIR`,
+`$XDG_CACHE_HOME` or `~/.cache`; with none of them set, in `xezim-<uid>` in
+the temporary directory, which must belong to you and be writable by no
+one else. Each source's object is keyed by its preprocessed text and
+compile command, and the library by those objects, the listed object
+files' contents and the link command, so an edit to a source or to a
+header it includes rebuilds the library, and an unchanged one is reused
+without compiling. `-LDFLAGS` can name files outside the key (an archive,
+a `-l` library), so with `-LDFLAGS` the library is linked again on every
+run, from the cached objects. A compile or link error stops the run before
+it starts.
+
+A compiled artifact (`--compile -o design.xzc`) holds the elaborated design
+only, so name the DPI files again when running it
+(`xezim design.xzc add.c`); `--compile` warns when it leaves them out.
+
+---
+
 ## What xezim expects
 
 `--dpi-lib <path>` is given a path to a **shared library** that exports the C symbols
@@ -734,7 +778,9 @@ characters for a string), `vpiSigned`, `vpiScalar`/`vpiVector`, `vpiArray`,
 parameter — the relations
 `vpiLeftRange`/`vpiRightRange` (constants: the outermost packed range, or
 the outermost unpacked range of an array — for a dynamic array or queue its
-current bounds `[0:size-1]`, for an associative array none), `vpiRange`
+current bounds `[0:size-1]`, for an associative array none; an element of an
+unpacked array, `top.ids[0]` of `logic [31:0] ids [4]`, has the range of its
+own type, the next unpacked range for a subarray, and a bit has none), `vpiRange`
 (every packed range, or every unpacked range of an array), and
 `vpiTypespec`. A typespec
 (`vpiLogicTypespec`, `vpiIntTypespec`, `vpiEnumTypespec`, `vpiStructTypespec`,

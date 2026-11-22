@@ -19,12 +19,17 @@ impl Simulator {
     /// §10.10/§11.4.12: the elements an unpacked-array concatenation's
     /// operands contribute, in order — a queue / array operand (bare, an
     /// object member, a struct member reached through any selects, an
-    /// associative element that is itself a collection) or a slice of one
-    /// contributes all of its elements; anything else is one element.
+    /// associative element that is itself a collection) or a slice contributes
+    /// its elements. Expand a fixed row only for a non-array element type.
     #[inline(never)]
-    pub(super) fn unpacked_concat_operand_values(&mut self, items: Vec<&Expression>) -> Vec<Value> {
+    pub(super) fn unpacked_concat_operand_values<'e>(
+        &mut self,
+        items: Vec<&'e Expression>,
+        expand_rows: bool,
+        mut first_row: Option<(&'e Expression, super::unpacked_slices::UnpackedLayout<'e>)>,
+    ) -> Vec<Value> {
         let mut all_vals: Vec<Value> = Vec::new();
-        for expr in items {
+        for (position, expr) in items.into_iter().enumerate() {
             // §10.10, §13.4.1: a call returning an unpacked array contributes
             // the elements it returns, in order (the call runs once).
             if matches!(expr.kind, ExprKind::Call { .. })
@@ -37,6 +42,24 @@ impl Simulator {
                         }
                     }
                 }
+                continue;
+            }
+            if expand_rows
+                && let Some(row) = if first_row
+                    .as_ref()
+                    .is_some_and(|(e, _)| std::ptr::eq(*e, expr))
+                {
+                    // A preceding operand can change an object's receiver.
+                    first_row
+                        .take()
+                        .filter(|(_, row)| position == 0 || !row.object_member())
+                        .map(|(_, row)| row)
+                        .or_else(|| self.fixed_row_concat_shape(expr))
+                } else {
+                    self.fixed_row_concat_shape(expr)
+                }
+            {
+                self.append_fixed_row_concat_values(row, &mut all_vals);
                 continue;
             }
             // A queue/array operand — bare (`q`), an instance-
@@ -68,13 +91,27 @@ impl Simulator {
                 ..
             } = &expr.kind
             {
-                if let ExprKind::Ident(rhier) = &rbase.kind {
-                    let mut rname = self.resolve_hier_name(rhier);
-                    // Instance-scope a member-queue slice
-                    // operand inside a concat (`{q[0:i], …}`).
-                    if let Some(s) = self.instance_assoc_member(&rname) {
-                        rname = std::borrow::Cow::Owned(s);
+                let rname = match &rbase.kind {
+                    ExprKind::Ident(rhier) => {
+                        let mut rname = self.resolve_hier_name(rhier);
+                        // Instance-scope a member-queue slice
+                        // operand inside a concat (`{q[0:i], …}`).
+                        if let Some(s) = self.instance_assoc_member(&rname) {
+                            rname = std::borrow::Cow::Owned(s);
+                        }
+                        Some(rname)
                     }
+                    _ => None,
+                };
+                // §7.4.5, §10.10: a slice of a fixed array or of one of its
+                // rows; a queue or dynamic-array slice takes the path below.
+                let collection = rname.as_deref().is_some_and(|n| {
+                    self.module.dynamic_arrays.contains(n) || self.class_queue_prop(n)
+                });
+                if !collection && self.append_fixed_slice_concat_values(expr, &mut all_vals) {
+                    continue;
+                }
+                if let Some(rname) = rname {
                     if self.module.arrays.contains_key(&*rname) {
                         let (r_lo_a, r_hi_a, _) = self.module.arrays[&*rname];
                         let r_is_dyn = self.module.dynamic_arrays.contains(&*rname);
@@ -104,9 +141,87 @@ impl Simulator {
                     }
                 }
             }
+            // §10.10, §11.4.11, §6.24.1: a conditional choosing between two
+            // array operands contributes the chosen operand's elements, and a
+            // cast of an array operand to an unpacked array type
+            // (`row_t'(src[1])`) contributes its operand's. An ambiguous
+            // condition keeps the value path below.
+            if let Some(inner) = self.unpacked_concat_inner_operand(expr) {
+                let vals = self.unpacked_concat_operand_values(vec![inner], expand_rows, None);
+                all_vals.extend(vals);
+                continue;
+            }
+            if self.append_member_array_concat_values(expr, &mut all_vals) {
+                continue;
+            }
             all_vals.push(self.eval_expr(expr));
         }
         all_vals
+    }
+
+    /// The array operand that a conditional or an unpacked-array cast item
+    /// of an unpacked concatenation stands for; `None` for any other item.
+    /// Only the condition is evaluated.
+    fn unpacked_concat_inner_operand<'e>(&mut self, e: &'e Expression) -> Option<&'e Expression> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.unpacked_concat_inner_operand(inner),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } if self.concat_array_operand_like(then_expr)
+                && self.concat_array_operand_like(else_expr) =>
+            {
+                match self.eval_expr(condition).is_nonzero()? {
+                    true => Some(Self::unparen(then_expr)),
+                    false => Some(Self::unparen(else_expr)),
+                }
+            }
+            ExprKind::SystemCall { name, args }
+                if name == "$__xz_named_cast"
+                    && args.len() == 2
+                    && matches!(&args[0].kind, ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty()
+                        && {
+                            let class = self
+                                .class_context_stack
+                                .last()
+                                .and_then(|c| c.as_deref())
+                                .unwrap_or("");
+                            Self::typedef_dims_via_tables(&self.module, class, &h.path[0].name.name)
+                                .is_some()
+                        })
+                    && self.concat_array_operand_like(&args[1]) =>
+            {
+                Some(Self::unparen(&args[1]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `e` names an array operand of an unpacked concatenation (a
+    /// collection, a fixed array or one of its rows), without evaluating it.
+    fn concat_array_operand_like(&mut self, e: &Expression) -> bool {
+        let e = Self::unparen(e);
+        self.fixed_row_concat_shape(e).is_some()
+            || self.array_operand_name(e).is_some()
+            || self.unpacked_concat_inner_operand_shape(e)
+    }
+
+    /// A nested conditional or cast of array operands, checked without
+    /// evaluating its condition.
+    fn unpacked_concat_inner_operand_shape(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.concat_array_operand_like(then_expr)
+                    && self.concat_array_operand_like(else_expr)
+            }
+            _ => false,
+        }
     }
 
     /// The size and optional source of a §7.5.1 dynamic-array constructor:
@@ -426,6 +541,26 @@ impl Simulator {
             self.set_queue_size(name, n);
             return;
         }
+        // §7.5.1, §10.10: `new[n]({src[1], 5})` initializes from the elements
+        // of an unpacked concatenation, read before the target is resized
+        // (`d = new[3]({d, 8})`). Read as one packed value, it was broadcast.
+        let concat_vals = match src_expr.map(|e| &e.kind) {
+            Some(ExprKind::Concatenation(parts))
+                if !self.module.arrays_2d.contains_key(name)
+                    && !self.module.arrays_nd.contains_key(name) =>
+            {
+                let mut items = Vec::with_capacity(parts.len());
+                let mut stack: Vec<&Expression> = parts.iter().rev().collect();
+                while let Some(e) = stack.pop() {
+                    match &e.kind {
+                        ExprKind::Concatenation(inner) => stack.extend(inner.iter().rev()),
+                        _ => items.push(e),
+                    }
+                }
+                Some(self.unpacked_concat_operand_values(items, true, None))
+            }
+            _ => None,
+        };
         let keep = match &src {
             Some(sn) => self.get_queue_size(sn).min(n),
             None => 0,
@@ -540,7 +675,12 @@ impl Simulator {
         // assignment pattern (array literal), not just a
         // named source array. Populate elements from it,
         // mirroring a plain `arr = '{...}` pattern assign.
-        if let Some(se) = src_expr
+        if let Some(vals) = concat_vals {
+            for (i, v) in vals.into_iter().take(n as usize).enumerate() {
+                let v = self.fit_queue_push_elem(name, v);
+                self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
+            }
+        } else if let Some(se) = src_expr
             && src.is_none()
         {
             match &self.unpacked_pattern(se).kind {
@@ -2184,6 +2324,9 @@ impl Simulator {
         signed: bool,
     ) -> Value {
         if is_real_type {
+            if matches!(data_type, DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }) {
+                return Value::from_f64(raw.to_f64() as f32 as f64);
+            }
             return if raw.is_real {
                 raw
             } else {
@@ -2635,8 +2778,14 @@ impl Simulator {
                         for (k, dv, mdt) in leaves {
                             self.register_packed_leaf_layout(&k, &mdt);
                             self.widths.insert(k.clone(), dv.width);
+                            // §6.11.3: a signed member (`int`, `byte`) reads
+                            // signed, as a module-scope leaf does.
+                            if dv.is_signed {
+                                self.signed_signals.insert(k.clone());
+                            }
                             self.signals.insert(k, dv);
                         }
+                        self.register_local_struct_member_arrays(&d.name.name, &su, 0);
                         if self.struct_colls_possible() {
                             self.fresh_struct_colls(&d.name.name, &su);
                         }
@@ -3661,6 +3810,11 @@ impl Simulator {
                         for (k, dv, mdt) in leaves {
                             self.register_packed_leaf_layout(&k, &mdt);
                             self.widths.insert(k.clone(), dv.width);
+                            // §6.11.3: a signed member (`int`, `byte`) reads
+                            // signed, as a module-scope leaf does.
+                            if dv.is_signed {
+                                self.signed_signals.insert(k.clone());
+                            }
                             self.signals.insert(k, dv);
                         }
                         continue;
@@ -4286,6 +4440,8 @@ impl Simulator {
                     }
                     None => rvalue,
                 };
+                let frozen_rhs = self.freeze_array_rhs_selectors(rvalue);
+                let rvalue = frozen_rhs.as_ref().unwrap_or(rvalue);
                 // §9.4.5 intra-assignment EVENT control on an NBA
                 // (`lhs <= [repeat(n)] @(edge sig) rhs`, canonicalized to
                 // `$__xz_intra_ev(n, edge, sig, rhs)`). Only the BLOCKING arm
@@ -4503,11 +4659,46 @@ impl Simulator {
                     }
                     return;
                 }
+                // §10.4.2, §7.6: a subarray or slice of a multidimensional
+                // array (a design variable's, a class property's) that the
+                // element-wise paths above do not pair with the target
+                // (`q <= src[1]` into a one-dimensional array) is read element
+                // by element now and stored as the pattern of those values.
+                // It was read as one scalar, so every element received 0.
+                // Only a design with multidimensional storage has one.
+                if packed_pattern.is_none()
+                    && intra_cycles.is_none()
+                    && (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+                    && let Some((pattern, release)) =
+                        self.unpacked_array_snapshot(rvalue, rvalue.span)
+                {
+                    let d = intra_d.unwrap_or_else(|| {
+                        delay
+                            .as_ref()
+                            .map(|e| self.eval_delay_ticks(e))
+                            .unwrap_or(0)
+                    });
+                    let delay = (d > 0)
+                        .then(|| self.make_intra_saved_expr(Value::from_u64(d, 64), stmt.span));
+                    self.exec_statement(&Statement::new(
+                        StatementKind::NonblockingAssign {
+                            lvalue: packed_lvalue.clone(),
+                            delay: delay.map(Box::new),
+                            rvalue: pattern,
+                        },
+                        stmt.span,
+                    ));
+                    if let Some(release) = release {
+                        self.exec_statement(&release);
+                    }
+                    return;
+                }
                 let val = match (packed_pattern, &rvalue.kind) {
                     (Some(v), _) => v,
                     (None, ExprKind::AssignmentPattern(_)) => self.eval_expr(rvalue),
                     (None, _) => self.eval_target_rhs(packed_lvalue, rvalue),
                 };
+                let val = self.fill_into_real_target(lvalue, val);
                 // LRM §14.4: clocking-block output drive
                 // `cb.<out_sig> <= val`. Defer to the cb's next clock
                 // edge (output skew) instead of driving now. Handles both a

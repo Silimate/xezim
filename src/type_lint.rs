@@ -376,6 +376,9 @@ struct Ck<'a> {
     /// is local to a generate block (or a genvar), which the elaborated
     /// parameter tables do not key by its bare name.
     body_depth: usize,
+    /// The concatenation being walked as an unpacked array concatenation
+    /// (§10.10): the right-hand side of an assignment to an unpacked array.
+    unpacked_concat: Option<Span>,
     errs: Vec<String>,
 }
 
@@ -400,6 +403,7 @@ impl<'a> Ck<'a> {
             gen_sel: None,
             gen_reach: None,
             body_depth: usize::MAX,
+            unpacked_concat: None,
             errs: Vec::new(),
         }
     }
@@ -942,6 +946,31 @@ impl<'a> Ck<'a> {
                 }
                 ModuleItem::ClassDeclaration(c) => {
                     self.top().types.remove(&c.name.name);
+                }
+                // §23.6, §23.9: an instance or a generate block is a scope of
+                // this one, so `p.s` is a hierarchical name through it even
+                // when a package is named `p` too; a package item is named
+                // with `::` (§26.3), never with a dot.
+                ModuleItem::ModuleInstantiation(mi) => {
+                    for hi in &mi.instances {
+                        let n = hi.name.name.split('[').next().unwrap_or_default();
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => {
+                    if let Some(n) = &g.name {
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateIf(g) => {
+                    for n in g.branch_labels.iter().flatten() {
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateCase(g) => {
+                    for n in g.arms.iter().filter_map(|a| a.label.as_ref()) {
+                        self.declare_scope_name(n);
+                    }
                 }
                 _ => {}
             }
@@ -1898,6 +1927,20 @@ impl<'a> Ck<'a> {
         self.walk_value(e, true);
     }
 
+    /// `walk_expr` for the value `e` assigned to a target of type `lt`.
+    /// §10.10: a concatenation assigned to an unpacked array is an unpacked
+    /// array concatenation, whose items may be real; §11.4.12 rules out real
+    /// operands of a packed concatenation only.
+    fn walk_rhs(&mut self, lt: &Ty, e: &Expression) {
+        let cat = peel_parens(e);
+        let unpacked = (matches!(lt, Ty::Unpacked { .. })
+            && matches!(cat.kind, ExprKind::Concatenation(_)))
+        .then_some(cat.span);
+        let saved = std::mem::replace(&mut self.unpacked_concat, unpacked);
+        self.walk_expr(e);
+        self.unpacked_concat = saved;
+    }
+
     /// Walk `e`; `value` is false for a call made as a statement.
     fn walk_value(&mut self, e: &Expression, value: bool) {
         match &e.kind {
@@ -2107,6 +2150,14 @@ impl<'a> Ck<'a> {
         let t = with_dims(self.resolve(dt), dims);
         self.declare_value(name, t.clone());
         t
+    }
+
+    /// The name of an instance or generate block: neither a constant nor a
+    /// variable (`u.x = 1` writes through it), of no type this pass models.
+    fn declare_scope_name(&mut self, name: &str) {
+        let top = self.top();
+        top.vars.insert(name.to_string(), Ty::Unknown);
+        top.unsure.insert(name.to_string());
     }
 
     /// A variable, net or port of type `t`.
@@ -2375,10 +2426,10 @@ impl<'a> Ck<'a> {
     /// operand of positive size.
     fn operand_errors(&self, e: &Expression, sized_sibling: bool, out: &mut Vec<(Span, String)>) {
         let zero = |x: &Expression| self.zero_width(x);
-        let operands = |xs: &[Expression], out: &mut Vec<(Span, String)>| {
+        let operands = |xs: &[Expression], unpacked: bool, out: &mut Vec<(Span, String)>| {
             let sized = xs.iter().any(|x| !zero(x));
             for x in xs {
-                if matches!(self.ty_of(x), Ty::Real { .. }) {
+                if !unpacked && matches!(self.ty_of(x), Ty::Real { .. }) {
                     out.push((
                         x.span,
                         "a real value cannot be an operand of a concatenation \
@@ -2390,7 +2441,7 @@ impl<'a> Ck<'a> {
             }
         };
         match &e.kind {
-            ExprKind::Concatenation(xs) => operands(xs, out),
+            ExprKind::Concatenation(xs) => operands(xs, self.unpacked_concat == Some(e.span), out),
             ExprKind::Replication { count, exprs } => {
                 match self.eval_const(count) {
                     Some(CVal::Xz) => out.push((
@@ -2424,7 +2475,7 @@ impl<'a> Ck<'a> {
                     }
                     _ => {}
                 }
-                operands(exprs, out);
+                operands(exprs, false, out);
             }
             ExprKind::SystemCall { name, args } => {
                 let size = match name.as_str() {
@@ -2568,11 +2619,13 @@ impl<'a> Ck<'a> {
                 self.walk_value(e, false)
             }
             StatementKind::BlockingAssign { lvalue, rvalue } => {
-                self.walk_expr(rvalue);
+                let lt = self.ty_of(lvalue);
+                self.walk_rhs(&lt, rvalue);
                 self.check_assign(lvalue, rvalue);
             }
             StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
-                self.walk_expr(rvalue);
+                let lt = self.ty_of(lvalue);
+                self.walk_rhs(&lt, rvalue);
                 self.check_nba_target(lvalue);
                 self.check_assign(lvalue, rvalue);
             }
@@ -2664,7 +2717,7 @@ impl<'a> Ck<'a> {
                     self.check_const_dims(&d.name.name, data_type, &d.dimensions);
                     let vt = with_dims(t.clone(), &d.dimensions);
                     if let Some(init) = &d.init {
-                        self.walk_expr(init);
+                        self.walk_rhs(&vt, init);
                         self.check_value(&vt, init, || format!("'{}'", d.name.name));
                     }
                     if *lifetime == Some(Lifetime::Static) {
@@ -2696,7 +2749,8 @@ impl<'a> Ck<'a> {
             StatementKind::Typedef(td) => self.declare_typedef(td),
             StatementKind::ProceduralContinuous(pc) => self.check_proc_continuous(pc),
             StatementKind::Return(Some(e)) => {
-                self.walk_expr(e);
+                let rt = self.ret.clone().unwrap_or(Ty::Unknown);
+                self.walk_rhs(&rt, e);
                 if let Some(rt) = self.ret.clone() {
                     self.check_value(&rt, e, || "the return value".to_string());
                 }
@@ -2857,7 +2911,7 @@ impl<'a> Ck<'a> {
                         self.check_const_dims(&dc.name.name, &d.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
-                            self.walk_expr(init);
+                            self.walk_rhs(&vt, init);
                             self.check_value(&vt, init, || format!("'{}'", dc.name.name));
                         }
                     }
@@ -2868,14 +2922,15 @@ impl<'a> Ck<'a> {
                         self.check_const_dims(&dc.name.name, &n.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
-                            self.walk_expr(init);
+                            self.walk_rhs(&vt, init);
                             self.check_value(&vt, init, || format!("'{}'", dc.name.name));
                         }
                     }
                 }
                 ModuleItem::ContinuousAssign(ca) => {
                     for (l, r) in &ca.assignments {
-                        self.walk_expr(r);
+                        let lt = self.ty_of(l);
+                        self.walk_rhs(&lt, r);
                         self.check_cont_lvalue(l);
                         self.check_assign(l, r);
                     }

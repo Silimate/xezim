@@ -485,6 +485,20 @@ impl Simulator {
                     index: Box::new(literal(value, index.span)),
                 }
             }
+            // §7.4.6, §7.10.1: a slice keeps its bounds, which `$` may name
+            // and which its reader evaluates once; its receiver is frozen
+            // like any other (`get_obj().q[0:1]`).
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.freeze_conditional_path(expr, evaluate)),
+                left: left.clone(),
+                right: right.clone(),
+                kind: *kind,
+            },
             ExprKind::MemberAccess { expr, member } => {
                 let memo = matches!(expr.kind, ExprKind::Call { .. })
                     .then(|| self.recv_call_memo_hit(expr))

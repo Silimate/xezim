@@ -2905,6 +2905,14 @@ impl Simulator {
         else {
             return None;
         };
+        // Finding a member's store evaluates its receiver (`get_obj().q`);
+        // a member no class holds as a collection names none, and is left
+        // for the caller to read as a part-select, evaluating it once.
+        if let ExprKind::MemberAccess { member, .. } = &Self::unparen(base).kind
+            && !self.coll_member_possible(&member.name)
+        {
+            return None;
+        }
         let name = self.queue_actual_storage(base)?;
         if self.module.descending_arrays.contains(&*name) || self.queue_elem_struct(&name).is_some()
         {

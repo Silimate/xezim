@@ -101,6 +101,19 @@ impl Simulator {
                 }
                 continue;
             }
+            // A slice of a queue or array, however it is reached (`q[a:b]`,
+            // `obj.q[1:$]`, `this.q[i+:2]`, `get_obj().q[0:1]`), contributes
+            // the elements it selects (§7.4.6, §7.10.1). A slice of a
+            // fixed-size array named directly (`a1[i+:2]`) is left to the
+            // branches below, which read an element past either end as the
+            // element default (§7.4.6) where this would drop it.
+            if let ExprKind::RangeSelect { expr: sbase, .. } = &expr.kind
+                && !self.names_fixed_array(sbase)
+                && let Some((vals, _)) = self.collection_slice_values(expr)
+            {
+                all_vals.extend(vals);
+                continue;
+            }
             // Slice of a queue: q[a:b]
             if let ExprKind::RangeSelect {
                 expr: rbase,
@@ -186,6 +199,21 @@ impl Simulator {
     /// effect sits anywhere else (another call, an increment of its own), an
     /// index value is real, or an index names `$` of a collection whose last
     /// index is not known here.
+    /// Whether `base` is a name of a fixed-size unpacked array (`a1`, a row
+    /// `s3[1]`): no queue or dynamic array, and nothing reached through a
+    /// handle or a call. Decided without evaluating anything.
+    fn names_fixed_array(&mut self, base: &Expression) -> bool {
+        let ExprKind::Ident(h) = &Self::unparen(base).kind else {
+            return false;
+        };
+        if self.ident_shadowed_by_non_collection(h) {
+            return false;
+        }
+        let n = self.resolve_hier_name(h).into_owned();
+        let n = n.split('[').next().unwrap_or(&n).to_string();
+        self.module.arrays.contains_key(&n) && !self.module.dynamic_arrays.contains(&n)
+    }
+
     pub(super) fn freeze_side_effect_indices(&mut self, e: &Expression) -> Option<Expression> {
         if Self::cond_expr_is_effect_free(e, false) {
             return Some(e.clone());
@@ -205,6 +233,19 @@ impl Simulator {
                 };
             }
             ExprKind::Paren(expr) => {
+                **expr = self.freeze_side_effect_indices(expr)?;
+            }
+            // A slice's receiver is frozen like any other (`get_obj().q[0:1]`);
+            // its bounds, which `$` may name, are left to the slice's reader,
+            // so a bound with a side effect of its own is not frozen.
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                if !Self::cond_expr_is_effect_free(left, false)
+                    || !Self::cond_expr_is_effect_free(right, false)
+                {
+                    return None;
+                }
                 **expr = self.freeze_side_effect_indices(expr)?;
             }
             ExprKind::Ident(h) => {

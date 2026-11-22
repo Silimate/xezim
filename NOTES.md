@@ -79,12 +79,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   A delay that moves time on waits for the next tick, and a `#0` keeps the
   tick of the edge that woke the procedure. At the time-0 edge, such an
   attempt reads the default sampled values (§16.5.1). (#450)
-* A process that an event control resumes, and that makes a nonblocking
-  assignment and then forks, starts the fork's children before the time
-  step's NBA region (§9.3.2, §4.4.2). A child that waits for the edge that
-  assignment makes now catches it. The children had started after the NBAs
-  and missed it, with `join`, `join_any` or `join_none`, or inside a task.
-  (#455)
+* A process that an edge or a named event resumed, and that then forks,
+  starts the fork's children before the time step's NBA region (§4.4.2.2,
+  §4.5, §9.3.2). So do the children a child forks after a `#0`, since the
+  Active and Inactive regions alternate until both are empty. The children
+  had started after the NBAs, so a child waiting for an edge one of those
+  NBAs makes never saw it. (#455)
+* A process on a clock that a continuous assignment copies
+  (`assign c2 = clk;`, `@(posedge c2)`) runs at the edge, before the NBAs
+  its peers on `clk` queue there (§4.4.2.2, §4.5, §10.3). While a
+  level-sensitive `wait` was pending anywhere, it ran after those NBAs and
+  read their new values. A `wait` on the copy itself resumed only after them
+  too. (#458)
 * `$dumpvars(0, tb_top.u)` called from another top-level module dumps
   `tb_top.u` and everything below it; the argument was ignored and the dump
   selected nothing. The same holds for a generate-block instance, a variable

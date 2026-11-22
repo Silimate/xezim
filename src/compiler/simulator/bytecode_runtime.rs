@@ -763,6 +763,7 @@ impl Simulator {
                     vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -812,6 +813,7 @@ impl Simulator {
         view: &mut [Value],
         signal_widths: &[u32],
         signal_signed: &[bool],
+        shortreal_signals: &HashSet<usize>,
         signal_name_to_id: &NameMap,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         vm_regs: &mut Vec<Value>,
@@ -1310,6 +1312,7 @@ impl Simulator {
                     vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -1367,6 +1370,13 @@ impl Simulator {
                     // (the source of the 522 is_signed repr_diffs).
                     let id = *sig_id;
                     let w = *width;
+                    if view[id].is_real && shortreal_signals.contains(&id) {
+                        let mut val = Value::from_f64(vm_regs[*val_reg as usize].to_f64() as f32 as f64);
+                        val.is_signed = signal_signed[id];
+                        comb_write_full!(id, val);
+                        pc += 1;
+                        continue;
+                    }
                     let mut handled = false;
                     if w > 0 && w <= 64 && signal_widths[id] == w {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -1502,7 +1512,12 @@ impl Simulator {
                             unsupported = true;
                             break;
                         }
-                        let val = vm_regs[*val_reg as usize].resize(*width);
+                        let rhs = &vm_regs[*val_reg as usize];
+                        let val = if shortreal_signals.contains(&eid) {
+                            Value::from_f64(rhs.to_f64() as f32 as f64)
+                        } else {
+                            rhs.resize(*width)
+                        };
                         comb_write_full!(eid, val);
                     }
                 }
@@ -4833,6 +4848,7 @@ impl Simulator {
                     self.vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut self.vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut self.vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     self.vm_regs[*d as usize] =
                         self.vm_regs[*l as usize].power(&self.vm_regs[*r as usize]);

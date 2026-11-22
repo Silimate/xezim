@@ -4275,9 +4275,8 @@ impl Simulator {
         println!("======================================");
     }
 
-    /// Current simulation time in the current module's time unit, as
-    /// `$time`/`$realtime` require (§20.3). For a default 1 ns design this is
-    /// just the tick count.
+    /// Current simulation time in the current module's time unit for
+    /// `$realtime` (§20.3.3).
     pub(super) fn time_in_current_unit(&self) -> f64 {
         // Exponent-difference division keeps the result exact where it can
         // be: 1600 ticks(1ps) in a 1ns unit is 1600.0 / 1000.0 == literal
@@ -4289,6 +4288,28 @@ impl Simulator {
             self.time as f64 / 10f64.powi(diff)
         } else {
             self.time as f64 * 10f64.powi(-diff)
+        }
+    }
+
+    pub(super) fn rounded_time_in_current_unit(&self) -> u64 {
+        self.rounded_time_in_unit(self.current_timescale_exp().0)
+    }
+
+    /// Scale integral time reads without losing low tick bits (§20.3.1–§20.3.2).
+    pub(super) fn rounded_time_in_unit(&self, unit_exp: i32) -> u64 {
+        let diff = unit_exp.saturating_sub(Self::secs_to_exp(self.tick_s));
+        match diff {
+            0 => self.time,
+            1..=19 => {
+                let ticks_per_unit = 10u64.pow(diff as u32);
+                let units = self.time / ticks_per_unit;
+                // Round a half unit up without adding to the tick counter.
+                units + u64::from(self.time % ticks_per_unit >= ticks_per_unit / 2)
+            }
+            20.. => 0, // Even half a unit exceeds u64::MAX ticks.
+            _ => self
+                .time
+                .saturating_mul(10u64.saturating_pow(diff.unsigned_abs())),
         }
     }
 
@@ -4317,20 +4338,100 @@ impl Simulator {
         format!("{}{}", mant, unit)
     }
 
-    /// Format a %t field (§21.2.1.5). `value` is the time argument in the
-    /// current scope's time unit ($time/$realtime already are); it is scaled to
-    /// the $timeformat unit, printed with the configured fraction digits and
-    /// suffix, and right-justified in the minimum field width.
-    /// `%t` body (unpadded) plus the minimum field width in effect —
-    /// `$timeformat`'s if called, else the §21.3.5 default of 20.
-    pub(super) fn format_time_parts(&self, value: f64) -> (String, usize) {
-        let (scope_unit_exp, _) = self.current_timescale_exp();
+    /// Scale a scope-unit value to the `$timeformat` unit and return the
+    /// unpadded %t body and minimum field width (§20.4.3, §21.2.1).
+    pub(super) fn format_time_parts(&self, value: &Value) -> (String, usize) {
+        self.format_time_parts_in(value, self.current_timescale_exp().0)
+    }
+
+    /// `format_time_parts` for a value in the unit 10^`scope_unit_exp` s: a
+    /// time read rewritten to its declaring scope's unit (§3.14.2.3) is
+    /// displayed from that unit, not the caller's.
+    pub(super) fn format_time_parts_in(
+        &self,
+        value: &Value,
+        scope_unit_exp: i32,
+    ) -> (String, usize) {
         let (tf_units, tf_prec, tf_suffix, tf_width) = self
             .time_format
             .clone()
             .unwrap_or_else(|| (Self::secs_to_exp(self.tick_s), 0, String::new(), 20));
-        let display = value * 10f64.powi(scope_unit_exp - tf_units);
+        let shift = scope_unit_exp - tf_units;
+        if (-19..=19).contains(&shift)
+            && !value.is_real
+            && !value.has_xz()
+            && (!value.is_signed
+                || value.get_bit(value.width.saturating_sub(1) as usize) == LogicBit::Zero)
+            && (64..value.width as usize).all(|bit| value.get_bit(bit) == LogicBit::Zero)
+            && let Some(integer) = value.to_u64()
+        {
+            return (
+                Self::format_integral_time(integer, shift, tf_prec, &tf_suffix),
+                tf_width,
+            );
+        }
+        let display = value.to_f64() * 10f64.powi(shift);
         let body = format!("{:.*}{}", tf_prec, display, tf_suffix);
         (body, tf_width)
+    }
+
+    /// The %t body and field width of the current simulation time, as for
+    /// `$realtime` (§20.3.3, §20.4.3). The tick counter is the time in the
+    /// global precision's unit, so it is scaled from that unit exactly; a
+    /// real in a coarser scope unit lost the low ticks above 2^53. An exact
+    /// display tie rounds to the even display value, as the real formatter
+    /// does below 2^53.
+    pub(super) fn format_current_time_parts(&self) -> (String, usize) {
+        let tick_exp = Self::secs_to_exp(self.tick_s);
+        let (tf_units, tf_prec, tf_suffix, tf_width) = self
+            .time_format
+            .clone()
+            .unwrap_or_else(|| (tick_exp, 0, String::new(), 20));
+        let shift = tick_exp - tf_units;
+        if (-19..=19).contains(&shift) {
+            return (
+                Self::format_integral_time(self.time, shift, tf_prec, &tf_suffix),
+                tf_width,
+            );
+        }
+        self.format_time_parts(&Value::from_f64(self.time_in_current_unit()))
+    }
+
+    /// Work in decimal so scaling and printing cannot lose low time bits.
+    fn format_integral_time(
+        value: u64,
+        shift: i32,
+        precision: usize,
+        suffix: &str,
+    ) -> String {
+        let digits = precision.min((-shift).max(0) as usize);
+        let exponent = shift + digits as i32;
+        let value = u128::from(value);
+        let scaled = if exponent >= 0 {
+            value * 10u128.pow(exponent as u32)
+        } else {
+            let divisor = 10u128.pow(exponent.unsigned_abs());
+            let twice_remainder = 2 * (value % divisor);
+            let quotient = value / divisor;
+            // Round an exact half to the even adjacent display value, using
+            // its decimal quotient even when f64 cannot distinguish the two.
+            quotient
+                + u128::from(
+                    twice_remainder > divisor
+                        || (twice_remainder == divisor && quotient % 2 != 0),
+                )
+        };
+        let radix = 10u128.pow(digits as u32);
+        let mut body = (scaled / radix).to_string();
+        if precision > 0 {
+            use std::fmt::Write as _;
+            body.push('.');
+            if digits > 0 {
+                let _ = write!(body, "{:0digits$}", scaled % radix);
+            }
+            body.extend(std::iter::repeat_n('0', precision - digits));
+        }
+        body.push_str(suffix);
+        body
     }
 }

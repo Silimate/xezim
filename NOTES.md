@@ -77,6 +77,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   A delay that moves time on waits for the next tick, and a `#0` keeps the
   tick of the edge that woke the procedure. At the time-0 edge, such an
   attempt reads the default sampled values (§16.5.1). (#450)
+* A process that an event control resumes, and that makes a nonblocking
+  assignment and then forks, starts the fork's children before the time
+  step's NBA region (§9.3.2, §4.4.2). A child that waits for the edge that
+  assignment makes now catches it. The children had started after the NBAs
+  and missed it, with `join`, `join_any` or `join_none`, or inside a task.
+  (#455)
 * `$dumpvars(0, tb_top.u)` called from another top-level module dumps
   `tb_top.u` and everything below it; the argument was ignored and the dump
   selected nothing. The same holds for a generate-block instance, a variable

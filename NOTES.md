@@ -91,16 +91,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   those NBAs, and read their new values, while a level-sensitive `wait` was
   pending anywhere or when a delayed nonblocking assignment fell due at the
   edge. A `wait` on the copy itself resumed only after them too. (#458)
-* `$dumpvars(0, tb_top.u)` called from another top-level module dumps
-  `tb_top.u` and everything below it; the argument was ignored and the dump
-  selected nothing. The same holds for a generate-block instance, a variable
-  and `$fsdbDumpvars` (§21.7.1.2, §23.6). (Silimate/xezim#306)
-* An old-style subroutine port declaration of a user-defined type with
-  packed dimensions (`input s_t [N-1:0] in;`) declares the port `in` of
-  type `s_t [N-1:0]` (§13.4, A.2.2.1). The type name was taken as the port,
-  so strict mode reported the next body declaration as following a
-  statement (§9.3.1), and a second declarator or a second packed dimension
-  was a parse error.
 * An `always` block that starts with an event control waits there before
   any `initial` block writes, as on the reference simulator and Icarus
   Verilog (§9.2), when the control has no `iff` and nothing after it waits
@@ -117,62 +107,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   never started. A runtime initializer in a `.v` file
   (`reg m = $test$plusargs("MODE");`) runs at time 0 with the others, and a
   `--compile -o` artifact keeps the `-sv` choice it was compiled with.
-* An equality, relational, logical, reduction or `inside` operator is 1 bit
-  wide in the interpreter too, so it no longer widens the operator around
-  it (§11.6.1, Table 11-21). In a self-determined condition,
-  `if ((~a) | (m == 5'd12))` over a 1-bit `a` and a 5-bit `m` read `~a` as
-  5'b11110 and took the branch; so did `?:`, loop and `case` conditions,
-  `wait`, an event's `iff` and assertions, and `$display` printed such an
-  expression 5 bits wide. An assignment to a 1-bit target hid it by
-  truncating. (Silimate/xezim#337)
-* An enum label used in a port connection of an instance inside a module
-  (`.din(state == STREAM)`) is a declared constant, not a §6.10 implicit
-  net. A label from a package (`import pk::*`) or `$unit` read x in that
-  module, in the connection and elsewhere, once the module sat two or more
-  levels below the top: every use took the instance path. A label of the
-  module's own enum got an "implicit 1-bit net created" warning, under
-  `` `default_nettype none `` too (§6.19, §26.3). (Silimate/xezim#305)
-* `$readmemh` and `$readmemb` load a multidimensional unpacked array, or a
-  partially indexed one (`ram[1]`), and `$writememh` and `$writememb` write
-  one (§21.4.3, §21.5). The words are in row-major order, the rightmost
-  dimension fastest and each dimension from its low index to its high one.
-  The start and finish addresses and the file's `@` entries count elements
-  in that order, as in Verilator, Icarus and the reference simulator. Both
-  reported that the array names no unpacked memory and did nothing, so
-  Caliptra's testbench loaded no firmware into its byte-wide
-  `caliptra_sram`. (Silimate/xezim#328)
-* A module-scope task evaluates an input actual at the formal's width, as
-  if assigned to it (§13.5, §11.6.1), as functions and class methods
-  already did: `t({2{1'b1}} << 4)` into `input [31:0] v` binds `32'h30`,
-  not 0, and `t(-b)` sign-fills the formal. A task or function formal whose
-  bounds name a parameter (`input [W-1:0] v`) now gives its actual that
-  width too. The operands of `&&`, `||`, `->` and `<->` stay
-  self-determined there: `(a << 1) || 1'b0` shifts at `a`'s width.
-  (Silimate/xezim#331)
-* A text macro defined in a `-y`/`-v` library file, itself or through an
-  `` `include `` of the design's headers, is defined for the library files
-  read after it, as for source files (§22.5.1, §3.12.1). A library module
-  that included the headers did not share them with the library modules it
-  instantiates, which then failed to parse. Library files are now read in a
-  fixed order, the order their modules are resolved in. (Silimate/xezim#310)
-* A `-v`/`-y` library file with a byte that is not UTF-8 (a Latin-1 `®` in a
-  comment) is decoded as source files are, the byte becoming U+FFFD. The
-  whole file was dropped ("stream did not contain valid UTF-8") and its
-  modules were not found.
-* A conditional generate branch that no instance selects is not checked
-  for struct members that do not exist: it is not elaborated, so its names
-  are never resolved (§27.5). Caliptra's `kmac.sv` with `EnFullKmac = 0` and
-  `entropy_src.sv` with `Stub = 0` were rejected with "not a member of the
-  struct or union". A branch some instance selects is still checked.
-  (Silimate/xezim#339)
-* With `-s`, a top-level module that was not selected (and what only it
-  instantiates) is not checked for connections to ports its targets do not
-  declare: it is never elaborated (§23.3.2). A connection there stopped the
-  run; Verilator runs it. An elaborated top is still checked.
-* A generate-if condition or generate-case selector may read a package
-  parameter by its package-scoped name, such as `p::Info[k].variant` with
-  `k` a genvar, without the module importing the package (§27.5, §11.2.1,
-  §26.3). It was rejected as not a constant expression.
 * An input port reads with its own declared signedness when it is
   connected to a concatenation, a select or a net of the other signedness
   (§23.3.3.7, §11.8.1): `input logic signed [12:0] e_i` connected to
@@ -188,68 +122,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `--relax-unconnected-interface-port` (or
   `XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT=1`) keeps that behavior, with a
   warning. (Silimate/xezim#340)
-* An event control on a member of a packed struct waits on that member:
-  `@(posedge a.clk)` on the member's least significant bit and `@(a.valid)`
-  on a change of its bits (§9.4.2, §7.2.1). The whole struct vector was
-  watched, so an edge was judged on another member's bit and any member's
-  change woke the block. A clock forwarded through a struct member to a
-  module's clock port (`.clk(b.clk)`) fired the child's flops on the wrong
-  edges; Caliptra-SS `otp_ctrl`'s OTP macro missed its Init command.
-* A process whose task calls never wait at one time step (a task that can
-  wait but does not, calling itself or another such task) is reported as a
-  zero-delay loop, naming the process and its source, at
-  `XEZIM_STALL_LIMIT` nested calls or before the native stack runs out. It
-  overflowed the stack and aborted with SIGABRT, with no message about the
-  design.
-* A typedef of a parameterized class that names a member type of its type
-  parameter (`class E #(type T); typedef T::hw_t hw_t;`) is that member type
-  in the specialization a class scope names: `E#(cfg_t)::hw_t` is
-  `cfg_t::hw_t`, also through a typedef of the specialization and as a type
-  parameter's default (`parameter type H = E#(C)::hw_t`). A type parameter
-  bound to a class names that class as a scope (`C::hw_t`). These were
-  32-bit types with no diagnostic, and member writes were lost (§8.25.1,
-  §6.20.3). (#389)
-* A packed struct whose members are all 2-state starts at 0 also when a
-  member is a packed array of another 2-state struct (`s_t [1:0] e;`); it
-  started as x, while its writes already dropped x/z (§7.2.1, §6.8). (#387)
-* In a module instance, an `always_comb` that reads one bit of a vector and
-  writes another bit of it runs again whenever the bit it reads changes, also
-  when the vector's range depends on a parameter (`logic [P+1:0] b`). The
-  block used to run once at time zero and never again: its sensitivity sized
-  the vector with the top module's parameters instead of the instance's
-  (§9.2.2.2.1). Caliptra's `caliptra_prim_arbiter_fixed`, whose priority tree
-  is built from such blocks in a generate loop, now follows its requests; its
-  index had stayed x. (Silimate/xezim#395)
-* A variable declared inside a process, task or function of an instantiated
-  module whose packed dimension calls a value system function on the
-  instance's parameters (`logic [$clog2(P)-1:0] v;`, `$signed(P)`,
-  `int'(P)`) has this instance's width. It was one bit wide in a process and
-  32 bits wide in a subroutine; a keccak `theta()` sized that way computed
-  every SHA3 digest wrong (§6.20.2, §20.8.1, §23.10).
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the
   attempts, nonvacuous passes, vacuous passes, failures, disabled attempts and
   cover matches (§16.14.3). The summed `assertions` list is unchanged.
-* A part-select through an index into an output port of an instantiated
-  module (`f[0][31:1]` on `output logic [0:0][31:1] f`) counts the port's
-  declared labels, as on a variable (§7.4.1, §11.5.1, §23.2.2.3). The port
-  had no declared type on file, so it took a store that mapped the labels
-  twice: a whole-element write was dropped, `f[0][30:2]` landed one bit low,
-  an ascending element mirrored the wrong way and a slice of a 3-D port's
-  middle dimension wrote bits. VeeR EH2's flush path stayed x after reset.
-  (Silimate/xezim#316)
 * Vacuity follows §16.14.8 through nested properties: `a |-> (c |-> b)`
   succeeds vacuously while `c` is false, so it runs no pass action and a
   `cover` of it does not match, and `p or q` with a sequence operand is never
   vacuous.
-* A size cast whose width is a field of a struct parameter (`pt.DEPTH'(x)`,
-  `(pt.DEPTH)'(x)`) evaluates its operand at that width and resizes to it
-  (§6.24.1). The width was ignored: the operand passed through at its own
-  width, or a same-named parameter sized it. The VeeR EL2 branch predictor
-  never updated its BHT, and every taken loop branch cost a cycle (EL2
-  hello_world: mcycle 809, now 742 as on the reference simulator); VeeR EH2
-  sizes its fetch bus tags this way. (Silimate/xezim#322)
 * Braces nested in an unpacked array concatenation are a vector or string
   concatenation, one element of the target (§10.10.3): `q = {q, {pc, insn}}`
   on a queue of 64-bit elements appends one element, as on the reference
@@ -263,31 +144,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
-* A part-select after an index into a multi-dimensional packed array selects
-  whole elements of the next dimension (§7.4.3, §11.5.1): `a[0][5:0]` on
-  `logic [3:0][5:0][7:0] a` is 48 bits. Continuous assignments, compiled
-  `always` blocks and NBAs wrote and read it as 6 bits, and its RHS was
-  evaluated at that width (§11.6.1); this included indexed part-selects,
-  variable indices and an element of an unpacked array. An NBA to a range of
-  the outer dimension (`pv[4:3] <= v` on `logic [5:0][7:0] pv`) wrote 2 bits.
-  The VeeR EH2 interrupt controller's priority tree went x at reset and
-  instruction fetch stalled. (Silimate/xezim#309)
-* The port width check (§23.3.3) measures a connection through an index
-  and a range of the next dimension, `.o(a[2][4:2])` on
-  `logic [3:0][5:0][7:0] a`, as the 24 bits it selects (§7.4.3). It counted
-  the labels and warned that the connection was 3 bits; the same width also
-  decided input port substitution and inout z-fill. (Silimate/xezim#316)
-* A module named `gated_clk_cell` is elaborated from its body like any
-  other. Every instance of that name ran as `assign clk_out = clk_in`, an
-  optimization for OpenC910's pass-through cell, so Wujian100's latch-based
-  clock gate never gated (its rtc test ran 15.4 ms instead of 2.26 ms) and
-  the cell's signals could not be reached by hierarchical name. A cell that
-  is exactly that pass-through keeps the direct assignment. (Silimate/xezim#344)
-* An unpacked-array port connected to a slice whose bounds are parameter
-  expressions, `.p(arr[0:N-1])`, inside an instantiated module takes the
-  slice's elements in order (§7.4.6, §23.3.3). Port element `t` took bit `t`
-  of the first element, and an output port drove nothing, so the Intel FPGA
-  NPU's vector register files got garbage. (Silimate/xezim#364)
 * `-sv_seed <n|random>` (also `-svseed` and `-seed`) seeds the RNG without
   adding a `+seed=` plusarg, as other simulators do. `$test$plusargs`,
   `$value$plusargs` and the argv from `vpi_get_vlog_info` no longer see it, so
@@ -297,15 +153,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§21.6, §38.17). The seed line the run prints (`[xezim] seed: <n>`, or
   `[xezim] random seed: <n> (replay with -sv_seed <n>)` for `random`) names
   the option the seed came from. (Silimate/xezim#2)
-* `$writememh` and `$writememb` write one word per line, with an
-  `@<address>` line only before a word that `$readmem*` would not otherwise
-  load at its address: the first word of a range that does not start at the
-  memory's first address, and the word after a gap, such as an associative
-  array's missing keys (§21.5). A whole memory is then data only, as
-  Verilator writes it. Every line was `@<address> <word>`, so tools that
-  compare a dump with a golden file failed: NVDLA's sanity3 checktest
-  failed with identical data. `--writemem-every-address` keeps the old
-  layout. (Silimate/xezim#335)
 * Code coverage leaves out what a constant condition rules out in an
   instance, as the reference simulator does: a `case` whose selector and
   items are constants, an `if` chain or `?:` on parameters, genvars or ports
@@ -315,12 +162,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   totals; a design unit counts an item that any of its instances counts.
   `--code-coverage-constant=keep` (or `XEZIM_CODE_COVERAGE_CONSTANT=keep`)
   counts them as before (§11.2.1, §12.4, §12.5). (Silimate/xezim#25)
-* `vpi_handle(vpiLeftRange)` and `vpi_handle(vpiRightRange)` of an element
-  or sub-array of an unpacked array give its own range (§38.11), and
-  `vpi_chk_error` fills `file` with an empty string instead of NULL (§38.3).
-  cocotb writing a list to an unpacked-array port (the I3C core's
-  `axi_adapter_id_filter` tests) read a value through the NULL range handle
-  and then crashed logging the error. (Silimate/xezim#349)
 * Toggle coverage counts each instance's input and inout ports in that
   instance, as commercial simulators do, with the value the connection gives
   the port: a port connected to a whole net shows that net's counts, one
@@ -357,14 +198,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
-* `$readmemh` and `$readmemb` load an associative array whose index type is
-  integral, each address a key (§21.4): from the file's addresses, from
-  address 0 when the file gives none, or between the start and finish
-  addresses given, through a local or a hierarchical name (`lmem.mem`).
-  `$writememh` and `$writememb` write the elements that exist, in index
-  order (§21.5). Both reported that the array names no unpacked memory and
-  did nothing, so the VeeR EH1, EH2 and EL2 testbenches loaded no program.
-  (Silimate/xezim#301)
 * An `always @*` whose statement starts with a delay or a `wait`
   (`always @(*) #10 clk <= ~clk;`, the clock generator of the ADI HDL
   testbenches) waits at `@*` for what that statement reads, as §9.4.2.2
@@ -373,11 +206,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   one timestamp. A block that suspends is also woken by a nonblocking update
   of a variable it writes, which lands after it is back at `@*`; a blocking
   write it makes as it runs still wakes nothing. (Silimate/xezim#303)
-* A struct passed through a type parameter keeps its member types when the
-  struct and its member typedefs are declared in a module below the top:
-  `a[i].id` on a `T [N-1:0] a` port read the member as a 32-bit `int` once the
-  struct was 32 bits or wider, and a child typedef of the same name took the
-  member's place (§6.20.3, §23.10).
 * In a module below the top, a write to a member of an element of a packed
   array of structs (`b_o.dw[0].value <= d` on an output port,
   `s2.e[0].dw[1].value <= d` on a variable) lands in the variable, which stayed
@@ -391,26 +219,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the upper bits read x (§11.5.1, §20.8.1). A bound that does not fold, such
   as a constant function, on a packed multidimensional base now selects whole
   elements. (#332)
-* A variable declared inside a procedural block or function with a type
-  parameter and packed dimensions (`T [1:0] tmp;`) is a packed array of the
-  bound type; it held one element of the wrong width (§6.20.3, §7.4.1).
-  (#333)
-* An unpacked-array parameter works in the generate conditions of a module
-  below the top (`if (Info[k].variant == ...)`, `if (V[k] == 1)`), whether it
-  is a `localparam` of that module (also when its struct typedef is declared
-  there) or a package parameter (`import p::*`, `import p::V`, `p::V[k]`);
-  every branch took `else` and the assignments in the others were lost
-  (§6.20.2, §26.3, §27.5). (#342)
 * In a compiled method, a compare of two elements of a method-local queue or
   dynamic array (`a[0] == a[1]`, a sort's `a[j] > a[j+1]`) compares the whole
   elements. The element read counted as one bit wide, so the compare saw only
   the lowest bits: `'{3, 1}` compared equal, and a bubble sort in a function
   left its array unsorted (#421).
-* A queue method's argument written as an unpacked array concatenation
-  (`q.push_back({1, 2})` on a queue of `int [2]`, and the same in
-  `push_front` and `insert`) is stored as the new element `'{1, 2}`: the
-  formal has the queue's element type, so the concatenation is one of that
-  type (§7.10.2, §10.10). Every item of the stored element was x. (#424)
 * A `$root` name that selects a member after an element select
   (`$root.tb.objs[1].v` through a queue of class handles, `$root.tb.qs[i].a`
   through a queue of packed structs) reads and sizes like the same name
@@ -449,24 +262,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   those imports in source order, as simulators that accept the name do, with
   a warning naming both packages. It is not part of `--compat`: the
   reference simulator rejects the name.
-* C and C++ DPI sources (`.c`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.C`) on the
-  command line or in a `-f` file are compiled with `$CC`/`$CXX` (else
-  Clang, else `cc`/`c++`), with xezim's `svdpi.h` and `vpi_user.h` on the
-  include path, linked with any `.o`/`.a` files named the same way into one
-  shared library and loaded like `--dpi-lib`; they used to be parsed as
-  SystemVerilog. The objects and library are cached by the preprocessed
-  sources and the commands, under `xezim/dpi` in the cache directory (a
-  private `xezim-<uid>` in the temporary directory when none is set).
-  `-CFLAGS`/`-LDFLAGS` (also `-ccflags`/`-ldflags`) add compiler and linker
-  arguments; with `-LDFLAGS` the library is linked again every run. A
-  `.so`/`.dylib`/`.dll` named among the files is loaded as `--dpi-lib`
-  (§35). (Silimate/xezim#307)
-* A DPI import that no `--dpi-lib` library defines binds to the C function
-  of that name in the libraries the process already has loaded, as the
-  reference simulator does, so `import "DPI-C" function string
-  getenv(input string name);` and other C library functions need no library
-  of their own (§35.5.1). An import found nowhere is still a `Fatal` when
-  called. (Silimate/xezim#338)
 * A procedural assignment to an ANSI output port declared with no data type
   (`output q`, `output [3:0] c`), which IEEE 1800-2023 §23.2.2.3 makes a net,
   is reported as such: the error names the port and module, says the port is a
@@ -491,10 +286,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   simulators with one flag: no time cap, `--relax-implicit-static`,
   `--relax-driver-conflicts` and `--error-exit`. An explicit `--max-time`
   or `-do` run time still sets the run length.
-* A run that SIGTERM or Ctrl-C (SIGINT) stops still closes its dumps through
-  the normal exit, and now exits 143 or 130 (128 + the signal number) instead
-  of 0, so a harness that judges a run by its exit status does not take a
-  killed run for a passing one. (Silimate/xezim#350)
 * `--max-time none` (or `0`) lifts the 100 ms cap, so the run goes until
   `$finish` or no events remain, as with `-do "run -all"`. The default is
   unchanged: a design that never finishes still stops.
@@ -542,23 +333,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`st.e[1].dw[0].value <= d`, `x = st.e[1].dw[0].value`) compiles to one
   static bit range of the container instead of running in the interpreter
   (§7.2, §7.4.2). (#356)
-* A packed declaration inside an instance is sized against that instance's
-  parameters overlaid on the design-wide table (§23.10). The parameters under
-  each scope are now collected once, and up to four shared copies of the
-  table, kept for the outermost scopes in use, move between instances by
-  taking off and putting on only the scopes the two do not share, instead of the whole table being copied whenever a select or an
-  assignment pattern moved to another instance. On a large design whose
-  continuous assignments assign patterns to instance-sized structs, each such
-  evaluation took about 1 ms. (#356)
-* The interpreter reads a struct typedef in place when it walks a dotted
-  name's declared type to see whether the name is a class handle, instead of
-  copying the whole typedef for every segment. Register blocks whose field
-  structs have hundreds of members spent much of a run copying them. (#356)
-* A `release` finds the drivers of the released net through an index of the
-  continuous assignments and combinational blocks that write each signal,
-  built at the first release, instead of scanning every one of them two or
-  three times (§10.6.2). A testbench that releases a signal on every clock
-  paid for those scans every cycle. (#356)
 * A read of a packed-struct member below the first level
   (`hwif_out.REG.field.value`, `decoded_reg_strb.rf.trig_r`) compiles to one
   range select of the root variable instead of running in the interpreter,
@@ -567,10 +341,6 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * A dotted call (`u_a.c_fn()`) finds whether its prefix names an instance
   in the sorted instance index instead of scanning every instance (§35.5.3).
   (#356)
-* The interface-alias name cache no longer keeps the answers for a
-  subroutine call's own storage keys (`@q#17`), which are new on every call:
-  on a design with interface ports it grew by an entry per call and element
-  for the whole run, to gigabytes over a long run. (#356)
 
 **Maintenance**
 

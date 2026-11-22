@@ -9,6 +9,10 @@
 //! reference simulator rejects them.
 use std::process::Command;
 
+// Run each case as its own xezim process: the relaxation flag is process-wide,
+// so cases in one process would share it. The inherited
+// `XEZIM_RELAX_WILDCARD_IMPORT_CONFLICT` is cleared so the strict cases stay
+// strict whatever the caller's environment sets.
 fn run(source: &str, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(

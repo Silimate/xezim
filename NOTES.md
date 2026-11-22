@@ -163,6 +163,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the lowest bits: `'{3, 1}` compared equal, and a bubble sort in a function
   left its array unsorted (#421).
 
+**Performance**
+
+* A select into a packed declaration of an instantiated module (`par[1].d`
+  with `s_t [N-1:0] par`) finds the instance's parameters by name in the
+  design-wide table, instead of scanning that table for every scope it had
+  not seen and keeping a copy of each scope's parameters (§23.10). On a
+  design with many such instances the time-0 settle was quadratic in the
+  design's size, and its memory grew with the copies: a SoC with a million
+  continuous assignments did not settle in 45 minutes, growing from 18 to
+  35 GB. (#415)
+
 **Usability**
 
 * FSM coverage: `--code-coverage=fsm` (part of `all` and of bare

@@ -130,6 +130,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `--relax-unconnected-interface-port` (or
   `XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT=1`) keeps that behavior, with a
   warning. (Silimate/xezim#340)
+* A write to a member of a packed struct nested in an element of an
+  unpacked-array class property (`inst[i].arch.vl = v`) lands in the element,
+  as a write to a member of the element itself (`inst[i].op = v`) did
+  (§7.2.1). The nested write was dropped, so the element kept its old value,
+  also through `this`, an object handle, a queue or a dynamic array. (#468)
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the

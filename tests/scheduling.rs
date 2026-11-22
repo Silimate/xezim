@@ -566,3 +566,6 @@ mod edge_before_slot_nba;
 // silimate: a wait's statement that suspends runs as the process's next statement
 #[path = "scheduling/wait_then_event_control.rs"]
 mod wait_then_event_control;
+// silimate: fork children an edge-woken process starts run before the NBA region
+#[path = "scheduling/fork_children_before_nba.rs"]
+mod fork_children_before_nba;

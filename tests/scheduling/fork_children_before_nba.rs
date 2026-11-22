@@ -12,7 +12,7 @@ use xezim::simulate;
 const SRC: &str = r#"
 module top;
   reg clk = 0;
-  reg s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+  reg s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0;
   event e;
   always #5 clk = ~clk;
   initial #5 -> e;
@@ -56,7 +56,52 @@ module top;
     s4 <= 1;
     watch();
   end
+  // A child whose `#0` continuation forks again: the Active and Inactive
+  // regions alternate until both are empty, then the NBAs commit.
+  initial begin
+    @(posedge clk);
+    s5 <= 1;
+    fork
+      begin
+        #0;
+        fork
+          @(posedge s5) $display("T|nested|%0t", $time);
+        join_none
+      end
+    join
+  end
   initial #40 $finish;
+endmodule
+"#;
+
+/// With another process's NBA pending at the edge, the edge's processes run
+/// before the slot's NBAs rather than in the edge cascade. Their fork
+/// children, and those of a `#0` continuation, start there too.
+const PENDING: &str = r#"
+module top;
+  reg clk = 0, s1 = 0, s2 = 0, other = 0;
+  always #5 clk = ~clk;
+  initial #5 other <= 1;
+  initial begin
+    @(posedge clk);
+    s1 <= 1;
+    fork
+      @(posedge s1) $display("T|pending|%0t", $time);
+    join_none
+  end
+  initial begin
+    @(posedge clk);
+    s2 <= 1;
+    fork
+      begin
+        #0;
+        fork
+          @(posedge s2) $display("T|pending_nested|%0t", $time);
+        join_none
+      end
+    join
+  end
+  initial #20 $finish;
 endmodule
 "#;
 
@@ -71,5 +116,27 @@ fn fork_children_of_an_event_woken_process_run_before_the_nbas() {
         .filter(|l| l.starts_with("T|"))
         .collect();
     got.sort();
-    assert_eq!(got, ["T|edge|5", "T|event|5", "T|none|5", "T|task|5"]);
+    assert_eq!(
+        got,
+        [
+            "T|edge|5",
+            "T|event|5",
+            "T|nested|5",
+            "T|none|5",
+            "T|task|5"
+        ]
+    );
+}
+
+#[test]
+fn fork_children_run_before_the_nbas_when_an_nba_is_pending_at_the_edge() {
+    let sim = simulate(PENDING, 1000).expect("simulate failed");
+    let mut got: Vec<String> = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim_end().to_string())
+        .filter(|l| l.starts_with("T|"))
+        .collect();
+    got.sort();
+    assert_eq!(got, ["T|pending_nested|5", "T|pending|5"]);
 }

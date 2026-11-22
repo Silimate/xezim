@@ -604,3 +604,6 @@ mod indexed_member_event;
 
 #[path = "scheduling/variable_assign_delay.rs"]
 mod variable_assign_delay;
+// silimate: overlapping and whole drives of one output that mature together merge per bit
+#[path = "scheduling/clocking_overlapping_drives.rs"]
+mod clocking_overlapping_drives;

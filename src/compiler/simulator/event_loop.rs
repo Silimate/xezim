@@ -1984,10 +1984,11 @@ impl Simulator {
             // edge pass must scan every edge signal: the clocks-only pass
             // missed `@(posedge c2)`, which then ran in the cascade, after the
             // NBAs its peers queued at the same edge had committed (§4.4.2.2,
-            // §4.5, §10.3).
+            // §4.5, §10.3). A drain with no waiter does neither, and a clock
+            // toggle alone keeps the clocks-only pass.
             let (dirty, epoch) = (self.dirty_any, self.late_resume_epoch);
             self.drain_condition_waiters(true, false);
-            if dirty || self.late_resume_epoch != epoch {
+            if (dirty && !self.dirty_any) || self.late_resume_epoch != epoch {
                 non_clock_change = true;
             }
             // /silimate

@@ -123,6 +123,42 @@ fn a_restored_run_continues_where_the_saved_one_was() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+// silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+/// §16.14.6: a process saved while it waits on a delay still resumes from a
+/// delay after the restore, so the procedural assertion it then reaches
+/// attempts at the clock's next tick (15), not at once (8).
+#[test]
+fn a_restored_delay_keeps_its_assertion_at_the_next_tick() {
+    let d = dir("delay_assert");
+    let f = d.join("tb.sv");
+    std::fs::write(
+        &f,
+        r#"module tb;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  initial begin
+    @(posedge clk);
+    #3;
+    a: assert property (@(posedge clk) 1) $display("R A %0t", $time);
+    #20 $finish;
+  end
+endmodule
+"#,
+    )
+    .unwrap();
+    let (full, _) = run(&f, &[], &[]);
+    assert_eq!(full, ["R A 15"]);
+    let ck = d.join("c.ckpt");
+    let spec = format!("6ns,{}", ck.display());
+    let (saved, err) = run(&f, &["--save-at", &spec], &[]);
+    assert_eq!(saved, full, "saving must not change the run: {err}");
+    let (restored, err) = run(&f, &["--restore", ck.to_str().unwrap()], &[]);
+    assert!(err.contains("restored"), "{err}");
+    assert_eq!(restored, full, "{err}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+// /silimate
+
 #[test]
 fn save_and_restart_from_the_design() {
     let d = dir("restart");
@@ -308,5 +344,42 @@ endmodule
     let (out, err) = run(&f, &restore, jit);
     assert!(out.is_empty(), "{out:?}");
     assert!(err.contains("saved running natively"), "{err}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn restored_fixed_class_arrays_preserve_element_widths() {
+    let d = dir("fixed_widths");
+    let f = d.join("tb.sv");
+    std::fs::write(
+        &f,
+        r#"
+`timescale 1ns/1ns
+class packet;
+    byte data[3:8];
+    logic [12:0] flags[8:3];
+endclass
+module tb;
+    packet p;
+    initial begin
+        p = new;
+        p.data[4] = 'h1f1;
+        #10;
+        p.flags[7][3:0] <= 5;
+        #1 $display("R %0d %b %0d %b", $signed(p.data[4]), p.flags[7], p.data[3], p.flags[3]);
+        $finish;
+    end
+endmodule
+"#,
+    )
+    .unwrap();
+    let ck = d.join("widths.ckpt");
+    let spec = format!("5ns,{}", ck.display());
+    let (saved, err) = run(&f, &["--save-at", &spec], &[]);
+    assert!(err.contains("saved"), "{err}");
+    assert_eq!(saved, ["R -15 xxxxxxxxx0101 0 xxxxxxxxxxxxx"]);
+    let (restored, err) = run(&f, &["--restore", ck.to_str().unwrap()], &[]);
+    assert!(err.contains("restored"), "{err}");
+    assert_eq!(restored, saved, "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }

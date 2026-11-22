@@ -292,7 +292,9 @@ impl Simulator {
     /// an anonymous aggregate, which other paths name.
     fn tn_base_text(&self, dt: &DataType, logic_kw: bool) -> Option<String> {
         match dt {
-            DataType::TypeReference { name, .. } => {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } => {
                 let n = name.name.name.as_str();
                 if self.module.interfaces.contains(n) {
                     return Some(format!("virtual {}", n));
@@ -305,12 +307,23 @@ impl Simulator {
                 } else {
                     self.module.typedef_types.get(&name.qualified()).cloned()
                 }?;
-                match &target {
+                let mut s = match &target {
                     DataType::Struct(_) | DataType::Enum(_) => {
                         self.tn_named_aggregate(&target, name)
                     }
                     _ => self.tn_base_text(&target, logic_kw),
+                }?;
+                // §20.6.1: the packed dimensions written on the type name
+                // (`lane_t [0:1] a`) follow the typedef's own, innermost
+                // first, as for a vector's dimensions above.
+                for d in dimensions.iter().rev() {
+                    if let PackedDimension::Range { left, right, .. } = d
+                        && let (Some(l), Some(r)) = (self.tn_const(left), self.tn_const(right))
+                    {
+                        s.push_str(&format!("[{}:{}]", l, r));
+                    }
                 }
+                Some(s)
             }
             DataType::IntegerVector {
                 kind,
@@ -486,6 +499,26 @@ impl Simulator {
     /// The integral type facts of a declared type; `logic_kw` as for
     /// [`tn_base_text`]. An enum reads as its base type.
     fn tn_type_of_dt(&self, dt: &DataType, logic_kw: bool) -> Option<TnType> {
+        let mut t = self.tn_type_of_resolved(dt, logic_kw)?;
+        // §20.6.1, §7.4.1: packed dimensions written on a typedef name
+        // (`lane_t [0:1]`) make a packed array of the typedef's type.
+        if let DataType::TypeReference { dimensions, .. } = dt
+            && !dimensions.is_empty()
+        {
+            let mut w = t.width as u64;
+            for d in dimensions {
+                if let PackedDimension::Range { left, right, .. } = d {
+                    let (l, r) = (self.tn_const(left)?, self.tn_const(right)?);
+                    w *= (l - r).unsigned_abs() + 1;
+                }
+            }
+            t.width = u32::try_from(w).ok()?;
+            t.name = self.tn_base_text(dt, logic_kw);
+        }
+        Some(t)
+    }
+
+    fn tn_type_of_resolved(&self, dt: &DataType, logic_kw: bool) -> Option<TnType> {
         let cur = self.resolve_dt_ref(dt);
         match cur {
             DataType::IntegerAtom { kind, signing, .. } => {
@@ -586,6 +619,156 @@ impl Simulator {
         Vec::new()
     }
 
+    /// §6.20.2, §23.10, §26.3: find the declaration in the active instance
+    /// or in its imported package. The value supplies the final width only
+    /// when the declaration specifies signing without a range.
+    fn tn_parameter(&self, path: &str, qualified: bool) -> Option<TnOperand> {
+        if qualified {
+            let (pkg, leaf) = path.split_once('.')?;
+            if !self.module.packages.contains(pkg) {
+                return None;
+            }
+            return self.tn_parameter_decl(&format!("{pkg}::{leaf}"));
+        }
+        let types = &self.module.param_decl_types;
+        let has_type = |key: &str| {
+            types.contains_key(key)
+                || (self.module.unpacked_decl_dims.contains_key(key)
+                    && self.module.parameters.contains_key(key))
+        };
+        let first = path.split('.').next()?;
+        let base = self.method_local_base.last().copied().unwrap_or(0);
+        if self
+            .local_stack
+            .get(base..)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .any(|frame| frame.contains_key(first) || frame.contains_key(path))
+            || self
+                .class_context_stack
+                .last()
+                .and_then(Option::as_deref)
+                .is_some_and(|class| self.class_property_decl_type(class, first).is_some())
+            || self.query_root_decl_type(first).is_some() && !has_type(first)
+        {
+            return None;
+        }
+        let mut scope = self
+            .name_resolve_hint
+            .borrow()
+            .clone()
+            .or_else(|| self.process_scope_hint.get(&self.current_pid).cloned())
+            .unwrap_or_default();
+        let key = loop {
+            let key = if scope.is_empty() {
+                path.to_owned()
+            } else {
+                format!("{scope}.{path}")
+            };
+            if has_type(&key) {
+                break key;
+            }
+            if self.module.var_decl_types.contains_key(&key)
+                || self.module.typedef_types.contains_key(&key)
+                || self.var_typedef_types.contains_key(&key)
+                || self.module.signals.get(&key).is_some_and(|s| !s.is_const)
+            {
+                return None;
+            }
+            if scope.is_empty() {
+                if path.contains('.') {
+                    return None;
+                }
+                let pkg = self.scope_import_pkg(path, &|p| has_type(&format!("{p}::{path}")))?;
+                break format!("{pkg}::{path}");
+            }
+            scope.truncate(scope.rfind('.').unwrap_or(0));
+        };
+        self.tn_parameter_decl(&key)
+    }
+
+    fn tn_parameter_decl(&self, key: &str) -> Option<TnOperand> {
+        let mut dt = self.module.param_decl_types
+            .get(key)
+            .or_else(|| {
+                self.module.unpacked_decl_dims.get(key)?;
+                self.module.parameters.get(key)?;
+                self.module.var_decl_types.get(key)
+            })?
+            .clone();
+        if let DataType::Implicit {
+            signing,
+            dimensions,
+            span,
+        } = dt
+        {
+            let dimensions = if dimensions.is_empty() {
+                let width = self.module.parameters.get(key)?.width.max(1);
+                vec![PackedDimension::Range {
+                    left: Box::new(Self::int_lit_expr(i64::from(width) - 1, span)),
+                    right: Box::new(Self::int_lit_expr(0, span)),
+                    span,
+                }]
+            } else {
+                dimensions
+            };
+            dt = DataType::IntegerVector {
+                kind: V::Logic,
+                signing,
+                dimensions,
+                span,
+            };
+        }
+        let dims = self
+            .module
+            .unpacked_decl_dims
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|&(l, r)| TnDim::Fixed(l, r))
+            .collect();
+        Some(TnOperand {
+            dt,
+            dims,
+            packed_member: true,
+            vec_selects: Vec::new(),
+        })
+    }
+
+    fn tn_parameter_operand(&self, e: &Expression, qualified: bool) -> Option<TnOperand> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.tn_parameter_operand(inner, qualified),
+            ExprKind::Index { expr, index } => {
+                let mut op = self.tn_parameter_operand(expr, qualified)?;
+                Self::tn_select(&mut op, index);
+                Some(op)
+            }
+            ExprKind::Ident(h) if h.root.is_none() => {
+                let (last, owners) = h.path.split_last()?;
+                if owners.iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                let path = h
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let mut op = self.tn_parameter(&path, qualified)?;
+                for index in &last.selects {
+                    Self::tn_select(&mut op, index);
+                }
+                Some(op)
+            }
+            ExprKind::MemberAccess { .. } => {
+                let path = crate::compiler::packed_assignment_pattern_plan::scoped_name_key(e)?;
+                self.tn_parameter(&path.replace("::", "."), qualified)
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve a `$typename` operand naming a variable, a class property, a
     /// struct member or an element of one of those to its declared type.
     fn tn_operand(&mut self, e: &Expression) -> Option<TnOperand> {
@@ -680,7 +863,18 @@ impl Simulator {
     /// operand (and its elements). `None` for a class handle or a shape it
     /// cannot resolve, which the caller's other paths name.
     pub(super) fn typename_operand_text(&mut self, e: &Expression) -> Option<String> {
-        let op = self.tn_operand(e)?;
+        let op = self
+            .tn_operand(e)
+            .or_else(|| self.tn_parameter_operand(e, false))?;
+        self.tn_render_operand(e, op)
+    }
+
+    pub(super) fn typename_parameter_text(&mut self, e: &Expression, qualified: bool) -> Option<String> {
+        let op = self.tn_parameter_operand(e, qualified)?;
+        self.tn_render_operand(e, op)
+    }
+
+    fn tn_render_operand(&mut self, e: &Expression, op: TnOperand) -> Option<String> {
         if op.vec_selects.is_empty() {
             let base = match &op.dt {
                 DataType::TypeReference { name, .. } => {
@@ -705,7 +899,9 @@ impl Simulator {
 
     /// The integral type of a variable operand after its selects.
     fn tn_operand_type(&mut self, e: &Expression) -> Option<TnType> {
-        let op = self.tn_operand(e)?;
+        let op = self
+            .tn_operand(e)
+            .or_else(|| self.tn_parameter_operand(e, false))?;
         if !op.dims.is_empty() {
             return None;
         }

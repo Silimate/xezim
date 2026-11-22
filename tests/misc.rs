@@ -157,6 +157,10 @@ mod init_reg_seed;
 mod inlined_call_caller_loop_constant;
 #[path = "misc/inspect_types.rs"]
 mod inspect_types;
+#[path = "misc/integral_time.rs"]
+mod integral_time;
+#[path = "misc/review_exact_time_reads.rs"]
+mod review_exact_time_reads;
 #[path = "misc/interconnect_and_var_ports.rs"]
 mod interconnect_and_var_ports;
 #[path = "misc/issue30_runner.rs"]
@@ -261,6 +265,8 @@ mod part_select_constant_bounds;
 mod part_select_negative_bound_compiled;
 #[path = "misc/placeholder_parameter_replication.rs"]
 mod placeholder_parameter_replication;
+#[path = "misc/port_conn_width_after_index.rs"]
+mod port_conn_width_after_index;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
 #[path = "misc/readmem_associative_array.rs"]
@@ -293,6 +299,8 @@ mod spec_static_and_pkg_queue;
 mod struct_member_unselected_generate;
 #[path = "misc/struct_members_and_constant_targets.rs"]
 mod struct_members_and_constant_targets;
+#[path = "misc/subroutine_body_port_packed_user_type.rs"]
+mod subroutine_body_port_packed_user_type;
 #[path = "misc/subroutine_port_redeclaration.rs"]
 mod subroutine_port_redeclaration;
 #[path = "misc/subroutine_port_type.rs"]
@@ -426,6 +434,8 @@ mod void_cast_operand;
 mod warm_cache_diag_replay;
 #[path = "misc/wildcard_import_conflict.rs"]
 mod wildcard_import_conflict;
+#[path = "misc/writemem_data_lines.rs"]
+mod writemem_data_lines;
 #[path = "misc/x_warn_switch.rs"]
 mod x_warn_switch;
 #[path = "misc/xselect_and_concat_flatten.rs"]
@@ -620,6 +630,8 @@ mod artifact_with_sources_738;
 mod checkpoint_save_restore;
 #[path = "misc/checkpoint_forked_process_bodies.rs"]
 mod checkpoint_forked_process_bodies;
+#[path = "misc/checkpoint_jit_display.rs"]
+mod checkpoint_jit_display;
 
 #[path = "misc/block_local_array_for_loop.rs"]
 mod block_local_array_for_loop;
@@ -687,3 +699,8 @@ mod declaration_order_snapshots;
 mod shared_procedural_bodies;
 #[path = "misc/deferred_assertion_counts.rs"]
 mod deferred_assertion_counts;
+
+#[path = "misc/stringify_macro_chain.rs"]
+mod stringify_macro_chain;
+#[path = "misc/continuous_assign_time_scope.rs"]
+mod continuous_assign_time_scope;

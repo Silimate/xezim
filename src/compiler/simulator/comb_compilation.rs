@@ -46,7 +46,7 @@ impl Simulator {
         Some(out)
     }
 
-    fn constant_selected_storage(&self, expr: &Expression) -> Option<String> {
+    pub(super) fn constant_selected_storage(&self, expr: &Expression) -> Option<String> {
         fn append(
             e: &Expression,
             module: &ElaboratedModule,
@@ -539,6 +539,7 @@ impl Simulator {
                 return false;
             }
         }
+        self.comb_writer_index = None;
         self.comb_entries = cache.entries;
         self.ts_comb.clear();
         self.comb_dep_offsets = cache.dep_offsets;
@@ -715,6 +716,27 @@ impl Simulator {
         let params_snapshot = self.module.parameters.clone();
         let descending_snapshot = self.module.descending_arrays.clone();
         let decl_dims_snapshot = self.module.unpacked_decl_dims.clone();
+        // §10.10: the arrays an unpacked concatenation item cannot be spread
+        // from element by element (`concat_array_assign_parts`).
+        let arrays_nd_snapshot = self.module.arrays_nd.clone();
+        let other_arrays_snapshot: HashSet<String> = self
+            .module
+            .dynamic_arrays
+            .iter()
+            .chain(&self.module.queue_vars)
+            .chain(self.module.associative_arrays.keys())
+            .cloned()
+            .collect();
+        let is_other_array = |n: &str| other_arrays_snapshot.contains(n);
+        let concat_tables = crate::compiler::elaborate::UnpackedArrayTables {
+            arrays: &arrays_snapshot,
+            arrays_2d: &arrays_2d_snapshot,
+            arrays_nd: &arrays_nd_snapshot,
+            descending: &descending_snapshot,
+            decl_dims: &decl_dims_snapshot,
+            params: &params_snapshot,
+            other_array: &is_other_array,
+        };
         // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
         // sub-instance INPUT PORT (`assign uut.mid.core.i_clk = tb_clk;`
         // with the port chain above unconnected). Identity port connects
@@ -781,6 +803,23 @@ impl Simulator {
                 })
                 .or_else(|| {
                     Self::row_pattern_assign_parts(&self.module, &ca, &decl_dims_snapshot, &params_snapshot)
+                })
+                .or_else(|| {
+                    crate::compiler::elaborate::concat_array_assign_parts(
+                        &ca.lhs,
+                        &ca.rhs,
+                        ca.delay,
+                        &concat_tables,
+                    )
+                })
+                .map(|mut parts| {
+                    if ca.delay_exprs.is_some() {
+                        for part in &mut parts {
+                            part.delay_exprs.clone_from(&ca.delay_exprs);
+                            part.origin.clone_from(&ca.origin);
+                        }
+                    }
+                    parts
                 })
                 .unwrap_or_else(|| vec![ca])
             })
@@ -1045,7 +1084,10 @@ impl Simulator {
                 // on the fast path.
                 let dst_real = self.signal_real.get(dst_id).copied().unwrap_or(false);
                 let src_real = self.signal_real.get(src_id).copied().unwrap_or(false);
-                if dst_real != src_real {
+                if dst_real != src_real
+                    || (dst_real && self.shortreal_signals.contains(&dst_id)
+                        && !self.shortreal_signals.contains(&src_id))
+                {
                     None
                 } else if width == self.signal_widths[src_id] {
                     if width <= 64 && delay == 0 {
@@ -1218,6 +1260,7 @@ impl Simulator {
                 || primitive_fall
                 || ca.delay_fall.is_some_and(|d| d > 0)
                 || ca.delay_off.is_some_and(|d| d > 0)
+                || ca.delay_exprs.is_some()
                 || (select_target && select_fall.is_some_and(|d| d > 0));
             // §10.3.3 versus §28.16: use the assignment's origin, not the
             // target's gate marker. Multi-driver lowering can give a gate
@@ -1241,7 +1284,7 @@ impl Simulator {
                     })
             } else if has_transition_delay
                 && select_target
-                && (select_fall.is_some_and(|f| f != explicit_delay)
+                && (ca.delay_exprs.is_some() || select_fall.is_some_and(|f| f != explicit_delay)
                     || ca.delay_off.is_some_and(|t| t != explicit_delay))
             {
                 // §10.3.3 / §28.16: a constant select keeps a select target
@@ -1271,7 +1314,7 @@ impl Simulator {
             // the one point where both the target and the new value are
             // known. Whole-net targets only, including widened overlapping
             // selects, like the gate form (§28.16).
-            if has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
+            if ca.delay_exprs.is_none() && has_transition_delay && wids.len() == 1 && lhs_is_bare_ident {
                 if let Some(f) = ca.delay_fall {
                     if f != explicit_delay {
                         self.gate_fall_delay_by_id.insert(wids[0], f);
@@ -1296,6 +1339,7 @@ impl Simulator {
                     rhs: Box::new(ca.rhs.clone()),
                     delay: explicit_delay,
                     delay_target: delay_target.map(Box::new),
+                    delay_exprs: ca.delay_exprs.take(),
                 }
             } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
@@ -1352,6 +1396,14 @@ impl Simulator {
                 // helpers) onto the slowest path. Every other compiler
                 // instantiation passes it; this one simply never did.
                 compiler.set_functions(&self.module.functions);
+                // §6.12.1: which operands are real decides the conversions
+                // (an integral net driven by a real rounds it).
+                compiler.set_signal_real(&self.signal_real);
+                compiler.set_deferred_callables(
+                    &self.module.deferred_function_bodies,
+                    &self.module.deferred_task_bodies,
+                    &self.module.packages,
+                );
                 compiler.top_module_name = Some(self.module.name.clone());
                 compiler.set_cov_fallback(self.code_cov.is_some());
                 if let Some(c) = cov_counter {
@@ -1395,6 +1447,7 @@ impl Simulator {
                             rhs: Box::new(ca.rhs),
                             delay: 0,
                             delay_target: None,
+                            delay_exprs: None,
                         }
                     }
                 }
@@ -1443,6 +1496,12 @@ impl Simulator {
                 // (`assign {a,b} = ({N{hit}} & f(w)) | ...`) could never
                 // inline its calls and stayed on the AST interpreter.
                 compiler.set_functions(&self.module.functions);
+                compiler.set_signal_real(&self.signal_real);
+                compiler.set_deferred_callables(
+                    &self.module.deferred_function_bodies,
+                    &self.module.deferred_task_bodies,
+                    &self.module.packages,
+                );
                 compiler.top_module_name = Some(self.module.name.clone());
                 compiler.set_cov_fallback(self.code_cov.is_some());
                 if let Some(c) = cov_counter {
@@ -1487,6 +1546,7 @@ impl Simulator {
                             rhs: Box::new(ca.rhs),
                             delay: 0,
                             delay_target: None,
+                            delay_exprs: None,
                         }
                     }
                 }
@@ -1496,6 +1556,7 @@ impl Simulator {
                     rhs: Box::new(ca.rhs),
                     delay: 0,
                     delay_target: None,
+                    delay_exprs: None,
                 }
             };
 
@@ -2254,6 +2315,11 @@ impl Simulator {
                     compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_functions(&self.module.functions);
+                    compiler.set_deferred_callables(
+                        &self.module.deferred_function_bodies,
+                        &self.module.deferred_task_bodies,
+                        &self.module.packages,
+                    );
                     compiler.set_params(&self.module.parameters);
                     compiler.set_param_leaf_idx(self.param_leaf_index());
                     compiler.set_cast_widths(&self.cast_widths);
@@ -5473,6 +5539,7 @@ impl Simulator {
                     .sum::<usize>()
             );
         }
+        self.comb_writer_index = None;
         self.comb_entries = entries;
         self.write_prepared_comb_cache();
         // Drop AST storage for items we've consumed into comb_entries.

@@ -15393,6 +15393,11 @@ mod finished_process_lifetime_tests;
 #[cfg(test)]
 mod class_heap_lifetime_tests;
 
+// silimate: a condition-waiter drain that did nothing keeps the clocks-only edge scan
+#[cfg(test)]
+mod clocks_only_scan_tests;
+// /silimate
+
 #[cfg(test)]
 mod signal_map_tests;
 

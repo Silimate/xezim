@@ -215,6 +215,9 @@ mod nba_leak_waiter_active_region;
 mod nba_region_join_none_order;
 #[path = "scheduling/nba_region_not_flushed_mid_edge.rs"]
 mod nba_region_not_flushed_mid_edge;
+// silimate: a condition-waiter drain's settle and writes reach the full edge pass
+#[path = "scheduling/settle_edges_before_nba.rs"]
+mod settle_edges_before_nba;
 #[path = "scheduling/null_mailbox_and_stall_location.rs"]
 mod null_mailbox_and_stall_location;
 #[path = "scheduling/oracle_timing_semantics.rs"]

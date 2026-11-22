@@ -1302,6 +1302,10 @@ checkpoint_state!(
     deferred_asserts,
     deferred_comb_pool,
     deferred_proc_entries,
+    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+    delay_pids,
+    delay_resumed,
+    // /silimate
     delayed_nba,
     delayed_nba_queue,
     delayed_slice_chains,

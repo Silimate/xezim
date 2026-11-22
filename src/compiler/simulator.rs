@@ -1785,6 +1785,17 @@ impl CombEntry {
             CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
         ) && (self.cold.read_signal_ids.iter()).any(|r| self.cold.write_signal_ids.contains(r))
     }
+
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// A level-sensitive block that writes no signal, seen only through its
+    /// side effects (immediate assertions, `$display`).
+    fn is_observer(&self) -> bool {
+        matches!(
+            self.item,
+            CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+        ) && self.cold.write_signal_ids.is_empty()
+    }
+    // /silimate
 }
 
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
@@ -4402,6 +4413,11 @@ struct SvaClockedSite {
     /// §16.14.6.2: matured instances, each the slot values it captured,
     /// waiting for the next tick of the leading clock.
     matured: Vec<SvaEnv>,
+    // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+    /// The time of the last tick. An instance that matures later in that
+    /// time step starts its attempt at that tick, not the next one.
+    tick_time: Option<u64>,
+    // /silimate
     /// The property has its own `disable iff` (§16.15: the scope's
     /// `default disable iff` does not apply).
     explicit_disable: bool,
@@ -5521,7 +5537,9 @@ struct BlockScopeSave {
     /// The subroutine's `static` locals that a non-static block variable of
     /// the same name hides, as `static_local_syncs` depth and the
     /// `(name, key)` entries taken out of that frame until the block ends.
-    static_hidden: Option<(usize, Vec<(String, String)>)>,
+    // silimate: a for-init variable hides the subroutine's same-named static local
+    // Each entry keeps the position it was taken from.
+    static_hidden: Option<(usize, Vec<(usize, (String, String))>)>,
     /// `next_pid` at entry: a block that forked keeps its collection storage
     /// (a child may still use it).
     pid_mark: usize,
@@ -8164,6 +8182,13 @@ pub struct Simulator {
     sva_abort_step: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
+    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+    /// `vpi_slot_post_nba` is running the slot's leftover cbNBASynch and
+    /// cbReadWriteSynch routines: the delta one opens matures the `#0`
+    /// deferred reports before its Reactive work.
+    #[serde(skip)]
+    vpi_slot_maturing: bool,
+    // /silimate
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -8959,6 +8984,26 @@ pub struct Simulator {
     /// Pids whose continuation `continue_stmts_or_trampoline` rescheduled
     /// with their context left live on the simulator.
     trampolined_pids: HashSet<usize>,
+    // silimate: a continuation of the same activation is no flush point
+    /// §16.4.2: pids whose next `run_process_stmts_inner` entry continues the
+    /// running activation (`continue_stmts_or_trampoline`), not a resume
+    /// after a suspension: their pending deferred reports and procedural
+    /// assertion instances stay queued.
+    #[serde(skip)]
+    cont_pids: HashSet<usize>,
+    // /silimate
+    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+    /// Pids parked on a delay (`#d`, `#0`, an intra-assignment delay), each
+    /// with whether the delay moves time on (`#0` does not). Checkpointed,
+    /// with the queued continuations.
+    delay_pids: HashMap<usize, bool>,
+    /// §16.14.6: pids whose running activation went on after a delay that
+    /// moved time on, not at an event control: a procedural concurrent
+    /// assertion they reach first is not at its clock's tick, so its first
+    /// attempt waits for the next one. A `#0` stays in the time step of the
+    /// event that woke the procedure.
+    delay_resumed: HashSet<usize>,
+    // /silimate
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
     /// `Simulator` exactly like `local_stack`, and moved into/out of a
@@ -10676,6 +10721,16 @@ pub struct Simulator {
     /// re-queue it. Other drivers of the vector still do. Rebuilt with the
     /// levels and whenever its length differs from `comb_entries`.
     comb_self_exempt: Vec<bool>,
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// Per comb entry: 1 for a block `CombEntry::is_observer` accepts, 2
+    /// while a settle holds it, else 0. Rebuilt whenever its length differs
+    /// from `comb_entries`.
+    #[serde(skip)]
+    comb_observer: Vec<u8>,
+    /// Whether `comb_observer` names any block.
+    #[serde(skip)]
+    comb_observer_any: bool,
+    // /silimate
     /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
     /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
     /// entries run on worker threads in the parallel BSP level dispatch.
@@ -11632,6 +11687,13 @@ pub struct Simulator {
     /// and call a sampled-value function: (body, scope, edge code, clock id),
     /// consumed by `register_sampled_watches` like the edge blocks.
     proc_sampled_blocks: Vec<(Statement, String, u8, usize)>,
+    // silimate: a procedural assertion in an always process samples its time-0 defaults too
+    /// The name segments the concurrent assertions in every always block
+    /// spell, taken as the blocks are classified: one that runs as a
+    /// process is in no list `capture_sampled_defaults` reads.
+    #[serde(skip)]
+    always_sva_names: HashSet<String>,
+    // /silimate
     /// True while `register_sampled_watches` pre-registers the sites.
     sampled_registering: bool,
 }

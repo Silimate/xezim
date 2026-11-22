@@ -4127,6 +4127,9 @@ impl Simulator {
             sva_owed: false,
             sva_abort_step: false,
             sva_post_nba_busy: false,
+            // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+            vpi_slot_maturing: false,
+            // /silimate
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),
             clocking_meta: HashMap::default(),
@@ -4389,6 +4392,11 @@ impl Simulator {
             block_scope_saves: Vec::new(),
             hoisted_scope: (0, 0),
             trampolined_pids: HashSet::default(),
+            // silimate: a continuation of the same activation is no flush point
+            cont_pids: HashSet::default(),
+            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+            delay_pids: HashMap::default(),
+            delay_resumed: HashSet::default(),
             local_gen_stack: Vec::new(),
             class_context_stack: vec![],
             method_local_base: vec![],
@@ -4839,6 +4847,10 @@ impl Simulator {
             comb_level: Vec::new(),
             comb_has_nba: Vec::new(),
             comb_self_exempt: Vec::new(),
+            // silimate: a level-sensitive block that writes nothing runs once the settle converges
+            comb_observer: Vec::new(),
+            comb_observer_any: false,
+            // /silimate
             comb_par_safe: Vec::new(),
             bsp_buckets: Vec::new(),
             bsp_next_seed: Vec::new(),
@@ -5172,6 +5184,7 @@ impl Simulator {
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),
+            always_sva_names: HashSet::default(),
             sampled_registering: false,
             pending_t0_triggers: Vec::new(),
             time0_port_edges: Vec::new(),

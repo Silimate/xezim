@@ -1050,6 +1050,27 @@ impl Simulator {
         // Consumed by whichever path runs this entry (see the direct-run
         // branch below).
         let trampolined = !self.trampolined_pids.is_empty() && self.trampolined_pids.remove(&pid);
+        // silimate: a continuation of the same activation is no flush point
+        // §16.4.2: a process resuming after a suspension reaches a flush
+        // point and drops its pending deferred reports and procedural
+        // assertion instances; a same-time trampoline entry of the running
+        // activation (`continue_stmts_or_trampoline`) does not.
+        if self.cont_pids.is_empty() || !self.cont_pids.remove(&pid) {
+            self.flush_deferred_asserts(pid);
+            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+            // A `#0` leaves the activation in its time step.
+            match self.delay_pids.remove(&pid) {
+                Some(true) => {
+                    self.delay_resumed.insert(pid);
+                }
+                Some(false) => {}
+                None if !self.delay_resumed.is_empty() => {
+                    self.delay_resumed.remove(&pid);
+                }
+                None => {}
+            }
+        }
+        // /silimate
         // A process terminated by `disable fork` (LRM §9.6.2) must not run any
         // remaining queued continuation (e.g. the resume of a `#delay` it was
         // parked on when killed). Pids are monotonic and never reused, so it is
@@ -2855,6 +2876,9 @@ impl Simulator {
     /// restores the process context, exactly as an immediate `@event` re-arm.
     pub(super) fn continue_stmts_or_trampoline(&mut self, pid: usize, cont: ProcCont) {
         if RPS_DEPTH.with(|c| c.get()) > RPS_TRAMPOLINE_DEPTH {
+            // silimate: a continuation of the same activation is no flush point
+            self.cont_pids.insert(pid);
+            // /silimate
             // The context stays live; mark the entry as this pid's own
             // continuation (see `run_scheduled_process_inner`).
             if !self.local_stack.is_empty() || !self.this_stack.is_empty() {
@@ -3436,7 +3460,12 @@ impl Simulator {
     pub(super) fn run_process_stmts_inner(&mut self, pid: usize, pc: &ProcCont) {
         let stmts: &[Statement] = pc.frame();
         self.current_pid = pid;
-        self.flush_deferred_asserts(pid);
+        // silimate: a continuation of the same activation is no flush point
+        // §16.4.2: the flush happens where the process resumes
+        // (`run_scheduled_process_inner`); every continuation of the running
+        // activation enters here too (a chained frame, an `always` body
+        // looping back to its event control), and is none.
+        // /silimate
         // Install THIS process's own instance scope as the resolution hint.
         // The hint is transient sibling-scope state: the previous process (or
         // a $display argument it evaluated) may have left its scope behind,
@@ -4651,6 +4680,8 @@ impl Simulator {
                     cont.extend(release);
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
+                    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+                    self.delay_pids.insert(pid, delay > 0);
                     self.event_queue.schedule(self.time + delay, pid, cont);
                     return;
                 }
@@ -4827,6 +4858,8 @@ impl Simulator {
                         }
                         // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
                         let cont = pc.pushed_body(body, pc.start + i + 1);
+                        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+                        self.delay_pids.insert(pid, delay > 0);
                         if delay == 0 {
                             // `#0` — IEEE 1800-2017 §4.4.2.3: suspend into the
                             // Inactive region of the SAME time slot, not the
@@ -5171,6 +5204,18 @@ impl Simulator {
                 if self.wait_condition_true(condition) {
                     self.vc_release(condition);
                     self.cond_progress = self.cond_progress.wrapping_add(1);
+                    // silimate: a wait's statement that suspends runs as the process's next statement
+                    // §9.7.4: in `wait (c) @(posedge clk);` the statement
+                    // the condition guards is an event control. Run through
+                    // the synchronous `exec_statement` it could not park the
+                    // process, which was never resumed. It runs here as the
+                    // next statement, ahead of the rest.
+                    if self.stmt_is_blocking(body) {
+                        let cont = pc.pushed_body(body, pc.start + i + 1);
+                        self.continue_stmts_or_trampoline(pid, cont);
+                        return;
+                    }
+                    // /silimate
                     self.exec_statement(body);
                     i += 1;
                     continue;
@@ -5541,6 +5586,9 @@ impl Simulator {
                     if owns_loop_frame {
                         self.push_loop_frame();
                     }
+                    // silimate: a for-init variable hides the subroutine's same-named static local
+                    // Shown again when the loop's scope closes (`block_scope_exit`).
+                    let mut static_hidden = None;
                     for fi in init {
                         match fi {
                             ForInit::VarDecl {
@@ -5551,6 +5599,8 @@ impl Simulator {
                                 let rv = self.declare_for_init_var(data_type, &name.name, e);
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
+                                    // silimate: a for-init variable hides the subroutine's same-named static local
+                                    self.hide_loop_static(&name.name, &mut static_hidden);
                                 } else {
                                     // §12.7.1: a variable declared in the for-init
                                     // has AUTOMATIC lifetime — it is local to the
@@ -5615,12 +5665,16 @@ impl Simulator {
                             .insert(for_key, (Arc::clone(&pc.stmts), f.clone()));
                         f
                     };
-                    if !saved.is_empty() {
+                    // silimate: a for-init variable hides the subroutine's same-named static local
+                    if !saved.is_empty() || static_hidden.is_some() {
                         self.block_scope_saves.push(BlockScopeSave {
                             frame_key: Self::frame_key(&frame),
                             frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
                             loop_vars: saved,
                             owns_loop_frame,
+                            // silimate: a for-init variable hides the subroutine's same-named static local
+                            static_hidden,
+                            // /silimate
                             ..Default::default()
                         });
                     }

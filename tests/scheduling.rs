@@ -545,3 +545,6 @@ mod intra_delay_array_items;
 mod review_intra_delay_array_items;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
+// silimate: a condition-waiter drain's settle and writes reach the full edge pass
+#[path = "scheduling/settle_edges_before_nba.rs"]
+mod settle_edges_before_nba;

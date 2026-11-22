@@ -1965,7 +1965,20 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
+            // silimate: a condition-waiter drain's settle and writes reach the full edge pass
+            // The drain settles the continuous assignments (`assign c2 = clk;`
+            // follows a clock there) and runs the waiters it releases. Both are
+            // changes to signals other than the toggled clocks, so the slot's
+            // edge pass must scan every edge signal: the clocks-only pass
+            // missed `@(posedge c2)`, which then ran in the cascade, after the
+            // NBAs its peers queued at the same edge had committed (§4.4.2.2,
+            // §4.5, §10.3).
+            let (dirty, epoch) = (self.dirty_any, self.late_resume_epoch);
             self.drain_condition_waiters(true, false);
+            if dirty || self.late_resume_epoch != epoch {
+                non_clock_change = true;
+            }
+            // /silimate
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
                 // Cont-assign propagation and edge-sensitive blocks are

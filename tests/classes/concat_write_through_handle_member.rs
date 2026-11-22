@@ -58,7 +58,11 @@ endmodule
 }
 
 /// The concatenation write converts each item to the member's element type,
-/// runs operand calls once, and splices nested braces into the member.
+/// runs operand calls once, and keeps braces nested in it as one vector
+/// concatenation, one element (§10.10.3). This test used to expect
+/// `{1, {2, {3}}}` to splice into `'{1, 2, 3}`; braces around unsized
+/// literals are no legal item (§10.10.1, §11.4.12), and sized ones form one
+/// element.
 #[test]
 fn concat_write_through_handle_member_element_type_calls_and_nesting() {
     let result = xezim::simulate(
@@ -80,7 +84,7 @@ class top_c;
     $display("A %p", cfg.r);
     cfg.q = {next_value()};
     $display("B %0d %p", calls, cfg.q);
-    cfg.q = {1, {2, {3}}};
+    cfg.q = {1, {16'h2, {16'h3}}};
     $display("C %p", cfg.q);
   endfunction
 endclass
@@ -100,5 +104,5 @@ endmodule
         .iter()
         .map(|entry| entry.message.as_str())
         .collect();
-    assert_eq!(lines, ["A '{'h1f, 'h0}", "B 1 '{10}", "C '{1, 2, 3}"]);
+    assert_eq!(lines, ["A '{'h1f, 'h0}", "B 1 '{10}", "C '{1, 131075}"]);
 }

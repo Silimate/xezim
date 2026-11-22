@@ -33,10 +33,10 @@ module tb;
       q = {10, 20, 30};
       `CK("queue literal", q.size() == 3 && q[2] == 30)
     end
-    begin // 10.10 unpacked array concat
-      int a[3];
-      a = {1, {2, 3}};
-      `CK("unpacked concat nested", a[0]==1 && a[2]==3)
+    begin // 10.10 unpacked array concat; 10.10.3 nested braces are one vector concat
+      logic [15:0] a[3];
+      a = {16'h1, {8'h23, 8'h45}, 16'h6};
+      `CK("unpacked concat nested", a[0]==16'h1 && a[1]==16'h2345 && a[2]==16'h6)
     end
     begin // 10.6/10.7 force-release on variables
       static int fv = 1;

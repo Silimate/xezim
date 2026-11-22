@@ -783,13 +783,22 @@ impl Simulator {
                 if self.assign_struct_concat(name, exprs.iter().collect()) {
                     return true;
                 }
-                let mut flat: Vec<&Expression> = exprs.iter().collect();
-                while let Some(i) = flat
-                    .iter()
-                    .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
-                {
-                    if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
-                        flat.splice(i..i, c);
+                // §10.10.3: braces nested in the concatenation are a vector
+                // or string concatenation, one element, unless they hold a
+                // collection operand (see `splice_array_braces`), when the
+                // elements are not themselves arrays.
+                let mut flat: Vec<&Expression> = Vec::new();
+                if self.foreach_dims(name).is_none_or(|d| d.len() == 1) {
+                    self.splice_array_braces(exprs, &mut flat);
+                } else {
+                    flat.extend(exprs.iter());
+                    while let Some(i) = flat
+                        .iter()
+                        .position(|x| matches!(x.kind, ExprKind::Concatenation(_)))
+                    {
+                        if let ExprKind::Concatenation(c) = &flat.remove(i).kind {
+                            flat.splice(i..i, c);
+                        }
                     }
                 }
                 let expand_rows = self.concat_has_non_array_elements(name);

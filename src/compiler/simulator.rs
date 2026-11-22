@@ -417,7 +417,9 @@ fn method_boost_enabled() -> bool {
 // §11.6.1, §7.10: an element read of a method-local queue or dynamic array has its element's
 // width, so a compare of two of them no longer resizes both to one bit. On an upstream bump,
 // take upstream's value and bump it once more.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317a;
+// §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
+// §23.9: a frame local that hides a parameter is not a constant element select.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317b;
 // /silimate
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
@@ -1945,7 +1947,10 @@ struct CombEntryCold {
 // §9.4.2: a selected member can require a value waiter instead of a comb block.
 // §6.24.1, §9.4.2: integer atom casts keep their operand, and a packed-struct member event
 // tries every scope spelling for its alias net.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB079";
+// §7.2, §7.4.2: a member select through constant element selects of a packed
+// struct is a compiled store.
+// §23.9: an index naming a frame local that hides a parameter is not constant.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB080";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

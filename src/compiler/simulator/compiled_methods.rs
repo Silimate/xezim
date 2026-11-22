@@ -2932,6 +2932,10 @@ impl Simulator {
                         let strings = self.class_string_coll_member_names(class);
                         let packed = self.class_coll_elem_packed_dims(class);
                         let mut colls = super::bytecode::ClassColls::default();
+                        colls.row_members = owners.iter()
+                            .filter(|(name, (_, cd))| cd.prop_coll_shapes.contains_key(name.as_str()))
+                            .map(|(name, _)| name.clone())
+                            .collect();
                         colls.members = self
                             .class_coll_member_names(class)
                             .into_iter()
@@ -3380,6 +3384,11 @@ impl Simulator {
                         }
                     }
                     compiler.set_dpi_import_fds(dpi_fds);
+                    compiler.set_deferred_callables(
+                        &self.module.deferred_function_bodies,
+                        &self.module.deferred_task_bodies,
+                        &self.module.packages,
+                    );
                     if method_trace_enabled() {
                         compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
                     }
@@ -5622,8 +5631,11 @@ impl Simulator {
         if let Some(t) = self.class_prop_type_named(type_name, member) {
             return Some(t);
         }
-        if let Some(dt) = self.module.typedef_types.get(type_name).cloned() {
-            let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
+        // Read the typedef in place: a register-block struct has hundreds
+        // of members, and this runs for every dotted name the interpreter
+        // reads or writes (`dotted_name_declared_class`).
+        if let Some(dt) = self.module.typedef_types.get(type_name) {
+            let resolved = Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types);
             if let DataType::Struct(su) = resolved {
                 for m in &su.members {
                     for d in &m.declarators {
@@ -5632,7 +5644,7 @@ impl Simulator {
                                 return Some(name.name.name.clone());
                             }
                             if let DataType::TypeReference { name, .. } =
-                                self.resolve_dt(&m.data_type)
+                                self.resolve_dt_ref(&m.data_type)
                             {
                                 return Some(name.name.name.clone());
                             }

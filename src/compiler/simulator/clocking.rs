@@ -37,6 +37,7 @@ impl Simulator {
         // the current time), so it moves into the nonblocking queue ahead of
         // this drive. This drive is recorded so a whole drive issued after
         // it queues behind it (`schedule_clocking_update`).
+        let mut again = false;
         if let Some(id) = self.clocking_select_signal(target) {
             let when = self.time.saturating_add(skew);
             for value in self.take_clocking_whole_drives(id, when) {
@@ -44,6 +45,7 @@ impl Simulator {
             }
             let now = self.time;
             self.clocking_select_due.retain(|&(t, _)| t >= now);
+            again = self.clocking_select_due.contains(&(when, id));
             self.clocking_select_due.push((when, id));
         }
         let rvalue = self.make_intra_saved_expr(val, span);
@@ -67,6 +69,88 @@ impl Simulator {
             },
             span,
         ));
+        if again {
+            self.supersede_clocking_selects(target, skew);
+        }
+    }
+
+    /// §14.16.2: when synchronous drives of one output mature in the same
+    /// time step, "the last value is the only value driven". Each select
+    /// drive is a nonblocking update of its bits, so two drives of the same
+    /// bits (`cb.e[0] <= 1; cb.e[0] <= 0;`) changed them twice in that step
+    /// and woke `@(e)` with the value unchanged. The earlier updates of the
+    /// same bits that mature with this one (the last one queued) take its
+    /// value, so the bits change at most once. Only reached when another
+    /// select drive of the output is due at the same time.
+    fn supersede_clocking_selects(&mut self, target: &Expression, skew: u64) {
+        let Some(range) = self.delayed_lhs_select_range(target) else {
+            return;
+        };
+        let when = self.time.saturating_add(skew);
+        let base = Self::select_chain_base(target).and_then(Self::member_path_head);
+        // The queued updates of this time whose target has the same base
+        // name: a cheap filter before the select ranges are evaluated.
+        let same_base = |e: &NbaEntry| {
+            e.lhs.as_ref().is_some_and(|l| {
+                Self::select_chain_base(l).and_then(Self::member_path_head) == base
+            })
+        };
+        // Indices only: the targets stay in the queue and are lent to
+        // `queued_select_range` (a drive runs this on every clock edge).
+        let picked: Vec<usize> = if skew == 0 {
+            self.nba_queue
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| same_base(e))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            self.delayed_nba_queue
+                .iter()
+                .enumerate()
+                .filter(|(_, (t, e))| *t == when && same_base(e))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let Some((&last, earlier)) = picked.split_last() else {
+            return;
+        };
+        if earlier.is_empty() || self.queued_select_range(last, skew > 0) != Some(range) {
+            return;
+        }
+        let value = if skew == 0 {
+            self.nba_queue[last].value.clone()
+        } else {
+            self.delayed_nba_queue[last].1.value.clone()
+        };
+        for &i in earlier {
+            if self.queued_select_range(i, skew > 0) != Some(range) {
+                continue;
+            }
+            if skew == 0 {
+                self.nba_queue[i].value = value.clone();
+            } else {
+                self.delayed_nba_queue[i].1.value = value.clone();
+            }
+        }
+    }
+
+    /// `delayed_lhs_select_range` of the target of queued update `i` (of
+    /// `delayed_nba_queue` when `delayed`), read in place: the target is
+    /// taken out of the entry for the call and put back.
+    fn queued_select_range(&mut self, i: usize, delayed: bool) -> Option<(usize, u32, u32)> {
+        let lhs = if delayed {
+            self.delayed_nba_queue[i].1.lhs.take()
+        } else {
+            self.nba_queue[i].lhs.take()
+        };
+        let range = lhs.as_ref().and_then(|l| self.delayed_lhs_select_range(l));
+        if delayed {
+            self.delayed_nba_queue[i].1.lhs = lhs;
+        } else {
+            self.nba_queue[i].lhs = lhs;
+        }
+        range
     }
 
     /// §14.3: the element signals (`net[i]`, with `i`) of clockvar net `net`
@@ -1166,7 +1250,15 @@ impl Simulator {
     /// `$time`, `$stime`, `$realtime` change every step (LRM §21.2.3).
     pub(super) fn is_monitor_time_arg(e: &Expression) -> bool {
         matches!(&e.kind, ExprKind::SystemCall { name, .. }
-            if matches!(name.as_str(), "$time" | "$stime" | "$realtime"))
+        if matches!(
+            name.as_str(),
+            "$time"
+                | "$stime"
+                | "$realtime"
+                | "$__xz_time_at"
+                | "$__xz_stime_at"
+                | "$__xz_realtime_at"
+        ))
     }
 
     /// The design root is the synthetic multi-top wrapper (§23.3.3): its

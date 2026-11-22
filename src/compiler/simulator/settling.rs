@@ -118,16 +118,49 @@ impl Simulator {
         self.mark_release_sources_dirty(id);
     }
 
+    /// The indices of the comb entries that write signal `id`, in table
+    /// order (§10.6.2). A release re-drives the net from them; looking them
+    /// up in `comb_writer_index` replaces a scan of every entry, which a
+    /// testbench releasing a signal each clock repeated every cycle. Empty
+    /// while a settle pass has the table taken out, as the scan was.
+    pub(super) fn comb_writers_of(&mut self, id: usize) -> Vec<usize> {
+        let n = self.comb_entries.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if self
+            .comb_writer_index
+            .as_ref()
+            .is_none_or(|(len, _)| *len != n)
+        {
+            let mut index: HashMap<usize, Vec<u32>> = HashMap::default();
+            for (eidx, entry) in self.comb_entries.iter().enumerate() {
+                for &w in &entry.cold.write_signal_ids {
+                    let writers = index.entry(w).or_default();
+                    // An entry that lists a signal twice is one writer.
+                    if writers.last() != Some(&(eidx as u32)) {
+                        writers.push(eidx as u32);
+                    }
+                }
+            }
+            self.comb_writer_index = Some((n, index));
+        }
+        self.comb_writer_index
+            .as_ref()
+            .and_then(|(_, index)| index.get(&id))
+            .map(|writers| writers.iter().map(|&e| e as usize).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
         let mut constant_drivers: Vec<CombEntry> = Vec::new();
-        for entry in self.comb_entries.iter() {
-            if entry.cold.write_signal_ids.contains(&id) {
-                if entry.cold.read_signal_ids.is_empty() {
-                    constant_drivers.push(entry.clone());
-                } else {
-                    sources.extend(entry.cold.read_signal_ids.iter().copied());
-                }
+        for eidx in self.comb_writers_of(id) {
+            let entry = &self.comb_entries[eidx];
+            if entry.cold.read_signal_ids.is_empty() {
+                constant_drivers.push(entry.clone());
+            } else {
+                sources.extend(entry.cold.read_signal_ids.iter().copied());
             }
         }
         for src_id in sources {
@@ -340,6 +373,7 @@ impl Simulator {
                         let view_len = view.len();
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
+                        let shortreal_signals = &self.shortreal_signals;
                         let two_state: &[bool] = &self.signal_two_state;
                         let gate_driven: &[bool] = &self.signal_gate_driven;
                         let n2id = &self.signal_name_to_id;
@@ -384,6 +418,7 @@ impl Simulator {
                                             &entries[eidx].item,
                                             widths,
                                             signed,
+                                            shortreal_signals,
                                             two_state,
                                             gate_driven,
                                             n2id,
@@ -652,6 +687,13 @@ impl Simulator {
         }
     }
 
+    /// The elaborator has already scaled each delay expression to global ticks.
+    pub(super) fn eval_driver_delays(&mut self, exprs: &[Option<Expression>; 3]) -> [Option<u64>; 3] {
+        exprs.each_ref().map(|expr| {
+            expr.as_ref().map(|e| apply_delay_mode(self.eval_delay_ticks(e)))
+        })
+    }
+
     /// AST comb-entry eval (`CombItem::ContAssign` / `AlwaysBlock`). These need
     /// the full `&mut self` interpreter (`eval_expr_ctx` / `exec_statement`), so
     /// they can't go through `eval_comb_entry_isolated`. Factored out of the
@@ -666,6 +708,7 @@ impl Simulator {
                 rhs,
                 delay: explicit_delay,
                 delay_target,
+                delay_exprs,
             } => {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
@@ -734,8 +777,11 @@ impl Simulator {
                     Some(v) => v.resize(w),
                     None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
+                let runtime = delay_exprs.as_deref().map(|exprs| self.eval_driver_delays(exprs));
                 self.timescale_scope_override = saved_ts;
-                let delay = if *explicit_delay > 0 {
+                let delay = if let Some([Some(rise), _, _]) = runtime {
+                    rise
+                } else if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
                     lhs_id
@@ -766,7 +812,7 @@ impl Simulator {
                     }
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
-                if delay > 0
+                if runtime.is_some() || delay > 0
                     || delay_target.is_some_and(|t| t.select_delays.is_some())
                     || lhs_id.is_some_and(|id| {
                         self.gate_fall_delay_by_id.contains_key(&id)
@@ -776,7 +822,8 @@ impl Simulator {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_transition(id, val, delay, delay_target);
+                                self.schedule_delayed_transition(id, val, delay, delay_target,
+                                    runtime.map(|[_, fall, off]| (fall, off)));
                             }
                         } else {
                             self.cancel_delayed(id);
@@ -795,6 +842,7 @@ impl Simulator {
                                 select_delays: Some((fall, off)),
                                 ..
                             }) => {
+                                let (fall, off) = runtime.map_or((fall, off), |[_, f, o]| (f, o));
                                 let hi = (lo + sel_w - 1) as usize;
                                 let old = self.signal_table[base_id].range_select(hi, lo as usize);
                                 Self::transition_delay(
@@ -813,11 +861,7 @@ impl Simulator {
                 } else if let Some(id) = lhs_id {
                     let width = self.signal_widths[id];
                     let mut resized = if self.signal_real[id] {
-                        if val.is_real {
-                            val.clone()
-                        } else {
-                            Value::from_f64(val.to_f64())
-                        }
+                        self.fit_value_to_signal(id, &val)
                     } else if val.is_real {
                         Self::real_to_int(val.to_f64(), width)
                     } else {

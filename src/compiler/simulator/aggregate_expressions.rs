@@ -1235,39 +1235,125 @@ impl Simulator {
         name: &str,
     ) -> Option<std::rc::Rc<HashMap<String, Value>>> {
         let (prefix, _) = name.rsplit_once('.')?;
-        if let Some((cached, scope)) = self.decl_param_scope_cache.borrow().as_ref()
-            && cached == prefix
+        let mut cache = self.decl_param_scope_cache.borrow_mut();
+        let cache = &mut *cache;
+        if let Some((last, owns)) = &cache.last
+            && last == prefix
         {
-            return scope.clone();
+            return if *owns {
+                cache.tables.last().map(|t| t.table.clone())
+            } else {
+                None
+            };
         }
         // Every enclosing scope of the prefix, outermost first: `u.g.par`
         // sees `u.N` as `N` and a generate-block constant `u.g.L` as `L`.
+        // Their groups go on in that order, so the innermost binding of a
+        // name wins over an outer same-named one.
         let scopes: Vec<&str> = prefix
             .match_indices('.')
             .map(|(i, _)| &prefix[..i])
             .chain(std::iter::once(prefix))
             .collect();
-        let mut overlay: Vec<(usize, &str, &Value)> = Vec::new();
-        for (k, v) in &self.module.parameters {
-            for (depth, scope) in scopes.iter().enumerate() {
-                if let Some(rest) = k.strip_prefix(scope).and_then(|r| r.strip_prefix('.')) {
-                    overlay.push((depth, rest, v));
+        let mut groups = Vec::with_capacity(scopes.len());
+        for scope in &scopes {
+            let group = match cache.groups.get(*scope) {
+                Some(group) => group.clone(),
+                None => {
+                    let group = self.decl_param_group(scope);
+                    cache.groups.insert(scope.to_string(), group.clone());
+                    group
+                }
+            };
+            groups.push(group);
+        }
+        if groups.iter().all(|g| g.is_empty()) {
+            cache.last = Some((prefix.to_string(), false));
+            return None;
+        }
+        // An overlaid table is moved between prefixes: the groups of the
+        // scopes the old and new prefix share stay on, the old prefix's
+        // other groups come off and the new prefix's go on. Of the tables
+        // nothing else holds, the one sharing the most outer scopes with the
+        // new prefix is moved; a prefix that shares none with any of them
+        // gets a fresh copy while there is room, else the least recently
+        // used one. A caller that still holds a table (a select whose index
+        // reads another instance's signal) keeps it untouched.
+        let shared = |t: &DeclParamTable| {
+            t.applied
+                .iter()
+                .zip(&scopes)
+                .take_while(|((applied, _), scope)| applied == *scope)
+                .count()
+        };
+        let unshared = |t: &DeclParamTable| std::rc::Rc::strong_count(&t.table) == 1;
+        let best = cache
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| unshared(t))
+            .map(|(i, t)| (shared(t), i))
+            .filter(|&(keep, _)| keep > 0)
+            .max_by_key(|&(keep, i)| (keep, i));
+        let fresh = || DeclParamTable {
+            table: std::rc::Rc::new(self.module.parameters.clone()),
+            applied: Vec::new(),
+            undo: Vec::new(),
+        };
+        let pick = if let Some((_, i)) = best {
+            i
+        } else if cache.tables.len() < DECL_PARAM_TABLES {
+            cache.tables.push(fresh());
+            cache.tables.len() - 1
+        } else if let Some(i) = cache.tables.iter().position(|t| unshared(t)) {
+            i
+        } else {
+            // Every table is held by a caller: replace the least recently
+            // used one; its holder keeps its own copy.
+            cache.tables[0] = fresh();
+            0
+        };
+        let mut t = cache.tables.remove(pick);
+        let keep = shared(&t);
+        // Nothing else holds `t.table` here, so this never copies it.
+        let table = std::rc::Rc::make_mut(&mut t.table);
+        if let Some(&(_, mark)) = t.applied.get(keep) {
+            for (k, prev) in t.undo.drain(mark..).rev() {
+                match prev {
+                    Some(v) => {
+                        table.insert(k, v);
+                    }
+                    None => {
+                        table.remove(&k);
+                    }
                 }
             }
+            t.applied.truncate(keep);
         }
-        let scope = if overlay.is_empty() {
-            None
-        } else {
-            // Innermost last, so its binding wins over an outer same-named one.
-            overlay.sort_by_key(|(depth, ..)| *depth);
-            let mut params = self.module.parameters.clone();
-            for (_, bare, v) in overlay {
-                params.insert(bare.to_string(), v.clone());
+        for (scope, group) in scopes[keep..].iter().zip(&groups[keep..]) {
+            t.applied.push((scope.to_string(), t.undo.len()));
+            for (rest, v) in group.iter() {
+                let prev = table.insert(rest.clone(), v.clone());
+                t.undo.push((rest.clone(), prev));
             }
-            Some(std::rc::Rc::new(params))
-        };
-        *self.decl_param_scope_cache.borrow_mut() = Some((prefix.to_string(), scope.clone()));
-        scope
+        }
+        let handed = t.table.clone();
+        cache.tables.push(t);
+        cache.last = Some((prefix.to_string(), true));
+        Some(handed)
+    }
+
+    /// The parameters named `<scope>.<rest>` in the design-wide table, as
+    /// `(rest, value)` in table order.
+    fn decl_param_group(&self, scope: &str) -> std::rc::Rc<[(String, Value)]> {
+        self.module
+            .parameters
+            .iter()
+            .filter_map(|(k, v)| {
+                let rest = k.strip_prefix(scope)?.strip_prefix('.')?;
+                Some((rest.to_string(), v.clone()))
+            })
+            .collect()
     }
 
     pub(super) fn declared_packed_type_in(
@@ -1416,6 +1502,34 @@ impl Simulator {
         })
     }
 
+    /// §23.2.2.3, §7.4.1: the type of a packed vector whose declaration is
+    /// not on file, from the dimensions elaboration recorded for it. An ANSI
+    /// port of an instantiated module (`output logic [0:0][31:1] f`) is
+    /// registered with its dimensions and width but no declared type, so its
+    /// nested selects missed the declaration walk below and took the generic
+    /// select path. For a plain vector those dimensions are all the type has.
+    fn recorded_vector_type(&self, name: &str) -> Option<DataType> {
+        let dims = self.module.packed_full_dims.get(name)?;
+        let id = *self.signal_name_to_id.get(name)?;
+        let mut total: u64 = 1;
+        for &(l, r) in dims {
+            total = total.checked_mul(l.abs_diff(r) + 1)?;
+        }
+        if dims.len() < 2 || total != u64::from(self.signal_widths[id]) {
+            return None;
+        }
+        Some(DataType::IntegerVector {
+            kind: if self.module.two_state_signals.contains(name) {
+                crate::ast::types::IntegerVectorType::Bit
+            } else {
+                crate::ast::types::IntegerVectorType::Logic
+            },
+            signing: self.signal_signed[id].then_some(crate::ast::types::Signing::Signed),
+            dimensions: Vec::new(),
+            span: crate::ast::Span::dummy(),
+        })
+    }
+
     pub(super) fn declared_packed_access(
         &mut self,
         expr: &Expression,
@@ -1475,7 +1589,38 @@ impl Simulator {
                 if self.is_associative_array(&name) {
                     return None;
                 }
-                let dt = self.module.var_decl_types.get(&name)?;
+                // §7.2.1, §7.4.3: a packed struct member spelled as one
+                // hierarchical name (`s.m`) has no declaration of its own;
+                // walk it as the member access it is, so a slice below an
+                // index into it (`s.m[1][2:1]`) selects whole elements. It
+                // fell to the generic select, which read the labels as bits.
+                if h.path.len() >= 2 && !self.module.var_decl_types.contains_key(&name) {
+                    let mut head = h.clone();
+                    head.path.truncate(1);
+                    head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                    head.cached_resolved_name = crate::ast::cache::NameCache::new();
+                    let mut chain = Expression::new(ExprKind::Ident(head), expr.span);
+                    for seg in &h.path[1..] {
+                        chain = Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(chain),
+                                member: seg.name.clone(),
+                            },
+                            expr.span,
+                        );
+                    }
+                    if let Some(access) = self.declared_packed_access(&chain) {
+                        return Some(access);
+                    }
+                }
+                let recorded_type;
+                let dt = match self.module.var_decl_types.get(&name) {
+                    Some(dt) => dt,
+                    None => {
+                        recorded_type = self.recorded_vector_type(&name)?;
+                        &recorded_type
+                    }
+                };
                 // §23.10: a declaration inside an instantiated module sizes its
                 // dimensions with THAT instance's parameters, which the
                 // design-wide table keys as `<inst>.N`. Evaluated against that
@@ -1852,7 +1997,9 @@ impl Simulator {
     }
 
     pub(super) fn read_declared_packed_access(&mut self, expr: &Expression) -> Option<Value> {
-        let access = self.declared_packed_access(expr)?;
+        let Some(access) = self.declared_packed_access(expr) else {
+            return self.read_partial_packed_range(expr);
+        };
         if access.unpacked != 0 || access.width == 0 {
             return None;
         }
@@ -1875,17 +2022,32 @@ impl Simulator {
         expr: &Expression,
         value: &Value,
     ) -> Option<bool> {
-        let access = self.declared_packed_access(expr)?;
-        if access.unpacked != 0 || access.width == 0 {
+        // Each piece is (bit in the stored vector, bit in the fitted value,
+        // width); a select inside its dimension is one piece.
+        let (access, fit_w, partial) = match self.declared_packed_access(expr) {
+            Some(access) => {
+                let w = access.width;
+                (access, w, None)
+            }
+            None => {
+                let (access, w, pieces) = self.partial_packed_range_pieces(expr)?;
+                (access, w, Some(pieces))
+            }
+        };
+        if access.unpacked != 0 || fit_w == 0 {
             return None;
         }
+        let single = [(access.offset, 0, access.width)];
+        let pieces: &[(u32, u32, u32)] = partial.as_deref().unwrap_or(&single);
         let mut stored = if let Some((class, spec, member)) = &access.static_target {
             self.static_read_in(class, spec.clone(), member)?
         } else {
             self.packed_local_value(&access.storage)?
         };
-        if access.offset.checked_add(access.width)? > stored.width {
-            return None;
+        for &(dst, _, w) in pieces {
+            if dst.checked_add(w)? > stored.width {
+                return None;
+            }
         }
         let before = stored.clone();
         if access.static_target.is_none() && self.forced_names.contains(&access.storage) {
@@ -1896,12 +2058,14 @@ impl Simulator {
                 &access.element_type,
                 &self.module.typedef_types,
             ) {
-            value.to_two_state().resize_for_assign(access.width)
+            value.to_two_state().resize_for_assign(fit_w)
         } else {
-            value.resize_for_assign(access.width)
+            value.resize_for_assign(fit_w)
         };
-        for bit in 0..access.width {
-            stored.set_bit((access.offset + bit) as usize, fitted.get_bit(bit as usize));
+        for &(dst, src, w) in pieces {
+            for bit in 0..w {
+                stored.set_bit((dst + bit) as usize, fitted.get_bit((src + bit) as usize));
+            }
         }
         let changed = stored != before;
         if let Some((class, spec, member)) = access.static_target {
@@ -1915,7 +2079,146 @@ impl Simulator {
         Some(changed)
     }
 
+    /// §11.5.1: a part-select after an index or member that runs partly (or
+    /// wholly) past its dimension reads x for its elements outside it; the
+    /// generic read placed it as bits (`a[0][k +: 2]` with `k = 5` read 0).
+    fn read_partial_packed_range(&mut self, expr: &Expression) -> Option<Value> {
+        let (access, fit_w, pieces) = self.partial_packed_range_pieces(expr)?;
+        if fit_w == 0 {
+            return None;
+        }
+        let stored = if let Some((class, spec, member)) = &access.static_target {
+            self.static_read_in(class, spec.clone(), member)?
+        } else {
+            self.packed_local_value(&access.storage)?
+        };
+        let mut out = Value::new(fit_w);
+        for (src, dst, w) in pieces {
+            if src.checked_add(w)? > stored.width {
+                return None;
+            }
+            for bit in 0..w {
+                out.set_bit((dst + bit) as usize, stored.get_bit((src + bit) as usize));
+            }
+        }
+        // A two-state element reads its missing bits as 0 (§7.4.6).
+        if super::elaborate::is_type_two_state_resolved(
+            &access.element_type,
+            &self.module.typedef_types,
+        ) {
+            out = out.to_two_state();
+        }
+        Some(out)
+    }
+
+    /// §11.5.1: a part-select after an index or member that runs partly (or
+    /// wholly) past its dimension writes only its elements inside it. The
+    /// declaration walk declines such a select, and the generic store then
+    /// placed it wrongly: `a[0][k +: 2] = 16'hbbaa` on
+    /// `logic [3:0][5:0][7:0] a` with `k = 5` wrote nothing, and
+    /// `a[1][k -: 2]` with `k = 0` wrote one bit. Returns the access of the
+    /// select's base, the width of the value the select stands for, and the
+    /// pieces of it that land inside the dimension.
+    #[allow(clippy::type_complexity)]
+    fn partial_packed_range_pieces(
+        &mut self,
+        expr: &Expression,
+    ) -> Option<(DeclaredPackedAccess, u32, Vec<(u32, u32, u32)>)> {
+        let ExprKind::RangeSelect {
+            expr: base,
+            left,
+            right,
+            kind,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        if !matches!(
+            base.kind,
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+        ) || !Self::cond_expr_is_effect_free(left, false)
+            || !Self::cond_expr_is_effect_free(right, false)
+        {
+            return None;
+        }
+        let access = self.declared_packed_access(base)?;
+        if access.unpacked != 0 {
+            return None;
+        }
+        let &(dl, dr) = access.dimensions.first()?;
+        let a = self.eval_expr(left).to_index()?;
+        let b = self.eval_expr(right).to_index()?;
+        let (l, r) = match kind {
+            RangeKind::Constant => (a, b),
+            RangeKind::IndexedUp if b > 0 => {
+                if dl >= dr {
+                    (a.checked_add(b - 1)?, a)
+                } else {
+                    (a, a.checked_add(b - 1)?)
+                }
+            }
+            RangeKind::IndexedDown if b > 0 => {
+                if dl >= dr {
+                    (a, a.checked_sub(b - 1)?)
+                } else {
+                    (a.checked_sub(b - 1)?, a)
+                }
+            }
+            _ => return None,
+        };
+        if l != r && (l > r) != (dl > dr) {
+            return None;
+        }
+        let count = u32::try_from(dl.abs_diff(dr) + 1).ok()?;
+        if access.width % count != 0 {
+            return None;
+        }
+        let stride = access.width / count;
+        let n = u32::try_from(l.abs_diff(r) + 1).ok()?;
+        let fit_w = n.checked_mul(stride)?;
+        // Element `k` of the value (from its least significant end) has
+        // label `r + k*step`.
+        let step: i64 = if l >= r { 1 } else { -1 };
+        let (lo, hi) = (dl.min(dr), dl.max(dr));
+        let mut pieces = Vec::new();
+        for k in 0..n {
+            let label = r + i64::from(k) * step;
+            if label < lo || label > hi {
+                continue;
+            }
+            let slot = if dl >= dr { label - dr } else { dr - label };
+            let dst = access
+                .offset
+                .checked_add(u32::try_from(slot).ok()?.checked_mul(stride)?)?;
+            pieces.push((dst, k * stride, stride));
+        }
+        Some((access, fit_w, pieces))
+    }
+
     pub(super) fn select_base_elem_dim(&self, base: &Expression) -> Option<(i64, i64)> {
+        let (dims, level) = self.select_base_elem_level(base)?;
+        dims.get(level).copied()
+    }
+
+    /// §7.4.3, §11.5.1: width in bits of one element of the dimension a
+    /// part-select on the index chain `base` addresses, when it is not the
+    /// last one — `a[0][5:0]` on `logic [3:0][5:0][7:0] a` counts six 8-bit
+    /// elements. None for a select of bits.
+    pub(super) fn select_base_elem_stride(&self, base: &Expression) -> Option<u32> {
+        let (dims, level) = self.select_base_elem_level(base)?;
+        if level + 1 >= dims.len() {
+            return None;
+        }
+        let stride: u64 = dims[level + 1..]
+            .iter()
+            .map(|&(l, r)| (l - r).unsigned_abs() + 1)
+            .product();
+        u32::try_from(stride).ok().filter(|&w| w > 1)
+    }
+
+    /// The packed dimensions of the element an index chain `base` lands in,
+    /// and which of them a select on `base` addresses.
+    fn select_base_elem_level(&self, base: &Expression) -> Option<(&Vec<(i64, i64)>, usize)> {
         let mut cur = base;
         let mut layers = 0usize;
         while let ExprKind::Index { expr: inner, .. } = &cur.kind {
@@ -1964,7 +2267,7 @@ impl Simulator {
             // An unpacked SLICE (a row of a 2-D array), not a packed element.
             return None;
         }
-        dims.get(layers - udepth).copied()
+        Some((dims, layers - udepth))
     }
 
     /// `[N-1:0]` maps idx→(idx-lo)·w, an ASCENDING `[0:N-1]` mirrors the slot
@@ -2078,6 +2381,37 @@ impl Simulator {
     /// re-stamp the declared signedness (`struct packed { int s; ... } x;`
     /// printed `x.s` as 4294967276 instead of -20). Resolves through the
     /// root's declared struct type; nested paths use the leaf member name.
+    /// §7.3: `field` is a `real` or `realtime` member of the unpacked
+    /// untagged union variable `root`. The union is one piece of storage, so
+    /// the member holds the real's IEEE 754 bits: a write stores them
+    /// (`$realtobits`) and a read takes them back (`$bitstoreal`).
+    pub(super) fn union_real_member(&self, root: &str, field: &str) -> bool {
+        let Some(dt) = self.module.var_decl_types.get(root) else {
+            return false;
+        };
+        let crate::ast::types::DataType::Struct(su) =
+            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types)
+        else {
+            return false;
+        };
+        if su.packed || su.tagged || !matches!(su.kind, crate::ast::types::StructUnionKind::Union) {
+            return false;
+        }
+        su.members.iter().any(|m| {
+            m.declarators.iter().any(|d| d.name.name == field)
+                && matches!(
+                    super::elaborate::resolve_typedef_chain(&m.data_type, &self.module.typedef_types),
+                    crate::ast::types::DataType::Real { kind, .. }
+                        if !matches!(kind, crate::ast::types::RealType::ShortReal)
+                )
+        })
+    }
+
+    /// The value read from a `union_real_member`: its bits as a real.
+    pub(super) fn union_real_read(v: Value) -> Value {
+        Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0)))
+    }
+
     pub(super) fn struct_member_signed(&self, root: &str, field: &str) -> bool {
         let Some(dt) = self.module.var_decl_types.get(root) else {
             return false;
@@ -3885,33 +4219,32 @@ impl Simulator {
                 v.is_signed = false;
                 v
             }
-            "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+            "$time" => Value::from_u64(self.rounded_time_in_current_unit(), 64),
             // §3.14.2.3: $time/$realtime from a body whose DECLARING
             // scope has its own timescale (CU/class/package subroutine
             // bodies are rewritten to this at elaboration; the literal
-            // argument is the scope's unit exponent).
-            "$__xz_time_at" | "$__xz_realtime_at" => {
+            // argument is the scope's unit exponent). §20.3.2: `$stime`
+            // keeps the low 32 bits there too.
+            "$__xz_time_at" | "$__xz_stime_at" | "$__xz_realtime_at" => {
                 let ue = args
                     .first()
                     .map(|a| self.eval_expr(a).to_f64() as i32)
                     .unwrap_or(self.module.timeunit_exp);
+                match name.as_str() {
+                    "$__xz_time_at" => return Value::from_u64(self.rounded_time_in_unit(ue), 64),
+                    "$__xz_stime_at" => return Value::from_u64(self.rounded_time_in_unit(ue), 32),
+                    _ => {}
+                }
                 let diff = ue - Self::secs_to_exp(self.tick_s);
                 let t = if diff >= 0 {
                     self.time as f64 / 10f64.powi(diff)
                 } else {
                     self.time as f64 * 10f64.powi(-diff)
                 };
-                if name == "$__xz_realtime_at" {
-                    Value::from_f64(t)
-                } else {
-                    Value::from_u64(t.round() as u64, 64)
-                }
+                Value::from_f64(t)
             }
             "$realtime" => Value::from_f64(self.time_in_current_unit()),
-            "$stime" => Value::from_u64(
-                (self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF,
-                32,
-            ),
+            "$stime" => Value::from_u64(self.rounded_time_in_current_unit(), 32),
             "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                 Value::from_u64(0, 1)
             }
@@ -4464,7 +4797,10 @@ impl Simulator {
                     return Self::sv_string_cast(&v);
                 }
                 if self.dt_is_real(&dt) {
-                    return Value::from_f64(v.to_f64());
+                    let f = v.to_f64();
+                    return Value::from_f64(if matches!(self.resolve_dt(&dt), crate::ast::types::DataType::Real {
+                        kind: crate::ast::types::RealType::ShortReal, ..
+                    }) { f as f32 as f64 } else { f });
                 }
                 // §6.24.1: a type cast to an UNPACKED ARRAY / QUEUE target
                 // (e.g. `bit_q_t'(stream)`) yields an unpacked collection.
@@ -4515,6 +4851,20 @@ impl Simulator {
                 }
                 let inner_is_call =
                     matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
+                // §6.24.1: a field of a struct parameter (`pt.DEPTH'(x)`) is
+                // a SIZE cast, its value the operand's context width. Looked
+                // up by its leaf (`DEPTH`) below it named nothing, and the
+                // operand passed through at its self-determined width:
+                // `pt.BHT_ARRAY_DEPTH'(en << addr)` in the VeeR branch
+                // predictor shifted a 1-bit value and read 0.
+                if let Some(w) = args.first().and_then(|a| self.member_cast_size(a)) {
+                    let v = match args.get(1) {
+                        Some(a) if !inner_is_call => self.eval_expr_ctx(a, w),
+                        Some(a) => self.eval_expr(a),
+                        None => Value::zero(w),
+                    };
+                    return v.resize(w);
+                }
                 // §6.24.1: an integral target (typedef, enum, or a constant
                 // size) is the operand's context width — see the type-cast
                 // arm above.
@@ -5122,7 +5472,7 @@ impl Simulator {
                 // $set_randstate.
                 Value::from_string(&self.rng.to_state_string())
             }
-            "$typename" => {
+            "$typename" | "$__xz_scoped_typename" => {
                 // §20.6.1: a typed pattern has the type that prefixes it.
                 if let Some(ExprKind::TypedPattern { ty, .. }) = args.first().map(|a| &a.kind) {
                     return Value::from_string(&self.typename_of_dt(ty));
@@ -5159,6 +5509,11 @@ impl Simulator {
                                 return Value::from_string(kw);
                             }
                         }
+                    }
+                    // §6.20.2: a typed parameter can be real, shortreal or
+                    // integral independently of its initializer's type.
+                    if let Some(t) = self.typename_parameter_text(arg, name == "$__xz_scoped_typename") {
+                        return Value::from_string(&t);
                     }
                     // §20.6.1: an expression of type real — a real or time
                     // literal (§5.8: `1ns` is realtime), real arithmetic, a
@@ -5206,6 +5561,10 @@ impl Simulator {
                         let bn = self.expr_type_leaf_name(base);
                         let parts = self.typename_args_text_parts(type_args_text);
                         return Value::from_string(&self.class_typename_with_args(&bn, parts));
+                    }
+                    // A class property declared with a specialization.
+                    if let Some(t) = self.prop_decl_class_typename(arg) {
+                        return Value::from_string(&t);
                     }
                     // A class-typed variable: "class <name> #(<args>)".
                     if let Some((base, ta)) = self.class_declared_type_of(arg) {

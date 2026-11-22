@@ -146,6 +146,8 @@ mod forever_break_and_disable_fork_label;
 mod fork_automatic_capture;
 #[path = "scheduling/fork_children_start_in_spawn_slot.rs"]
 mod fork_children_start_in_spawn_slot;
+#[path = "scheduling/fork_intra_assignment_child_start.rs"]
+mod fork_intra_assignment_child_start;
 #[path = "scheduling/fork_join_edge.rs"]
 mod fork_join_edge;
 #[path = "scheduling/fork_join_none_await_context.rs"]
@@ -162,12 +164,16 @@ mod gap_fixes_scoping_and_nba;
 mod gate_rise_fall_delay;
 #[path = "scheduling/iff_guard_module_scope.rs"]
 mod iff_guard_module_scope;
+#[path = "scheduling/intra_assignment_array_capture.rs"]
+mod intra_assignment_array_capture;
 #[path = "scheduling/intra_assignment_delay.rs"]
 mod intra_assignment_delay;
 #[path = "scheduling/intra_assignment_event_identifier.rs"]
 mod intra_assignment_event_identifier;
 #[path = "scheduling/intra_delay_assignment_pattern.rs"]
 mod intra_delay_assignment_pattern;
+#[path = "scheduling/intra_delay_unpacked_array_shapes.rs"]
+mod intra_delay_unpacked_array_shapes;
 #[path = "scheduling/issue_237_mixed_clock_configs.rs"]
 mod issue_237_mixed_clock_configs;
 #[path = "scheduling/ivtest_always_cluster.rs"]
@@ -250,6 +256,10 @@ mod static_local_nba_per_instance;
 mod struct_member_read_sensitivity;
 #[path = "scheduling/suspending_loop_depth_and_continue.rs"]
 mod suspending_loop_depth_and_continue;
+#[path = "scheduling/sva_delay_operand_forms.rs"]
+mod sva_delay_operand_forms;
+#[path = "scheduling/sva_multiclock_delay_then_clock.rs"]
+mod sva_multiclock_delay_then_clock;
 #[path = "scheduling/sva_time0_default_samples.rs"]
 mod sva_time0_default_samples;
 #[path = "scheduling/task_body_delay_scaling.rs"]
@@ -347,6 +357,10 @@ mod package_cli_timescale_delay;
 mod phase_jump_static_latch;
 #[path = "scheduling/release_constant_driver_from_always.rs"]
 mod release_constant_driver_from_always;
+#[path = "scheduling/release_redrive_writers_each_clock.rs"]
+mod release_redrive_writers_each_clock;
+#[path = "scheduling/partial_force_redrive_each_clock.rs"]
+mod partial_force_redrive_each_clock;
 #[path = "scheduling/release_from_level_sensitive_block.rs"]
 mod release_from_level_sensitive_block;
 #[path = "scheduling/static_recursion_shared_cell.rs"]
@@ -487,6 +501,8 @@ mod delay_always_constant_scaled_delay;
 
 #[path = "scheduling/packed_comb_sensitivity_844.rs"]
 mod packed_comb_sensitivity_844;
+#[path = "scheduling/packed_struct_member_event.rs"]
+mod packed_struct_member_event;
 
 #[path = "scheduling/review_fork_baseline_935.rs"]
 mod review_fork_baseline_935;
@@ -583,3 +599,8 @@ mod observer_runs_after_settle;
 mod time0_effect_entries_1314;
 #[path = "scheduling/sva_default_actuals_1309.rs"]
 mod sva_default_actuals_1309;
+#[path = "scheduling/indexed_member_event.rs"]
+mod indexed_member_event;
+
+#[path = "scheduling/variable_assign_delay.rs"]
+mod variable_assign_delay;

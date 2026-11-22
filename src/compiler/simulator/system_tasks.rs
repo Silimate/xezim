@@ -321,6 +321,9 @@ impl Simulator {
             self.record_sampled_defaults(args);
             return;
         }
+        if name == VERILOG_DECL_INIT_MARKER || name == VERILOG_DECL_RUNTIME_MARKER {
+            return;
+        }
         // §21.7: every waveform task is inert without `--wave`, which is what
         // makes the dump opt-in at model-compile time rather than triggered by
         // whatever the source happens to call.

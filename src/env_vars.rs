@@ -869,6 +869,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Elab: elaborate an instance that leaves an interface port unconnected (§25.3), with a warning (1 enables)",
     ),
     (
+        "XEZIM_RELAX_UNTYPED_OUTPUT_PORT",
+        "Lint: take an output port declared with no data type, which a procedural block assigns, as a variable, with a warning (§23.2.2.3, §6.5; 1 enables)",
+    ),
+    (
         "XEZIM_RELAX_USE_BEFORE_DECL",
         "Elab: accept module data references before their declarations with a warning (§6.5; 1 enables)",
     ),

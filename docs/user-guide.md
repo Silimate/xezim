@@ -522,6 +522,7 @@ relaxed run's design. Every switch also has an environment variable,
 | `--relax-macro-space` | `` ` NAME `` (§22.5.1) | `` `NAME `` |
 | `--relax-nul-bytes` | a NUL byte in the source (§5.3) | white space |
 | `--relax-cross-hier-item` | `cross vif.mode, cp_a;` (§19.6), and `binsof(vif.mode)` in its bin selects (§19.6.1) | a cross over an implicit coverpoint of `vif.mode` |
+| `--relax-untyped-output-port` | a procedural assignment to an ANSI output port declared with no data type, `module m (output q); ... q <= d;` (§23.2.2.3, §6.5) | `output logic q` |
 | `--relax-use-before-decl` | a reference to module data before its declaration, including in call arguments (§6.5) | a reference to the later declaration, with a warning |
 | `--relax-wildcard-import-conflict` | a name that two wildcard-imported packages both declare, used where neither a local declaration nor an explicit import decides it (§26.3) | the first of those imports in source order, with a warning naming both packages |
 | `--relax-library-packages` | a package declared in a `-v` library file, which supplies only modules, interfaces, programs and primitives (#937) | a package compiled as if the file were also a source file |

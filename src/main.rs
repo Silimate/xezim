@@ -247,7 +247,7 @@ fn print_usage() {
                    static, --relax-driver-conflicts and --error-exit. Also
                    enabled by XEZIM_COMPAT=1."
     );
-    for f in sv_parser::relax_flags() {
+    for f in xezim::relax_flags() {
         eprintln!("  --relax-{}  Accept, with a warning: {}.", f.name, f.help);
         eprintln!("                   Also enabled by {}=1.", f.env);
     }
@@ -790,12 +790,12 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
     }
 }
 
-/// The opt-in parser relaxations (`--relax-<name>`, one per
-/// `sv_parser::RelaxFlag`), `--no-config-keywords` and `--keywords=<ver>`
+/// The opt-in relaxations (`--relax-<name>`, one per `xezim::relax_flags()`
+/// entry: the parser's and the lint's), `--no-config-keywords` and `--keywords=<ver>`
 /// (#608, #622-#629). True when `flag` is one of them.
 fn handle_relax_flag(flag: &str) -> bool {
     if let Some(name) = flag.strip_prefix("--relax-")
-        && let Some(f) = sv_parser::relax_flags().into_iter().find(|f| f.name == name)
+        && let Some(f) = xezim::relax_flags().find(|f| f.name == name)
     {
         f.set(true);
         return true;

@@ -79,6 +79,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   A delay that moves time on waits for the next tick, and a `#0` keeps the
   tick of the edge that woke the procedure. At the time-0 edge, such an
   attempt reads the default sampled values (§16.5.1). (#450)
+* A process that an edge or a named event resumed, and that then forks,
+  starts the fork's children before the time step's NBA region (§4.4.2.2,
+  §4.5, §9.3.2). So do the children a child forks after a `#0`, since the
+  Active and Inactive regions alternate until both are empty. The children
+  had started after the NBAs, so a child waiting for an edge one of those
+  NBAs makes never saw it. (#455)
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the

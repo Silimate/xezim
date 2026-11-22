@@ -91,6 +91,37 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   those NBAs, and read their new values, while a level-sensitive `wait` was
   pending anywhere or when a delayed nonblocking assignment fell due at the
   edge. A `wait` on the copy itself resumed only after them too. (#458)
+* An `always` block that starts with an event control waits there before
+  any `initial` block writes, as on the reference simulator and Icarus
+  Verilog (§9.2), when the control has no `iff` and nothing after it waits
+  on an event again (a `wait`, another event control, or one in a called
+  task or joined `fork`). `initial clk = 0; always @(clk) #10 clk = ~clk;`
+  starts its clock wherever the two blocks sit in the source; the time-0
+  change was missed when the `initial` block ran first.
+* In a `.v` file, a variable declaration assignment (`reg clk = 1'b0;`) is
+  an `initial` assignment at time 0 (IEEE 1364-2005 §6.2.1), so the
+  variable changes from x then and the processes waiting on it wake, as on
+  the reference simulator. In a `.sv` file, or with `-sv`, it still sets
+  the value before time 0 with no event (§6.8). The clock of the Analog
+  Devices HDL testbenches (`reg clk = 1'b0; always @(*) #10 clk <= ~clk;`)
+  never started. A runtime initializer in a `.v` file
+  (`reg m = $test$plusargs("MODE");`) runs at time 0 with the others, and a
+  `--compile -o` artifact keeps the `-sv` choice it was compiled with.
+* An input port reads with its own declared signedness when it is
+  connected to a concatenation, a select or a net of the other signedness
+  (§23.3.3.7, §11.8.1): `input logic signed [12:0] e_i` connected to
+  `{c[11], c}` reads -27, not 8165, so `a_i - e_i` and `e_i < 0` are
+  signed in the module. A net driven by `assign` from a variable of the
+  other signedness keeps its own too. lowRISC Muntjac's FPU returned 1e-8
+  for `fadd.s pi + 1e-8`. (Silimate/xezim#352)
+* An instance that leaves an interface port unconnected (absent from a
+  named list, `.p()`, or an empty ordered slot) is an elaboration error
+  naming the port and the instance, as on Verilator and the reference
+  simulator (§25.3, §23.3.3). It used to elaborate, the port's members
+  reading x of their own, which hid a stale testbench.
+  `--relax-unconnected-interface-port` (or
+  `XEZIM_RELAX_UNCONNECTED_INTERFACE_PORT=1`) keeps that behavior, with a
+  warning. (Silimate/xezim#340)
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the
@@ -100,6 +131,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   succeeds vacuously while `c` is false, so it runs no pass action and a
   `cover` of it does not match, and `p or q` with a sequence operand is never
   vacuous.
+* Braces nested in an unpacked array concatenation are a vector or string
+  concatenation, one element of the target (§10.10.3): `q = {q, {pc, insn}}`
+  on a queue of 64-bit elements appends one element, as on the reference
+  simulator. xezim spliced the braced operands as separate elements, which
+  gave CHERIoT Ibex's testbench spurious `dii_if` errors. Braces around a
+  queue or unpacked array operand, which no vector concatenation can hold,
+  still splice. A selected queue (`rows[0] = {rows[0], {pc, insn}}`) follows
+  the same rule, and each operand of an unpacked array concatenation
+  assigned to a queue or array is evaluated once: `q = {q, f()}` called `f`
+  twice, and `q = {m[i++]}` advanced `i` more than once. (Silimate/xezim#336)
 * An assertion in a task or function declared in another module or in a
   package reports that module's or package's file and line in the results
   file; it had the calling process's file and a wrong line.
@@ -157,14 +198,80 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* An `always @*` whose statement starts with a delay or a `wait`
+  (`always @(*) #10 clk <= ~clk;`, the clock generator of the ADI HDL
+  testbenches) waits at `@*` for what that statement reads, as §9.4.2.2
+  says. Its inferred sensitivity came out empty, so the block ran as
+  combinational logic without its event control and spun in delta cycles at
+  one timestamp. A block that suspends is also woken by a nonblocking update
+  of a variable it writes, which lands after it is back at `@*`; a blocking
+  write it makes as it runs still wakes nothing. (Silimate/xezim#303)
+* In a module below the top, a write to a member of an element of a packed
+  array of structs (`b_o.dw[0].value <= d` on an output port,
+  `s2.e[0].dw[1].value <= d` on a variable) lands in the variable, which stayed
+  x, and a member of a packed-struct net (`wire t_t n; ... n.a`) reads the net
+  and wakes its readers, which kept a stale value (§7.2, §7.4.2, §6.7.1).
+  (#347, #348)
+* A part-select bounded by `$clog2` of a constant (`a[$clog2(N)-1:3]`), as in
+  a port connection read by the child's clocked blocks, selects the declared
+  bits. Compiled code did not fold the `$clog2`, and its select with unfolded
+  bounds took the labels as physical bit positions, so on `input [11:2] a`
+  the upper bits read x (§11.5.1, §20.8.1). A bound that does not fold, such
+  as a constant function, on a packed multidimensional base now selects whole
+  elements. (#332)
 * In a compiled method, a compare of two elements of a method-local queue or
   dynamic array (`a[0] == a[1]`, a sort's `a[j] > a[j+1]`) compares the whole
   elements. The element read counted as one bit wide, so the compare saw only
   the lowest bits: `'{3, 1}` compared equal, and a bubble sort in a function
   left its array unsorted (#421).
+* A `$root` name that selects a member after an element select
+  (`$root.tb.objs[1].v` through a queue of class handles, `$root.tb.qs[i].a`
+  through a queue of packed structs) reads and sizes like the same name
+  without `$root` (§23.6). It read 0, and in an expression it counted as one
+  bit wide. (#425)
+* An event control on a member of an element of an unpacked array of packed
+  structs (`@(sa[1].a)`, also inside a larger expression such as
+  `@(sa[1].a ^ b)`) waits on that member's value (§9.4.2, §7.2.1). It watched
+  nothing: a procedural wait never woke (in a task with an automatic index it
+  returned at once), and an `always` block missed changes or woke on every
+  change of the element. (#439)
+* In a queue of fixed-size arrays, `$` in the row select reads the last row
+  (`k.q[$][1]`, `mq[$][1]`), which read x, and a one-variable `foreach` over
+  a class-property queue or dynamic array of rows visits its current rows
+  instead of a 64-row buffer whose extra rows read x (§7.10.1, §12.7.3).
+  (#446)
+* `pop_front()` and `pop_back()` on a queue of fixed-size arrays return the
+  removed row (§7.10.2.4, §7.10.2.5): in `%p`, an assignment to a fixed-size
+  or dynamic array, a slice or a row of a 2-D array, an equality, an actual
+  argument and `return q.pop_front();`. They returned 0, so the target read
+  `'{0, 0}`. (#447)
+* A member read through an element select whose index has a side effect
+  (`objs[i++].v`, `qs[i++].a`, `objs[next()].v`) evaluates the index once
+  (§11.4.2, §13.4). The lookups that find the element, and the width probes
+  of a comparison or an arithmetic operator above the read, each evaluated it
+  again, so `i++` ran up to thirteen times and the read returned another
+  element's member. (#445)
 
 **Usability**
 
+* A name that two wildcard-imported packages both declare, which §26.3
+  makes invisible, is now reported with both packages and the scope that
+  imports them, including in a cast (`size_e'(x)`), where it used to be an
+  undeclared identifier. `--relax-wildcard-import-conflict` (or
+  `XEZIM_RELAX_WILDCARD_IMPORT_CONFLICT=1`) resolves it to the first of
+  those imports in source order, as simulators that accept the name do, with
+  a warning naming both packages. It is not part of `--compat`: the
+  reference simulator rejects the name.
+* A procedural assignment to an ANSI output port declared with no data type
+  (`output q`, `output [3:0] c`), which IEEE 1800-2023 §23.2.2.3 makes a net,
+  is reported as such: the error names the port and module, says the port is a
+  net because its declaration has no data type (§6.5), and suggests declaring
+  it `output logic` rather than `output`, which keeps its range and signing.
+  `--relax-untyped-output-port` (or
+  `XEZIM_RELAX_UNTYPED_OUTPUT_PORT=1`) takes such a port as a variable, with a
+  warning, as Verilator does; OpenHW CORE-ET relies on it. A port declared as a
+  net (`output wire q`) stays an error. It is not part of `--compat`: the
+  reference simulator rejects the construct.
 * FSM coverage: `--code-coverage=fsm` (part of `all` and of bare
   `--code-coverage`), `+cover=f` and `-coverage F` find the design's state
   machines (one- and two-process, enum, parameter and `` `define `` encodings,
@@ -219,6 +326,21 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `xezim_cov.json` gains a `type`, the data type the signal was declared with
   (`logic`, `int`, `enum`, ...), so a report can filter on it (§6.11).
   See docs/coverage-guide.md.
+
+**Performance**
+
+* A member select through constant element selects of a packed struct
+  (`st.e[1].dw[0].value <= d`, `x = st.e[1].dw[0].value`) compiles to one
+  static bit range of the container instead of running in the interpreter
+  (§7.2, §7.4.2). (#356)
+* A read of a packed-struct member below the first level
+  (`hwif_out.REG.field.value`, `decoded_reg_strb.rf.trig_r`) compiles to one
+  range select of the root variable instead of running in the interpreter,
+  as a write to it already did (§7.2). Register blocks read their field
+  storage this way in every flop and read-back mux. (#356)
+* A dotted call (`u_a.c_fn()`) finds whether its prefix names an instance
+  in the sorted instance index instead of scanning every instance (§35.5.3).
+  (#356)
 
 **Maintenance**
 

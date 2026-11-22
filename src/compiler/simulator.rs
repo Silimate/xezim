@@ -5546,42 +5546,49 @@ struct DeclShadow {
 /// `Simulator::decl_param_scope`'s state (§23.10).
 #[derive(Default)]
 struct DeclParamScopeCache {
-    /// The prefix asked for last, and whether it owns parameters (when it
-    /// does, the last of `tables` holds its overlay).
-    last: Option<(String, bool)>,
-    /// Per scope: the parameters declared in it or below it, by their name
-    /// relative to the scope (`u.g.L` is `g.L` for `u`), in table order.
-    groups: HashMap<String, std::rc::Rc<[(String, Value)]>>,
-    /// Overlaid copies of the design-wide table, least recently used first,
-    /// at most `DECL_PARAM_TABLES`. Lookups that alternate between hierarchies
-    /// with different outermost scopes (a testbench component and the design
-    /// under test) each keep a copy, instead of taking one hierarchy's groups
-    /// off a single copy and putting the other's on at every move.
-    tables: Vec<DeclParamTable>,
+    /// Every scope that has a parameter at or below it: each dot-prefix of
+    /// a key of the design-wide table (`u` and `u.g` for `u.g.L`). Built on
+    /// first use, in one pass over the table.
+    owners: Option<HashSet<String>>,
+    /// The prefix asked for last, and its scope.
+    last: Option<(String, Option<DeclScope>)>,
 }
 
-/// How many overlaid parameter tables `decl_param_scope` keeps.
-const DECL_PARAM_TABLES: usize = 4;
+impl DeclParamScopeCache {
+    /// Note a key added to the design-wide table after `owners` was built.
+    fn note_param(&mut self, key: &str) {
+        if let Some(owners) = &mut self.owners {
+            for (i, _) in key.match_indices('.') {
+                if !owners.contains(&key[..i]) {
+                    owners.insert(key[..i].to_string());
+                }
+            }
+        }
+        self.last = None;
+    }
+}
 
-/// One overlaid copy of the design-wide parameter table (§23.10).
-struct DeclParamTable {
-    /// The design-wide parameter table with the groups of `applied` on it.
-    table: std::rc::Rc<HashMap<String, Value>>,
-    /// The scopes whose groups `table` holds, outermost first, each with the
-    /// length `undo` had before its group went on.
-    applied: Vec<(String, usize)>,
-    /// What each group write replaced in `table`, in write order, so a group
-    /// comes off again in reverse.
-    undo: Vec<(String, Option<Value>)>,
+/// §23.10: the instance scope a declaration stored under `<prefix>.<name>`
+/// is sized in (see `DeclScopeParams`). Cheap to clone.
+#[derive(Clone)]
+pub(super) struct DeclScope {
+    /// The declaration's instance path (`u.g` for `u.g.par`).
+    prefix: std::rc::Rc<str>,
+    /// The lengths of the enclosing scopes of `prefix` (`u`, `u.g`) that
+    /// have parameters, innermost first.
+    owners: std::rc::Rc<[usize]>,
+    /// The bindings as one table, for the rare whole-table reads
+    /// (`ParamLookup::rows`), built on the first.
+    flat: std::rc::Rc<std::cell::OnceCell<HashMap<String, Value>>>,
 }
 
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
 struct DeclaredPackedAccess {
     storage: String,
-    /// §23.10: the parameter table the declaration is sized against — the
-    /// instance's own parameters overlaid on the design-wide table when the
-    /// storage lives in an instantiated module; `None` for the top scope.
-    params: Option<std::rc::Rc<HashMap<String, Value>>>,
+    /// §23.10: the instance scope the declaration is sized in when the
+    /// storage lives in an instantiated module whose scopes have parameters;
+    /// `None` for the top scope (the design-wide table).
+    params: Option<DeclScope>,
     is_signed: bool,
     static_target: Option<(String, Option<(String, String)>, String)>,
     offset: u32,
@@ -7890,6 +7897,10 @@ pub struct Simulator {
     class_packed_layout_cache: std::cell::RefCell<HashMap<usize, ClassPackedLayouts>>,
     #[serde(skip)]
     aggregate_type_work: [std::cell::Cell<u64>; 2],
+    /// Parameter-table rows `decl_param_scope` and its lookups have read or
+    /// copied (`Simulator::decl_param_rows`).
+    #[serde(skip)]
+    decl_param_rows: std::cell::Cell<u64>,
     #[serde(skip)]
     aggregate_type_generation: std::cell::Cell<u64>,
     /// Immutable class parameter names; values are always read from the object.
@@ -10095,11 +10106,8 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
-    /// `decl_param_scope`'s state: the parameters under each scope, and the
-    /// overlaid parameter tables it hands out. A select loop over one
-    /// instance's signal rebuilds nothing, and a move to another instance
-    /// changes only the scopes the two do not share instead of copying the
-    /// table.
+    /// `decl_param_scope`'s state: which scopes have parameters, and the
+    /// scope asked for last.
     #[serde(skip)]
     decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
     /// Reused buffer for the `__vif_local__` key probes (`&self` paths).

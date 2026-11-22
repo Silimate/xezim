@@ -10,6 +10,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An `always_comb` or `always @*` block that writes a member of an element
+  of a packed array of packed structs (`r[0].data.id[i] |= ...`) writes that
+  array, and the member it writes is not part of its sensitivity
+  (§9.2.2.2.1). No write was recorded for a member below an index, so the
+  block counted as writing nothing and stayed sensitive to the whole array.
+  Two such blocks building different elements woke each other and exhausted
+  the settle limit in every time slot. A read of a member the block does not
+  write (`r[1].tag`) still wakes it. (#464)
 * A deferred assertion (`assert #0`, `assert final`) counts its outcome in
   the results file when its report matures. A report flushed because its
   process resumed in the same time slot, or because its `always_comb` ran

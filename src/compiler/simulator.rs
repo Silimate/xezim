@@ -401,11 +401,20 @@ fn method_boost_enabled() -> bool {
 // §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
+// §6.12.1, §6.24.1, §12.5: `RealToInt` rounds a value that may be real fitted to 64 integral
+// bits; a value stored into a real target converts first; a real `case` runs interpreted.
+// §20.3, §3.14.2.3: a scoped `$realtime` read is a real that is not a constant, and a
+// scoped `$time` read is 64 bits wide. §6.24.1, §7.4.3, §11.5.1: a struct-parameter field
+// sizes its cast, and a part-select after a packed index selects whole elements, clipped to
+// its dimension.
+// Packed word selects inherit the declared dimensions of their bank.
+// §7.4.5: member collection reads that yield unpacked rows use their row storage.
+// §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
 // silimate: bump the method-cache salt past upstream's for the local-collection element width fix
 // §11.6.1, §7.10: an element read of a method-local queue or dynamic array has its element's
 // width, so a compare of two of them no longer resizes both to one bit. On an upstream bump,
 // take upstream's value and bump it once more.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3097;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317a;
 // /silimate
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
@@ -758,7 +767,7 @@ pub fn set_delay_mode(mode: u8) {
     DELAY_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn delay_mode() -> u8 {
+pub(crate) fn delay_mode() -> u8 {
     DELAY_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1161,15 +1170,11 @@ macro_rules! write_sig {
         }
         // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
         // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
-        // keeps every bit. Only a REAL write pays the type-name lookup.
-        if __wsig_val.is_real
-            && $self
-                .signal_type_names
-                .get(&__wsig_id)
-                .is_some_and(|tn| tn == "shortreal")
-        {
+        // keeps every bit. Only a real write checks destination precision.
+        if __wsig_val.is_real && $self.shortreal_signals.contains(&__wsig_id) {
             let __wsig_f = __wsig_val.to_f64() as f32 as f64;
             __wsig_val = Value::from_f64(__wsig_f);
+            __wsig_val.is_signed = $self.signal_signed[__wsig_id];
         }
         // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
         // keeps the common no-force case to one branch — `contains_key`
@@ -1284,6 +1289,8 @@ enum CombItem {
         /// §10.3.3 / §28.16: the original target before driver widening,
         /// boxed like the ASTs so the entry stays cache compact.
         delay_target: Option<Box<DelayTarget>>,
+        // §10.3.3: expressions are evaluated when the right-hand side changes.
+        delay_exprs: Option<Box<[Option<Expression>; 3]>>,
     },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy {
@@ -1687,14 +1694,43 @@ mod edgesel_writers {
             {
                 proc_cont_targets(&b.stmt, &mut forced);
             }
-            for t in module.tasks.values() {
-                for x in &t.items {
-                    proc_cont_targets(x, &mut forced);
+            let mut routine_forced: HashMap<usize, Vec<String>> = HashMap::default();
+            for (k, t) in &module.tasks {
+                let ptr = std::sync::Arc::as_ptr(t.items.as_arc()) as usize;
+                let bases = routine_forced.entry(ptr).or_insert_with(|| {
+                    let mut f: Vec<&Expression> = Vec::new();
+                    for x in &t.items {
+                        proc_cont_targets(x, &mut f);
+                    }
+                    f.into_iter().filter_map(base_ident).collect()
+                });
+                let dctx = module.deferred_task_bodies.get(k);
+                for b in bases.iter() {
+                    ix.forced.insert(leaf(b).to_string());
+                    if let Some(dctx) = dctx
+                        && let Some(mb) = dctx.ctx.port_map.get(b).and_then(base_ident)
+                    {
+                        ix.forced.insert(leaf(&mb).to_string());
+                    }
                 }
             }
-            for f in module.functions.values() {
-                for x in &f.items {
-                    proc_cont_targets(x, &mut forced);
+            for (k, f) in module.functions.iter() {
+                let ptr = std::sync::Arc::as_ptr(f.items.as_arc()) as usize;
+                let bases = routine_forced.entry(ptr).or_insert_with(|| {
+                    let mut fv: Vec<&Expression> = Vec::new();
+                    for x in &f.items {
+                        proc_cont_targets(x, &mut fv);
+                    }
+                    fv.into_iter().filter_map(base_ident).collect()
+                });
+                let dctx = module.deferred_function_bodies.get(k);
+                for b in bases.iter() {
+                    ix.forced.insert(leaf(b).to_string());
+                    if let Some(dctx) = dctx
+                        && let Some(mb) = dctx.ctx.port_map.get(b).and_then(base_ident)
+                    {
+                        ix.forced.insert(leaf(&mb).to_string());
+                    }
                 }
             }
             for e in forced {
@@ -1785,6 +1821,17 @@ impl CombEntry {
             CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
         ) && (self.cold.read_signal_ids.iter()).any(|r| self.cold.write_signal_ids.contains(r))
     }
+
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// A level-sensitive block that writes no signal, seen only through its
+    /// side effects (immediate assertions, `$display`).
+    fn is_observer(&self) -> bool {
+        matches!(
+            self.item,
+            CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+        ) && self.cold.write_signal_ids.is_empty()
+    }
+    // /silimate
 }
 
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
@@ -1864,7 +1911,19 @@ struct CombEntryCold {
 // §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
 // §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
 // process, not as a combinational entry.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB054";
+// §6.12.1, §6.24.1, §12.5: `RealToInt` (a new opcode) rounds a value that may be real fitted
+// to 64 integral bits, continuous assignments see which signals are real, a value stored into
+// a real target converts first, and a real `case` runs interpreted.
+// §10.3, §10.10: a continuous assignment of an unpacked concatenation to a fixed array
+// drives each element. §3.14.2.3: scoped time reads of continuous assignments are typed
+// by their result. §6.11.2: a gate-shaped assignment to a 2-state scalar is no fused gate.
+// §6.24.1, §7.4.3, §9.4.2: struct-parameter field casts, part-selects of whole elements after a
+// packed index, and alias nets for event controls on packed-struct members.
+// Packed word selects inherit the declared dimensions of their bank.
+// §9.4.2: a selected member can require a value waiter instead of a comb block.
+// §6.24.1, §9.4.2: integer atom casts keep their operand, and a packed-struct member event
+// tries every scope spelling for its alias net.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB079";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -3232,6 +3291,8 @@ mod sensitivity;
 mod settling;
 mod setup;
 mod signal_commits;
+mod signal_width_table;
+pub use signal_width_table::SignalWidths;
 mod statement_assignments;
 mod statements;
 mod system_tasks;
@@ -3266,6 +3327,9 @@ mod ts_x;
 mod typename;
 mod uvm_dpi;
 mod vpi_api;
+mod vpi_value;
+use vpi_value::fill_vpi_value;
+pub use vpi_value::{vpi_get_value, vpi_put_value};
 mod vpi_assert;
 mod vpi_cb;
 mod vpi_model;
@@ -4402,6 +4466,11 @@ struct SvaClockedSite {
     /// §16.14.6.2: matured instances, each the slot values it captured,
     /// waiting for the next tick of the leading clock.
     matured: Vec<SvaEnv>,
+    // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+    /// The time of the last tick. An instance that matures later in that
+    /// time step starts its attempt at that tick, not the next one.
+    tick_time: Option<u64>,
+    // /silimate
     /// The property has its own `disable iff` (§16.15: the scope's
     /// `default disable iff` does not apply).
     explicit_disable: bool,
@@ -4939,6 +5008,8 @@ const CG_HANDLE_TAG: usize = 1 << 30;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CovergroupInstance {
+    /// Coverpoints whose declared expression or sample formal is real (§19.5).
+    real_points: HashSet<String>,
     cg_name: String,
     /// The object whose constructor ran `cg = new` (a class-body
     /// covergroup): coverpoint expressions read ITS properties, so sampling
@@ -5402,8 +5473,9 @@ struct PortPlan {
 enum RetConv {
     /// Not a numeric scalar: the value passes through untouched.
     Keep,
-    /// `real` / `shortreal` / `realtime`.
+    /// Binary64 real and realtime.
     Real,
+    ShortReal,
     /// An integral type; `two_state` for bit, byte, int, ... (§6.11.1).
     Int { two_state: bool },
 }
@@ -5440,6 +5512,38 @@ struct DeclShadow {
     real: bool,
     string: bool,
     meta: FormalMetadataSnapshot,
+}
+
+/// `Simulator::decl_param_scope`'s state (§23.10).
+#[derive(Default)]
+struct DeclParamScopeCache {
+    /// The prefix asked for last, and whether it owns parameters (when it
+    /// does, the last of `tables` holds its overlay).
+    last: Option<(String, bool)>,
+    /// Per scope: the parameters declared in it or below it, by their name
+    /// relative to the scope (`u.g.L` is `g.L` for `u`), in table order.
+    groups: HashMap<String, std::rc::Rc<[(String, Value)]>>,
+    /// Overlaid copies of the design-wide table, least recently used first,
+    /// at most `DECL_PARAM_TABLES`. Lookups that alternate between hierarchies
+    /// with different outermost scopes (a testbench component and the design
+    /// under test) each keep a copy, instead of taking one hierarchy's groups
+    /// off a single copy and putting the other's on at every move.
+    tables: Vec<DeclParamTable>,
+}
+
+/// How many overlaid parameter tables `decl_param_scope` keeps.
+const DECL_PARAM_TABLES: usize = 4;
+
+/// One overlaid copy of the design-wide parameter table (§23.10).
+struct DeclParamTable {
+    /// The design-wide parameter table with the groups of `applied` on it.
+    table: std::rc::Rc<HashMap<String, Value>>,
+    /// The scopes whose groups `table` holds, outermost first, each with the
+    /// length `undo` had before its group went on.
+    applied: Vec<(String, usize)>,
+    /// What each group write replaced in `table`, in write order, so a group
+    /// comes off again in reverse.
+    undo: Vec<(String, Option<Value>)>,
 }
 
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
@@ -5521,7 +5625,9 @@ struct BlockScopeSave {
     /// The subroutine's `static` locals that a non-static block variable of
     /// the same name hides, as `static_local_syncs` depth and the
     /// `(name, key)` entries taken out of that frame until the block ends.
-    static_hidden: Option<(usize, Vec<(String, String)>)>,
+    // silimate: a for-init variable hides the subroutine's same-named static local
+    // Each entry keeps the position it was taken from.
+    static_hidden: Option<(usize, Vec<(usize, (String, String))>)>,
     /// `next_pid` at entry: a block that forked keeps its collection storage
     /// (a child may still use it).
     pid_mark: usize,
@@ -7616,11 +7722,10 @@ enum CombPlan {
     /// (forces, X inputs); the plan then falls through JIT-then-interp,
     /// exactly like the unplanned dispatch.
     Ts(std::sync::Arc<super::bytecode::TwoStateBlock>),
-    /// Native slot; its function is stored in `comb_jit_fns`.
-    #[cfg(feature = "jit")]
+    /// Native slot; its function is stored in `comb_jit_fns`. Keep the same
+    /// checkpoint discriminants in builds with and without the JIT feature.
     Jit,
     /// Template slot; its function and mapping window are in `comb_tpl_fns`.
-    #[cfg(feature = "jit")]
     Tpl,
     Interp,
 }
@@ -7654,6 +7759,13 @@ pub struct Simulator {
     /// Nets released while a settle pass was running (the entry table is
     /// taken out then); re-driven when the pass ends.
     pending_release_ids: Vec<usize>,
+    /// §10.6.2: the comb entries that write each signal, by entry index in
+    /// table order, for re-driving a released net. Built at the first
+    /// release from `comb_entries` (whose read and write lists are fixed once
+    /// compiled) and dropped whenever that table is replaced; `None` until
+    /// then. The length is the table's when it was built.
+    #[serde(skip)]
+    comb_writer_index: Option<(usize, HashMap<usize, Vec<u32>>)>,
     /// Memoization for `prop_bound_collection`: (class, member) → resolved
     /// raw type name (hierarchy walk), and type name → is-collection verdict
     /// (which otherwise LINEAR-SCANS every class's local typedefs — 5% of an
@@ -7994,7 +8106,9 @@ pub struct Simulator {
     /// here. Populated once at construction so `module.signals` can
     /// be freed afterwards.
     signal_type_names: HashMap<usize, String>,
-    pub widths: HashMap<String, u32>,
+    /// Real signal slots that round writes to binary32.
+    shortreal_signals: HashSet<usize>,
+    pub widths: SignalWidths,
     pub signed_signals: HashSet<String>,
     /// Names of ARRAY locals whose packed element geometry
     /// `exec_stmt_var_decl` registered in `packed_full_dims` (so a later
@@ -8164,6 +8278,13 @@ pub struct Simulator {
     sva_abort_step: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
+    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+    /// `vpi_slot_post_nba` is running the slot's leftover cbNBASynch and
+    /// cbReadWriteSynch routines: the delta one opens matures the `#0`
+    /// deferred reports before its Reactive work.
+    #[serde(skip)]
+    vpi_slot_maturing: bool,
+    // /silimate
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -8180,6 +8301,11 @@ pub struct Simulator {
     /// LRM §14.3: per-cb metadata. `(clock_signal_name, [(signal_name, is_input)])`.
     /// Populated at compile() from `module.clocking_blocks`.
     clocking_meta: HashMap<String, (String, Vec<(String, bool)>)>,
+    /// §27.6: some clocking block is declared in a generate copy or an
+    /// instance-array element (its key holds a select, `gen[1].cb`), so a
+    /// name with a select (`gen[1].cb.a`) may reach a block. Without one, the
+    /// indexed lookups of member reads are skipped.
+    clocking_in_indexed_scope: bool,
     /// LRM §14.4: pending clocking-output drives. Each drive retains its
     /// clockvar name, physical net and value. `cb.<out_sig> <= val` queues here instead of driving
     /// immediately; `tick_clocking_blocks` applies them at the next
@@ -8959,6 +9085,26 @@ pub struct Simulator {
     /// Pids whose continuation `continue_stmts_or_trampoline` rescheduled
     /// with their context left live on the simulator.
     trampolined_pids: HashSet<usize>,
+    // silimate: a continuation of the same activation is no flush point
+    /// §16.4.2: pids whose next `run_process_stmts_inner` entry continues the
+    /// running activation (`continue_stmts_or_trampoline`), not a resume
+    /// after a suspension: their pending deferred reports and procedural
+    /// assertion instances stay queued.
+    #[serde(skip)]
+    cont_pids: HashSet<usize>,
+    // /silimate
+    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+    /// Pids parked on a delay (`#d`, `#0`, an intra-assignment delay), each
+    /// with whether the delay moves time on (`#0` does not). Checkpointed,
+    /// with the queued continuations.
+    delay_pids: HashMap<usize, bool>,
+    /// §16.14.6: pids whose running activation went on after a delay that
+    /// moved time on, not at an event control: a procedural concurrent
+    /// assertion they reach first is not at its clock's tick, so its first
+    /// attempt waits for the next one. A `#0` stays in the time step of the
+    /// event that woke the procedure.
+    delay_resumed: HashSet<usize>,
+    // /silimate
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
     /// `Simulator` exactly like `local_stack`, and moved into/out of a
@@ -9913,12 +10059,13 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
-    /// One-entry cache of `decl_param_scope`: the instance prefix last asked
-    /// for and its overlaid parameter table (`None` when the prefix owns no
-    /// parameters). A select loop over one instance's signal rebuilds nothing.
+    /// `decl_param_scope`'s state: the parameters under each scope, and the
+    /// overlaid parameter tables it hands out. A select loop over one
+    /// instance's signal rebuilds nothing, and a move to another instance
+    /// changes only the scopes the two do not share instead of copying the
+    /// table.
     #[serde(skip)]
-    decl_param_scope_cache:
-        std::cell::RefCell<Option<(String, Option<std::rc::Rc<HashMap<String, Value>>>)>>,
+    decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
     /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
     vif_key_scratch: std::cell::RefCell<String>,
     /// §8.25: specialization-argument texts already folded to their value
@@ -10676,6 +10823,16 @@ pub struct Simulator {
     /// re-queue it. Other drivers of the vector still do. Rebuilt with the
     /// levels and whenever its length differs from `comb_entries`.
     comb_self_exempt: Vec<bool>,
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// Per comb entry: 1 for a block `CombEntry::is_observer` accepts, 2
+    /// while a settle holds it, else 0. Rebuilt whenever its length differs
+    /// from `comb_entries`.
+    #[serde(skip)]
+    comb_observer: Vec<u8>,
+    /// Whether `comb_observer` names any block.
+    #[serde(skip)]
+    comb_observer_any: bool,
+    // /silimate
     /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
     /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
     /// entries run on worker threads in the parallel BSP level dispatch.
@@ -11632,6 +11789,13 @@ pub struct Simulator {
     /// and call a sampled-value function: (body, scope, edge code, clock id),
     /// consumed by `register_sampled_watches` like the edge blocks.
     proc_sampled_blocks: Vec<(Statement, String, u8, usize)>,
+    // silimate: a procedural assertion in an always process samples its time-0 defaults too
+    /// The name segments the concurrent assertions in every always block
+    /// spell, taken as the blocks are classified: one that runs as a
+    /// process is in no list `capture_sampled_defaults` reads.
+    #[serde(skip)]
+    always_sva_names: HashSet<String>,
+    // /silimate
     /// True while `register_sampled_watches` pre-registers the sites.
     sampled_registering: bool,
 }
@@ -13834,564 +13998,6 @@ fn vpi_str_scratch(s: &str) -> *mut libc::c_char {
     })
 }
 
-/// Read a signal value via VPI.
-///
-/// On any failure — bad handle, out-of-range signal, or a format xezim
-/// cannot supply — sets `value_p->format` to `vpiSuppressVal` and writes
-/// nothing else. IEEE 1800-2017 §38.16 makes that the caller's only way
-/// to detect the failure, and `vpi_get_value` returns `void`, so there is
-/// nowhere else to say so.
-///
-/// This used to handle exactly two formats and silently ignore the rest.
-/// `vpiVectorVal` was among the ignored ones, which is the format
-/// HDL backdoor read routines use: `vpi_get_value` returned success having
-/// written nothing into the caller's buffer.
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_value) {
-    if value_p.is_null() {
-        return;
-    }
-    let vp = unsafe { &mut *value_p };
-    let Some(h) = (unsafe { vpi_deref(handle) }) else {
-        vpi_error(vpi::ERROR, "vpi_get_value: null handle".into());
-        vp.format = vpi::SUPPRESS_VAL;
-        return;
-    };
-    // VPI object model (vpi_model.rs): expressions, constants, and the
-    // objects that have no value.
-    if matches!(h.kind, VpiKind::Obj | VpiKind::Scope) || h.type_code == vpi_model::c::NAMED_EVENT {
-        let _ = try_active_sim("vpi_get_value", |sim| vpi_model::get_value(sim, h, vp));
-        return;
-    }
-    // A constant argument carries its own value and needs no simulator.
-    if h.kind == VpiKind::Constant {
-        let ok = match &h.value {
-            Some(v) => fill_vpi_value(v, 0, Some(h.type_code), vp),
-            None => false,
-        };
-        if !ok {
-            vpi_error(
-                vpi::ERROR,
-                format!(
-                    "vpi_get_value: cannot supply format {} for a constant",
-                    vp.format
-                ),
-            );
-            vp.format = vpi::SUPPRESS_VAL;
-        }
-        return;
-    }
-    // Modules, memories, iterators and call handles have no readable value.
-    if matches!(
-        h.kind,
-        VpiKind::Module
-            | VpiKind::Iterator
-            | VpiKind::Memory
-            | VpiKind::SysTfCall
-            | VpiKind::UserSystf
-            | VpiKind::ModPath
-            | VpiKind::Tchk
-            | VpiKind::InterModPath
-            | VpiKind::Callback
-    ) {
-        vpi_error(
-            vpi::ERROR,
-            "vpi_get_value: this object has no readable value".into(),
-        );
-        vp.format = vpi::SUPPRESS_VAL;
-        return;
-    }
-    let sig_id = h.signal_id;
-
-    let ok = try_active_sim("vpi_get_value", |sim| {
-        let val = if h.kind == VpiKind::Slice {
-            match vpi_slice_read(sim, h) {
-                Some(v) => v,
-                None => return false,
-            }
-        } else {
-            match vpi_api::cell_value(sim, sig_id) {
-                Some(v) => v,
-                None => return false,
-            }
-        };
-        let current_time = sim.time;
-        // vpiStrengthVal reports the driving strength of a net.
-        vpi_api::set_strength_hint(sim, sig_id, h.type_code, vp.format);
-        let ok = fill_vpi_value(&val, current_time, Some(h.type_code), vp);
-        vpi_api::clear_strength_hint();
-        ok
-    })
-    .unwrap_or(false);
-
-    if !ok {
-        // vpiSuppressVal is the only failure channel this function has, and a
-        // caller that never checks `format` needs vpi_chk_error to notice.
-        vpi_error(
-            vpi::ERROR,
-            format!("vpi_get_value: cannot supply format {}", vp.format),
-        );
-        vp.format = vpi::SUPPRESS_VAL;
-    }
-}
-
-/// Render `val` into `vp` using `vp.format`. Returns false when the
-/// format cannot be supplied; the caller then sets `vpiSuppressVal`.
-///
-/// Shared by `vpi_get_value` and the value-change dispatcher, so a
-/// callback sees its trigger object's value in exactly the format a
-/// direct read would have produced.
-fn fill_vpi_value(
-    val: &Value,
-    _current_time: u64,
-    obj_type_code: Option<libc::c_int>,
-    vp: &mut s_vpi_value,
-) -> bool {
-    {
-        // vpiObjTypeVal: the simulator picks the object's natural format
-        // and reports which one it chose in `format` (§38.15).
-        let mut format = vp.format;
-        if format == vpi::OBJ_TYPE_VAL {
-            format = vpi_api::obj_type_format(val, obj_type_code);
-            vp.format = format;
-        }
-        // §38.15: a real object is converted to an integer, rounded as
-        // §6.12.2 specifies, for every format but vpiRealVal and vpiStringVal.
-        let rounded;
-        let val = if val.is_real && !vpi_api::format_keeps_real(format) {
-            rounded = vpi_api::real_to_integer(val);
-            &rounded
-        } else {
-            val
-        };
-
-        match format {
-            vpi::INT_VAL => {
-                // PLI_INT32: the low 32 bits, X/Z read as 0, a signed value
-                // sign-extended. Callers that need the full width must use
-                // vpiVectorVal; vpiSize tells them whether they do.
-                let n = if val.is_signed {
-                    val.to_i64().unwrap_or(0) as u64
-                } else {
-                    val.to_u64().unwrap_or(0)
-                };
-                vp.value.integer = (n & 0xFFFF_FFFF) as u32 as libc::c_int;
-            }
-            vpi::REAL_VAL => vp.value.real = val.to_f64(),
-            vpi::SCALAR_VAL => {
-                vp.value.scalar = match val.get_bit_code(0) {
-                    0 => vpi::SCALAR_0,
-                    1 => vpi::SCALAR_1,
-                    2 => vpi::SCALAR_X,
-                    _ => vpi::SCALAR_Z,
-                };
-            }
-            vpi::VECTOR_VAL => {
-                let ptr = VPI_VEC_SCRATCH.with(|cell| {
-                    let mut buf = cell.borrow_mut();
-                    value_to_vecval(val, &mut buf);
-                    buf.as_mut_ptr()
-                });
-                vp.value.vector = ptr;
-            }
-            vpi::BIN_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 1)),
-            vpi::OCT_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_api::radix_string_xz(val, 3)),
-            vpi::HEX_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_api::radix_string_xz(val, 4)),
-            vpi::DEC_STR_VAL => vp.value.str = vpi_str_scratch(&val.to_dec_string()),
-            vpi::STRING_VAL if val.is_real => {
-                vp.value.str = vpi_str_scratch(&vpi_api::real_string(val.to_f64()))
-            }
-            vpi::STRING_VAL => vp.value.str = vpi_str_scratch(&val.to_sv_string()),
-            vpi::TIME_VAL => {
-                let t = val.to_u64().unwrap_or(0);
-                let ptr = VPI_TIME_SCRATCH.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-                    *slot = s_vpi_time {
-                        type_: vpi::SIM_TIME,
-                        high: (t >> 32) as u32,
-                        low: (t & 0xFFFF_FFFF) as u32,
-                        // §37 vpiTimeVal: `.real` must describe the SAME value
-                        // as high/low (the value being read, `t`), not the sim
-                        // clock. Using `current_time` made the record
-                        // self-inconsistent (a `time` var holding 42 read at
-                        // tick 5 reported real=5).
-                        real: t as f64,
-                    };
-                    cell.as_ptr()
-                });
-                vp.value.time = ptr;
-            }
-            vpi::SUPPRESS_VAL => {} // caller explicitly wants no value
-            // vpiStrengthVal, the short/long/shortreal formats and the raw
-            // formats; false for anything unknown.
-            other => return vpi_api::fill_extra_format(val, obj_type_code, other, vp),
-        }
-        true
-    }
-}
-
-/// Write a signal value via VPI (supports force/release).
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_put_value(
-    handle: *mut libc::c_void,
-    value_p: *mut s_vpi_value,
-    _time_p: *mut s_vpi_time,
-    flags: libc::c_int,
-) -> *mut libc::c_void {
-    if handle.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    // Depositing into the call handle sets a system function's return value
-    // (IEEE 1800-2017 §38.33). Handled before the simulator lookup because it
-    // touches only the call frame.
-    {
-        let Some(h) = (unsafe { vpi_deref(handle) }) else {
-            return std::ptr::null_mut();
-        };
-        if h.kind == VpiKind::SysTfCall {
-            if value_p.is_null() {
-                vpi_error(
-                    vpi::ERROR,
-                    "vpi_put_value: null value on a $systf call".into(),
-                );
-                return std::ptr::null_mut();
-            }
-            let w = h.width.max(1);
-            let vp = unsafe { &*value_p };
-            let v = match vp.format {
-                vpi::INT_VAL => Value::from_u64(unsafe { vp.value.integer } as i64 as u64, w),
-                vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
-                vpi::VECTOR_VAL => {
-                    let ptr = unsafe { vp.value.vector };
-                    if ptr.is_null() {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: null vector on a $systf call".into(),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                    let words = (w as usize).div_ceil(32);
-                    vecval_to_value(unsafe { std::slice::from_raw_parts(ptr, words) }, w, false)
-                }
-                other => {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!(
-                            "vpi_put_value: format {} unsupported on a $systf call",
-                            other
-                        ),
-                    );
-                    return std::ptr::null_mut();
-                }
-            };
-            let frame = h.frame;
-            VPI_SYSTF_STACK.with(|st| {
-                if let Some(f) = st.borrow_mut().get_mut(frame) {
-                    if f.tf_type == vpi::SYS_FUNC {
-                        f.ret = Some(v);
-                    } else {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: a $systf TASK has no return value".into(),
-                        );
-                    }
-                }
-            });
-            return std::ptr::null_mut();
-        }
-        if h.kind == VpiKind::Constant {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: a vpiConstant argument is read-only".into(),
-            );
-            return std::ptr::null_mut();
-        }
-        // VPI object model (vpi_model.rs): objects with no writable value.
-        if vpi_model::put_value_rejected(h) {
-            return std::ptr::null_mut();
-        }
-    }
-
-    try_active_sim("vpi_put_value", |sim| {
-        let h = unsafe { &*(handle as *const VpiHandle) };
-        if matches!(
-            h.kind,
-            VpiKind::Module | VpiKind::Iterator | VpiKind::Memory | VpiKind::Callback
-        ) {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: this object has no value; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-        // §38.36.2: nothing may be written from a cbReadOnlySynch routine.
-        if sim.vpi_in_read_only() {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: writes are not allowed in the read-only synch region; ignored"
-                    .into(),
-            );
-            return std::ptr::null_mut();
-        }
-        let sig_id = h.signal_id;
-        if matches!(
-            h.kind,
-            VpiKind::UserSystf | VpiKind::ModPath | VpiKind::Tchk | VpiKind::InterModPath
-        ) {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: this object has no value; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-
-        if flags == vpi::RELEASE_FLAG && is_packed_id(sig_id) {
-            // Nothing can force a packed-arena word, so there is nothing to release.
-            return std::ptr::null_mut();
-        }
-        if flags == vpi::RELEASE_FLAG {
-            // §38.36.1 cbRelease, once the net has been re-driven.
-            if sim.vpi_cb_mask != 0 {
-                sim.vpi_queue_release(vpi_cb::CB_RELEASE, Some(sig_id));
-            }
-            // Release: remove from forced_signals and trigger settle
-            sim.forced_signals.remove(&sig_id);
-            // Re-evaluate the continuous drivers of the released net.
-            sim.redrive_released_signal(sig_id);
-            // Release invalidates the event-edge assumption that a flop's
-            // output still reflects its last sampled inputs.
-            sim.edge_block_snap_valid
-                .iter_mut()
-                .for_each(|v| *v = false);
-            sim.edge_block_armed
-                .iter_mut()
-                .for_each(|v| *v |= EDGE_ARMED);
-            sim.dirty_any = true;
-            return std::ptr::null_mut();
-        }
-
-        if value_p.is_null() {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: null value_p with a write flag; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-
-        // A slice decodes at its own width, then splices back into its parent.
-        let w = if h.kind == VpiKind::Slice {
-            h.width
-        } else {
-            vpi_api::cell_width(sim, sig_id).unwrap_or(32)
-        };
-        let is_signed = vpi_api::cell_signed(sim, sig_id);
-        let vp = unsafe { &*value_p };
-
-        // A format we cannot decode writes NOTHING. The old code fell
-        // through to "read the current value and write it back", which
-        // looks like a successful no-op and hides the unsupported format.
-        let value = match vp.format {
-            vpi::INT_VAL => {
-                // PLI_INT32 is signed; widen through i64 so a negative
-                // integer sign-extends into a wider signal.
-                let ival = unsafe { vp.value.integer } as i64;
-                let mut v = Value::from_u64(ival as u64, w);
-                v.is_signed = is_signed;
-                v
-            }
-            vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
-            vpi::SCALAR_VAL => {
-                let mut v = Value::zero(w);
-                let code = match unsafe { vp.value.scalar } {
-                    // vpiL / vpiH are the weak 0 / 1 levels.
-                    vpi::SCALAR_0 | vpi_api::vc::SCALAR_L => 0,
-                    vpi::SCALAR_1 | vpi_api::vc::SCALAR_H => 1,
-                    vpi::SCALAR_X => 2,
-                    vpi::SCALAR_Z => 3,
-                    other => {
-                        vpi_error(
-                            vpi::ERROR,
-                            format!("vpi_put_value: unsupported vpiScalarVal code {}", other),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                };
-                v.set_bit_code(0, code);
-                v.is_signed = is_signed;
-                v
-            }
-            vpi::VECTOR_VAL => {
-                // Every word of the signal's width, and both aval and
-                // bval, so X and Z survive a deposit. The old code read
-                // only `vec[0].aval` for a signal of 64 bits or fewer —
-                // dropping the upper word of anything wider than 32 —
-                // masked X/Z away as `aval & !bval`, and capped the wide
-                // path at four words (128 bits).
-                let vec_ptr = unsafe { vp.value.vector };
-                if vec_ptr.is_null() {
-                    vpi_error(
-                        vpi::ERROR,
-                        "vpi_put_value: vpiVectorVal with a null vector; ignored".into(),
-                    );
-                    return std::ptr::null_mut();
-                }
-                let num_words = (w as usize).div_ceil(32);
-                let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
-                vecval_to_value(vec, w, is_signed)
-            }
-            // §38.16 string payloads. cocotb writes 4-state values this way
-            // (a `LogicArray` carrying x/z has no lossless integer form), so
-            // without these every cocotb drive of a clock or reset was
-            // rejected here and silently never reached the signal.
-            vpi::BIN_STR_VAL
-            | vpi::OCT_STR_VAL
-            | vpi::HEX_STR_VAL
-            | vpi::DEC_STR_VAL
-            | vpi::STRING_VAL => {
-                let sp = unsafe { vp.value.str };
-                if sp.is_null() {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!(
-                            "vpi_put_value: null string for format {}; ignored",
-                            vp.format
-                        ),
-                    );
-                    return std::ptr::null_mut();
-                }
-                let text = match unsafe { std::ffi::CStr::from_ptr(sp) }.to_str() {
-                    Ok(t) => t.trim(),
-                    Err(_) => {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: string payload is not valid UTF-8; ignored".into(),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                };
-                let mut v = match vp.format {
-                    vpi::BIN_STR_VAL => vpi_value_from_radix_str(text, 1, w),
-                    vpi::OCT_STR_VAL => vpi_value_from_radix_str(text, 3, w),
-                    vpi::HEX_STR_VAL => vpi_value_from_radix_str(text, 4, w),
-                    vpi::DEC_STR_VAL => match text.parse::<i64>() {
-                        Ok(n) => Value::from_u64(n as u64, w),
-                        Err(_) => {
-                            vpi_error(
-                                vpi::ERROR,
-                                format!("vpi_put_value: '{}' is not a decimal; ignored", text),
-                            );
-                            return std::ptr::null_mut();
-                        }
-                    },
-                    // vpiStringVal: the payload is CHARACTERS, packed
-                    // right-aligned one byte per 8 bits.
-                    _ => {
-                        let mut sv = Value::zero(w);
-                        for (i, byte) in text.as_bytes().iter().rev().enumerate() {
-                            for k in 0..8u32 {
-                                let bit = i as u32 * 8 + k;
-                                if bit >= w {
-                                    break;
-                                }
-                                sv.set_bit_code(bit as usize, ((byte >> k) & 1) as u8);
-                            }
-                        }
-                        sv
-                    }
-                };
-                v.is_signed = is_signed;
-                v
-            }
-            // vpiTimeVal, vpiStrengthVal, the short/long/shortreal formats and
-            // the raw formats.
-            other => match vpi_api::decode_extra_put(vp, other, w, is_signed) {
-                Ok(v) => v,
-                Err(msg) => {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!("vpi_put_value: {} (nothing written)", msg),
-                    );
-                    return std::ptr::null_mut();
-                }
-            },
-        };
-        // §6.12.2: an integral value put to a real object converts to real, a
-        // real one put to an integral object rounds to an integer.
-        let value = vpi_api::fit_put_value(sim, h, value, w, is_signed);
-
-        // Splice a slice back into its parent before it hits the signal table.
-        let value = if h.kind == VpiKind::Slice {
-            match vpi_slice_write(sim, h, &value) {
-                Some(v) => v,
-                None => return std::ptr::null_mut(),
-            }
-        } else {
-            value
-        };
-
-        // A word of a packed-arena memory has no signal-table slot.
-        if is_packed_id(sig_id) {
-            if flags == vpi::FORCE_FLAG {
-                vpi_error(
-                    vpi::ERROR,
-                    "vpi_put_value: an element of a packed-arena memory cannot be forced".into(),
-                );
-            } else {
-                sim.cell_write(sig_id, &value);
-            }
-            return std::ptr::null_mut();
-        }
-
-        // For force: write value first, THEN add to forced_signals
-        if flags == vpi::FORCE_FLAG {
-            // Write directly to signal_table (bypass write_sig! which would skip)
-            if sig_id < sim.signal_table.len() {
-                sim.signal_table[sig_id] = value.clone();
-                sim.sync_mirror(sig_id);
-                if sig_id < sim.signal_has_xz.len() {
-                    sim.signal_has_xz[sig_id] = if value.raw_bits().1 != 0 { 1u8 } else { 0u8 };
-                }
-                if sig_id < sim.signal_inline_bits.len() {
-                    let (v, x) = value.raw_bits();
-                    sim.signal_inline_bits[sig_id] = [v, x];
-                }
-                sim.after_signal_write(sig_id);
-            }
-            sim.ctl_note_external_write(sig_id);
-            // Now mark as forced (after the write succeeded)
-            sim.forced_signals.insert(sig_id, value);
-            // §38.36.1 cbForce.
-            if sim.vpi_cb_mask != 0 {
-                sim.vpi_notify_override(vpi_cb::CB_FORCE, Some(sig_id));
-            }
-        } else {
-            // Normal write - write_sig! will skip if signal is forced
-            write_sig!(sim, sig_id, value);
-            sim.ctl_note_external_write(sig_id);
-            // A VPI deposit is an EXTERNAL write: no HDL driver stands behind
-            // it, so nothing else marks the signal dirty or re-snapshots it for
-            // edge detection. Without this a cocotb-driven clock landed in the
-            // signal table and propagated nowhere — `always @(posedge clk)` and
-            // even `always @(clk)` never fired, so the DUT sat at x while the
-            // Python side saw its own writes read back correctly.
-            sim.after_signal_write(sig_id);
-            if sig_id < sim.dirty_signals.len() && !sim.dirty_signals[sig_id] {
-                sim.dirty_signals[sig_id] = true;
-                sim.dirty_list.push(sig_id);
-            }
-            sim.dirty_any = true;
-        }
-        if let Some(w) = sim.start_of_simulation_writes.as_mut() {
-            let part = (h.kind == VpiKind::Slice).then_some((h.lsb as usize, h.width as usize));
-            w.push((sig_id, part));
-        }
-
-        std::ptr::null_mut()
-    })
-    .unwrap_or(std::ptr::null_mut())
-}
-
 /// Read the current simulation time.
 ///
 /// `object` is accepted for IEEE compatibility and currently ignored.
@@ -15568,6 +15174,16 @@ endmodule
 fn drop_xz(r: &mut Value) {
     if r.has_xz() {
         *r = r.to_two_state();
+    }
+}
+
+/// `Insn::RealToInt`: §6.12.1 — a real rounds to a 64-bit integer, ties
+/// away from zero (a target narrower than 64 bits wraps it at the `Resize`
+/// that follows); any other value is left as it is.
+#[inline]
+fn real_to_int_reg(r: &mut Value) {
+    if r.is_real {
+        *r = Value::from_real_wrapped(r.to_f64(), 64);
     }
 }
 

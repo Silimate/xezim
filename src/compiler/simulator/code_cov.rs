@@ -4256,6 +4256,18 @@ impl Simulator {
         if kinds & KIND_CODE != 0 {
             let mut program = std::mem::take(&mut self.module.program_initial_blocks);
             let mut fin = std::mem::take(&mut self.module.final_blocks);
+            // Materialize any deferred instance-scoped callable bodies before
+            // instrumenting so per-instance signal references are in place.
+            let deferred_fns: Vec<String> =
+                self.module.deferred_function_bodies.keys().cloned().collect();
+            for key in deferred_fns {
+                Self::materialize_deferred_fn_in_place(&mut self.module, &key);
+            }
+            let deferred_tasks: Vec<String> =
+                self.module.deferred_task_bodies.keys().cloned().collect();
+            for key in deferred_tasks {
+                Self::materialize_deferred_task_in_place(&mut self.module, &key);
+            }
             let mut functions = std::mem::take(&mut self.module.functions).into_map();
             let mut tasks = std::mem::take(&mut self.module.tasks);
             {
@@ -5346,12 +5358,19 @@ impl Simulator {
         // testbench writing those through the simulator's interface, the
         // reference simulator updates it with them, so it can change with
         // them or after.
+        // silimate: a net's VPI driver stage is part of the net, not a variable
+        // A net's driver stage (`<net>$vpidrv<k>`, which elaboration adds
+        // when a VPI library may deposit on the net) is part of that net.
         let mut loose = vec![false; n];
         for id in assigned.iter().filter_map(|(x, scope)| self.cov_signal(x, Some(scope))) {
-            if id < n && !self.module.nets.contains(self.name_for_id(id)) {
+            if id < n
+                && !self.module.nets.contains(self.name_for_id(id))
+                && !xezim_core::elaborate::is_delay_stage_net(self.name_for_id(id))
+            {
                 loose[id] = true;
             }
         }
+        // /silimate
         let mut top = vec![false; n];
         for (name, _) in self.vpi_port_directions.iter().filter(|(name, dir)| {
             !name.contains('.') && matches!(dir, PortDirection::Input | PortDirection::Inout)

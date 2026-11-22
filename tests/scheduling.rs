@@ -543,6 +543,9 @@ mod event_call_struct_arguments;
 mod array_capture_1217;
 #[path = "scheduling/intra_delay_pattern_item_width.rs"]
 mod intra_delay_pattern_item_width;
+// silimate: sampled-value functions of a whole unpacked array track its cells
+#[path = "scheduling/sva_array_sampled_fns.rs"]
+mod sva_array_sampled_fns;
 
 #[path = "scheduling/parked_waiter_signal_index.rs"]
 mod parked_waiter_signal_index;

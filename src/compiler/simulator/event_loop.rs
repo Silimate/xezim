@@ -1663,6 +1663,16 @@ impl Simulator {
                 break;
             }
             let prog_before = self.cond_progress;
+            // silimate: a waiter rechecks its condition against settled continuous assignments
+            // §10.3: an `assign` updates its target in the Active region when
+            // an operand changes, and a `wait` on that target wakes on the
+            // update. Settle before the recheck so `wait (c2)` under
+            // `assign c2 = clk;` reads `c2` after this slot's toggle; it read
+            // the old value, stayed parked, and resumed only after the NBAs.
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            // /silimate
             let ready = std::mem::take(&mut self.ready_condition_waiters);
             for (cpid, cont) in ready {
                 self.cond_waiter_gate.remove(&cpid);

@@ -1610,22 +1610,46 @@ impl<'a> BytecodeCompiler<'a> {
     /// left to the interpreter. So is a local of the running frame (§23.9: a
     /// function's `int I` hides a module's `parameter I`), unless it is an
     /// unrolled loop's index, bound to a constant for this iteration.
+    ///
+    /// A literal or parameter is read at its own value (§11.5.1: an index
+    /// keeps its full width). One with an x or z bit selects no element, and
+    /// one that does not fit in 64 bits cannot name a layout entry, so both
+    /// are left to the interpreter too, which discards such a write and reads
+    /// such an element as the default (`e[64'h1_0000_0001]` is not `e[1]`).
     fn plain_const_index(&self, e: &Expression) -> Option<i64> {
         match &e.kind {
             ExprKind::Paren(inner) => self.plain_const_index(inner),
             ExprKind::Unary {
                 op: UnaryOp::Minus,
                 operand,
-            } if matches!(operand.kind, ExprKind::Number(_)) => self.eval_const_bound(e),
-            ExprKind::Number(_) => self.eval_const_bound(e),
+            } if matches!(operand.kind, ExprKind::Number(_)) => {
+                self.plain_const_index(operand)?.checked_neg()
+            }
+            ExprKind::Number(n) => Self::exact_index_value(&self.eval_number_static(n)?),
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let name = h.path[0].name.name.as_str();
-                if !self.const_var_binds.contains_key(name) && self.frame_bound_target(e) {
+                if let Some(&v) = self.const_var_binds.get(name) {
+                    return Some(v as i64);
+                }
+                if self.frame_bound_target(e) {
                     return None;
                 }
-                self.eval_const_bound(e)
+                Self::exact_index_value(&self.lookup_param_value(h)?)
             }
             _ => None,
+        }
+    }
+
+    /// The value of a constant index with no x or z bit, signed or unsigned
+    /// as declared, when it fits in an `i64`.
+    fn exact_index_value(v: &Value) -> Option<i64> {
+        if v.has_xz() {
+            return None;
+        }
+        if v.is_signed {
+            v.to_i64()
+        } else {
+            v.to_u64().and_then(|u| i64::try_from(u).ok())
         }
     }
 

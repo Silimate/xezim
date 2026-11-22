@@ -87,10 +87,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   NBAs makes never saw it. (#455)
 * A process on a clock that a continuous assignment copies
   (`assign c2 = clk;`, `@(posedge c2)`) runs at the edge, before the NBAs
-  its peers on `clk` queue there (§4.4.2.2, §4.5, §10.3). While a
-  level-sensitive `wait` was pending anywhere, it ran after those NBAs and
-  read their new values. A `wait` on the copy itself resumed only after them
-  too. (#458)
+  its peers on `clk` queue there (§4.4.2.2, §4.5, §10.3). It ran after
+  those NBAs, and read their new values, while a level-sensitive `wait` was
+  pending anywhere or when a delayed nonblocking assignment fell due at the
+  edge. A `wait` on the copy itself resumed only after them too. (#458)
 * `$dumpvars(0, tb_top.u)` called from another top-level module dumps
   `tb_top.u` and everything below it; the argument was ignored and the dump
   selected nothing. The same holds for a generate-block instance, a variable

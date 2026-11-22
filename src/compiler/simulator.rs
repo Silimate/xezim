@@ -4413,6 +4413,11 @@ struct SvaClockedSite {
     /// §16.14.6.2: matured instances, each the slot values it captured,
     /// waiting for the next tick of the leading clock.
     matured: Vec<SvaEnv>,
+    // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+    /// The time of the last tick. An instance that matures later in that
+    /// time step starts its attempt at that tick, not the next one.
+    tick_time: Option<u64>,
+    // /silimate
     /// The property has its own `disable iff` (§16.15: the scope's
     /// `default disable iff` does not apply).
     explicit_disable: bool,
@@ -8979,6 +8984,26 @@ pub struct Simulator {
     /// Pids whose continuation `continue_stmts_or_trampoline` rescheduled
     /// with their context left live on the simulator.
     trampolined_pids: HashSet<usize>,
+    // silimate: a continuation of the same activation is no flush point
+    /// §16.4.2: pids whose next `run_process_stmts_inner` entry continues the
+    /// running activation (`continue_stmts_or_trampoline`), not a resume
+    /// after a suspension: their pending deferred reports and procedural
+    /// assertion instances stay queued.
+    #[serde(skip)]
+    cont_pids: HashSet<usize>,
+    // /silimate
+    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+    /// Pids parked on a delay (`#d`, `#0`, an intra-assignment delay), each
+    /// with whether the delay moves time on (`#0` does not). Checkpointed,
+    /// with the queued continuations.
+    delay_pids: HashMap<usize, bool>,
+    /// §16.14.6: pids whose running activation went on after a delay that
+    /// moved time on, not at an event control: a procedural concurrent
+    /// assertion they reach first is not at its clock's tick, so its first
+    /// attempt waits for the next one. A `#0` stays in the time step of the
+    /// event that woke the procedure.
+    delay_resumed: HashSet<usize>,
+    // /silimate
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
     /// `Simulator` exactly like `local_stack`, and moved into/out of a
@@ -11662,6 +11687,13 @@ pub struct Simulator {
     /// and call a sampled-value function: (body, scope, edge code, clock id),
     /// consumed by `register_sampled_watches` like the edge blocks.
     proc_sampled_blocks: Vec<(Statement, String, u8, usize)>,
+    // silimate: a procedural assertion in an always process samples its time-0 defaults too
+    /// The name segments the concurrent assertions in every always block
+    /// spell, taken as the blocks are classified: one that runs as a
+    /// process is in no list `capture_sampled_defaults` reads.
+    #[serde(skip)]
+    always_sva_names: HashSet<String>,
+    // /silimate
     /// True while `register_sampled_watches` pre-registers the sites.
     sampled_registering: bool,
 }

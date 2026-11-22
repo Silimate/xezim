@@ -37,13 +37,21 @@ impl Simulator {
         // the current time), so it moves into the nonblocking queue ahead of
         // this drive. This drive is recorded so a whole drive issued after
         // it queues behind it (`schedule_clocking_update`).
+        let mut again = None;
         if let Some(id) = self.clocking_select_signal(target) {
             let when = self.time.saturating_add(skew);
+            // silimate: overlapping and whole drives of one output that mature together merge per bit
+            let mut moved = false;
             for value in self.take_clocking_whole_drives(id, when) {
                 self.queue_clocking_whole_nba(id, value, skew);
+                moved = true;
             }
             let now = self.time;
             self.clocking_select_due.retain(|&(t, _)| t >= now);
+            if moved || self.clocking_select_due.contains(&(when, id)) {
+                again = Some(id);
+            }
+            // /silimate
             self.clocking_select_due.push((when, id));
         }
         let rvalue = self.make_intra_saved_expr(val, span);
@@ -67,7 +75,145 @@ impl Simulator {
             },
             span,
         ));
+        if let Some(id) = again {
+            self.supersede_clocking_drives(id, skew);
+        }
     }
+
+    // silimate: overlapping and whole drives of one output that mature together merge per bit
+    /// §14.16.2: when synchronous drives of one output mature in the same
+    /// time step, "the last value is the only value driven". Each drive is a
+    /// nonblocking update of the bits it selects, or of the whole output, so
+    /// two drives that select some of the same bits (`cb.e[0] <= 1;
+    /// cb.e[0] <= 0;`, `cb.e[1:0] <= 2'b01; cb.e[0] <= 0;`, `cb.e[0] <= 1;
+    /// cb.e <= 0;`) changed those bits twice in that step and woke `@(e)`
+    /// with the value unchanged. In the earlier updates of signal `id` that
+    /// mature with the last one queued, each bit the last one writes takes
+    /// its value, so every bit changes at most once, to its last value, and
+    /// the bits that no later drive selects keep the earlier drives' values.
+    /// Only reached when another drive of the output is due at the same time.
+    pub(super) fn supersede_clocking_drives(&mut self, id: usize, skew: u64) {
+        let when = self.time.saturating_add(skew);
+        let delayed = skew > 0;
+        // The updates of signal `id` that commit in that step, in commit
+        // order: with no skew, its whole-signal updates (`nba_fast`, which
+        // a bit select merges into) commit before the nonblocking queue. Indices
+        // only: the targets stay in the queue and are lent to
+        // `queued_drive_range` (a drive runs this on every clock edge).
+        let mut picked: Vec<NbaSlot> = Vec::new();
+        if delayed {
+            for i in 0..self.delayed_nba_queue.len() {
+                let (t, e) = &self.delayed_nba_queue[i];
+                if *t == when && self.nba_entry_writes(e, id) {
+                    picked.push(NbaSlot::Delayed(i));
+                }
+            }
+        } else {
+            for (i, e) in self.nba_fast.iter().enumerate() {
+                if e.signal_id == id {
+                    picked.push(NbaSlot::Fast(i));
+                }
+            }
+            for i in 0..self.nba_queue.len() {
+                if self.nba_entry_writes(&self.nba_queue[i], id) {
+                    picked.push(NbaSlot::Queue(i));
+                }
+            }
+        }
+        let Some((&last, earlier)) = picked.split_last() else {
+            return;
+        };
+        if earlier.is_empty() {
+            return;
+        }
+        let Some((last_id, last_lo, last_w)) = self.queued_drive_range(last) else {
+            return;
+        };
+        if last_id != id {
+            return;
+        }
+        let last_value = self.nba_slot_value(last).resize(last_w);
+        let last_hi = last_lo + last_w;
+        for &slot in earlier {
+            let Some((eid, lo, w)) = self.queued_drive_range(slot) else {
+                continue;
+            };
+            let (from, to) = (lo.max(last_lo), (lo + w).min(last_hi));
+            if eid != id || from >= to {
+                continue;
+            }
+            let value = self.nba_slot_value(slot);
+            let mut merged = value.resize(w);
+            for bit in from..to {
+                merged.set_bit(
+                    (bit - lo) as usize,
+                    last_value.get_bit((bit - last_lo) as usize),
+                );
+            }
+            *value = merged;
+        }
+    }
+
+    /// The value queued update `slot` writes.
+    fn nba_slot_value(&mut self, slot: NbaSlot) -> &mut Value {
+        match slot {
+            NbaSlot::Fast(i) => &mut self.nba_fast[i].value,
+            NbaSlot::Queue(i) => &mut self.nba_queue[i].value,
+            NbaSlot::Delayed(i) => &mut self.delayed_nba_queue[i].1.value,
+        }
+    }
+
+    /// Whether queued update `e` writes bits of signal `id` as a plain
+    /// vector: a select of it or the whole of it, outside any class object,
+    /// call frame, static local or element list.
+    fn nba_entry_writes(&self, e: &NbaEntry, id: usize) -> bool {
+        if e.elements.is_some()
+            || e.static_key.is_some()
+            || e.static_slice.is_some()
+            || e.this_handle.is_some()
+            || e.root_frame.is_some()
+        {
+            return false;
+        }
+        match &e.lhs {
+            None => e.resolved_id == Some(id),
+            Some(l) => {
+                let base = Self::select_chain_base(l).unwrap_or(l);
+                self.get_lhs_signal_id(base) == Some(id)
+            }
+        }
+    }
+
+    /// The signal, low bit and width that queued update `slot` writes: its
+    /// select's (`delayed_lhs_select_range`), or the whole signal's. The
+    /// target is read in place: it is taken out of the entry for the call
+    /// and put back.
+    fn queued_drive_range(&mut self, slot: NbaSlot) -> Option<(usize, u32, u32)> {
+        let whole = |sim: &Self, id: usize| Some((id, 0, sim.signal_widths[id] as u32));
+        let entry = match slot {
+            NbaSlot::Fast(i) => {
+                let id = self.nba_fast[i].signal_id;
+                return whole(self, id);
+            }
+            NbaSlot::Queue(i) => &mut self.nba_queue[i],
+            NbaSlot::Delayed(i) => &mut self.delayed_nba_queue[i].1,
+        };
+        let (lhs, resolved) = (entry.lhs.take(), entry.resolved_id);
+        let range = match &lhs {
+            None => resolved.and_then(|id| whole(self, id)),
+            Some(l) if matches!(l.kind, ExprKind::Ident(_)) => {
+                self.get_lhs_signal_id(l).and_then(|id| whole(self, id))
+            }
+            Some(l) => self.delayed_lhs_select_range(l),
+        };
+        match slot {
+            NbaSlot::Queue(i) => self.nba_queue[i].lhs = lhs,
+            NbaSlot::Delayed(i) => self.delayed_nba_queue[i].1.lhs = lhs,
+            NbaSlot::Fast(_) => {}
+        }
+        range
+    }
+    // /silimate
 
     /// §14.3: the element signals (`net[i]`, with `i`) of clockvar net `net`
     /// when it is a one-dimensional unpacked array, which has no signal under
@@ -155,6 +301,9 @@ impl Simulator {
             .any(|&(t, sid)| t == when && sid == id)
         {
             self.queue_clocking_whole_nba(id, value, delay);
+            // silimate: overlapping and whole drives of one output that mature together merge per bit
+            self.supersede_clocking_drives(id, delay);
+            // /silimate
             return;
         }
         self.delayed_updates.push((when, id, value, None));
@@ -890,6 +1039,14 @@ impl Simulator {
         let i = self.imm_assert_inst(a, kind);
         let key = self.assert_insts[i].key;
         self.note_assert_label(key, label);
+        self.imm_assert_count(i, kind, passed);
+    }
+
+    // silimate: count a deferred assertion when its report matures, not when it is queued
+    /// Count one outcome of `assert_insts[i]`, an immediate or deferred
+    /// assertion of kind tag `kind`, there and in its statement's
+    /// `assertion_stats` entry.
+    pub(super) fn imm_assert_count(&mut self, i: usize, kind: u8, passed: bool) {
         let ai = &mut self.assert_insts[i];
         let entry = self.assertion_stats.entry(ai.key).or_insert(AssertionStat {
             kind,
@@ -909,10 +1066,14 @@ impl Simulator {
             ai.fail += 1;
         }
     }
+    // /silimate
 
     /// §16.4: record a deferred assertion's outcome; its action block runs
     /// when the report matures. Arguments of a subroutine-call action are
-    /// evaluated now, as §16.4 requires.
+    /// evaluated now, as §16.4 requires. The outcome is counted only when
+    /// the report matures: a report flushed because its process resumed in
+    /// the same time slot (§16.4.2), superseded by a re-execution of its
+    /// `always_comb`, or killed (§20.12) is no attempt.
     pub(super) fn queue_deferred_assert(
         &mut self,
         a: &crate::ast::stmt::AssertionStatement,
@@ -925,29 +1086,38 @@ impl Simulator {
             crate::ast::stmt::AssertionKind::Assume => 1,
             crate::ast::stmt::AssertionKind::Cover => 2,
         };
-        self.imm_assert_tally(a, kind_tag, passed, label);
+        // silimate: count a deferred assertion when its report matures, not when it is queued
+        let inst = self.imm_assert_inst(a, kind_tag);
+        let key = self.assert_insts[inst].key;
+        self.note_assert_label(key, label);
+        // /silimate
         // An `always_comb` / `always @*` the settle runs as a comb entry is
         // not the process that happens to be current (whose resumption, a
         // §16.4.2 flush point, would drop the report): its reports belong to
-        // no process, keyed by the block's scope instead.
-        let (pid, comb_scope) = if self.settling {
-            (usize::MAX, self.name_resolve_hint.borrow().clone())
+        // no process, keyed by the scope `%m` names instead. The copies of a
+        // generate loop share the statement, and can share the settle's
+        // name hint, but each has its own `%m` path.
+        let (pid, comb_scope) = if self.settling || self.comb_direct_eval {
+            (usize::MAX, Some(self.m_path()))
         } else {
             (self.current_pid, None)
         };
         // A re-executed assertion of the same activation (an always_comb
         // evaluated twice in one slot) supersedes its earlier report.
-        self.deferred_asserts
-            .retain(|d| !(d.pid == pid && d.span == a.span && d.comb_scope == comb_scope));
+        // silimate: supersede by assertion instance, not by span and name hint
+        // The copies of a generate loop share the span, and the name hint
+        // can be just the block's label in all of them, so only the instance
+        // tells them apart. The hint can also differ between two executions
+        // of one copy, which must still supersede.
+        self.deferred_asserts.retain(|d| !(d.pid == pid && d.inst == inst));
+        // /silimate
         let action = if passed { &a.action } else { &a.else_action };
         let action = action.as_deref().map(|st| self.capture_deferred_action(st));
         // §16.3: a failure without an `else` clause calls `$error` (a cover
         // has no failure action).
         let default_error_scope =
             (action.is_none() && !passed && kind_tag != 2).then(|| self.m_path());
-        if action.is_none() && default_error_scope.is_none() {
-            return;
-        }
+        // A report with no action still matures, to be counted then.
         let ctl = self.imm_assert_ident(a);
         self.deferred_asserts.push(DeferredReport {
             pid,
@@ -960,6 +1130,8 @@ impl Simulator {
             this_handle: self.this_stack.last().copied().flatten(),
             class_context: self.class_context_stack.last().cloned().flatten(),
             ctl,
+            inst,
+            tag: kind_tag,
         });
     }
 
@@ -1015,9 +1187,52 @@ impl Simulator {
     pub(super) fn mature_deferred_asserts(&mut self) {
         let mut pending = std::mem::take(&mut self.deferred_asserts);
         pending.sort_by_key(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final);
-        for d in pending {
+        // silimate: count a deferred assertion when its report matures, not when it is queued
+        // The `#0` reports mature together in the Observed region and the
+        // `final` ones in the Postponed region, before any of their actions
+        // run (§16.4): each group is counted on reaching its region, so a
+        // `$finish` in one report's action leaves the others counted. A
+        // region `$finish` kept the slot from reaching matures nothing.
+        let at = pending
+            .iter()
+            .position(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final)
+            .unwrap_or(pending.len());
+        let finals = pending.split_off(at);
+        for group in [pending, finals] {
+            if !self.finished {
+                for d in &group {
+                    self.imm_assert_count(d.inst, d.tag, d.passed);
+                }
+            }
+            self.run_deferred_actions(group);
+        }
+        // /silimate
+    }
+
+    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+    /// The pending `#0` reports alone (Observed region), counted before any
+    /// of their actions run; the `final` ones wait for the Postponed region.
+    pub(super) fn mature_deferred_observed(&mut self) {
+        let (zero, finals): (Vec<_>, Vec<_>) = std::mem::take(&mut self.deferred_asserts)
+            .into_iter()
+            .partition(|d| d.kind != crate::ast::stmt::DeferredAssertion::Final);
+        self.deferred_asserts = finals;
+        if !self.finished {
+            for d in &zero {
+                self.imm_assert_count(d.inst, d.tag, d.passed);
+            }
+        }
+        self.run_deferred_actions(zero);
+    }
+    // /silimate
+
+    /// The actions of matured deferred reports (see `mature_deferred_asserts`).
+    fn run_deferred_actions(&mut self, group: Vec<DeferredReport>) {
+        for d in group {
             if self.finished {
-                if !d.passed {
+                // Only a report with a failure action left to run is noted:
+                // a cover that did not match has none (§16.14.3).
+                if !d.passed && (d.action.is_some() || d.default_error_scope.is_some()) {
                     let loc = self
                         .span_file_line_in(d.span, None)
                         .unwrap_or_else(|| "?".to_string());
@@ -1100,7 +1315,15 @@ impl Simulator {
     /// `$time`, `$stime`, `$realtime` change every step (LRM §21.2.3).
     pub(super) fn is_monitor_time_arg(e: &Expression) -> bool {
         matches!(&e.kind, ExprKind::SystemCall { name, .. }
-            if matches!(name.as_str(), "$time" | "$stime" | "$realtime"))
+        if matches!(
+            name.as_str(),
+            "$time"
+                | "$stime"
+                | "$realtime"
+                | "$__xz_time_at"
+                | "$__xz_stime_at"
+                | "$__xz_realtime_at"
+        ))
     }
 
     /// The design root is the synthetic multi-top wrapper (§23.3.3): its
@@ -1467,3 +1690,14 @@ impl Simulator {
         out
     }
 }
+
+// silimate: overlapping and whole drives of one output that mature together merge per bit
+/// A queued update of a signal: an entry of `nba_fast`, `nba_queue` or
+/// `delayed_nba_queue` (`Simulator::supersede_clocking_drives`).
+#[derive(Clone, Copy)]
+enum NbaSlot {
+    Fast(usize),
+    Queue(usize),
+    Delayed(usize),
+}
+// /silimate

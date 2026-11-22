@@ -41,7 +41,14 @@ use serde::ser::{SerializeSeq, Serializer};
 // §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
 // §9.4.2 / §9.3.2: Simulator::prev_wide holds a wide signal only once it is sampled; the
 // frame cache of a synchronous fork child is rebuilt, not carried (#721).
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x11";
+// Preserve declaration-scope typedefs across procedural shadowing (§6.18).
+// §10.9.1, §26.3 / §9.4.2: named assignment pattern keys carry a bound type name; the guard
+// and value expressions of an event term are shared.
+// §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
+// §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
+// §19.5: covergroup instances retain the real-valued coverpoint set.
+// silimate: §16.4.2: DeferredReport::inst and ::tag, tallied when the report matures.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x22";
 
 #[derive(Default)]
 struct Session {
@@ -680,6 +687,7 @@ checkpoint_once_cells!(
     param_leaf_index_cell,
     var_decl_leaf_index_cell,
     vif_capable_statics,
+    scoped_unpacked_leaves,
     iface_instance_paths,
     iface_by_token,
     iface_path_parts,
@@ -952,6 +960,14 @@ impl Simulator {
             let inline_bits = std::mem::take(&mut self.signal_inline_bits);
             let has_xz = std::mem::take(&mut self.signal_has_xz);
             self.checkpoint_decode_state(&mut fields)?;
+            self.restore_class_width_ranges();
+            // Resolve backend choices against this run's available native slots.
+            // Keep two-state islands, which carry their portable instructions.
+            for plan in &mut self.comb_plan {
+                if matches!(plan, CombPlan::Jit | CombPlan::Tpl | CombPlan::Interp) {
+                    *plan = CombPlan::Unresolved;
+                }
+            }
             self.refill_inline_bits(inline_bits)?;
             refill_in_place(&mut self.signal_has_xz, has_xz, "signal_has_xz")?;
             #[cfg(feature = "jit")]
@@ -988,8 +1004,12 @@ impl Simulator {
             Ok(())
         })?;
         self.reopen_files(file.files)?;
+        // §10.6.2: the writers index is built from the restored entry table.
+        self.comb_writer_index = None;
         // Caches keyed by an address in the run that wrote the checkpoint.
         self.recv_call_memo.clear();
+        // §23.10: the parameter overlays are built from the restored table.
+        *self.decl_param_scope_cache.get_mut() = Default::default();
         // A checkpoint is taken at the end of a time slot, so every initial
         // block of the saving run had started; the bodies this build queued
         // for its own time 0 belong to no restored process.
@@ -1264,6 +1284,7 @@ checkpoint_state!(
     comb_plan_abortn,
     comb_time0_deferred_done,
     comb_time0_fired,
+    comb_time0_held,
     compiled_class_method_ids,
     compiled_fast_calls,
     compiled_fast_static_calls,
@@ -1294,6 +1315,10 @@ checkpoint_state!(
     deferred_asserts,
     deferred_comb_pool,
     deferred_proc_entries,
+    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+    delay_pids,
+    delay_resumed,
+    // /silimate
     delayed_nba,
     delayed_nba_queue,
     delayed_slice_chains,
@@ -1673,6 +1698,7 @@ checkpoint_state!(
     ts_wregs,
     ts_wregs8,
     ts_xregs,
+    declaration_typedefs,
     type_tables_gen,
     typedef_layouts_by_width,
     typedef_target_cache,

@@ -243,6 +243,8 @@ axb : cross cp_a, cp_b {
 - **Automatic bins** (a coverpoint with no `bins`): one bin per value of the sampled
   expression's width, or `option.auto_bin_max` (default 64) equal ranges when there
   are more values than that. A 4-bit coverpoint has 16 bins; an `int` has 64.
+  A coverpoint of a `real` expression has no automatic bins; its explicit bins
+  match the sampled value numerically (`bins lo = {[0.0:1.5]};`) (§19.5).
 - **Array bins** `name[]`: one bin per value, named `name[<value>]`. `name[N]`: N bins
   `name[0]` to `name[N-1]`; the listed values, in order, are split evenly among them
   and the last one also takes the remainder.
@@ -441,6 +443,13 @@ For the [assertion example](#assertion-coverage):
 | `cover property`, `cover sequence` | Matches | Always 0 |
 | `assert property`, `assume property` | Attempts that succeeded, including vacuous ones (`gnt` low, so `gnt \|-> ...` holds) | Attempts that failed |
 | Immediate `cover`, `assert`, `assume` | Evaluations where the expression was true | Evaluations where it was false |
+| Deferred `assert #0`, `assert final` (and `assume`, `cover`) | Reports that matured with the expression true | Reports that matured with it false |
+
+A deferred assertion counts a report only when it matures in the Observed
+(`#0`) or Postponed (`final`) region of its time slot (§16.4.2). A report that
+a flush point discards, because its process resumed in the same time slot,
+or that a later evaluation of the same `always_comb` supersedes, is no
+attempt.
 
 An immediate `cover`'s false evaluations therefore count in `assertion_fail_total`
 too. In the example, all 5 fails are clock edges where `req && !gnt` was false; no
@@ -1191,9 +1200,12 @@ reference simulator's "FSM States" and "FSM Transitions".
 
 #### Counting rules
 
-Six options change what is counted. Each is off by default. The first five
-follow the code coverage defaults the reference simulator documents; the last
-leaves out the bits that are constant by construction.
+Six options change what is counted. Each is off by default. They were
+inferred from CVDP's coverage targets: on its target-100 designs, enum toggles,
+generate-block toggles and a constant expression term were bins no stimulus
+can reach, and the bits that only constants drive keep some designs below their
+target. Block granularity leaves out the arm an `if` or `case` doesn't write,
+as Verilator 5.038's line coverage does.
 
 | Option | What it counts |
 |---|---|
@@ -1213,12 +1225,10 @@ block starts:
 
 - where a process body starts (after the event or delay control of an
   `always`), and where a task or function body starts;
-- at each arm of an `if` chain or a `case`, written or implicit: an `if`
-  without an `else`, or a `case` without a `default`, has an implicit arm
-  that is a block of its own (`kind` `else (implicit)` or `default
-  (implicit)`, counted when no written arm runs), except in a `unique` or
-  `priority` decision. Its count comes from branch coverage when that is
-  collected, and from a counter of its own otherwise;
+- at each written arm of an `if` chain or a `case`. The implicit arm of an
+  `if` without an `else`, or of a `case` without a `default`, is no block:
+  no statement runs there. Branch coverage still counts it (`else
+  (implicit)`, `default (implicit)`);
 - after an `if`, `case` or loop, where the paths meet again;
 - at a loop body, and at the statement an event control, delay or `wait`
   controls;
@@ -1343,7 +1353,7 @@ The results file gains a `code_coverage` member:
 | `scopes[].design_unit` | The module or interface of the instance; the scope's own name otherwise |
 | `scopes[].kind` | `instance`, `package`, `unit` or `module` (see [Scopes](#scopes)) |
 | `scopes[].statement`, `.branch`, `.toggle`, `.condition`, `.expression`, `.fsm` | The scope's totals, like the design totals |
-| `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait`; in block granularity it is `block`, `else (implicit)` or `default (implicit)` (see [Counting rules](#counting-rules)). An excluded statement has `"excluded": "constant"` and is not in the totals |
+| `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait`; in block granularity it is `block` (see [Counting rules](#counting-rules)). An excluded statement has `"excluded": "constant"` and is not in the totals |
 | `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count`. `"excluded": "constant"` after `kind` marks a branch whose decision is a constant or that is in an excluded arm: none of its arms is in the totals. On an arm, it marks one that can never run |
 | `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, `type`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first. `type` is the data type the signal was declared with, after any typedef: `logic` (also a net declared without a data type), `bit`, `reg`, `byte`, `shortint`, `int`, `longint`, `integer`, `enum`, `struct` or `union`. A member of an unpacked struct or union has the type of the variable it belongs to, `struct` or `union`. `--no-toggle-integers` leaves out the entries of type `byte`, `shortint`, `int`, `longint` and `integer` |
 | `scopes[].conditions[]`, `.expressions[]` | Every condition and expression item, never-evaluated ones included: `file`, `line`, `kind` (a condition's `if`, `while`, `do` or `ternary`; an expression's `statement`, `assign` or `port`), `block` (the generate block within the scope, when there is one), `text` (the source text) and `terms[]`, each with `term` (its source text), `hits` (the counts of its rows 0 and 1) and, in a bimodal item (one with `^`, `~^` or `?:`), `outputs` (`[[row 0 at 0, row 0 at 1], [row 1 at 0, row 1 at 1]]`, by the item's value). An item in code that [constant conditions](#constant-conditions) rule out is neither listed nor in the totals |

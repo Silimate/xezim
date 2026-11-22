@@ -2127,28 +2127,6 @@ impl Simulator {
                     Some(f) => f,
                     None => self.fold_enclosing_param_expr(e)?,
                 };
-                // §8.25: a bare SELF-REFERENCE — the argument names the
-                // class whose specialization context we are resolving in
-                // (`uvm_object_registry#(C,"C") type_id`, written by
-                // `uvm_object_utils(C)`) — denotes the CURRENT
-                // specialization `C#(sig)`, not the default. Without
-                // this, a static method entered through a specialization
-                // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
-                // declared `C#(T2)`) keyed the registry on the default
-                // `C`, so the factory created default-specialized objects
-                // and the `$cast` in `uvm_create_on` correctly rejected
-                // them.
-                //
-                // Only inside that class's own declaration (or a derived
-                // one): elsewhere the bare name IS the default
-                // specialization — a non-parameterized class whose typedef
-                // names `C` must not read `C#(sig)` just because its method
-                // happens to run under an active `C#(sig)` context.
-                if let Some((b, s)) = &self.current_spec {
-                    if frag == *b && self.inside_class_decl_of(b) {
-                        return Some(format!("{}#({})", b, s));
-                    }
-                }
                 // Resolve bare type-param names (e.g. `T`, `this_type`)
                 // through the active specialization so the typedef's
                 // specialization carries concrete values.
@@ -3183,6 +3161,9 @@ impl Simulator {
                 // member's DECLARED signedness (`int s` in a packed struct
                 // printed as unsigned without this).
                 if let Some(field) = name.strip_prefix(&format!("{}.", base)) {
+                    if w == 64 && self.union_real_member(&base, field) {
+                        return Some(Self::union_real_read(v));
+                    }
                     if self.struct_member_signed(&base, field) {
                         v.is_signed = true;
                     }
@@ -3257,7 +3238,12 @@ impl Simulator {
             {
                 let fitted = match self.frame_get(name) {
                     Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
-                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => val.resize(p.width),
+                    // §6.11.3: the leaf keeps its member's signedness.
+                    Some(p) if !p.is_real && !val.is_real && p.width > 0 => {
+                        let mut v = val.resize(p.width);
+                        v.is_signed = p.is_signed;
+                        v
+                    }
                     // §6.12.2: a real into an integral leaf rounds.
                     Some(p) if !p.is_real && val.is_real => Self::real_into_slot(p, val.to_f64()),
                     _ => val,
@@ -3301,7 +3287,11 @@ impl Simulator {
             }
             let w = self.signal_widths[id];
             let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-            let mut resized = if is_str { val } else { val.resize(w) };
+            let mut resized = if is_str {
+                val
+            } else {
+                self.cell_real_fit(id, val).resize(w)
+            };
             if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
                 resized = resized.to_two_state();
             }
@@ -3328,6 +3318,16 @@ impl Simulator {
             let through_alias = aliased.is_some();
             if let Some(cur) = aliased.or_else(|| self.get_local_or_signal(&base)) {
                 let mut next = cur.clone();
+                // §7.3: a real member of an untagged union stores the real's
+                // bits; an integral value converts to real first (§6.12.1).
+                let val = match name.strip_prefix(&format!("{base}.")) {
+                    Some(field)
+                        if w == 64 && !val.is_real && self.union_real_member(&base, field) =>
+                    {
+                        Value::from_f64(val.to_f64())
+                    }
+                    _ => val,
+                };
                 let mut piece = val.resize(w);
                 if !self.mixed_packed_vars.is_empty() {
                     piece = self.packed_member_piece(&base, name, piece);
@@ -3410,6 +3410,23 @@ impl Simulator {
     /// Store `val` in table cell `id` as a by-name write of the cell's name
     /// does: fitted to the cell's width, value set and signedness, and marked
     /// dirty when it changed. Returns whether it changed.
+    /// §6.12.1, §10.7: a value written into table cell `id` takes the cell's
+    /// real or integral type before its width: a real into an integral cell
+    /// rounds (`Resize` to 64 bits would keep the real), and an integral or
+    /// unbased unsized value into a real cell converts at its own width
+    /// (§5.7.1: `'1` is one bit there, not 2**64-1).
+    #[inline]
+    fn cell_real_fit(&self, id: usize, val: Value) -> Value {
+        let cell_real = self.signal_real.get(id).copied().unwrap_or(false);
+        if val.is_real == cell_real {
+            val
+        } else if cell_real {
+            Value::from_f64(val.to_f64())
+        } else {
+            Self::real_to_int(val.to_f64(), self.signal_widths[id].max(1))
+        }
+    }
+
     pub(super) fn store_named_cell(&mut self, id: usize, val: Value) -> bool {
         let w = self.signal_widths[id];
         // A width-0 signal (e.g. an untracked module-scope class handle)
@@ -3421,7 +3438,11 @@ impl Simulator {
         // it a `string q[$]` element was still clamped to 128 characters
         // after scalar strings had been fixed.
         let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
-        let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
+        let mut resized = if w == 0 || is_str {
+            val
+        } else {
+            self.cell_real_fit(id, val).resize(w)
+        };
         // §6.11.1: a 2-state destination drops x/z.
         if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
             resized = resized.to_two_state();
@@ -3559,6 +3580,44 @@ impl Simulator {
         // sign-extended scalar). Clamp so element-scan loops can't spin
         // formatting billions of `name[i]` lookups.
         if raw > 1 << 26 { 0 } else { raw }
+    }
+
+    /// Check a sequence element write before touching its backing store. Queues
+    /// append only at their current size (IEEE 1800-2023 §7.10.1).
+    pub(super) fn prepare_sequence_write(&mut self, name: &str, index: &Value) -> Option<i64> {
+        let i = index.to_index();
+        let size = self.get_queue_size(name);
+        if i.is_some_and(|i| i >= 0 && (i as u64) < size) {
+            return i;
+        }
+        if self.is_queue_store(name) {
+            let room = self.module.queue_max_sizes.get(name).is_none_or(|&max| size < u64::from(max));
+            if i == Some(size as i64) && room {
+                self.set_queue_size(name, size + 1);
+                return i;
+            }
+            self.warn_invalid_queue_write(name, i, size);
+            return None;
+        }
+        // Other sequence stores retain their existing assignment behavior.
+        if let Some(i) = i && i >= 0 {
+            self.set_queue_size(name, i as u64 + 1);
+        }
+        i
+    }
+
+    pub(super) fn is_queue_store(&self, name: &str) -> bool {
+        self.module.queue_vars.contains(name)
+            || matches!(self.declared_dim(name), Some(Dim::Queue))
+            || name.rsplit_once("::").is_some_and(|(owner, member)| {
+                self.module.classes.get(owner.split('#').next().unwrap_or(owner))
+                    .is_some_and(|cd| cd.queue_property_names.contains(member))
+            })
+    }
+
+    pub(super) fn warn_invalid_queue_write(&self, name: &str, index: Option<i64>, size: u64) {
+        let index = index.map_or_else(|| "x/z".to_string(), |i| i.to_string());
+        eprintln!("[xezim][warning] ignoring write to queue {name}[{index}] with size {size} (IEEE 1800-2023 §7.10.1)");
     }
 
     pub(super) fn set_queue_size(&mut self, obj_name: &str, size: u64) {

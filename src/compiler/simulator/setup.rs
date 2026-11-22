@@ -353,8 +353,14 @@ impl Simulator {
         if self.code_cov.is_some() {
             // FSM writes of the last time slot, when it ended early.
             self.cov_fsm_sample();
-            self.emit_coverage_summary();
         }
+        // Assertion + coverage summary (always when any data was recorded;
+        // the JSON database goes to XEZIM_COV_DB, else to xezim_cov.json when
+        // at least one stat exists). It follows the `final` blocks and the
+        // last slot's deferred reports, which mature above (§16.4): a run
+        // without code coverage wrote it at the end of the event loop,
+        // before those were counted.
+        self.emit_coverage_summary();
         // Flush any `--warn-x` reports captured during the final region.
         self.drain_warn_x();
         self.drain_value_trace();
@@ -1627,9 +1633,9 @@ impl Simulator {
             }
             for c in &cands {
                 if let Some(td) = self.module.tasks.get(c.as_str()) {
-                    return td.items.iter().any(|st| self.stmt_is_blocking(st))
-                        || td
-                            .items
+                    let items = self.module.resolved_task_items(c, td);
+                    return items.iter().any(|st| self.stmt_is_blocking(st))
+                        || items
                             .iter()
                             .any(|st| self.stmt_calls_blocking_task(st, scope, depth - 1));
                 }
@@ -1710,6 +1716,9 @@ impl Simulator {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
+        // silimate: a procedural assertion in an always process samples its time-0 defaults too
+        Self::sva_stmt_names(&ab.stmt, false, &mut self.always_sva_names);
+        // /silimate
         // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile
@@ -1733,7 +1742,9 @@ impl Simulator {
         if !ab.scope.is_empty() {
             *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
         }
+        Self::take_star_kept_own_write();
         let extracted = self.extract_sensitivity(&ab.stmt);
+        let star_reads_own_nba = Self::take_star_kept_own_write();
         // §14.13: a clocking event is delivered after sampling/NBA, rather
         // than as the raw clock edge returned by extract_sensitivity.
         fn leading_event(stmt: &Statement) -> Option<&EventControl> {
@@ -1812,10 +1823,18 @@ impl Simulator {
                 // (`always @(big[i])` on a large memory) has no dependency
                 // edge the comb path could wake on; such a block runs as a
                 // process below.
+                // §9.4.2.2: an `@*` block that reads a variable it writes
+                // with `<=` (`dot <= b; prod <= a * dot;`) has that variable
+                // in its sensitivity, and the NBA update wakes it again in
+                // the same time step. The comb path leaves every variable a
+                // block writes out of its dependencies, so it ran the block
+                // once and `prod` kept the old `dot`, a cycle late. Such a
+                // block runs as a waiting process below instead.
                 if all_level
                     && !clocking_head
                     && !has_named_event
                     && !self_ref
+                    && !star_reads_own_nba
                     && !self.stmt_is_blocking(&body)
                     && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
                     && !sens.iter().any(|s| self.sens_unnamed_cell(s))
@@ -1937,7 +1956,15 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
-                if clocking_head || self.event_needs_value_waiter(&sens, &ab.scope) {
+                // `star_reads_own_nba`: a process arms `@*` only after the
+                // body has run, so the body's own blocking writes (`x[7:4] =
+                // x[7:4] + 1` beside `x[3:0] <= b`) cannot wake it, while the
+                // NBA update does. An edge block re-detects writes made while
+                // it runs and would wake itself on them again and again.
+                if clocking_head
+                    || star_reads_own_nba
+                    || self.event_needs_value_waiter(&sens, &ab.scope)
+                {
                     if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
                         return None;
                     }
@@ -2343,6 +2370,11 @@ impl Simulator {
         compiler.set_scope_hint(scope_hint);
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
+        compiler.set_deferred_callables(
+            &self.module.deferred_function_bodies,
+            &self.module.deferred_task_bodies,
+            &self.module.packages,
+        );
         compiler.set_params(&self.module.parameters);
         compiler.set_param_leaf_idx(self.param_leaf_index());
         compiler.set_cast_widths(&self.cast_widths);

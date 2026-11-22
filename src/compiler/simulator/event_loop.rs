@@ -1665,6 +1665,25 @@ impl Simulator {
         true
     }
 
+    // silimate: a settle that moves a copied clock widens the pre-NBA edge pass
+    /// Whether an edge signal other than a clock generator's output was
+    /// written since the last edge scan: an `assign c2 = clk;` copy the settle
+    /// just moved, which the clocks-only pass would miss (§10.3). The dirty-edge
+    /// log records those writes. Without it (`XEZIM_DIRTY_EDGE=0`), any settle
+    /// counts.
+    fn non_clock_edge_changed(&self) -> bool {
+        if !self.dirty_edge && !self.dirty_edge_shadow {
+            return true;
+        }
+        self.changed_edge_pos.iter().any(|&p| {
+            self.is_edge_signal_non_clock
+                .get(self.edge_signal_ids[p])
+                .copied()
+                .unwrap_or(false)
+        })
+    }
+    // /silimate
+
     /// Resume level-sensitive `wait(expr)` waiters parked in
     /// `condition_waiters` whose condition has just become true. IEEE
     /// 1800-2023 §9.7.4: `wait(cond)` is level-sensitive — the process
@@ -1731,6 +1750,16 @@ impl Simulator {
                 break;
             }
             let prog_before = self.cond_progress;
+            // silimate: a waiter rechecks its condition against settled continuous assignments
+            // §10.3: an `assign` updates its target in the Active region when
+            // an operand changes, and a `wait` on that target wakes on the
+            // update. Settle before the recheck so `wait (c2)` under
+            // `assign c2 = clk;` reads `c2` after this slot's toggle; it read
+            // the old value, stayed parked, and resumed only after the NBAs.
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            // /silimate
             let ready = std::mem::take(&mut self.ready_condition_waiters);
             for (cpid, cont) in ready {
                 self.cond_waiter_gate.remove(&cpid);
@@ -2036,7 +2065,21 @@ impl Simulator {
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
             self.drain_active_driver_updates();
+            // silimate: a condition-waiter drain's settle and writes reach the full edge pass
+            // The drain settles the continuous assignments (`assign c2 = clk;`
+            // follows a clock there) and runs the waiters it releases. Both are
+            // changes to signals other than the toggled clocks, so the slot's
+            // edge pass must scan every edge signal: the clocks-only pass
+            // missed `@(posedge c2)`, which then ran in the cascade, after the
+            // NBAs its peers queued at the same edge had committed (§4.4.2.2,
+            // §4.5, §10.3). A drain with no waiter does neither, and a clock
+            // toggle alone keeps the clocks-only pass.
+            let (dirty, epoch) = (self.dirty_any, self.late_resume_epoch);
             self.drain_condition_waiters(true, false);
+            if (dirty && !self.dirty_any) || self.late_resume_epoch != epoch {
+                non_clock_change = true;
+            }
+            // /silimate
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
                 // Cont-assign propagation and edge-sensitive blocks are
@@ -2119,6 +2162,10 @@ impl Simulator {
         {
             if self.dirty_any {
                 self.settle_combinatorial();
+                // silimate: a settle that moves a copied clock widens the pre-NBA edge pass
+                if self.non_clock_edge_changed() {
+                    non_clock_change = true;
+                }
             }
             if !non_clock_change && !self.toggled_clock_positions.is_empty() {
                 self.check_edges_clocks_only();

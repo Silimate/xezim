@@ -64,9 +64,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   the operands of an assignment pattern (§16.5.1). It had read them after
   the edge's NBA region. (#434)
 * `$past`, `$stable` and `$changed` track every cell of a whole
-  unpacked-array operand (§16.9.3). `$stable(mem)` had always held,
-  `$changed(mem)` never had, and `mem == $past(mem)` compared against a
-  constant. (#435)
+  fixed-size unpacked-array operand (§16.9.3). `$stable(mem)` had always
+  held, `$changed(mem)` never had, and `mem == $past(mem)` compared against
+  a constant. That is still so for an array with a negative bound
+  (`mem[-2:-1]`) and for a large memory in the packed arena (more than
+  100,000 cells; see `XEZIM_PACKED_MEM`). (#435)
 * A procedural concurrent assertion, or a deferred assertion, that an
   `always` procedure reaches after a delay or an event control reports
   (§16.4.2, §16.14.6). Its process had dropped its pending instances on

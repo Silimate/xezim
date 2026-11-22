@@ -688,6 +688,7 @@ impl Simulator {
             // and run BEFORE this slot's NBA region — loop again at the same
             // time without applying NBAs yet. Settle first so they observe
             // completed active-region (cont-assign) state.
+            self.drain_active_driver_updates();
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
                 if self.dirty_any {
@@ -1050,6 +1051,27 @@ impl Simulator {
         // Consumed by whichever path runs this entry (see the direct-run
         // branch below).
         let trampolined = !self.trampolined_pids.is_empty() && self.trampolined_pids.remove(&pid);
+        // silimate: a continuation of the same activation is no flush point
+        // §16.4.2: a process resuming after a suspension reaches a flush
+        // point and drops its pending deferred reports and procedural
+        // assertion instances; a same-time trampoline entry of the running
+        // activation (`continue_stmts_or_trampoline`) does not.
+        if self.cont_pids.is_empty() || !self.cont_pids.remove(&pid) {
+            self.flush_deferred_asserts(pid);
+            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+            // A `#0` leaves the activation in its time step.
+            match self.delay_pids.remove(&pid) {
+                Some(true) => {
+                    self.delay_resumed.insert(pid);
+                }
+                Some(false) => {}
+                None if !self.delay_resumed.is_empty() => {
+                    self.delay_resumed.remove(&pid);
+                }
+                None => {}
+            }
+        }
+        // /silimate
         // A process terminated by `disable fork` (LRM §9.6.2) must not run any
         // remaining queued continuation (e.g. the resume of a `#delay` it was
         // parked on when killed). Pids are monotonic and never reused, so it is
@@ -1580,12 +1602,11 @@ impl Simulator {
     /// the register-value half of `delay_value_to_ticks`, without the
     /// pathological-real diagnostics (no source expression at hand).
     pub(super) fn fsm_delay_ticks(&self, v: &Value, precision_diff: i32) -> u64 {
-        let raw = if v.is_real {
-            let f = v.to_f64();
-            if f.is_finite() && f > 0.0 { f } else { 0.0 }
-        } else {
-            v.to_u64().unwrap_or(0) as f64
-        };
+        if !v.is_real {
+            return Self::quantize_integral_delay_ticks(v.to_u64().unwrap_or(0), precision_diff);
+        }
+        let f = v.to_f64();
+        let raw = if f.is_finite() && f > 0.0 { f } else { 0.0 };
         Self::quantize_delay_ticks(raw, precision_diff)
     }
 
@@ -2432,7 +2453,7 @@ impl Simulator {
             }
             if f.is_finite() && f > 0.0 { f } else { 0.0 }
         } else {
-            v.to_u64().unwrap_or(0) as f64
+            return Self::quantize_integral_delay_ticks(v.to_u64().unwrap_or(0), precision_diff);
         };
         // §3.14.3: a delay rounds to the CURRENT MODULE's time precision, not
         // the (finer) global tick — `#1.55` in a 1ns/100ps module is 1.6ns,
@@ -2459,6 +2480,26 @@ impl Simulator {
             ) as u64
         } else {
             raw.round() as u64
+        }
+    }
+
+    /// §3.14.1, §9.4.1: an integral tick count rounded to the running scope's
+    /// precision, 10^`precision_diff` ticks, ties away from zero, in integer
+    /// arithmetic. Converting the count to binary64 first lost its low bits
+    /// above 2^53 ticks (`#(64'd9007199254740993)` under 1 fs woke at
+    /// ...992).
+    #[inline]
+    pub(super) fn quantize_integral_delay_ticks(raw: u64, precision_diff: i32) -> u64 {
+        if precision_diff <= 0 {
+            return raw;
+        }
+        match 10u64.checked_pow(precision_diff as u32) {
+            Some(grid) => {
+                let rem = raw % grid;
+                (raw / grid + u64::from(rem >= grid - rem)).saturating_mul(grid)
+            }
+            // Half a grid step is more than any count: every count rounds to 0.
+            None => 0,
         }
     }
 
@@ -2495,6 +2536,37 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// Freeze a selected RHS before trying the array and scalar capture paths.
+    /// Each path then sees the same label even when its selector calls a function.
+    pub(super) fn freeze_array_rhs_selectors(&mut self, rhs: &Expression) -> Option<Expression> {
+        let rhs = Self::unparen(rhs);
+        if (self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+            || !matches!(rhs.kind, ExprKind::Index { .. })
+            || Self::cond_expr_is_effect_free(rhs, false)
+        {
+            return None;
+        }
+        // Freeze just select chains on a name. Expressions that produce an
+        // array by calling a function keep their own call-result handling.
+        let mut base = rhs;
+        let mut selects = 0;
+        while let ExprKind::Index { expr, .. } = &base.kind {
+            selects += 1;
+            base = expr;
+        }
+        let ExprKind::Ident(h) = &base.kind else { return None };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.array_operand_name(base).unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
+        let rank = if self.module.arrays_2d.contains_key(&name) {
+            2
+        } else {
+            self.module.arrays_nd.get(&name)?.0.len()
+        };
+        (rank > selects).then(|| self.freeze_conditional_path(rhs, true))
     }
 
     /// §10.10: capture a one-dimensional unpacked array in element order.
@@ -2570,7 +2642,8 @@ impl Simulator {
             return None;
         }
         flatten(rhs, &mut items);
-        Some(self.unpacked_concat_operand_values(items))
+        let expand_rows = self.concat_has_non_array_elements(&dst);
+        Some(self.unpacked_concat_operand_values(items, expand_rows, None))
     }
 
     pub(super) fn saved_array_pattern(
@@ -2600,6 +2673,8 @@ impl Simulator {
         rhs: &Expression,
         span: crate::ast::Span,
     ) -> (Expression, Option<Statement>) {
+        let frozen = self.freeze_array_rhs_selectors(rhs);
+        let rhs = frozen.as_ref().unwrap_or(rhs);
         let mut inner = rhs;
         while let ExprKind::Paren(e) = &inner.kind {
             inner = e;
@@ -2621,6 +2696,13 @@ impl Simulator {
         if let Some(values) = self.capture_array_rhs(lvalue, inner) {
             return (self.saved_array_pattern(values, span), None);
         }
+        // §9.4.5, §7.6: any other unpacked array (a whole multidimensional
+        // array, a subarray or slice of one, an array of unpacked structs, a
+        // class property's row) is read element by element now. It was
+        // captured as one scalar, so the delayed store wrote zeros.
+        if let Some(snapshot) = self.unpacked_array_snapshot(inner, span) {
+            return snapshot;
+        }
         if matches!(inner.kind, ExprKind::AssignmentPattern(_)) {
             // A packed target shapes the pattern now; its value is the one
             // evaluation of the items (a second would repeat their calls).
@@ -2630,24 +2712,71 @@ impl Simulator {
             let mut slots = Vec::new();
             let shape = self.intra_target_shape(lvalue);
             let captured = self.capture_intra_pattern(inner, &mut slots, shape.as_ref());
-            let args = slots
-                .iter()
-                .map(|&idx| Self::intra_slot_literal(idx, span))
-                .collect();
-            let release = Statement::new(
-                StatementKind::Expr(Expression::new(
-                    ExprKind::SystemCall {
-                        name: INTRA_RELEASE_MARKER.to_string(),
-                        args,
-                    },
-                    span,
-                )),
-                span,
-            );
-            return (captured, Some(release));
+            return (captured, Some(Self::intra_release_stmt(&slots, span)));
         }
         let val = self.eval_target_rhs(lvalue, rhs);
         (self.make_intra_saved_expr(val, span), None)
+    }
+
+    /// The statement that frees the captured pattern items `slots` once the
+    /// store that reads them has run.
+    fn intra_release_stmt(slots: &[u64], span: crate::ast::Span) -> Statement {
+        let args = slots
+            .iter()
+            .map(|&idx| Self::intra_slot_literal(idx, span))
+            .collect();
+        Statement::new(
+            StatementKind::Expr(Expression::new(
+                ExprKind::SystemCall {
+                    name: INTRA_RELEASE_MARKER.to_string(),
+                    args,
+                },
+                span,
+            )),
+            span,
+        )
+    }
+
+    /// §7.6, §9.4.5: the unpacked array `e` (see `unpacked_array_leaves`)
+    /// read now, as an assignment pattern of the captured elements nested
+    /// like the array, with the statement that frees them after the store.
+    /// None, with nothing read, when `e` names no such array.
+    pub(super) fn unpacked_array_snapshot(
+        &mut self,
+        e: &Expression,
+        span: crate::ast::Span,
+    ) -> Option<(Expression, Option<Statement>)> {
+        let e = Self::unparen(e);
+        if !matches!(
+            e.kind,
+            ExprKind::Ident(_)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::MemberAccess { .. }
+        ) {
+            return None;
+        }
+        let leaves = self.unpacked_array_leaves(e)?;
+        let rows = Self::leaf_rows(leaves);
+        let mut slots = Vec::new();
+        let captured = self.kept_element_pattern(rows, span, &mut slots);
+        Some((captured, Some(Self::intra_release_stmt(&slots, span))))
+    }
+
+    /// Leaf paths (`[1][0]`, `[1].a`) split into one step per dimension or
+    /// member, in declared order, so `kept_element_pattern` nests them.
+    fn leaf_rows(leaves: Vec<(String, Value)>) -> Vec<(Vec<String>, Value)> {
+        leaves
+            .into_iter()
+            .map(|(suffix, v)| {
+                let path = suffix
+                    .split(['[', '.'])
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.trim_end_matches(']').to_string())
+                    .collect();
+                (path, v)
+            })
+            .collect()
     }
 
     /// The pattern `e` with each item's value captured (`capture_intra_rhs`),
@@ -2731,18 +2860,47 @@ impl Simulator {
                     // `[1][0]` or, for an element that is an unpacked
                     // struct, `[1].a`: one path step per dimension or member,
                     // in declared order, so the steps nest positionally.
-                    let rows = elems
-                        .into_iter()
-                        .map(|(suffix, v)| {
-                            let path = suffix
-                                .split(['[', '.'])
-                                .filter(|c| !c.is_empty())
-                                .map(|c| c.trim_end_matches(']').to_string())
-                                .collect();
-                            (path, v)
-                        })
-                        .collect();
+                    let rows = Self::leaf_rows(elems);
                     return self.kept_element_pattern(rows, e.span, slots);
+                }
+                // §7.2, §10.9.2: a whole unpacked struct matched to a struct
+                // element (`'{sa[1], sa[0]}`) has no value of its own, only
+                // member leaves: each is read now, nested like the members.
+                // Captured as one value, it filled every member with it. A
+                // class property's target has no known shape; an element of
+                // its struct array (`'{ks[1], ks[0]}`) is recognized by itself.
+                let elem_su = match shape {
+                    Some(super::intra_pattern_shape::ItemShape::Struct(su)) => Some(su.clone()),
+                    None if matches!(e.kind, ExprKind::Index { .. }) => self.struct_elem_type(e),
+                    _ => None,
+                };
+                if let Some(su) = elem_su
+                    && matches!(
+                        e.kind,
+                        ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+                    )
+                    && Self::cond_expr_is_effect_free(e, false)
+                    && !su.members.iter().any(|m| {
+                        m.declarators.iter().any(|d| {
+                            d.dimensions.iter().any(|dim| {
+                                !matches!(
+                                    dim,
+                                    crate::ast::types::UnpackedDimension::Range { .. }
+                                        | crate::ast::types::UnpackedDimension::Expression { .. }
+                                )
+                            })
+                        })
+                    })
+                {
+                    let mut leaves = Vec::new();
+                    self.unpacked_struct_leaves("", e, &su, 0, &mut leaves);
+                    if !leaves.is_empty() {
+                        let values = leaves
+                            .into_iter()
+                            .map(|(key, leaf, _, _)| (key, self.eval_expr(&leaf)))
+                            .collect();
+                        return self.kept_element_pattern(Self::leaf_rows(values), e.span, slots);
+                    }
                 }
                 let val = self.intra_item_value(shape, e);
                 self.kept_item(val, e.span, slots)
@@ -2855,6 +3013,9 @@ impl Simulator {
     /// restores the process context, exactly as an immediate `@event` re-arm.
     pub(super) fn continue_stmts_or_trampoline(&mut self, pid: usize, cont: ProcCont) {
         if RPS_DEPTH.with(|c| c.get()) > RPS_TRAMPOLINE_DEPTH {
+            // silimate: a continuation of the same activation is no flush point
+            self.cont_pids.insert(pid);
+            // /silimate
             // The context stays live; mark the entry as this pid's own
             // continuation (see `run_scheduled_process_inner`).
             if !self.local_stack.is_empty() || !self.this_stack.is_empty() {
@@ -2895,6 +3056,175 @@ impl Simulator {
         }
         self.continue_flag = false;
         false
+    }
+
+    /// §23.6 / §7.4: resolve literal instance selectors and fixed memory
+    /// banks once, before checking a process loop for combinational feedback.
+    /// A packed word selector remains an ordinary select on its stored signal.
+    fn loop_memory_path(
+        &self,
+        e: &Expression,
+        locals: &[&str],
+        scope: Option<&str>,
+    ) -> Option<Expression> {
+        let ExprKind::Index { expr: base, .. } = &e.kind else {
+            return None;
+        };
+        let literal_index = |e: &Expression| {
+            let ExprKind::Number(n) = &e.kind else {
+                return None;
+            };
+            let v = self.eval_number(n);
+            if v.is_real {
+                return None;
+            }
+            v.to_index()
+        };
+        let (name, root) = match &base.kind {
+            ExprKind::MemberAccess { .. } => {
+                let mut path = Vec::new();
+                if !Self::fold_hier_path_segments(base, &mut path)
+                    || !path.iter().any(|seg| !seg.selects.is_empty())
+                    || path.iter().flat_map(|seg| seg.selects.iter()).any(|i| {
+                        literal_index(i)
+                            .is_none_or(|v| Some(v) != Self::constant_array_index(i, &self.module))
+                    })
+                {
+                    return None;
+                }
+                let name = self.constant_selected_storage(base)?;
+                let (scope, _) = name.rsplit_once('.')?;
+                if !self.module.instances.iter().any(|i| i.path == scope) {
+                    return None;
+                }
+                (name, path.first()?.name.name.clone())
+            }
+            ExprKind::Index { expr, index } if matches!(index.kind, ExprKind::Number(_)) => {
+                let ExprKind::Ident(h) = &expr.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let root = &h.path[0].name.name;
+                let &(lo, hi, width) = self.module.arrays.get(root)?;
+                let idx = literal_index(index)?;
+                if !(lo.min(hi)..=lo.max(hi)).contains(&idx)
+                    || !self.module.packed_signal_elem_widths.contains_key(root)
+                {
+                    return None;
+                }
+                let name = format!("{root}[{idx}]");
+                let id = *self.signal_name_to_id.get(name.as_str())?;
+                if self.signal_widths.get(id) != Some(&width) {
+                    return None;
+                }
+                (name, root.clone())
+            }
+            _ => return None,
+        };
+        if locals.contains(&root.as_str())
+            || self.frame_get(&root).is_some()
+            || scope.is_some_and(|s| {
+                self.signal_name_to_id
+                    .contains_key(format!("{s}.{name}").as_str())
+            })
+        {
+            return None;
+        }
+        Some(Self::flat_name_ident(name, base.span))
+    }
+
+    fn loop_memory_stmt<'a>(
+        &self,
+        stmt: &'a Statement,
+        locals: &mut Vec<&'a str>,
+        scope: Option<&str>,
+    ) -> Option<Statement> {
+        use crate::ast::stmt::ForInit;
+        use crate::compiler::elaborate::{for_each_sub_expr, for_each_sub_expr_mut};
+        if !self.this_stack.is_empty() {
+            return None;
+        }
+        let mut out;
+        match &stmt.kind {
+            StatementKind::For { init, body, .. } => {
+                let len = locals.len();
+                for i in init {
+                    if let ForInit::VarDecl { name, .. } = i {
+                        locals.push(&name.name);
+                    }
+                }
+                let changed = self.loop_memory_stmt(body, locals, scope);
+                locals.truncate(len);
+                let child = changed?;
+                out = stmt.clone();
+                if let StatementKind::For { body, .. } = &mut out.kind {
+                    **body = child;
+                }
+            }
+            StatementKind::SeqBlock { name, stmts } => {
+                // A block declaration may shadow an instance or memory bank.
+                if stmts.iter().any(|s| {
+                    matches!(
+                        s.kind,
+                        StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+                    )
+                }) {
+                    return None;
+                }
+                let mut changed = None;
+                for (i, s) in stmts.iter().enumerate() {
+                    if let Some(child) = self.loop_memory_stmt(s, locals, scope) {
+                        changed.get_or_insert_with(|| stmts.clone())[i] = child;
+                    }
+                }
+                let stmts = changed?;
+                out = Statement::new(
+                    StatementKind::SeqBlock {
+                        name: name.clone(),
+                        stmts,
+                    },
+                    stmt.span,
+                );
+            }
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                let rewrite = |e: &Expression| {
+                    let mut hit = false;
+                    for_each_sub_expr(e, &mut |sub| {
+                        if !hit && self.loop_memory_path(sub, locals, scope).is_some() {
+                            hit = true;
+                        }
+                    });
+                    if !hit {
+                        return None;
+                    }
+                    let mut result = e.clone();
+                    for_each_sub_expr_mut(&mut result, &mut |sub| {
+                        if let Some(folded) = self.loop_memory_path(sub, locals, scope)
+                            && let ExprKind::Index { expr, .. } = &mut sub.kind
+                        {
+                            **expr = folded;
+                        }
+                    });
+                    Some(result)
+                };
+                let l = rewrite(lvalue);
+                let r = rewrite(rvalue);
+                if l.is_none() && r.is_none() {
+                    return None;
+                }
+                out = Statement::new(
+                    StatementKind::BlockingAssign {
+                        lvalue: l.unwrap_or_else(|| lvalue.clone()),
+                        rvalue: r.unwrap_or_else(|| rvalue.clone()),
+                    },
+                    stmt.span,
+                );
+            }
+            _ => return None,
+        }
+        Some(out)
     }
 
     /// Execute a process's continuation: the current frame from its cursor, then
@@ -2987,6 +3317,11 @@ impl Simulator {
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
+            compiler.set_deferred_callables(
+                &self.module.deferred_function_bodies,
+                &self.module.deferred_task_bodies,
+                &self.module.packages,
+            );
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
@@ -3020,6 +3355,12 @@ impl Simulator {
             // The feedback walk is per-SPAN (cached below), not per
             // activation — collect_stmt_reads is too heavy to re-run on a
             // 10k-cycle stimulus loop.
+            let folded = self.loop_memory_stmt(
+                stmt,
+                &mut Vec::new(),
+                self.process_scope_hint.get(&pid).map(String::as_str),
+            );
+            let stmt = folded.as_ref().unwrap_or(stmt);
             let feedback = self.stmt_has_comb_feedback(stmt);
             let ok = !feedback && compiler.compile_stmt(stmt);
             if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some() {
@@ -3230,6 +3571,11 @@ impl Simulator {
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
+            compiler.set_deferred_callables(
+                &self.module.deferred_function_bodies,
+                &self.module.deferred_task_bodies,
+                &self.module.packages,
+            );
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
@@ -3436,7 +3782,12 @@ impl Simulator {
     pub(super) fn run_process_stmts_inner(&mut self, pid: usize, pc: &ProcCont) {
         let stmts: &[Statement] = pc.frame();
         self.current_pid = pid;
-        self.flush_deferred_asserts(pid);
+        // silimate: a continuation of the same activation is no flush point
+        // §16.4.2: the flush happens where the process resumes
+        // (`run_scheduled_process_inner`); every continuation of the running
+        // activation enters here too (a chained frame, an `always` body
+        // looping back to its event control), and is none.
+        // /silimate
         // Install THIS process's own instance scope as the resolution hint.
         // The hint is transient sibling-scope state: the previous process (or
         // a $display argument it evaluated) may have left its scope behind,
@@ -4651,6 +5002,8 @@ impl Simulator {
                     cont.extend(release);
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
+                    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+                    self.delay_pids.insert(pid, delay > 0);
                     self.event_queue.schedule(self.time + delay, pid, cont);
                     return;
                 }
@@ -4827,6 +5180,8 @@ impl Simulator {
                         }
                         // Chain the caller's tail rather than copying it (ProcCont::pushed_body).
                         let cont = pc.pushed_body(body, pc.start + i + 1);
+                        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+                        self.delay_pids.insert(pid, delay > 0);
                         if delay == 0 {
                             // `#0` — IEEE 1800-2017 §4.4.2.3: suspend into the
                             // Inactive region of the SAME time slot, not the
@@ -5171,6 +5526,18 @@ impl Simulator {
                 if self.wait_condition_true(condition) {
                     self.vc_release(condition);
                     self.cond_progress = self.cond_progress.wrapping_add(1);
+                    // silimate: a wait's statement that suspends runs as the process's next statement
+                    // §9.7.4: in `wait (c) @(posedge clk);` the statement
+                    // the condition guards is an event control. Run through
+                    // the synchronous `exec_statement` it could not park the
+                    // process, which was never resumed. It runs here as the
+                    // next statement, ahead of the rest.
+                    if self.stmt_is_blocking(body) {
+                        let cont = pc.pushed_body(body, pc.start + i + 1);
+                        self.continue_stmts_or_trampoline(pid, cont);
+                        return;
+                    }
+                    // /silimate
                     self.exec_statement(body);
                     i += 1;
                     continue;
@@ -5541,6 +5908,9 @@ impl Simulator {
                     if owns_loop_frame {
                         self.push_loop_frame();
                     }
+                    // silimate: a for-init variable hides the subroutine's same-named static local
+                    // Shown again when the loop's scope closes (`block_scope_exit`).
+                    let mut static_hidden = None;
                     for fi in init {
                         match fi {
                             ForInit::VarDecl {
@@ -5551,6 +5921,8 @@ impl Simulator {
                                 let rv = self.declare_for_init_var(data_type, &name.name, e);
                                 if let Some(frame) = self.local_stack.last_mut() {
                                     frame.insert(name.name.clone(), rv);
+                                    // silimate: a for-init variable hides the subroutine's same-named static local
+                                    self.hide_loop_static(&name.name, &mut static_hidden);
                                 } else {
                                     // §12.7.1: a variable declared in the for-init
                                     // has AUTOMATIC lifetime — it is local to the
@@ -5615,12 +5987,16 @@ impl Simulator {
                             .insert(for_key, (Arc::clone(&pc.stmts), f.clone()));
                         f
                     };
-                    if !saved.is_empty() {
+                    // silimate: a for-init variable hides the subroutine's same-named static local
+                    if !saved.is_empty() || static_hidden.is_some() {
                         self.block_scope_saves.push(BlockScopeSave {
                             frame_key: Self::frame_key(&frame),
                             frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
                             loop_vars: saved,
                             owns_loop_frame,
+                            // silimate: a for-init variable hides the subroutine's same-named static local
+                            static_hidden,
+                            // /silimate
                             ..Default::default()
                         });
                     }
@@ -5741,32 +6117,11 @@ impl Simulator {
                     }
                     self.inherit_fork_child_context(pid_child);
                     self.inherit_fork_m_scope(pid_child, pid, block_name.as_ref());
-                    // §9.4.5: a child that IS an intra-assignment delay
-                    // (`fork lhs = #d rhs; join_none`) captures its RHS at the
-                    // fork point — a join_none parent keeps running and may
-                    // overwrite RHS operands before the child would start, so
-                    // deferring the capture to child start-up reads the
-                    // post-fork values. Evaluate now and schedule the
-                    // pre-computed assignment directly at t+d.
-                    if let StatementKind::BlockingAssign { lvalue, rvalue } = &s.kind {
-                        if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
-                            let (saved, release) = self.capture_intra_rhs(lvalue, rhs, rvalue.span);
-                            let delay = self.eval_delay_ticks(d_expr);
-                            let assign = Statement::new(
-                                StatementKind::BlockingAssign {
-                                    lvalue: lvalue.clone(),
-                                    rvalue: saved,
-                                },
-                                s.span,
-                            );
-                            let mut cont = vec![assign];
-                            cont.extend(release);
-                            self.event_queue
-                                .schedule(self.time + delay, pid_child, cont.into());
-                            child_pids.insert(pid_child);
-                            continue;
-                        }
-                    }
+                    // §9.3.2, §9.4.5: a child that is an intra-assignment
+                    // delay (`fork lhs = #d rhs; join_none`) evaluates its
+                    // right-hand side when it starts, like any other child:
+                    // after the parent blocks or finishes, so it reads what
+                    // the parent wrote after the fork.
                     // Schedule children to run at current time, sharing one
                     // cached Arc<[Statement]> per static fork branch node.
                     let frame = self.blocking_cont_frame(&pc.stmts, s, 5, std::slice::from_ref(s));

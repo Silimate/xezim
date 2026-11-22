@@ -777,7 +777,8 @@ impl Simulator {
         // block declares its locals for the whole body. A block among other
         // statements declares them for itself only, and a design variable
         // of the same name may be read outside it: its locals are nested.
-        let body: &[Statement] = match fdecl.items.as_slice() {
+        let resolved = module.resolved_function_items(name, fdecl);
+        let body: &[Statement] = match resolved.as_ref() {
             [
                 Statement {
                     kind: StatementKind::SeqBlock { stmts, .. },
@@ -801,7 +802,7 @@ impl Simulator {
             .chain(nested.iter().cloned())
             .collect();
         let outer_shadow = FRAME_SHADOW.with(|c| c.replace(Some(shadow)));
-        for item in &fdecl.items {
+        for item in resolved.as_ref() {
             Self::collect_stmt_reads(item, module, &mut body_reads, &mut scratch_writes);
         }
         FRAME_SHADOW.with(|c| c.replace(outer_shadow));
@@ -1252,6 +1253,8 @@ impl Simulator {
         // skip it. Behaviour is identical: an empty map answers `false`.
         if !module.clocking_blocks.is_empty()
             && let Some(segs) = Self::flatten_member_path(expr)
+                // §27.6: `gen[1].cb.v` reads the block of copy 1.
+                .or_else(|| Self::clocking_term_segs(expr))
         {
             if segs.len() >= 2 {
                 let cb = segs[..segs.len() - 1].join(".");
@@ -2336,6 +2339,17 @@ impl Simulator {
         {
             return None;
         }
+        // §6.11.2, §23.3.3.2: a 2-state target drops X and Z on every write.
+        // A gate evaluates four-state bits and stores them as they are, so a
+        // `bit` input formal bound to a 4-state scalar (`.b(x1)`) read x.
+        if self
+            .signal_two_state
+            .get(dst.sig_id as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
         // Strip outer parens on rhs
         fn unparen(e: &Expression) -> &Expression {
             if let ExprKind::Paren(inner) = &e.kind {
@@ -2783,10 +2797,23 @@ impl Simulator {
     }
 
     /// Does the event expression need value evaluation for selects or calls?
+    /// §9.4.2, §8.4: a property reached through a selected class handle
+    /// (`ca[1].v`) lives in the object, not in a signal of the handle array,
+    /// so it is waited on as a class property and not through a select.
+    pub(super) fn event_member_of_class_handle(&self, e: &Expression) -> bool {
+        let ExprKind::MemberAccess { expr, .. } = &Self::peel_parens(e).kind else {
+            return false;
+        };
+        self.get_expr_type_name(expr)
+            .is_some_and(|class| self.module.classes.contains_key(&class))
+    }
+
     pub(super) fn event_expr_needs_value_wait(e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::event_expr_needs_value_wait(x),
+            ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Paren(x)
+            | ExprKind::Unary { operand: x, .. } => Self::event_expr_needs_value_wait(x),
             ExprKind::Binary { left, right, .. } => {
                 Self::event_expr_needs_value_wait(left) || Self::event_expr_needs_value_wait(right)
             }
@@ -2816,6 +2843,7 @@ impl Simulator {
         match &e.kind {
             ExprKind::Ident(h) => out.push((h, None)),
             ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::MemberAccess { expr: x, .. }
             | ExprKind::Paren(x)
             | ExprKind::Unary { operand: x, .. } => Self::collect_select_operands(x, out),
             ExprKind::Index { expr, index } => {
@@ -2934,7 +2962,7 @@ impl Simulator {
                 let Some(e) = &s.value_of else {
                     return false;
                 };
-                if !Self::event_expr_needs_value_wait(e) {
+                if !Self::event_expr_needs_value_wait(e) || self.event_member_of_class_handle(e) {
                     return false;
                 }
                 return s.edge != EdgeKind::AnyEdge
@@ -2946,6 +2974,7 @@ impl Simulator {
                     // exists. A scoped struct can have no container slot.
                     self.unpacked_dims_of(name) > 0
                         || Self::event_expr_needs_value_wait(e)
+                            && !self.event_member_of_class_handle(e)
                             && !self.event_struct_collection(name)
                             && self.module.var_decl_types.get(name).is_some_and(|dt| {
                                 matches!(
@@ -3247,6 +3276,21 @@ impl Simulator {
                         }
                         None => ee,
                     };
+                    // §14.3, §27.6: a clocking block through an indexed scope
+                    // (`@(gen[2].cb)`) is keyed by the copy's name.
+                    let ee_idx;
+                    let ee = match self.clocking_indexed_term_as_ident(&ee.expr) {
+                        Some(flat) => {
+                            ee_idx = crate::ast::stmt::EventExpr {
+                                edge: ee.edge,
+                                expr: flat,
+                                iff: ee.iff.clone(),
+                                span: ee.span,
+                            };
+                            &ee_idx
+                        }
+                        None => ee,
+                    };
                     // §23.6/§27.5: the same normalisation for a path that
                     // enters a scope through an INDEXED one
                     // (`always @(posedge gen_blk[0].u.sig)`).
@@ -3341,7 +3385,8 @@ impl Simulator {
                     // reached through handles (`vif.data[0]`), which only
                     // the waiting process can evaluate.
                     let selects = Self::event_expr_needs_value_wait(&ee.expr)
-                        && self.this_stack.last().copied().flatten().is_none();
+                        && self.this_stack.last().copied().flatten().is_none()
+                        && !self.event_member_of_class_handle(&ee.expr);
                     let value_expr = Self::peel_parens(&ee.expr);
                     let expand_structs = selects && !self.unpacked_struct_sens.is_empty();
                     let mut idents = Vec::new();
@@ -3395,15 +3440,19 @@ impl Simulator {
                         // strips the instance prefix to `cb`, so try the raw path
                         // first, then the resolved name.
                         let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                        // §27.6: `@(gen[1].cb)` names the block of copy 1.
+                        let scoped = Self::clocking_scoped_segs(h);
+                        let csegs = Self::clocking_segs(h, &scoped);
                         // §14.13 `@(cb.sig)` — sensitize to the hidden sample
                         // mirror so the event lands at the clocking edge and
                         // only when the sample actually changed.
-                        if segs.len() >= 2 {
-                            if let Some(cbk) = self.resolve_clocking_key(&segs[..segs.len() - 1]) {
+                        if csegs.len() >= 2 {
+                            if let Some(cbk) = self.resolve_clocking_key(&csegs[..csegs.len() - 1])
+                            {
                                 let hidden = Self::clocking_mirror_name(
                                     &self.module,
                                     &cbk,
-                                    segs[segs.len() - 1],
+                                    csegs[csegs.len() - 1],
                                 );
                                 if self.signal_name_to_id.contains_key(hidden.as_str()) {
                                     out.push(Sensitivity {
@@ -3452,7 +3501,7 @@ impl Simulator {
                             }
                         }
                         let cb_key = self
-                            .resolve_clocking_key(&segs)
+                            .resolve_clocking_key(&csegs)
                             .unwrap_or_else(|| sig.to_string());
                         if ee.edge.is_none() {
                             if let Some(s) = self.clocking_event_sens(&cb_key, iff.clone()) {
@@ -3659,7 +3708,8 @@ impl Simulator {
                     // no signal id, and fell into the delta-yield — returning
                     // at t=0 instead of waiting for the block's clock edge.
                     // Every `@cb;` sampling loop then spun without advancing.
-                    let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    let scoped = Self::clocking_scoped_segs(h);
+                    let segs = Self::clocking_segs(h, &scoped);
                     if let Some(s) = self
                         .resolve_clocking_key(&segs)
                         .and_then(|k| self.clocking_event_sens(&k, None))
@@ -4446,7 +4496,8 @@ impl Simulator {
                     || self.expr_selects_array_cell(left)
                     || self.expr_selects_array_cell(right)
             }
-            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+            ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
                 self.expr_selects_array_cell(x)
             }
             ExprKind::Binary { left, right, .. } => {
@@ -4513,6 +4564,7 @@ impl Simulator {
                 self.collect_selected_cells(right, out);
             }
             ExprKind::NamedArg { expr: Some(x), .. }
+            | ExprKind::MemberAccess { expr: x, .. }
             | ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
                 self.collect_selected_cells(x, out)
             }
@@ -4602,7 +4654,8 @@ impl Simulator {
             // so its waiter must resume in the Reactive region like `@(cb)`.
             EventControl::HierIdentifier(e) => {
                 if let ExprKind::Ident(h) = &e.kind {
-                    let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    let scoped = Self::clocking_scoped_segs(h);
+                    let segs = Self::clocking_segs(h, &scoped);
                     segs == ["__xz_default_clocking"] || self.resolve_clocking_key(&segs).is_some()
                 } else {
                     false
@@ -4621,13 +4674,15 @@ impl Simulator {
                 // edge's sample.
                 let rebased = self.vif_rebase_expr(&ee.expr);
                 let term = rebased.as_ref().unwrap_or(&ee.expr);
-                let flat = Self::member_chain_as_flat_ident_for_sens(term);
+                let flat = Self::member_chain_as_flat_ident_for_sens(term)
+                    .or_else(|| self.clocking_indexed_term_as_ident(term));
                 let term = flat.as_ref().unwrap_or(term);
                 if let ExprKind::Ident(h) = &term.kind {
                     // Interface-scoped `@(iface.cb)` / vif-aliased `@(vif.cb)`
                     // key on the (alias-resolved) dotted path; resolve_hier_name
                     // strips it to `cb`. Try both.
-                    let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    let scoped = Self::clocking_scoped_segs(h);
+                    let segs = Self::clocking_segs(h, &scoped);
                     if self.resolve_clocking_key(&segs).is_some() {
                         return true;
                     }
@@ -4663,20 +4718,21 @@ impl Simulator {
             }
             EventControl::HierIdentifier(e) => match &e.kind {
                 ExprKind::Ident(h) => {
-                    let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
-                    self.resolve_clocking_key(&segs)
+                    let scoped = Self::clocking_scoped_segs(h);
+                    self.resolve_clocking_key(&Self::clocking_segs(h, &scoped))
                 }
                 _ => None,
             },
             EventControl::EventExpr(exprs) if exprs.len() == 1 && exprs[0].edge.is_none() => {
                 let rebased = self.vif_rebase_expr(&exprs[0].expr);
                 let term = rebased.as_ref().unwrap_or(&exprs[0].expr);
-                let flat = Self::member_chain_as_flat_ident_for_sens(term);
+                let flat = Self::member_chain_as_flat_ident_for_sens(term)
+                    .or_else(|| self.clocking_indexed_term_as_ident(term));
                 let term = flat.as_ref().unwrap_or(term);
                 match &term.kind {
                     ExprKind::Ident(h) => {
-                        let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
-                        self.resolve_clocking_key(&segs)
+                        let scoped = Self::clocking_scoped_segs(h);
+                        self.resolve_clocking_key(&Self::clocking_segs(h, &scoped))
                     }
                     _ => None,
                 }

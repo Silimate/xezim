@@ -331,8 +331,14 @@ mod assoc_elem_select_read;
 mod assoc_packed_elem;
 #[path = "collections/packed_struct_member_idx_select.rs"]
 mod packed_struct_member_idx_select;
+#[path = "collections/real_unpacked_concat_items.rs"]
+mod real_unpacked_concat_items;
+#[path = "collections/review_unpacked_concat_1322.rs"]
+mod review_unpacked_concat_1322;
 #[path = "collections/unpacked_case_compare.rs"]
 mod unpacked_case_compare;
+#[path = "collections/unpacked_concat_fixed_row.rs"]
+mod unpacked_concat_fixed_row;
 #[path = "collections/unpacked_row_pattern_store.rs"]
 mod unpacked_row_pattern_store;
 #[path = "collections/unpacked_row_pattern_followups.rs"]
@@ -383,6 +389,12 @@ mod dyn_array_of_dyn_array_rows;
 
 #[path = "collections/pattern_array_items.rs"]
 mod pattern_array_items;
+#[path = "collections/pattern_replication_evaluated_once.rs"]
+mod pattern_replication_evaluated_once;
+#[path = "collections/pattern_struct_array_and_slice_items.rs"]
+mod pattern_struct_array_and_slice_items;
+#[path = "collections/pattern_struct_element_items.rs"]
+mod pattern_struct_element_items;
 #[path = "collections/struct_concat_forms.rs"]
 mod struct_concat_forms;
 #[path = "collections/queue_front_shift.rs"]
@@ -397,3 +409,7 @@ mod pattern_self_read;
 mod pattern_self_read_scopes;
 #[path = "collections/queue_pop_drain_loop_1210.rs"]
 mod queue_pop_drain_loop_1210;
+#[path = "collections/unpacked_concat_targets.rs"]
+mod unpacked_concat_targets;
+#[path = "collections/concat_operand_effects.rs"]
+mod concat_operand_effects;

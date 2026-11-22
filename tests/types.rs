@@ -207,6 +207,8 @@ mod nested_packed_typedefs;
 mod nonzero_based_vector_reads;
 #[path = "types/nonzero_based_vector_writes.rs"]
 mod nonzero_based_vector_writes;
+#[path = "types/one_bit_operator_condition_width.rs"]
+mod one_bit_operator_condition_width;
 #[path = "types/package_base_constraint_inherited.rs"]
 mod package_base_constraint_inherited;
 #[path = "types/package_scope_resolution.rs"]
@@ -233,10 +235,14 @@ mod packed_elem_shift_context_width;
 mod packed_element_range_select;
 #[path = "types/packed_local_nested_select.rs"]
 mod packed_local_nested_select;
+#[path = "types/packed_middle_dim_slice_width.rs"]
+mod packed_middle_dim_slice_width;
 #[path = "types/packed_multidim_unpacked_select.rs"]
 mod packed_multidim_unpacked_select;
 #[path = "types/packed_struct_array_elem_member_in_instance.rs"]
 mod packed_struct_array_elem_member_in_instance;
+#[path = "types/packed_decl_instance_param_swap.rs"]
+mod packed_decl_instance_param_swap;
 #[path = "types/packed_struct_array_elem_write.rs"]
 mod packed_struct_array_elem_write;
 #[path = "types/packed_struct_array_local.rs"]
@@ -293,10 +299,14 @@ mod shift_context_width;
 mod shift_width_and_scope_hint;
 #[path = "types/compiled_member_operand_width.rs"]
 mod compiled_member_operand_width;
+#[path = "types/shortreal_binary32.rs"]
+mod shortreal_binary32;
 #[path = "types/signedness_and_power_context.rs"]
 mod signedness_and_power_context;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
 mod size_cast_context_and_fn_return_default;
+#[path = "types/size_cast_struct_param_field.rs"]
+mod size_cast_struct_param_field;
 #[path = "types/static_typedef_singleton.rs"]
 mod static_typedef_singleton;
 #[path = "types/stmt_local_scoped_decls.rs"]
@@ -311,8 +321,11 @@ mod struct_member_array_of_structs_copy;
 mod submodule_struct_array_member_writes;
 #[path = "types/struct_member_typedef_element_dims.rs"]
 mod struct_member_typedef_element_dims;
+#[path = "types/typedef_unpacked_array_member.rs"] mod typedef_unpacked_array_member;
 #[path = "types/struct_named_patterns.rs"]
 mod struct_named_patterns;
+#[path = "types/struct_return_variable_whole_struct.rs"]
+mod struct_return_variable_whole_struct;
 #[path = "types/struct_unpacked_array_member.rs"]
 mod struct_unpacked_array_member;
 #[path = "types/submodule_packed_struct_member_contassign.rs"]
@@ -333,8 +346,12 @@ mod task_input_context_width;
 mod type_param_bound_to_specialization;
 #[path = "types/type_param_static_property.rs"]
 mod type_param_static_property;
+#[path = "types/type_param_block_local_dims.rs"]
+mod type_param_block_local_dims;
 #[path = "types/type_param_struct_per_instance.rs"]
 mod type_param_struct_per_instance;
+#[path = "types/type_param_struct_nontop_typedef.rs"]
+mod type_param_struct_nontop_typedef;
 #[path = "types/typed_parameter_value_context.rs"]
 mod typed_parameter_value_context;
 #[path = "types/typedef_declaring_scope.rs"]
@@ -347,6 +364,8 @@ mod typedef_specialization_dispatch;
 mod typedef_two_state_and_untyped_param_sign;
 #[path = "types/typename_real_expressions.rs"]
 mod typename_real_expressions;
+#[path = "types/typename_value_parameters.rs"]
+mod typename_value_parameters;
 #[path = "types/typeparam_default_resolution.rs"]
 mod typeparam_default_resolution;
 #[path = "types/typeparam_typeid_create.rs"]
@@ -472,8 +491,12 @@ mod inside_const_members;
 mod issue_233_parenless_calls;
 #[path = "types/multi_dim_unpacked_arrays.rs"]
 mod multi_dim_unpacked_arrays;
+#[path = "types/nettype_nested_struct_drivers.rs"]
+mod nettype_nested_struct_drivers;
 #[path = "types/nettype_struct_variable_driver.rs"]
 mod nettype_struct_variable_driver;
+#[path = "types/nettype_undriven.rs"]
+mod nettype_undriven;
 #[path = "types/package_data_members_in_subroutine.rs"]
 mod package_data_members_in_subroutine;
 #[path = "types/package_param_declared_signedness.rs"]
@@ -637,6 +660,8 @@ mod inlined_typedef_packed_array_dims;
 mod struct_param_member_select_bounds;
 #[path = "types/instance_local_typedef_struct_array.rs"]
 mod instance_local_typedef_struct_array;
+#[path = "types/instance_local_syscall_dims.rs"]
+mod instance_local_syscall_dims;
 
 #[path = "types/scoped_typed_assignment_pattern.rs"]
 mod scoped_typed_assignment_pattern;
@@ -765,6 +790,8 @@ mod packed_struct_array_member_reads_1088;
 mod struct_negative_array_pattern;
 #[path = "types/negative_index_compiled_blocks.rs"]
 mod negative_index_compiled_blocks;
+#[path = "types/signed_index_local_write.rs"]
+mod signed_index_local_write;
 #[path = "types/signed_literal_pattern_index.rs"]
 mod signed_literal_pattern_index;
 #[path = "types/literal_pattern_key_sites.rs"]
@@ -811,6 +838,8 @@ mod inside_compiled_forms;
 mod nettype_declaration_initializer_drivers;
 #[path = "types/unsized_decimal_width_1120.rs"]
 mod unsized_decimal_width_1120;
+#[path = "types/two_state_struct_member_array_init.rs"]
+mod two_state_struct_member_array_init;
 #[path = "types/negative_bound_packed_slice_write_1193.rs"]
 mod negative_bound_packed_slice_write_1193;
 #[path = "types/review_pattern_type_keys_params.rs"]
@@ -829,3 +858,38 @@ mod pattern_type_key_scoped_and_lexical_1290;
 mod struct_element_return_1310;
 #[path = "types/review_pattern_type_keys_imports.rs"]
 mod review_pattern_type_keys_imports;
+#[path = "types/real_to_integral_cast.rs"]
+mod real_to_integral_cast;
+#[path = "types/compiled_atom_cast_operand.rs"]
+mod compiled_atom_cast_operand;
+#[path = "types/real_into_integral_64.rs"]
+mod real_into_integral_64;
+#[path = "types/real_case_items.rs"]
+mod real_case_items;
+#[path = "types/real_items_integral_aggregates.rs"]
+mod real_items_integral_aggregates;
+#[path = "types/real_fill_literal_stores.rs"]
+mod real_fill_literal_stores;
+#[path = "types/local_struct_signed_members.rs"]
+mod local_struct_signed_members;
+#[path = "types/struct_array_member_defaults.rs"]
+mod struct_array_member_defaults;
+#[path = "types/union_real_member.rs"]
+mod union_real_member;
+#[path = "types/local_struct_member_arrays.rs"]
+mod local_struct_member_arrays;
+#[path = "types/struct_parameter_percent_p.rs"]
+mod struct_parameter_percent_p;
+#[path = "types/typename_typedef_packed_dims.rs"]
+mod typename_typedef_packed_dims;
+#[path = "types/imported_constant_dimension_type_collision.rs"]
+mod imported_constant_dimension_type_collision;
+
+#[path = "types/class_scope_type_param_member_typedef.rs"]
+mod class_scope_type_param_member_typedef;
+#[path = "types/review_packed_slice_partial_range.rs"]
+mod review_packed_slice_partial_range;
+#[path = "types/review_struct_param_cast_in_instance.rs"]
+mod review_struct_param_cast_in_instance;
+#[path = "types/shortreal_storage_1463.rs"]
+mod shortreal_storage_1463;

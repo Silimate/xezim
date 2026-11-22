@@ -702,3 +702,5 @@ mod deferred_assertion_counts;
 mod stringify_macro_chain;
 #[path = "misc/continuous_assign_time_scope.rs"]
 mod continuous_assign_time_scope;
+#[path = "misc/relax_wildcard_import_conflict.rs"]
+mod relax_wildcard_import_conflict;

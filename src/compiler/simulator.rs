@@ -1785,6 +1785,17 @@ impl CombEntry {
             CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
         ) && (self.cold.read_signal_ids.iter()).any(|r| self.cold.write_signal_ids.contains(r))
     }
+
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// A level-sensitive block that writes no signal, seen only through its
+    /// side effects (immediate assertions, `$display`).
+    fn is_observer(&self) -> bool {
+        matches!(
+            self.item,
+            CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+        ) && self.cold.write_signal_ids.is_empty()
+    }
+    // /silimate
 }
 
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
@@ -10683,6 +10694,16 @@ pub struct Simulator {
     /// re-queue it. Other drivers of the vector still do. Rebuilt with the
     /// levels and whenever its length differs from `comb_entries`.
     comb_self_exempt: Vec<bool>,
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// Per comb entry: 1 for a block `CombEntry::is_observer` accepts, 2
+    /// while a settle holds it, else 0. Rebuilt whenever its length differs
+    /// from `comb_entries`.
+    #[serde(skip)]
+    comb_observer: Vec<u8>,
+    /// Whether `comb_observer` names any block.
+    #[serde(skip)]
+    comb_observer_any: bool,
+    // /silimate
     /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
     /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
     /// entries run on worker threads in the parallel BSP level dispatch.

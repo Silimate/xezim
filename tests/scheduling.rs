@@ -558,6 +558,9 @@ mod intra_delay_array_items;
 mod review_intra_delay_array_items;
 #[path = "scheduling/level_always_waits_for_writer.rs"]
 mod level_always_waits_for_writer;
+// silimate: a level-sensitive block that writes nothing runs once the settle converges
+#[path = "scheduling/observer_runs_after_settle.rs"]
+mod observer_runs_after_settle;
 #[path = "scheduling/time0_effect_entries_1314.rs"]
 mod time0_effect_entries_1314;
 #[path = "scheduling/sva_default_actuals_1309.rs"]

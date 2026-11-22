@@ -85,6 +85,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   Active and Inactive regions alternate until both are empty. The children
   had started after the NBAs, so a child waiting for an edge one of those
   NBAs makes never saw it. (#455)
+* A process on a clock that a continuous assignment copies
+  (`assign c2 = clk;`, `@(posedge c2)`) runs at the edge, before the NBAs
+  its peers on `clk` queue there (§4.4.2.2, §4.5, §10.3). It ran after
+  those NBAs, and read their new values, while a level-sensitive `wait` was
+  pending anywhere or when a delayed nonblocking assignment fell due at the
+  edge. A `wait` on the copy itself resumed only after them too. (#458)
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the

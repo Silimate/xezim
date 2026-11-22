@@ -169,3 +169,24 @@ endmodule
         );
     }
 }
+
+/// §7.4.6: a slice of a fixed-size array keeps every position it names in an
+/// unpacked array concatenation, an element past the end reading as the
+/// element default, so `q = {a[0+:3]}` on `logic [7:0] a[2]` pushes three
+/// elements and the operand after it stays in place.
+#[test]
+fn fixed_array_slice_past_the_end_keeps_its_positions() {
+    let src = r#"
+module tb;
+  logic [7:0] a[2] = '{8'h11, 8'h22};
+  logic [7:0] q[$];
+  initial begin
+    q = {a[0+:3], 8'h99};
+    $display("T|%0d %h %h %h %h", q.size(), q[0], q[1], q[2], q[3]);
+  end
+endmodule
+"#;
+    let out = lines(src);
+    let t: Vec<_> = out.iter().filter(|l| l.starts_with("T|")).collect();
+    assert_eq!(t, ["T|4 11 22 xx 99"]);
+}

@@ -41,7 +41,13 @@ use serde::ser::{SerializeSeq, Serializer};
 // §14.16.2: Simulator::clocking_select_due, the pending clocking select drives.
 // §9.4.2 / §9.3.2: Simulator::prev_wide holds a wide signal only once it is sampled; the
 // frame cache of a synchronous fork child is rebuilt, not carried (#721).
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x11";
+// Preserve declaration-scope typedefs across procedural shadowing (§6.18).
+// §10.9.1, §26.3 / §9.4.2: named assignment pattern keys carry a bound type name; the guard
+// and value expressions of an event term are shared.
+// §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
+// §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
+// silimate: §16.4.2: DeferredReport::inst and ::tag, tallied when the report matures.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x15";
 
 #[derive(Default)]
 struct Session {
@@ -680,6 +686,7 @@ checkpoint_once_cells!(
     param_leaf_index_cell,
     var_decl_leaf_index_cell,
     vif_capable_statics,
+    scoped_unpacked_leaves,
     iface_instance_paths,
     iface_by_token,
     iface_path_parts,
@@ -1264,6 +1271,7 @@ checkpoint_state!(
     comb_plan_abortn,
     comb_time0_deferred_done,
     comb_time0_fired,
+    comb_time0_held,
     compiled_class_method_ids,
     compiled_fast_calls,
     compiled_fast_static_calls,
@@ -1294,6 +1302,10 @@ checkpoint_state!(
     deferred_asserts,
     deferred_comb_pool,
     deferred_proc_entries,
+    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+    delay_pids,
+    delay_resumed,
+    // /silimate
     delayed_nba,
     delayed_nba_queue,
     delayed_slice_chains,
@@ -1673,6 +1685,7 @@ checkpoint_state!(
     ts_wregs,
     ts_wregs8,
     ts_xregs,
+    declaration_typedefs,
     type_tables_gen,
     typedef_layouts_by_width,
     typedef_target_cache,

@@ -390,7 +390,23 @@ fn method_boost_enabled() -> bool {
 // declared with an ascending or offset range does not inline.
 // §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
 // site, and boxed optional delays, initializers and case item patterns (#721).
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_308c;
+// §12.5: an unsigned item makes the entire case comparison unsigned.
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
+// and a subroutine or block selecting a packed array of a named signed type does not compile.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+// §11.8.2: preserve integral arithmetic in constant operands of real comparisons.
+// §6.24.1: a signing conversion consumes an unsized fill literal.
+// §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
+// §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
+// §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
+// silimate: bump the method-cache salt past upstream's for the local-collection element width fix
+// §11.6.1, §7.10: an element read of a method-local queue or dynamic array has its element's
+// width, so a compare of two of them no longer resizes both to one bit. On an upstream bump,
+// take upstream's value and bump it once more.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3097;
+// /silimate
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
@@ -932,6 +948,10 @@ fn dpi_trampoline_cc_command(
     cmd.push(so.into());
     cmd.push(c.into());
     cmd
+}
+
+pub(crate) fn foreign_libraries_configured() -> bool {
+    !configured_dpi_libs().is_empty() || !configured_vpi_libs().is_empty()
 }
 
 fn configured_dpi_libs() -> Vec<String> {
@@ -1765,11 +1785,25 @@ impl CombEntry {
             CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
         ) && (self.cold.read_signal_ids.iter()).any(|r| self.cold.write_signal_ids.contains(r))
     }
+
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// A level-sensitive block that writes no signal, seen only through its
+    /// side effects (immediate assertions, `$display`).
+    fn is_observer(&self) -> bool {
+        matches!(
+            self.item,
+            CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+        ) && self.cold.write_signal_ids.is_empty()
+    }
+    // /silimate
 }
 
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntryCold {
+    /// Lexical instance of a continuous RHS that may enter the interpreter.
+    /// An empty scope selects the top module independently of the waking process.
+    rhs_time_scope: Option<Arc<str>>,
     /// Preferred hierarchical scope for resolving unqualified identifiers.
     scope_hint: Option<String>,
     /// Pre-resolved signal IDs for reads (for fast dependency lookup).
@@ -1789,6 +1823,9 @@ struct CombEntryCold {
     /// compiled form counts with an `Insn::CovHit`). Never cached.
     #[serde(skip)]
     cov: Option<u32>,
+    /// §9.2.2.2: evaluating the entry is observable beyond its outputs
+    /// (see `time0_effects`); it waits for the time-0 start batch.
+    time0_effects: bool,
 }
 
 // §9.2.2.2.1 (#844): rebuild dependency tables made before packed-region
@@ -1824,7 +1861,21 @@ struct CombEntryCold {
 // §6.21, §13.4.2, §7.4.1: continuous assigns calling a static function whose local constant
 // selects write whole before a read compile; a call selecting an ascending or offset-range
 // variable of its callee stays interpreted.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB044";
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §6.24.1: a cast to a typedef of real is a real operand of a continuous assignment.
+// §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
+// not a read of its caller.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+// §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
+// §6.24.1: compiled sign conversions use the self-determined operand width.
+// §10.9.1: packed array default drivers retain their element type.
+// §20.8.1, §7.4.1: `$clog2` of a constant folds, and a select bound that does
+// not fold still maps its label to a physical bit.
+// §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
+// §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
+// process, not as a combinational entry.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB054";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
@@ -2098,17 +2149,17 @@ struct SensitivityId {
     /// LRM §9.4.2.3 `iff` guard for this event term: the edge only counts
     /// when this expression is true at edge time. `None` for an unguarded
     /// term. Consulted by the procedural `@`-event wake path; the always-
-    /// block edge paths carry it but do not yet evaluate it. Boxed, like
-    /// `value_of`: almost every term has neither, and an inline
+    /// block edge paths carry it but do not yet evaluate it. Shared with
+    /// the other operands of this event expression. An inline
     /// `Option<Expression>` made each term hundreds of bytes (68 MB of edge
     /// sensitivity lists on a 64k-cell DRAM).
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// §9.4.2: for a NON-TRIVIAL event expression (`@(a + b)`), the term's
     /// full expression. Operand-signal edges only COUNT when this
     /// expression's value differs from its value at arm time (stored in
     /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
     /// fire. `None` for plain signal/edge terms.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
     /// Scheduling depth of the NAME this term was written with (see
     /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
     wake_rank: u8,
@@ -2132,9 +2183,9 @@ struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
     /// See `SensitivityId::iff` — carried through name→id resolution.
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// See `SensitivityId::value_of` — carried through name→id resolution.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -3195,6 +3246,7 @@ mod signal_commits;
 mod statement_assignments;
 mod statements;
 mod system_tasks;
+mod time0_effects;
 mod two_state;
 mod type_metadata;
 mod udp;
@@ -4215,6 +4267,13 @@ struct DeferredReport {
     class_context: Option<String>,
     /// §20.12: what an assertion control selects the assertion by.
     ctl: CtlIdent,
+    // silimate: count a deferred assertion when its report matures, not when it is queued
+    /// The assertion's `assert_insts` entry and kind tag (0 assert, 1 assume,
+    /// 2 cover). Its outcome is counted there when the report matures; a
+    /// flushed or killed report counts as no attempt (§16.4.2, §20.12).
+    inst: usize,
+    tag: u8,
+    // /silimate
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -4354,6 +4413,11 @@ struct SvaClockedSite {
     /// §16.14.6.2: matured instances, each the slot values it captured,
     /// waiting for the next tick of the leading clock.
     matured: Vec<SvaEnv>,
+    // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+    /// The time of the last tick. An instance that matures later in that
+    /// time step starts its attempt at that tick, not the next one.
+    tick_time: Option<u64>,
+    // /silimate
     /// The property has its own `disable iff` (§16.15: the scope's
     /// `default disable iff` does not apply).
     explicit_disable: bool,
@@ -5473,7 +5537,9 @@ struct BlockScopeSave {
     /// The subroutine's `static` locals that a non-static block variable of
     /// the same name hides, as `static_local_syncs` depth and the
     /// `(name, key)` entries taken out of that frame until the block ends.
-    static_hidden: Option<(usize, Vec<(String, String)>)>,
+    // silimate: a for-init variable hides the subroutine's same-named static local
+    // Each entry keeps the position it was taken from.
+    static_hidden: Option<(usize, Vec<(usize, (String, String))>)>,
     /// `next_pid` at entry: a block that forked keeps its collection storage
     /// (a child may still use it).
     pid_mark: usize,
@@ -7135,19 +7201,18 @@ impl SignalMap {
             if let Some(name) = k.strip_suffix(".size") {
                 let name = name.to_string();
                 let prev = self.map.insert(k, v);
-                self.note_sized(&name);
+                self.register_element_run(&name, true);
                 return prev;
             }
         }
         self.map.insert(k, v)
     }
 
-    /// `name.size` was stored: `name` is a queue or dynamic array, so its
-    /// elements are kept in a run from now on. Elements the map already
-    /// holds move into it (the contiguous ones, from the lowest index).
-    fn note_sized(&mut self, name: &str) {
+    /// Store contiguous elements in a run. Only a queue or dynamic array
+    /// with a `.size` key keeps its run after the last element is removed.
+    fn register_element_run(&mut self, name: &str, sized: bool) {
         if let Some(run) = self.runs.get_mut(name) {
-            run.sized = true;
+            run.sized |= sized;
             return;
         }
         let outer = Self::outer_of(name);
@@ -7164,7 +7229,7 @@ impl SignalMap {
         };
         held.sort_unstable();
         let mut run = ElemRun {
-            sized: true,
+            sized,
             strays: held.len() as u32,
             ..ElemRun::default()
         };
@@ -8117,6 +8182,13 @@ pub struct Simulator {
     sva_abort_step: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
+    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
+    /// `vpi_slot_post_nba` is running the slot's leftover cbNBASynch and
+    /// cbReadWriteSynch routines: the delta one opens matures the `#0`
+    /// deferred reports before its Reactive work.
+    #[serde(skip)]
+    vpi_slot_maturing: bool,
+    // /silimate
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
     /// is `cb_name → (signal_name → pre-edge value)`. Updated in
     /// `tick_clocking_blocks` just before the clock signal's posedge
@@ -8253,7 +8325,7 @@ pub struct Simulator {
     /// has sampled — the clocking event, and so its guard, occurs after the
     /// clockvars update. Each entry holds the waiter and the guard of the
     /// term that fired; see `resolve_deferred_clocking_guards`.
-    deferred_clocking_guarded: Vec<(EventWaiter, Box<Expression>)>,
+    deferred_clocking_guarded: Vec<(EventWaiter, Rc<Expression>)>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
@@ -8356,6 +8428,15 @@ pub struct Simulator {
     /// (#1149) Whether the `u32::MAX` marker (an entry with no resolvable
     /// read) is in `deferred_proc_entries`.
     deferred_proc_unres: bool,
+    // silimate: always_comb / always @* blocks wait for the writer to yield too
+    /// The buffer of a deferring settle's changed signals: the ones its
+    /// process wrote (the dirty seeds), then the outputs its eager entries
+    /// changed. A deferred `always` entry lists these, not every signal it
+    /// reads: re-dirtying a read that did not change (`x` of
+    /// `always_comb y = f(x)` woken by `g`) would wake blocks the change
+    /// never woke (`always @* z = f(x)`, whose sensitivity is `x` alone).
+    defer_changed: Vec<usize>,
+    // /silimate
     /// (#t0-comb-defer) Compile-time process starts still unrun in the
     /// time-0 slot. A commercial simulator queues the cont-assign /
     /// port-connect update events that a time-0 process write schedules
@@ -8508,6 +8589,10 @@ pub struct Simulator {
     /// before `bind_static_vif` looks at an assignment.
     #[serde(skip)]
     vif_capable_statics: std::cell::OnceCell<HashSet<String>>,
+    /// The leaf names of the unpacked variables declared below a scope
+    /// (`arr` of `bus.arr`): the prefilter of `vif_aggregate_canon`.
+    #[serde(skip)]
+    scoped_unpacked_leaves: std::cell::OnceCell<HashSet<String>>,
     /// False once start-up found no such static (`vif_capable_statics`
     /// empty): the one-byte test every blocking assignment makes.
     may_bind_static_vif: bool,
@@ -8899,6 +8984,26 @@ pub struct Simulator {
     /// Pids whose continuation `continue_stmts_or_trampoline` rescheduled
     /// with their context left live on the simulator.
     trampolined_pids: HashSet<usize>,
+    // silimate: a continuation of the same activation is no flush point
+    /// §16.4.2: pids whose next `run_process_stmts_inner` entry continues the
+    /// running activation (`continue_stmts_or_trampoline`), not a resume
+    /// after a suspension: their pending deferred reports and procedural
+    /// assertion instances stay queued.
+    #[serde(skip)]
+    cont_pids: HashSet<usize>,
+    // /silimate
+    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+    /// Pids parked on a delay (`#d`, `#0`, an intra-assignment delay), each
+    /// with whether the delay moves time on (`#0` does not). Checkpointed,
+    /// with the queued continuations.
+    delay_pids: HashMap<usize, bool>,
+    /// §16.14.6: pids whose running activation went on after a delay that
+    /// moved time on, not at an event control: a procedural concurrent
+    /// assertion they reach first is not at its clock's tick, so its first
+    /// attempt waits for the next one. A `#0` stays in the time step of the
+    /// event that woke the procedure.
+    delay_resumed: HashSet<usize>,
+    // /silimate
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
     /// `Simulator` exactly like `local_stack`, and moved into/out of a
@@ -10030,6 +10135,12 @@ pub struct Simulator {
     meta_pending: usize,
     /// Call plans by `Arc<ClassMethod>` address (see `MethodCallPlan`).
     method_plans: std::cell::RefCell<HashMap<usize, std::rc::Rc<MethodCallPlan>>>,
+    /// Declaration-scope typedefs before a procedural typedef shadows a name.
+    /// The tables share storage until a write (§6.18, §23.9).
+    declaration_typedefs: Option<(
+        super::elaborate::TypedefTable,
+        super::elaborate::SharedMap<DataType>,
+    )>,
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
     /// type tables at run time (see `MethodCallPlan`).
     type_tables_gen: u64,
@@ -10505,6 +10616,14 @@ pub struct Simulator {
     /// address), so the re-entrant evaluation reads the slice itself.
     #[serde(skip)]
     packed_named_sign_guard: usize,
+    /// §7.4.1: whether the design declares a signed integral type by name
+    /// at all. Only then can a subroutine or block variable be a packed
+    /// array whose elements are signed, so only then does an element select
+    /// of one consult its declaration.
+    packed_named_signed_types: bool,
+    /// §7.2, §7.4.1: names of structure members that are packed arrays of a
+    /// named signed type (see its construction).
+    packed_named_signed_members: HashSet<String>,
     /// The arithmetic or bitwise operand (its address) being evaluated
     /// whose parent operator found no context-determined shift in it
     /// (`has_context_shift`), so its own operator does not scan its operands
@@ -10602,6 +10721,16 @@ pub struct Simulator {
     /// re-queue it. Other drivers of the vector still do. Rebuilt with the
     /// levels and whenever its length differs from `comb_entries`.
     comb_self_exempt: Vec<bool>,
+    // silimate: a level-sensitive block that writes nothing runs once the settle converges
+    /// Per comb entry: 1 for a block `CombEntry::is_observer` accepts, 2
+    /// while a settle holds it, else 0. Rebuilt whenever its length differs
+    /// from `comb_entries`.
+    #[serde(skip)]
+    comb_observer: Vec<u8>,
+    /// Whether `comb_observer` names any block.
+    #[serde(skip)]
+    comb_observer_any: bool,
+    // /silimate
     /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
     /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
     /// entries run on worker threads in the parallel BSP level dispatch.
@@ -10666,6 +10795,10 @@ pub struct Simulator {
     comb_time0_deferred: Vec<CombEntry>,
     /// Latches once the deferred empty-sensitivity always_comb blocks fired.
     comb_time0_deferred_done: bool,
+    /// §9.2.2.2: the entries with time-0 effects and the items taken out of
+    /// them (a `Noop` stands in) until every process has started; see
+    /// `hold_time0_effect_entries`.
+    comb_time0_held: Vec<(usize, CombItem)>,
     /// Reverse index: signal_id → list of comb_entry indices that read
     /// this signal. CSR layout — `comb_dep_entries[comb_dep_offsets[id]
     /// .. comb_dep_offsets[id+1]]` gives the dependents of signal `id`.
@@ -10918,6 +11051,11 @@ pub struct Simulator {
     /// While this is non-zero, procedural comb entries triggered mid-process
     /// are parked in `deferred_comb` and run at the process's exit instead.
     proc_depth: u32,
+    /// Nesting of `run_process_stmts` activations on the native stack. A
+    /// process that calls a task which can wait but does not resumes the
+    /// caller from inside the callee's activation, so a call chain that never
+    /// waits nests one level per call (see `process_nesting_exceeded`).
+    stmts_depth: u32,
     /// (comb entry index, outputs it produced) for procedural entries that ran
     /// while a process was mid-flight. Checked for clobbering at process exit.
     deferred_comb: Vec<(usize, Vec<(usize, Value)>)>,
@@ -11530,6 +11668,10 @@ pub struct Simulator {
     edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
+    /// A combinational entry is being evaluated outside the settle
+    /// (`release_time0_held`): its deferred assertion reports are the
+    /// block's, as in the settle (`queue_deferred_assert`).
+    comb_direct_eval: bool,
     /// Call-site (expression span start) → per activation scope (see
     /// `sampled_scope`) → index into `sampled_watches`. Every instance of a
     /// child module shares the call's span, so the scope tells them apart.
@@ -11545,6 +11687,13 @@ pub struct Simulator {
     /// and call a sampled-value function: (body, scope, edge code, clock id),
     /// consumed by `register_sampled_watches` like the edge blocks.
     proc_sampled_blocks: Vec<(Statement, String, u8, usize)>,
+    // silimate: a procedural assertion in an always process samples its time-0 defaults too
+    /// The name segments the concurrent assertions in every always block
+    /// spell, taken as the blocks are classified: one that runs as a
+    /// process is in no list `capture_sampled_defaults` reads.
+    #[serde(skip)]
+    always_sva_names: HashSet<String>,
+    // /silimate
     /// True while `register_sampled_watches` pre-registers the sites.
     sampled_registering: bool,
 }
@@ -13535,7 +13684,11 @@ pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> libc::c_
         info.message = vpi_err_scratch(&msg);
         info.product = b"xezim\0".as_ptr() as *mut libc::c_char;
         info.code = b"\0".as_ptr() as *mut libc::c_char;
-        info.file = std::ptr::null_mut();
+        // §38.3: every string field points at a string. An error has no
+        // source file, so `file` is empty rather than NULL: cocotb logs
+        // `file` and `product` as C strings, and a NULL `file` crashed it
+        // on the first error it checked.
+        info.file = b"\0".as_ptr() as *mut libc::c_char;
         info.line = 0;
     }
     level

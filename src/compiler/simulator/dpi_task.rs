@@ -398,6 +398,8 @@ impl Simulator {
         let Some((owner, cont)) = self.dpi_park_target() else {
             return self.dpi_suspend();
         };
+        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+        self.delay_pids.insert(owner, ticks > 0);
         if ticks == 0 {
             // §4.4.2.3: `#0` resumes in the Inactive region.
             self.inactive_queue.push((owner, cont));

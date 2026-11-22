@@ -228,6 +228,76 @@ impl Simulator {
         }
     }
 
+    /// §16.8, §16.12: the actual argument of each formal of the named
+    /// sequence or property `key` in an instance with the arguments `args`:
+    /// bound by position or by name (`.x(a)`), and the declaration's default
+    /// actual argument for a formal the instance leaves out. A default may
+    /// name an earlier formal, which takes that formal's actual.
+    pub(super) fn sva_bind_actuals(
+        &self,
+        key: &str,
+        args: &[Expression],
+    ) -> HashMap<String, Expression> {
+        let formals: &[String] = self
+            .module
+            .property_params
+            .get(key)
+            .map_or(&[], |v| v.as_slice());
+        let mut map: HashMap<String, Expression> = HashMap::default();
+        for (i, a) in args.iter().enumerate() {
+            match &a.kind {
+                ExprKind::NamedArg { name, expr } => {
+                    if let Some(e) = expr
+                        && !matches!(e.kind, ExprKind::Empty)
+                    {
+                        map.insert(name.name.clone(), (**e).clone());
+                    }
+                }
+                ExprKind::Empty => {}
+                _ => {
+                    if let Some(f) = formals.get(i) {
+                        map.insert(f.clone(), a.clone());
+                    }
+                }
+            }
+        }
+        if let Some(defaults) = self.module.property_param_defaults.get(key) {
+            for (f, d) in formals.iter().zip(defaults) {
+                if let Some(d) = d
+                    && !map.contains_key(f)
+                {
+                    let d = super::elaborate::rewrite_expr(
+                        d,
+                        "",
+                        &map,
+                        &std::collections::HashSet::new(),
+                        &HashMap::default(),
+                    );
+                    map.insert(f.clone(), d);
+                }
+            }
+        }
+        map
+    }
+
+    /// §16.8: the body of the named sequence or property `key` for an
+    /// instance written without an argument list: each formal with a default
+    /// actual argument replaced by it.
+    pub(super) fn sva_body_with_defaults(&self, key: &str) -> Option<Expression> {
+        let body = self.module.property_decls.get(key)?;
+        if !self.module.property_param_defaults.contains_key(key) {
+            return Some(body.clone());
+        }
+        let map = self.sva_bind_actuals(key, &[]);
+        Some(super::elaborate::rewrite_expr(
+            body,
+            "",
+            &map,
+            &std::collections::HashSet::new(),
+            &HashMap::default(),
+        ))
+    }
+
     pub(super) fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
@@ -249,6 +319,15 @@ impl Simulator {
                         return self.sva_expand_named(&inner, depth + 1);
                     }
                 }
+                // §16.8: an instance without an argument list takes every
+                // default actual argument.
+                if self.module.sequences.contains(name)
+                    && self.module.property_param_defaults.contains_key(name)
+                    && let Some(body) = self.sva_body_with_defaults(name)
+                {
+                    let inner = Self::sva_unclocked(&body);
+                    return self.sva_expand_named(&inner, depth + 1);
+                }
                 e.clone()
             }
             // `s(x, y)`: a named sequence / property with formals — the
@@ -257,18 +336,7 @@ impl Simulator {
                 let name = self.sva_named_key(func);
                 if let Some(name) = name {
                     if let Some(body) = self.module.property_decls.get(&name).cloned() {
-                        let formals = self
-                            .module
-                            .property_params
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or_default();
-                        let mut map: HashMap<String, Expression> = HashMap::default();
-                        for (i, f) in formals.iter().enumerate() {
-                            if let Some(actual) = args.get(i) {
-                                map.insert(f.clone(), actual.clone());
-                            }
-                        }
+                        let map = self.sva_bind_actuals(&name, args);
                         let body = super::elaborate::rewrite_expr(
                             &body,
                             "",
@@ -2011,6 +2079,12 @@ impl Simulator {
         }
         let mut var_sels = Vec::new();
         for mut e in sels {
+            // silimate: a whole unpacked array a concurrent assertion reads is sampled
+            if matches!(e.kind, ExprKind::Ident(_)) {
+                self.sva_all_cells(&e, &mut sampled_ids);
+                continue;
+            }
+            // /silimate
             match Self::sva_sel_kind(&e) {
                 Some(true) => {
                     self.sva_cells(&e, &mut sampled_ids);
@@ -2087,6 +2161,12 @@ impl Simulator {
         // A procedural assertion registers while its procedure runs, which
         // for an edge-triggered procedure is at the tick that starts its
         // first attempt: take that edge as seen (§16.14.6).
+        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+        // One reached after a delay is not at a tick: its first attempt
+        // waits for the clock's next event.
+        let at_tick =
+            procedural && (self.settling || !self.delay_resumed.contains(&self.current_pid));
+        // /silimate
         let mut clock_events = Vec::with_capacity(events.len());
         for mut event in events {
             self.sva_fold_scopes(&mut event.expr);
@@ -2106,7 +2186,8 @@ impl Simulator {
                 previous: Value::all_x(1),
             };
             clock_event.previous = self.sva_event_value(&clock_event);
-            if procedural {
+            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
+            if at_tick {
                 let bit = clock_event.previous.get_bit(0);
                 let opposite = match (clock_event.event.edge, bit) {
                     (Some(Edge::Posedge), LogicBit::One) => Some(LogicBit::Zero),
@@ -2173,6 +2254,7 @@ impl Simulator {
             procedural,
             captured,
             matured: Vec::new(),
+            tick_time: None,
             explicit_disable,
             disable_scope,
             ctl,
@@ -2234,20 +2316,20 @@ impl Simulator {
         if outcome {
             stat.pass_count += 1;
             ai.pass += 1;
-            self.fire_sva_action(site_idx, true);
+            self.fire_sva_action(site_idx, true, false);
         } else if kind != 2 {
             stat.fail_count += 1;
             ai.fail += 1;
-            self.fire_sva_action(site_idx, false);
+            self.fire_sva_action(site_idx, false, false);
         }
     }
 
-    pub(super) fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
+    pub(super) fn fire_sva_action(&mut self, site_idx: usize, passed: bool, vacuous: bool) {
         // §20.12 PassOff/FailOff, decided when the attempt finishes.
         if self.assert_ctl_on {
             let st = self.sva_site_ctl(site_idx);
             if !(if passed {
-                st.pass_action(false)
+                st.pass_action(vacuous)
             } else {
                 st.fail_action()
             }) {
@@ -2324,15 +2406,22 @@ impl Simulator {
             e.kind,
             ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
         );
-        if chain
-            && Self::sva_sel_root(e).is_some_and(|h| {
-                let n = self.resolve_hier_name(h);
-                self.array_first_id.contains_key(n.as_ref())
-                    || self.module.arrays.contains_key(n.as_ref())
-                    || self.module.arrays_2d.contains_key(n.as_ref())
-                    || self.module.arrays_nd.contains_key(n.as_ref())
-            })
-        {
+        let array = Self::sva_sel_root(e).is_some_and(|h| {
+            let n = self.resolve_hier_name(h);
+            self.array_first_id.contains_key(n.as_ref())
+                || self.module.arrays.contains_key(n.as_ref())
+                || self.module.arrays_2d.contains_key(n.as_ref())
+                || self.module.arrays_nd.contains_key(n.as_ref())
+        });
+        // silimate: a whole unpacked array a concurrent assertion reads is sampled
+        // §16.5.1: the whole array (`v inside {m}`, `m == '{default: 0}`)
+        // reads every cell, each at its sampled value.
+        if array && matches!(e.kind, ExprKind::Ident(_)) {
+            out.push(e.clone());
+            return;
+        }
+        // /silimate
+        if chain && array {
             out.push(e.clone());
             let mut cur = e;
             loop {
@@ -2399,6 +2488,10 @@ impl Simulator {
                 sub(hi);
             }
             ExprKind::SvaClocked { body, .. } => sub(body),
+            // silimate: a whole unpacked array a concurrent assertion reads is sampled
+            ExprKind::AssignmentPattern(items) => items.iter().for_each(|it| sub(it.expr())),
+            ExprKind::TypedPattern { pattern, .. } => sub(pattern),
+            // /silimate
             _ => {}
         }
     }
@@ -2663,6 +2756,16 @@ impl Simulator {
                 self.collect_sva_signal_ids(hi, out);
             }
             ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
+            // silimate: a whole unpacked array a concurrent assertion reads is sampled
+            // The operands of an assignment pattern (`m == '{a, b}`) are
+            // sampled like any other.
+            ExprKind::AssignmentPattern(items) => {
+                for it in items {
+                    self.collect_sva_signal_ids(it.expr(), out);
+                }
+            }
+            ExprKind::TypedPattern { pattern, .. } => self.collect_sva_signal_ids(pattern, out),
+            // /silimate
             _ => {}
         }
     }
@@ -3162,17 +3265,35 @@ impl Simulator {
             }
             // Only the sites whose clock event was recorded tick. The others
             // check their asynchronous abort conditions (§16.12.14).
-            if !std::mem::take(&mut self.sva_sites[i].fired) {
+            let fired = std::mem::take(&mut self.sva_sites[i].fired);
+            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+            // §16.14.6: an instance maturing in a time step whose tick has
+            // passed (one queued after a `#0`) starts its attempt at that
+            // tick; the attempts in flight have taken it already.
+            let late = !fired
+                && !self.sva_sites[i].matured.is_empty()
+                && self.sva_sites[i].tick_time == Some(self.time);
+            // /silimate
+            if !fired && !late {
                 if self.sva_sites[i].async_abort && !self.sva_sites[i].attempts.is_empty() {
                     self.sva_abort_step_site(i);
                 }
                 continue;
             }
+            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+            self.sva_sites[i].tick_time = Some(self.time);
+            // /silimate
             let node = self.sva_sites[i].node.clone();
             // §16.12.14: attempts an abort settled since the last tick come
             // first; a `disable iff` at this tick does not reach them.
-            let settled = std::mem::take(&mut self.sva_sites[i].settled);
-            let settled_meta = std::mem::take(&mut self.sva_sites[i].settled_meta);
+            let (settled, settled_meta) = if late {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    std::mem::take(&mut self.sva_sites[i].settled),
+                    std::mem::take(&mut self.sva_sites[i].settled_meta),
+                )
+            };
             // LRM §16.5.1: the referenced-signal ids whose Preponed samples
             // this fire's predicates must read through the sampled-value overlay.
             let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
@@ -3181,8 +3302,11 @@ impl Simulator {
             *self.activation_scope.borrow_mut() = Some(self.sva_sites[i].scope.clone());
             // LRM §16.9.3: refresh the past-value snapshots BEFORE anything
             // evaluates, so `$past(<sig>)` in a consequent that comes due
-            // this tick reads the previous cycle's sample too.
-            self.refresh_sva_past_snapshots(i, &sampled_ids);
+            // this tick reads the previous cycle's sample too. A late start
+            // reads the ones its tick took.
+            if !late {
+                self.refresh_sva_past_snapshots(i, &sampled_ids);
+            }
             // §20.12 Off/Kill: no new attempt; those in flight go on.
             let starts = !self.assert_ctl_on || self.sva_site_ctl(i).enabled();
             // The attempts this tick starts: one, or for a procedural
@@ -3245,13 +3369,31 @@ impl Simulator {
             let saved = self.install_preponed(&sampled_ids);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
             let mut metas = self.sva_take_meta(i, attempts.len());
+            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+            // A late start steps only the attempts it started (the last ones;
+            // a Kill or Reset from a start callback may have dropped them):
+            // the older ones took this tick's step already, and stay where
+            // assertion controls reach them.
+            let skip = if late {
+                attempts.len().saturating_sub(started)
+            } else {
+                0
+            };
+            // /silimate
             let mut results: Vec<SvaOutcome> = settled;
             let mut result_meta: Vec<SvaAttemptMeta> = settled_meta;
             result_meta.resize(results.len(), new_meta);
             let mut live: Vec<SvaState> = Vec::with_capacity(attempts.len());
             let mut live_meta: Vec<SvaAttemptMeta> = Vec::with_capacity(attempts.len());
             let all_matches = self.sva_sites[i].all_matches;
-            for (mut st, mut meta) in attempts.drain(..).zip(metas.drain(..)) {
+            for (k, (mut st, mut meta)) in attempts.drain(..).zip(metas.drain(..)).enumerate() {
+                // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
+                if k < skip {
+                    live.push(st);
+                    live_meta.push(meta);
+                    continue;
+                }
+                // /silimate
                 meta.clock_steps += 1;
                 if all_matches {
                     let step = match (&*node, &mut st) {
@@ -3293,7 +3435,7 @@ impl Simulator {
             // still in flight after advancing; `sva_report_outcomes` reports
             // the ones it decided.
             if self.vpi_assert_on {
-                self.vpi_assert_fire_steps(i);
+                self.vpi_assert_fire_steps(i, skip);
             }
             self.sva_report_outcomes(i, results, result_meta);
             self.active_sva_site = prev_active;
@@ -3359,13 +3501,10 @@ impl Simulator {
                                 fail_count: 0,
                             });
                     stat.kind = site_kind;
-                    // §16.12.1: holds, but no pass action unless a
-                    // §20.12 PassOn enabled it for vacuous successes.
+                    // §20.11: an enabled vacuous pass action runs for assert and assume.
                     if site_kind != 2 {
                         stat.pass_count += 1;
-                        if self.assert_ctl_on && self.sva_site_ctl(i).pass_action(true) {
-                            self.fire_sva_action(i, true);
-                        }
+                        self.fire_sva_action(i, true, true);
                     }
                 }
             }

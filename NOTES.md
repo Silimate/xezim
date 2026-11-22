@@ -10,11 +10,73 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A deferred assertion (`assert #0`, `assert final`) counts its outcome in
+  the results file when its report matures. A report flushed because its
+  process resumed in the same time slot, or because its `always_comb` ran
+  again, ran no action and now counts as no attempt (§16.4.2); it counted as
+  a failure, so an assertion that never reported one read as failing.
+* The `always_comb` copies of a generate loop keep their own deferred
+  reports. A report replaced the pending report of another copy with the
+  same assertion statement, so that copy's action did not run, and a
+  failure there printed nothing.
+* A deferred assertion (`assert #0`, `assert final`) report matures only
+  after the time slot's leftover cbNBASynch and cbReadWriteSynch routines
+  have run (§4.5, §16.4.1). cocotb applies its writes from a
+  cbReadWriteSynch it registers inside another one, so an `always_comb`'s
+  time-0 failure on x inputs matured before the writes re-ran the block and
+  flushed it. (#432)
+* An `always_comb` or `always @*` block woken by another process's blocking
+  writes runs once that process suspends, after the continuous assignments it
+  reads have been updated, as the continuous assignments themselves already
+  did (§4.5, §9.2.2.2). It ran after each write instead, seeing values that
+  never coexist (the first write new, the second and the assignment's output
+  old), so an immediate assertion in it failed up to twice per time step.
+* A level-sensitive `always` block that writes no signal (an immediate
+  assertion, a `$display`) runs once the settle has converged, on the
+  settled values (§4.5, §9.2.2.2). Inside a carry chain that the settle
+  orders as a cycle, it had run once per carry step and asserted on
+  intermediate sums. (#433)
+* The processes a clock edge wakes run before the slot's NBA region
+  (§4.4.2, §4.5). A testbench process that resumed from a delay at the
+  edge's time and wrote with `<=` (`#20 x <= v;` landing on a posedge), or
+  an intra-assignment delay maturing then, had its value seen by that
+  edge's flops and waiters, so a DUT captured its input one cycle early.
+  (#436)
+* `wait (c) @(posedge clk);` resumes the process at the edge after `c`
+  holds (§9.7.4). The event control the `wait` guards had been run where it
+  could not suspend, so the process never resumed. (#437)
+* A variable declared in a for-init hides the task's or function's own
+  variable of the same name (§6.21, §12.7.1). In a task with an unassigned
+  `integer j;`, `for (integer j = 0; j < n; j++)` read the task's `j` (x)
+  and ran no iteration, with or without a timing control in the body. A
+  later initializer (`k = j`) also reads the loop's `j` now. (#438)
+* A task's static variable keeps its value across calls when a nested block
+  hides it inside a block that declares its own static. The hidden variable
+  had been put back out of order, and the outer block's exit dropped it.
+  (#438)
 * A value a VPI client writes from cbStartOfSimulation (cocotb's
   `Immediate`) is in place before the time-0 slot, so it is the default
   sampled value a time-0 assertion attempt and a `$past` at the first tick
   read, as on the reference simulator (§16.5.1, §38.36.3). A write to some
   bits of a vector sets only those bits' defaults.
+* A concurrent assertion reads a whole unpacked array it names
+  (`v inside {m}`, `m == '{...}`) at its cells' sampled values, as it does
+  the operands of an assignment pattern (§16.5.1). It had read them after
+  the edge's NBA region. (#434)
+* `$past`, `$stable` and `$changed` track every cell of a whole
+  unpacked-array operand (§16.9.3). `$stable(mem)` had always held,
+  `$changed(mem)` never had, and `mem == $past(mem)` compared against a
+  constant. (#435)
+* A procedural concurrent assertion, or a deferred assertion, that an
+  `always` procedure reaches after a delay or an event control reports
+  (§16.4.2, §16.14.6). Its process had dropped its pending instances on
+  every interpreter entry, including same-time continuations and the loop
+  back to its event control. They are now flushed only where the process
+  resumes. An instance's attempt starts at its clock's event in the time
+  step where it matures, if there is one, and otherwise at the next event.
+  A delay that moves time on waits for the next tick, and a `#0` keeps the
+  tick of the edge that woke the procedure. At the time-0 edge, such an
+  attempt reads the default sampled values (§16.5.1). (#450)
 * The results file lists every assertion statement per instance in
   `assertion_instances`: the instance path, the label (or the reference
   simulator's name for an unlabeled statement), kind, file and line, and the
@@ -81,6 +143,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and the covered terms on 18. The items in code that a constant condition
   rules out are left out, like its statements and arms. Off by default; a run
   without it compiles and runs as before. (#48)
+* In a compiled method, a compare of two elements of a method-local queue or
+  dynamic array (`a[0] == a[1]`, a sort's `a[j] > a[j+1]`) compares the whole
+  elements. The element read counted as one bit wide, so the compare saw only
+  the lowest bits: `'{3, 1}` compared equal, and a bubble sort in a function
+  left its array unsorted (#421).
 
 **Usability**
 
@@ -111,21 +178,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `-errormax`, `-xmlibdirname` and `-cds_implicit_tmpdir`. Their values used
   to be read as source files or top names, and `-licqueue` as `-l icqueue`,
   which sent the transcript to a file named `icqueue`.
-* Code coverage counting rules, each its own option and off by default.
-  Five follow the code coverage defaults the reference simulator documents:
-  `--no-toggle-enums` and `--no-toggle-generate` leave enum variables and the
-  signals declared in generate blocks out of toggle coverage;
-  `--code-coverage-expressions=logical` scores only the conditions with a
-  `&&` or `||`, a term covered once it has been 0 and 1;
-  `--code-coverage-granularity=block` counts straight-line blocks, implicit
-  `else` and `default` arms included and continuous assignments not; and
-  `--no-fsm-reset-transitions` leaves out the FSM transitions only a reset
-  makes, an asynchronous reset's included. FSM coverage skips the code a
-  constant condition rules out, as statement and branch coverage do, also
-  where the rest of the condition can't change it (`if (EN && go)` with `EN`
-  0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of bits whose
-  only drivers are constants (`{4'b0, x}`, a port tied to `1'b0` and the
-  ports wired to it). Each has an `XEZIM_*` variable. See
+* Code coverage counting rules, each its own option and off by default,
+  inferred from CVDP's coverage targets. On its target-100 designs, enum
+  toggles, generate-block toggles and a constant expression term were bins
+  no stimulus can reach: `--no-toggle-enums` and `--no-toggle-generate`
+  leave enum variables and the signals declared in generate blocks out of
+  toggle coverage, and `--code-coverage-expressions=logical` scores only the
+  conditions with a `&&` or `||`, a term covered once it has been 0 and 1.
+  `--code-coverage-granularity=block` counts straight-line blocks, not
+  continuous assignments, and not the implicit arm of an `if` without an
+  `else` or a `case` without a `default`, where no statement runs (Verilator
+  5.038's line coverage has no line for one either; the arm stays in branch
+  coverage). `--no-fsm-reset-transitions` leaves out the FSM transitions
+  only a reset makes, an asynchronous reset's included. FSM coverage skips
+  the code a constant condition rules out, as statement and branch coverage
+  do, also where the rest of the condition can't change it (`if (EN && go)`
+  with `EN` 0). A sixth, `--no-toggle-tied`, leaves out the toggle bins of
+  bits whose only drivers are constants (`{4'b0, x}`, a port tied to `1'b0`
+  and the ports wired to it). Each has an `XEZIM_*` variable. See
   docs/coverage-guide.md, "Counting rules".
 * `--no-toggle-integers` (or `XEZIM_TOGGLE_INTEGERS=0`) leaves variables of
   an integer type (`int`, `integer`, `shortint`, `longint`, `byte`) out of

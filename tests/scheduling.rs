@@ -527,6 +527,8 @@ mod fork_child_hidden_locals_943;
 mod unpacked_struct_copy_chain;
 #[path = "scheduling/unpacked_struct_array_sens.rs"]
 mod unpacked_struct_array_sens;
+#[path = "scheduling/packed_struct_elem_member_event.rs"]
+mod packed_struct_elem_member_event;
 
 #[path = "scheduling/clocking_edge_regressions.rs"]
 mod clocking_edge_regressions;

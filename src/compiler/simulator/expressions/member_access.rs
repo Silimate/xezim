@@ -313,7 +313,10 @@ impl Simulator {
                 && h.path[0].selects.is_empty()
                 && self.module.classes.contains_key(&h.path[0].name.name)
             {
-                if let Some(v) = self.class_scoped_const(&h.path[0].name.name, &member.name) {
+                let scope = &h.path[0].name.name;
+                if let Some(v) = self.class_qualified_instance_value(scope, &member.name)
+                    .or_else(|| self.class_scoped_const(scope, &member.name))
+                {
                     return v;
                 }
             }

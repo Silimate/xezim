@@ -1301,6 +1301,9 @@ impl Simulator {
                             if let Some(v) = self.active_spec_param_value(cls, prop) {
                                 return v;
                             }
+                            if let Some(v) = self.class_qualified_instance_value(cls, prop) {
+                                return v;
+                            }
                             if let Some(v) = self.class_static_get(cls, prop) {
                                 return v;
                             }

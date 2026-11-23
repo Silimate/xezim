@@ -454,7 +454,6 @@ impl Simulator {
     /// `disable <label>`) never releases through `child_finished`.
     pub(super) fn release_killed_process_state(&mut self, pid: usize) {
         self.release_fork_process_metadata(pid);
-        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
         self.release_resume_markers(pid);
         // A killed fork child can still be unwinding on the current or a
         // nested scheduler stack. Keep that path's scope metadata intact.
@@ -532,8 +531,6 @@ impl Simulator {
             .iter()
             .any(|(c, &p)| p == pid && !self.adopted_pids.contains(c))
     }
-
-    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
     /// A finished or killed process drops its resume markers (`cont_pids`,
     /// `delay_pids`, `delay_resumed`).
     fn release_resume_markers(&mut self, pid: usize) {
@@ -547,7 +544,6 @@ impl Simulator {
             self.delay_resumed.remove(&pid);
         }
     }
-    // /silimate
 
     fn release_process_execution_caches(&mut self, pid: usize) {
         if !self.exec_cache_pids.remove(&pid) {
@@ -611,7 +607,6 @@ impl Simulator {
 
     pub(super) fn child_finished(&mut self, child_pid: usize) {
         self.release_fork_process_metadata(child_pid);
-        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
         self.release_resume_markers(child_pid);
         self.finished_pids.insert(child_pid);
         self.release_process_execution_caches(child_pid);

@@ -643,13 +643,11 @@ impl Simulator {
         }
         Some(acc)
     }
-
-    // silimate: sampled-value functions of a whole unpacked array track its cells
     /// §11.4.5, §16.9.3: a fixed-size unpacked array against `$past` or
     /// `$sampled` of a whole one (`mem == $past(mem)`). The call's value is
-    /// the concatenation of the cells, the left bound's first
-    /// (`whole_array_cells`), compared with the array's elements in order.
-    /// `None` for any other pair.
+    /// the concatenation of the cells in declared order
+    /// (`whole_array_cells`), compared with the array's elements in the same
+    /// order. `None` for any other pair.
     fn compare_fixed_array_sampled(
         &mut self,
         left: &Expression,
@@ -657,8 +655,12 @@ impl Simulator {
         mode: PatternCmpMode,
     ) -> Option<PatCmp> {
         let sampled = |me: &Self, e: &Expression| match &e.kind {
-            ExprKind::SystemCall { name, args } if matches!(name.as_str(), "$past" | "$sampled") => {
-                args.first().and_then(|a| me.whole_array_cells(a)).map(|(_, ids)| ids.len())
+            ExprKind::SystemCall { name, args }
+                if matches!(name.as_str(), "$past" | "$sampled") =>
+            {
+                args.first()
+                    .and_then(|a| me.whole_array_cell_list(a))
+                    .map(|(_, _, ids)| ids.len())
             }
             _ => None,
         };
@@ -669,18 +671,40 @@ impl Simulator {
             (Some(n), None) => (right, left, n, true),
             (None, None) => return None,
         };
-        let (name, lo, hi) = self.fixed_array_operand(arr)?;
-        let ew = self.coll_elem_width(&name)?;
-        if ew == 0 || (hi - lo + 1) as usize != n {
-            return (ew != 0).then_some(PatCmp::Unequal);
+        // The other operand's cells, in declared order: a whole array of any
+        // number of dimensions, or a class's fixed-size array property.
+        let cells: Vec<String> = if let Some((name, indices, _)) = self.whole_array_cell_list(arr) {
+            indices
+                .iter()
+                .map(|ix| {
+                    ix.iter()
+                        .fold(name.clone(), |base, &i| Self::name_with_index(&base, i))
+                })
+                .collect()
+        } else {
+            let (name, lo, hi) = self.fixed_array_operand(arr)?;
+            let order: Vec<i64> = if self.module.descending_arrays.contains(&name) {
+                (lo..=hi).rev().collect()
+            } else {
+                (lo..=hi).collect()
+            };
+            order
+                .into_iter()
+                .map(|i| Self::name_with_index(&name, i))
+                .collect()
+        };
+        if cells.len() != n {
+            return Some(PatCmp::Unequal);
         }
         let v = self.eval_expr(call);
-        let desc = self.module.descending_arrays.contains(&name);
+        if n == 0 || v.width as usize % n != 0 {
+            return None;
+        }
+        let ew = v.width / n as u32;
         let mut acc = PatCmp::Equal;
-        for k in 0..n {
-            let idx = if desc { hi - k as i64 } else { lo + k as i64 };
+        for (k, cell) in cells.iter().enumerate() {
             let a = self
-                .get_signal_value_by_name(&format!("{name}[{idx}]"))
+                .get_signal_value_by_name(cell)
                 .unwrap_or_else(|| Value::new(ew));
             let low = (n - 1 - k) * ew as usize;
             let b = v.range_select(low + ew as usize - 1, low);
@@ -692,7 +716,6 @@ impl Simulator {
         }
         Some(acc)
     }
-    // /silimate
 
     /// The element-wise comparison of two unpacked arrays — fixed,
     /// multi-dimensional, associative, dynamic or queue — under `mode`;
@@ -709,11 +732,9 @@ impl Simulator {
         if let Some(c) = self.compare_fixed_arrays(left, right, mode) {
             return Some(c);
         }
-        // silimate: sampled-value functions of a whole unpacked array track its cells
         if let Some(c) = self.compare_fixed_array_sampled(left, right, mode) {
             return Some(c);
         }
-        // /silimate
         if let Some(c) = self.compare_assoc_arrays(left, right, mode) {
             return Some(c);
         }
@@ -2242,6 +2263,10 @@ impl Simulator {
         // count (3) where the LRM requires 1.
         let mut expr_w: u32 = 0;
         let mut expr_s = false;
+        // §7.12.3: a real `with` expression makes the result real; `+` and
+        // `*` are defined for it (Table 11-1). Its values are folded as reals:
+        // read as integers they were their binary64 bit patterns.
+        let mut real_acc: Option<f64> = None;
         for i in 0..size {
             let key = assoc.as_ref().map(|(k, ty)| (k[i as usize].as_str(), *ty));
             let elem = self
@@ -2275,6 +2300,19 @@ impl Simulator {
                 f.insert("item.index".to_string(), ix);
             }
             let fv = self.eval_expr(filter);
+            if (fv.is_real || real_acc.is_some()) && matches!(method, "sum" | "product") {
+                // A conditional may yield integral values before its first
+                // real one: they start the real fold.
+                let v = fv.to_f64();
+                let prefix = real_acc
+                    .or_else(|| acc.map(|a| if expr_s { a as f64 } else { (a as u128) as f64 }));
+                real_acc = Some(match prefix {
+                    None => v,
+                    Some(a) if method == "sum" => a + v,
+                    Some(a) => a * v,
+                });
+                continue;
+            }
             if expr_w == 0 {
                 expr_w = fv.width.max(1);
                 expr_s = fv.is_signed;
@@ -2332,6 +2370,9 @@ impl Simulator {
         }
         if pushed_frame {
             self.pop_local_frame();
+        }
+        if let Some(r) = real_acc {
+            return Value::from_f64(r);
         }
         // Truncate to the expression's width for the accumulating reductions;
         // min/max/and/or/xor cannot exceed an operand and need no masking.
@@ -3794,6 +3835,7 @@ impl Simulator {
             ));
         }
         if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
+            let elems = self.reduction_elem_names(obj_name);
             let (w, signed) = self.array_elem_sign_width(obj_name);
             // §7.12.3: the reduction is computed at the element's own width
             // and wraps there. A wide (>64-bit) element type needs a 128-bit
@@ -3803,8 +3845,8 @@ impl Simulator {
             // (the sum read as its low word, 0).
             if w > 64 {
                 let mut total: u128 = if bm == BuiltinM::Sum { 0 } else { 1 };
-                for elem in self.reduction_elem_names(obj_name) {
-                    if let Some(v) = self.get_signal_value_by_name(&elem) {
+                for elem in &elems {
+                    if let Some(v) = self.get_signal_value_by_name(elem) {
                         let mut x = v.to_u128();
                         if signed && w < 128 && (x >> (w - 1)) & 1 == 1 {
                             x |= !0u128 << (w - 1);
@@ -3826,8 +3868,20 @@ impl Simulator {
                 return Some(val);
             }
             let mut total: u64 = if bm == BuiltinM::Sum { 0 } else { 1 };
-            for elem in self.reduction_elem_names(obj_name) {
-                if let Some(v) = self.get_signal_value_by_name(&elem) {
+            // A real element type: `+` and `*` are defined for it (Table
+            // 11-1), so the elements fold as reals, not as their bit patterns.
+            let mut real_total: Option<f64> = None;
+            for elem in &elems {
+                if let Some(v) = self.get_signal_value_by_name(elem) {
+                    if v.is_real {
+                        let r = real_total.unwrap_or(if bm == BuiltinM::Sum { 0.0 } else { 1.0 });
+                        real_total = Some(if bm == BuiltinM::Sum {
+                            r + v.to_f64()
+                        } else {
+                            r * v.to_f64()
+                        });
+                        continue;
+                    }
                     let x = if signed {
                         v.to_i64().unwrap_or(0) as u64
                     } else {
@@ -3839,6 +3893,9 @@ impl Simulator {
                         total.wrapping_mul(x)
                     };
                 }
+            }
+            if let Some(r) = real_total {
+                return Some(Value::from_f64(r));
             }
             // Truncate to the element width — the accumulation wraps there.
             let mut out = Value::from_u64(

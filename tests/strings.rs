@@ -97,6 +97,8 @@ mod ref_arg_assoc_writeback;
 mod ref_arg_collection_writeback;
 #[path = "strings/review_vpi_unlabelled_block_data.rs"]
 mod review_vpi_unlabelled_block_data;
+#[path = "strings/scan_real_field_end.rs"]
+mod scan_real_field_end;
 #[path = "strings/scanf_four_state_digits.rs"]
 mod scanf_four_state_digits;
 #[path = "strings/string_eq_relational_2state.rs"]
@@ -190,6 +192,5 @@ mod format_backslash_literal;
 mod scan_zero_width;
 #[path = "strings/review_vpi_scoped_callee_deposit.rs"]
 mod review_vpi_scoped_callee_deposit;
-// silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
 #[path = "strings/vpi_deferred_rw_writes.rs"]
 mod vpi_deferred_rw_writes;

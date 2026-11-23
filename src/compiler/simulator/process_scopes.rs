@@ -2064,7 +2064,6 @@ impl Simulator {
                             sv.static_hidden
                                 .get_or_insert_with(|| (depth, Vec::new()))
                                 .1
-                                // silimate: a for-init variable hides the subroutine's same-named static local
                                 // Kept with its position, where `unhide_statics` puts it back.
                                 .push((i, hidden));
                         }
@@ -2202,7 +2201,6 @@ impl Simulator {
             }
         }
         // The statics the block's variables hid are visible again.
-        // silimate: a for-init variable hides the subroutine's same-named static local
         // Each goes back at its position, which `static_mark` relies on.
         self.unhide_statics(sv.static_hidden.take());
         let forked = self.next_pid != sv.pid_mark;
@@ -2295,8 +2293,6 @@ impl Simulator {
         }
         self.restore_loop_vars(&sv.loop_vars);
     }
-
-    // silimate: a for-init variable hides the subroutine's same-named static local
     /// §6.21, §12.7.1: a variable a for-init declares is automatic and local
     /// to the loop, so it hides the subroutine's same-named `static` local:
     /// its reads and writes must not reach the static's shared cell. Takes
@@ -2340,7 +2336,6 @@ impl Simulator {
             }
         }
     }
-    // /silimate
 
     /// §6.21 for a synchronous loop: open the body block's scope once for
     /// the whole loop rather than once per iteration (each iteration's
@@ -3294,7 +3289,6 @@ impl Simulator {
                             return;
                         }
                         let cont = self.forever_cont(pid, body, body_stmts, i, 0, tbody);
-                        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
                         self.delay_pids.insert(pid, delay > 0);
                         if delay == 0 {
                             // `forever begin ... #0 ... end` — same §4.4.2.3
@@ -4135,8 +4129,14 @@ impl Simulator {
                             self.dollar_bound.pop();
                         }
                         let idx = idx?;
-                        // Use a small buffer to avoid allocation for common array names
-                        let elem = format!("{}[{}]", name, idx);
+                        // Reuse the name buffer across indexed writes and keep
+                        // the same lookup for aliases and virtual element names.
+                        let mut elem = self.hint_key_scratch.borrow_mut();
+                        elem.clear();
+                        elem.push_str(&name);
+                        elem.push('[');
+                        Self::push_i64(&mut elem, idx);
+                        elem.push(']');
                         return self.signal_name_to_id.get(elem.as_str()).copied();
                     }
                 }

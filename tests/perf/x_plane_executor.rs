@@ -136,7 +136,6 @@ fn x_plane_executor_matches_the_four_state_vm() {
     for e in expected {
         assert!(text.lines().any(|l| l == e), "missing `{e}` in:\n{text}");
     }
-    // silimate: always_comb / always @* blocks wait for the writer to yield too
     // The blocks run once per step, not after each of its four writes: 77 runs.
     assert!(
         stat(&text, "x_plane_runs=") >= 50,

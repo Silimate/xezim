@@ -105,9 +105,14 @@ mod decl_init_time_literal_scaling;
 mod assertion_control;
 #[path = "scheduling/deferred_immediate_assertions.rs"]
 mod deferred_immediate_assertions;
-// silimate: a procedural concurrent assertion reached after a delay waits for the next tick
 #[path = "scheduling/procedural_assert_after_delay.rs"]
 mod procedural_assert_after_delay;
+#[path = "scheduling/procedural_assert_woken_off_tick.rs"]
+mod procedural_assert_woken_off_tick;
+#[path = "scheduling/wait_released_by_edge_woken_writer.rs"]
+mod wait_released_by_edge_woken_writer;
+#[path = "scheduling/observer_after_carry_chain_settles.rs"]
+mod observer_after_carry_chain_settles;
 #[path = "scheduling/delay_lands_on_clock_edge.rs"]
 mod delay_lands_on_clock_edge;
 #[path = "scheduling/delay_spike_warning.rs"]
@@ -546,7 +551,6 @@ mod hierarchical_subroutine_static;
 mod review_loop_jumps_and_block_disables;
 #[path = "scheduling/nba_partial_commit_order.rs"]
 mod nba_partial_commit_order;
-// silimate: a wait's statement that suspends runs as the process's next statement
 #[path = "scheduling/wait_then_event_control.rs"]
 mod wait_then_event_control;
 #[path = "scheduling/finished_process_metadata.rs"]
@@ -561,7 +565,6 @@ mod review_sva_property_operators_220;
 mod review_sva_abort_first_tick_1155;
 #[path = "scheduling/deferred_assign_reads_1149.rs"]
 mod deferred_assign_reads_1149;
-// silimate: the processes a clock edge wakes run before the slot's NBA region
 #[path = "scheduling/edge_before_slot_nba.rs"]
 mod edge_before_slot_nba;
 #[path = "scheduling/function_call_assign_reads_1126.rs"]
@@ -584,7 +587,6 @@ mod event_call_struct_arguments;
 mod array_capture_1217;
 #[path = "scheduling/intra_delay_pattern_item_width.rs"]
 mod intra_delay_pattern_item_width;
-// silimate: sampled-value functions of a whole unpacked array track its cells
 #[path = "scheduling/sva_array_sampled_fns.rs"]
 mod sva_array_sampled_fns;
 
@@ -594,12 +596,10 @@ mod parked_waiter_signal_index;
 mod replication_pattern_capture;
 #[path = "scheduling/nettype_relay_chain_1239.rs"]
 mod nettype_relay_chain_1239;
-// silimate: a whole unpacked array a concurrent assertion reads is sampled
 #[path = "scheduling/sva_whole_array_sampled.rs"]
 mod sva_whole_array_sampled;
 #[path = "scheduling/time_literal_exact_1299.rs"]
 mod time_literal_exact_1299;
-// silimate: a for-init variable hides the subroutine's same-named static local
 #[path = "scheduling/for_init_hides_static.rs"]
 mod for_init_hides_static;
 #[path = "scheduling/intra_delay_array_items.rs"]
@@ -620,6 +620,17 @@ mod indexed_member_event;
 
 #[path = "scheduling/variable_assign_delay.rs"]
 mod variable_assign_delay;
-// silimate: overlapping and whole drives of one output that mature together merge per bit
 #[path = "scheduling/clocking_overlapping_drives.rs"]
 mod clocking_overlapping_drives;
+#[path = "scheduling/frame_local_event_selects.rs"]
+mod frame_local_event_selects;
+#[path = "scheduling/clocking_select_drive_bits.rs"]
+mod clocking_select_drive_bits;
+#[path = "scheduling/review_sva_whole_array_shapes.rs"]
+mod review_sva_whole_array_shapes;
+#[path = "scheduling/review_foreach_hides_static.rs"]
+mod review_foreach_hides_static;
+#[path = "scheduling/forced_partial_stores.rs"]
+mod forced_partial_stores;
+#[path = "scheduling/array_write_feedback.rs"]
+mod array_write_feedback;

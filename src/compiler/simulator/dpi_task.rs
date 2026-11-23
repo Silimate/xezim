@@ -208,7 +208,7 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        if !self.module.instances.iter().any(|i| i.path == prefix) {
+        if self.instance_by_path(&prefix).is_none() {
             return None;
         }
         let name = self
@@ -398,7 +398,6 @@ impl Simulator {
         let Some((owner, cont)) = self.dpi_park_target() else {
             return self.dpi_suspend();
         };
-        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
         self.delay_pids.insert(owner, ticks > 0);
         if ticks == 0 {
             // §4.4.2.3: `#0` resumes in the Inactive region.

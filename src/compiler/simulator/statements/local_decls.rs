@@ -679,7 +679,7 @@ impl Simulator {
             // DUT paths (pixel-conversion battery).
             if d.dimensions.is_empty() && !plain {
                 if let Some(ew) = self.ast_decl_elem_width(data_type) {
-                    if ew > 0 && w > ew && w % ew == 0 {
+                    if ew > 0 && w >= ew && w % ew == 0 {
                         self.module
                             .packed_signal_elem_widths
                             .insert(d.name.name.clone(), ew);

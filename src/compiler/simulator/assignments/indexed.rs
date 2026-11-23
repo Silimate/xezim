@@ -164,7 +164,7 @@ impl Simulator {
                             VarStore::Frame => self.frame_get(&base).map_or(0, |v| v.width),
                             VarStore::Table(id) => self.signal_table[id].width,
                         };
-                        if width > elem_w {
+                        if width >= elem_w {
                             if let Some(lo) = self
                                 .packed_elem_lsb(&pkey, idx, elem_w)
                                 .filter(|lo| lo + (elem_w as usize) <= width as usize)
@@ -213,7 +213,7 @@ impl Simulator {
                     };
                     if let Some(key) = storage_key {
                         if let Some(mut cur) = self.get_local_or_signal(&key) {
-                            if cur.width > elem_w {
+                            if cur.width >= elem_w {
                                 self.select_store_copies += u64::from(cur.width > 64);
                                 let piece = val.resize_for_assign(elem_w);
                                 let Some(lo) = self.packed_elem_lsb(&pkey, idx, elem_w) else {

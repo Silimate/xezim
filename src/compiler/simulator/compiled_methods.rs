@@ -1475,7 +1475,9 @@ impl Simulator {
     ) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        METHOD_CACHE_COMPILER_SALT.hash(&mut h);
+        // Advance the method version for typed loop bindings as well as the
+        // shared bytecode version. A method-only bump composes with this one.
+        (METHOD_CACHE_COMPILER_SALT + 1, PREPARED_COMB_MAGIC).hash(&mut h);
         // A declined statement compiles as a fallback only when this is on.
         super::bytecode::method_stmt_fallback_enabled().hash(&mut h);
         // Methods embed package constants, typedef targets, foreign class
@@ -1687,6 +1689,67 @@ impl Simulator {
             .any(|s| self.declares_vif_local(std::slice::from_ref(*s)))
     }
 
+    /// Standalone method bytecode binds locals and formals as flat registers.
+    /// Only a single zero-based descending packed dimension has the same
+    /// index mapping as the declared type.
+    fn declares_unsupported_packed_range(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        body: &[crate::ast::stmt::Statement],
+    ) -> bool {
+        use crate::ast::stmt::StatementKind;
+        use crate::ast::types::{DataType, PackedDimension};
+        let unsupported = |dt: &DataType| {
+            let mut current = dt;
+            let mut rank = 0;
+            // Dimensions on a typedef use surround the target's dimensions.
+            for _ in 0..64 {
+                let dims = match current {
+                    DataType::IntegerVector { dimensions, .. }
+                    | DataType::Implicit { dimensions, .. }
+                    | DataType::TypeReference { dimensions, .. } => dimensions,
+                    // An integer atom or packed aggregate supplies its own
+                    // element width below any dimensions on the typedef use.
+                    DataType::IntegerAtom { .. } | DataType::Struct(_) | DataType::Enum(_) => {
+                        return rank != 0;
+                    }
+                    _ => return false,
+                };
+                rank += dims.len();
+                if rank > 1 || dims.iter().any(|d| match d {
+                    PackedDimension::Range { left, right, .. } => {
+                        let c = |e| super::elaborate::const_eval_i64_with_params(
+                            e, Some(&self.module.parameters),
+                        );
+                        c(right) != Some(0) || c(left).is_some_and(|l| l < 0)
+                    }
+                    PackedDimension::Unsized(_) => false,
+                }) {
+                    return true;
+                }
+                let DataType::TypeReference { name, .. } = current else {
+                    return false;
+                };
+                let Some(target) = super::elaborate::lookup_scoped_type(
+                    name, &self.module.typedef_types,
+                ) else {
+                    return false;
+                };
+                current = target;
+            }
+            true
+        };
+        fn walk(s: &crate::ast::stmt::Statement, f: &dyn Fn(&DataType) -> bool) -> bool {
+            match &s.kind {
+                StatementKind::VarDecl { data_type, .. }
+                | StatementKind::ParamDecl { data_type, .. } => f(data_type),
+                _ => Simulator::sub_stmts(s).into_iter().any(|child| walk(child, f)),
+            }
+        }
+        ports.iter().any(|p| unsupported(&p.data_type))
+            || body.iter().any(|s| walk(s, &unsupported))
+    }
+
     /// class-perf free-function tier: run a package/module-scope FUNCTION
     /// body as bytecode, reusing `try_run_compiled_method`'s entire plan +
     /// admission + block-cache machinery under a SYNTHETIC class name. The
@@ -1696,50 +1759,6 @@ impl Simulator {
     /// would — and a body that touches `this`-relative names was never
     /// compilable anyway (the compiler's handle-chain gates require a
     /// class-typed root, which no free-function frame provides).
-    /// Whether a subroutine's formals or body variables declare an explicit
-    /// packed range other than `[N-1:0]` (a non-zero low bound or an
-    /// ascending range), or whose right bound is not a constant.
-    fn declares_offset_packed_range(
-        &self,
-        ports: &[crate::ast::decl::FunctionPort],
-        body: &[crate::ast::stmt::Statement],
-    ) -> bool {
-        use crate::ast::stmt::StatementKind;
-        use crate::ast::types::{DataType, PackedDimension};
-        let offset = |dt: &DataType| {
-            let dims = match dt {
-                DataType::IntegerVector { dimensions, .. }
-                | DataType::Implicit { dimensions, .. }
-                | DataType::TypeReference { dimensions, .. } => dimensions,
-                _ => return false,
-            };
-            dims.iter().any(|d| match d {
-                PackedDimension::Range { left, right, .. } => {
-                    let c = |e| {
-                        super::elaborate::const_eval_i64_with_params(
-                            e,
-                            Some(&self.module.parameters),
-                        )
-                    };
-                    // `[W-1:0]` keeps compiling whatever `W` is.
-                    c(right) != Some(0) || c(left).is_some_and(|l| l < 0)
-                }
-                PackedDimension::Unsized(_) => false,
-            })
-        };
-        fn walk(s: &crate::ast::stmt::Statement, f: &dyn Fn(&DataType) -> bool) -> bool {
-            match &s.kind {
-                StatementKind::VarDecl { data_type, .. }
-                | StatementKind::ParamDecl { data_type, .. } => f(data_type),
-                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
-                    stmts.iter().any(|s| walk(s, f))
-                }
-                _ => false,
-            }
-        }
-        ports.iter().any(|p| offset(&p.data_type)) || body.iter().any(|s| walk(s, &offset))
-    }
-
     pub(super) fn try_run_compiled_free_function(
         &mut self,
         fd: &crate::ast::decl::FunctionDeclaration,
@@ -1906,8 +1925,8 @@ impl Simulator {
             // that is not `[N-1:0]` (`input logic [12:1] a`) is selected by
             // its labels, which the compiled selects do not rebase: `a[i]`
             // read bit i, so a hot function read the wrong bit or x (#650).
-            if self.declares_offset_packed_range(ports, body) {
-                trace_decline("offset-packed-range");
+            if self.declares_unsupported_packed_range(ports, body) {
+                trace_decline("packed-index-layout");
                 self.compiled_method_skip.insert((cid, mid, spec_id));
                 return None;
             }

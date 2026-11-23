@@ -3,6 +3,16 @@
 use super::*;
 
 impl<'a> BytecodeCompiler<'a> {
+    /// §11.5.1: a packed element has to exist before its index can be
+    /// converted to a bit offset. A 32-bit offset alone can wrap to zero.
+    pub(super) fn local_lane_in_bounds(&mut self, index: RegId, lanes: u32) -> RegId {
+        let limit = self.alloc_reg();
+        self.emit(Insn::LoadConst(limit, Box::new(Value::from_u64(u64::from(lanes), 32))));
+        let valid = self.alloc_reg();
+        self.emit(Insn::Lt(valid, index, limit));
+        valid
+    }
+
     /// Walk a chain of `Index` nodes down to its root identifier. Returns the
     /// root and the index EXPRESSIONS outermost-first; indices need not be
     /// constant.

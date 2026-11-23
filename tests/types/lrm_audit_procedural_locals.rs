@@ -16,6 +16,188 @@ fn t_lines(sim: &xezim::compiler::Simulator) -> Vec<String> {
 }
 
 #[test]
+fn hot_functions_preserve_packed_lane_widths() {
+    // Each instance must cross the default 1,000-call compilation threshold to test its lane widths.
+    const SRC: &str = r#"module block #(parameter DataWidth=64, parameter Bytes=$clog2(DataWidth/8)) ();
+ function automatic logic [63:0] tl_align_load(input logic [DataWidth-1:0] value, input logic [Bytes-1:0] addr);
+   logic [DataWidth/64-1:0][63:0] split = value;
+   return split[addr >> 3];
+ endfunction
+endmodule
+module top;
+ block #(64) narrow();
+ block #(128) wide();
+ logic [127:0] data;
+ int nerr;
+ initial begin
+   for(int i=0;i<2048;i++) begin
+     logic [63:0] narrow_word,wide_word;
+     data=128'hcafe000012345678_0000000020001401+i;
+     narrow_word=narrow.tl_align_load(data[63:0],3'h0);
+     wide_word=wide.tl_align_load(data,4'h8);
+     if(narrow_word!==data[63:0] || wide_word!==data[127:64]) begin
+       if(nerr==0)$display("FIRST i=%0d narrow=%h wide=%h input=%h",i,narrow_word,wide_word,data);
+       nerr++;
+     end
+   end
+   $display("T|errors=%0d",nerr);
+   $finish;
+ end
+endmodule"#;
+    let sim = simulate(SRC, 1000).expect("simulate");
+    assert_eq!(t_lines(&sim), ["T|errors=0"]);
+}
+
+#[test]
+fn hot_functions_follow_packed_typedef_dimensions() {
+    // Exercise the direct, locally aliased, package-qualified, and extra-dimension typedef forms
+    // on both sides of the default 1,000-call compilation threshold.
+    const SRC: &str = r#"package lane_types;
+  typedef logic [0:0][63:0] bank_t;
+  typedef bank_t alias_t;
+  typedef logic [63:0] word_t;
+endpackage
+module top;
+  import lane_types::*;
+  function automatic logic [63:0] direct(input bank_t formal);
+    return formal[0];
+  endfunction
+  function automatic logic [63:0] local_alias(input logic [63:0] value);
+    alias_t local_word = value;
+    return local_word[0];
+  endfunction
+  function automatic logic [63:0] qualified(input lane_types::bank_t formal);
+    return formal[0];
+  endfunction
+  function automatic logic [63:0] extra_dim(input word_t [0:0] formal);
+    return formal[0];
+  endfunction
+  int errors;
+  initial begin
+    for(int i=0;i<2048;i++) begin
+      logic [63:0] value = 64'h12345678_20001401 + i;
+      if (direct(value)!==value || local_alias(value)!==value || qualified(value)!==value || extra_dim(value)!==value) begin
+        if (errors==0) $display("first i=%0d direct=%h local=%h qualified=%h extra=%h expected=%h",i,direct(value),local_alias(value),qualified(value),extra_dim(value),value);
+        errors++;
+      end
+    end
+    $display("T|typedef_errors=%0d", errors);
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 1000).expect("simulate typedef formals and locals");
+    assert_eq!(t_lines(&sim), ["T|typedef_errors=0"]);
+}
+
+#[test]
+fn singleton_packed_function_local_selects_a_whole_lane() {
+    const SRC: &str = r#"module probe #(parameter DataWidth=64, parameter Bytes=$clog2(DataWidth/8))(
+  input logic [DataWidth-1:0] value,
+  input logic [Bytes-1:0] addr,
+  output logic [63:0] lane
+);
+  function automatic logic [63:0] align_load(input logic [DataWidth-1:0] data, input logic [Bytes-1:0] at);
+    logic [DataWidth/64-1:0][63:0] split = data;
+    return split[at >> 3];
+  endfunction
+  assign lane = align_load(value, addr);
+endmodule
+module top;
+  logic [127:0] data;
+  logic [3:0] addr;
+  wire [63:0] a,b;
+  probe #(64) narrow(data[63:0],addr[2:0],a);
+  probe #(128) wide(data,addr,b);
+  initial begin
+    data = 128'hcafeba9876543210_0000000020001401; addr=0;
+    #1 $display("T|low=%h wide_lo=%h",a,b);
+    addr=8; #1 $display("T|wide_hi=%h",b);
+    data[63:0]=64'hff123456789abcde; addr=0;
+    #1 $display("T|next=%h wide_next=%h",a,b);
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|low=0000000020001401 wide_lo=0000000020001401",
+            "T|wide_hi=cafeba9876543210",
+            "T|next=ff123456789abcde wide_next=ff123456789abcde",
+        ]
+    );
+}
+
+#[test]
+fn singleton_packed_formals_and_writes_keep_the_declared_bounds() {
+    const SRC: &str = r#"module top;
+  logic [63:0] from_tb;
+  logic [0:0][63:0] global_bank;
+  int calls;
+  function automatic logic [63:0] selected(input logic [0:0][63:0] formal, input int i);
+    return formal[i];
+  endfunction
+  function automatic logic [63:0] with_side_effect(input logic [63:0] dat, input int idx);
+    logic [2:2][63:0] local_bank = dat;
+    calls++;
+    return local_bank[idx];
+  endfunction
+  function automatic logic [63:0] write_lane(input logic [63:0] dat, input int i);
+    logic [0:0][63:0] local_bank='0;
+    local_bank[i]=dat;
+    return local_bank;
+  endfunction
+  initial begin
+    from_tb=64'h1002040008102040;
+    global_bank[0]=from_tb;
+    $display("T|write=%h formal=%h offset=%h global=%h",write_lane(from_tb,0),selected(from_tb,0),with_side_effect(from_tb,2),global_bank[0]);
+    $display("T|bad_read=%b bad_offset=%b bad_write=%h",$isunknown(selected(from_tb,1)),$isunknown(with_side_effect(from_tb,3)),write_lane(from_tb,1));
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|write=1002040008102040 formal=1002040008102040 offset=1002040008102040 global=1002040008102040",
+            "T|bad_read=1 bad_offset=1 bad_write=0000000000000000",
+        ]
+    );
+}
+
+#[test]
+fn singleton_formal_preserves_caller_selects_and_default_scope() {
+    const SRC: &str = r#"module top;
+  logic [63:0] data;
+  int visits;
+  function automatic logic [63:0] view(input logic [0:0][63:0] data,
+                                        input logic [63:0] later = data[0]);
+    visits++;
+    return data[0] | later;
+  endfunction
+  initial begin
+    data = 64'h123456789abcdef2;
+    $display("T|args=%h", view(data[0],data[1]));
+    $display("T|default=%h", view(data));
+    $display("T|caller=%b%b visits=%0d",data[0],data[1],visits);
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|args=0000000000000001",
+            "T|default=123456789abcdef2",
+            "T|caller=01 visits=2",
+        ]
+    );
+}
+
+#[test]
 fn blocklocal_2state_vector() {
     const SRC: &str = r#"
 module rbs;
@@ -368,4 +550,36 @@ endmodule"#;
             "T|n4|1x1x",
         ],
     );
+}
+
+#[test]
+fn packed_lane_offsets_check_the_full_index_before_scaling() {
+    let source = r#"module top;
+  typedef logic [0:0][63:0] bank_t;
+  bank_t bank = 64'hd0c0beef1234fedc;
+  logic [79:0] index;
+  function automatic logic [63:0] load(input bank_t src, input logic [79:0] i);
+    return src[i];
+  endfunction
+  function automatic bank_t store(input bank_t src, input logic [79:0] i);
+    bank_t tmp = src;
+    tmp[i] = 64'h0123456789abcdef;
+    return tmp;
+  endfunction
+  wire [63:0] selected = load(bank, index);
+  wire [63:0] written = store(bank, index);
+  initial begin
+    index = 0; #1;
+    $display("T|valid=%0b", selected === bank && written === 64'h0123456789abcdef);
+    index = 32'h04000000; #1;
+    $display("T|overflow=%0b", selected === 64'bx && written === bank);
+    index = 80'h0100_0000_0000_0000_0000; #1;
+    $display("T|wide=%0b", selected === 64'bx && written === bank);
+    index = 'x; #1;
+    $display("T|unknown=%0b", selected === 64'bx && written === bank);
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(source, 1000).unwrap();
+    assert_eq!(t_lines(&sim), ["T|valid=1", "T|overflow=1", "T|wide=1", "T|unknown=1"]);
 }

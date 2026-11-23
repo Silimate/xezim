@@ -282,8 +282,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   read 0 and a constraint `v inside {set}` had no solution; a parameterized
   class's static collections still start empty. In a queue or dynamic-array
   initializer, of a static or an instance property, an `N{...}` item gives
-  N elements, its operand evaluated once (§10.9.1, §11.4.12.1); it gave one.
-  (#466)
+  N copies of its items (`'{2{1, 2}}` is four elements), each operand
+  evaluated once (§10.9.1, §11.4.12.1); it gave one element. (#466)
 
 **Performance**
 

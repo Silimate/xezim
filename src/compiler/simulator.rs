@@ -420,7 +420,8 @@ fn method_boost_enabled() -> bool {
 // §7.2, §7.4.2: a member select through constant element selects of a packed struct compiles.
 // §23.9: a frame local that hides a parameter is not a constant element select.
 // §7.2: reads of nested packed-struct members (`s.inner.f`) compile to a range select.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317c;
+// §6.18, §8.13: class typedefs with folded bounds size method formals and results.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_317d;
 // /silimate
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so

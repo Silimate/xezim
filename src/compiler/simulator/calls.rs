@@ -128,6 +128,63 @@ impl Simulator {
         Some((tmp, mname))
     }
 
+    /// §8.23, §8.25: resolve a member typedef in its receiver's specialization,
+    /// then run the requested method in the member's own specialization.
+    fn call_aliased_member_type(
+        &mut self,
+        receiver: &str,
+        member: &str,
+        method: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|locals| locals.contains_key(receiver))
+            || self.signal_name_to_id.contains_key(receiver)
+        {
+            return None;
+        }
+        let bound = self.resolve_type_param_binding(receiver);
+        let receiver = bound.as_deref().unwrap_or(receiver);
+        let (base, spec) = self.resolve_typedef_spec(receiver).or_else(|| {
+            let alias = self.resolve_plain_alias_chain(receiver)?;
+            self.resolve_typedef_spec(&alias)
+                .or_else(|| Some((alias, String::new())))
+        })?;
+        if !self.module.classes.contains_key(&base) {
+            return None;
+        }
+        let previous = self.current_spec.replace((base.clone(), spec));
+        let target = self
+            .resolve_class_member_typedef_spec(&base, member)
+            .or_else(|| {
+                self.resolve_class_member_typedef_class(&base, member)
+                    .map(|c| (c, String::new()))
+            });
+        self.current_spec = previous;
+        let (class, sig) = target?;
+        if sig.is_empty() {
+            let value = self.exec_static_method(&class, method, args);
+            if value.is_none() && method == "new" {
+                let definition = self.module.classes.get(&class)?.clone();
+                return Some(self.instantiate_class(&definition, args));
+            }
+            return value;
+        }
+        self.ensure_spec_statics(&class, &sig);
+        let previous = self.current_spec.replace((class.clone(), sig));
+        if let Some(outer) = &previous {
+            self.spec_scope_stack.push(outer.clone());
+        }
+        let result = self.exec_static_method(&class, method, args);
+        if previous.is_some() {
+            self.spec_scope_stack.pop();
+        }
+        self.current_spec = previous;
+        result
+    }
+
     pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
         // §11.4.1, §7.8.7: a receiver's selects (`m[f()].push_back(x)`) are
         // evaluated once; the dispatch below resolves the receiver several
@@ -573,80 +630,10 @@ impl Simulator {
                                     return v;
                                 }
                             }
-                        }
-                        // §6.18/§8.23: `Alias::typedef::method(args)` where the
-                        // FIRST segment `pkg` is a MODULE-LEVEL TYPEDEF ALIAS to a
-                        // class (`typedef base_class#(9) BaseType;` or a chain of
-                        // plain class aliases),
-                        // and `cls` is a member typedef of that class
-                        // (`BaseType::type_id::get()` where `base_class` declares
-                        // `typedef uvm_object_registry#(base_class#(P)) type_id;`).
-                        // The existing branches only handle `pkg` being a package or
-                        // a real class name, so this 3-segment path never reached
-                        // the registry's `get()` and returned null (factory/registry
-                        // parameterized-object tests: type_id identity and factory
-                        // registration checks). Resolve `pkg` to its class spec, set
-                        // the active specialization so the member typedef's type args
-                        // bind their params, resolve the member typedef, and dispatch.
-                        else if !self
-                            .local_stack
-                            .last()
-                            .is_some_and(|m| m.contains_key(pkg.as_str()))
-                            && !self.signal_name_to_id.contains_key(pkg.as_str())
+                        } else if let Some(value) =
+                            self.call_aliased_member_type(pkg, &cls, mname, args)
                         {
-                            if let Some((alias_base, alias_sig)) =
-                                self.resolve_typedef_spec(pkg).or_else(|| {
-                                    let hop = self.resolve_plain_alias_chain(pkg)?;
-                                    self.resolve_typedef_spec(&hop)
-                                        .or_else(|| Some((hop, String::new())))
-                                })
-                                && self.module.classes.contains_key(&alias_base)
-                            {
-                                // Resolve the member typedef within the alias's
-                                // specialization. Set current_spec so type args that
-                                // reference the class's own params resolve to the
-                                // alias's concrete values.
-                                let saved = self.current_spec.take();
-                                self.current_spec = Some((alias_base.clone(), alias_sig.clone()));
-                                let member =
-                                    self.resolve_class_member_typedef_spec(&alias_base, &cls);
-                                let mem_class_only =
-                                    self.resolve_class_member_typedef_class(&alias_base, &cls);
-                                self.current_spec = saved;
-                                let target: Option<(String, String)> = match member {
-                                    Some(m) => Some(m),
-                                    None => mem_class_only.map(|c| (c, String::new())),
-                                };
-                                if let Some((target_base, target_sig)) = target {
-                                    if !target_sig.is_empty() {
-                                        self.ensure_spec_statics(&target_base, &target_sig);
-                                    }
-                                    let saved_spec = self.current_spec.take();
-                                    if !target_sig.is_empty() {
-                                        if let Some(cs) = &saved_spec {
-                                            self.spec_scope_stack.push(cs.clone());
-                                        }
-                                        self.current_spec =
-                                            Some((target_base.clone(), target_sig.clone()));
-                                    }
-                                    let res = self.exec_static_method(&target_base, mname, args);
-                                    let had_spec = saved_spec.is_some() && !target_sig.is_empty();
-                                    self.current_spec = saved_spec;
-                                    if had_spec {
-                                        self.spec_scope_stack.pop();
-                                    }
-                                    if let Some(v) = res {
-                                        return v;
-                                    }
-                                    if mname == "new" && target_sig.is_empty() {
-                                        if let Some(cd) =
-                                            self.module.classes.get(&target_base).cloned()
-                                        {
-                                            return self.instantiate_class(&cd, args);
-                                        }
-                                    }
-                                }
-                            }
+                            return value;
                         }
                     }
                 }
@@ -2597,42 +2584,17 @@ impl Simulator {
                 }
             }
 
-            // Counterpart of the flattened `...,type_id,create` path
-            // (the MemberAccess form is handled in eval_call_inner's call site
-            // above). Resolve `C::type_id::create` from `C`'s own registry
-            // typedef and construct the registered target class.  When `C` is a
-            // typedef alias (e.g. `typedef base_seq#(T) my_sqr`) there is no
-            // class entry for `my_sqr`; fall through to `typedef_types` to
-            // resolve the alias and instantiate the parameterised target.
-            if len >= 3
-                && path[len - 1].name.name == "create"
-                && path[len - 2].name.name == "type_id"
+            // §8.23: scope-qualified calls also arrive as one flat path.
+            if let [receiver, member, method] = &path[..]
+                && path.iter().all(|part| part.selects.is_empty())
+                && let Some(value) = self.call_aliased_member_type(
+                    &receiver.name.name,
+                    &member.name.name,
+                    &method.name.name,
+                    args,
+                )
             {
-                let class_name = path[len - 3].name.name.clone();
-                // NOTE: the plain (non-parameterized, non-typedef-alias) form
-                // `C::type_id::create(...)` is deliberately NOT intercepted
-                // here so it falls through to the real UVM factory
-                // (`common_type::create` -> `create_*_by_type`), which applies
-                // type/instance overrides and bumps each override's `used`
-                // counter. A direct `instantiate_class` (the old shortcut)
-                // bypassed the factory entirely, so an override on `C` was
-                // silently ignored and `factory.print()` reported `used 0`.
-                // The MemberAccess-form shortcut above keeps the
-                // parameterized `C#(P)::type_id::create` and type-parameter
-                // receiver (`T::type_id::create`) direct paths.
-                if let Some(DataType::TypeReference {
-                    name, type_args, ..
-                }) = self.module.typedef_types.get(&class_name).cloned()
-                {
-                    if let Some(class_def) = self.module.classes.get(&name.name.name).cloned() {
-                        let ta: Option<&[Expression]> = if type_args.is_empty() {
-                            None
-                        } else {
-                            Some(&type_args)
-                        };
-                        return self.instantiate_class_with_type_args(&class_def, args, ta);
-                    }
-                }
+                return value;
             }
 
             // §6.19.6: enum method with ARGS through a scoped/flattened path —

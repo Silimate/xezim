@@ -112,3 +112,61 @@ fn param_registry_typeid_identity_and_cast_and_registration() {
         out
     );
 }
+
+/// §8.23, §8.25: a type parameter bound to a typedef retains the specialized
+/// class's registry and executes its static method, including its side effects.
+#[test]
+fn inherited_type_parameter_preserves_registry_dispatch() {
+    let result = xezim::simulate(
+        r#"class component;
+  int marker;
+endclass
+class registry #(type T=component);
+  static function T create();
+    T c=new;
+    c.marker+=5;
+    return c;
+  endfunction
+endclass
+class seq_base #(type ITEM_T=int,type RSP_ITEM_T=ITEM_T) extends component;
+  typedef registry #(seq_base #(.ITEM_T(ITEM_T),.RSP_ITEM_T(RSP_ITEM_T))) type_id;
+  function new(); marker=42; endfunction
+endclass
+class item;
+endclass
+typedef seq_base #(.ITEM_T(item)) jtag_seq;
+class default_seq extends component;
+  typedef registry #(default_seq) type_id;
+  function new(); marker=900; endfunction
+endclass
+class agent_base #(type SEQ_T=default_seq);
+  SEQ_T sequencer;
+  function void build();
+    sequencer=SEQ_T::type_id::create();
+  endfunction
+endclass
+class agent extends agent_base #(.SEQ_T(jtag_seq));
+endclass
+module top;
+  initial begin
+    static agent a=new;
+    static jtag_seq direct=jtag_seq::type_id::create();
+    a.build();
+    $display("JTAG direct=%0d generic=%0d values=%0d/%0d",direct!=null,a.sequencer!=null,direct.marker,a.sequencer.marker);
+    $finish;
+  end
+endmodule
+
+"#,
+        100_000,
+    )
+    .unwrap();
+    assert!(
+        result
+            .output
+            .iter()
+            .any(|line| line.message == "JTAG direct=1 generic=1 values=47/47"),
+        "{:?}",
+        result.output
+    );
+}

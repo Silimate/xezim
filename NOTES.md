@@ -17,7 +17,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * A method argument or result declared with a class's packed typedef keeps
   its width when a class constant sizes the range, including when a derived
   class inherits the typedef. The Coral RVV model's 128-bit ALU arguments
-  were truncated to one bit. (#474)
+  were truncated to one bit. Compiled methods also preserve the full argument
+  when a statement such as `$display` reads it before a direct return. (#474)
 * An imported package enum member hides a same-named compilation-unit
   parameter in class methods and constant expressions. (#475)
 * A factory-created object in a module instance retains its specialized

@@ -1587,7 +1587,8 @@ impl Simulator {
     /// selects of it resolve: a packed struct's field layout, or the
     /// dimensions of a multidimensional packed array.
     pub(super) fn formal_meta_has_selects(&self, name: &str) -> bool {
-        self.module.packed_struct_fields.contains_key(name)
+        self.module.struct_members.contains_key(name)
+            || self.module.packed_struct_fields.contains_key(name)
             || self.module.packed_signal_elem_widths.contains_key(name)
             || self
                 .module
@@ -1616,7 +1617,8 @@ impl Simulator {
         let frames = std::mem::take(&mut self.task_cleanup);
         for c in &frames {
             for (name, own) in &c.struct_formal_meta {
-                let same = self.module.packed_struct_fields.get(name) == own.packed_fields.as_ref()
+                let same = self.module.struct_members.get(name) == own.struct_members.as_ref()
+                    && self.module.packed_struct_fields.get(name) == own.packed_fields.as_ref()
                     && self.module.packed_full_dims.get(name) == own.packed_dimensions.as_ref()
                     && self.module.packed_signal_elem_widths.get(name).copied()
                         == own
@@ -1639,7 +1641,7 @@ impl Simulator {
         }
     }
 
-    /// Formal-metadata write barrier: called before any write to the six
+    /// Formal-metadata write barrier: called before any write to the
     /// tables `snapshot_formal_parts` reads, with the written key. Every open
     /// class-method save (see `MetaFrame`) that names the key's base and has
     /// no snapshot yet takes it now.
@@ -1737,6 +1739,7 @@ impl Simulator {
         };
         FormalMetaParts {
             declared_type: self.module.var_decl_types.get_shared(name).cloned(),
+            struct_members: self.module.struct_members.get(name).cloned(),
             packed_fields: self.module.packed_struct_fields.get(name).cloned(),
             packed_element_widths,
             packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
@@ -1748,6 +1751,7 @@ impl Simulator {
     pub(super) fn clear_formal_metadata(&mut self, name: &str) {
         self.meta_note(name);
         self.module.var_decl_types.remove(name);
+        self.module.struct_members.remove(name);
         self.module.packed_struct_fields.remove(name);
         self.clear_formal_elem_widths(name);
         self.module.packed_full_dims.remove(name);
@@ -1928,6 +1932,7 @@ impl Simulator {
             name: name.to_string(),
             parts: FormalMetaParts {
                 declared_type: self.module.var_decl_types.remove(name),
+                struct_members: self.module.struct_members.remove(name),
                 packed_fields: self.module.packed_struct_fields.remove(name),
                 packed_element_widths,
                 packed_dimensions: self.module.packed_full_dims.remove(name),
@@ -1988,6 +1993,7 @@ impl Simulator {
             && !m.packed_full_dims.contains_key(name)
             && !m.packed_signal_elem_widths.contains_key(name)
             && !m.packed_struct_fields.contains_key(name)
+            && !m.struct_members.contains_key(name)
         {
             return;
         }
@@ -2077,6 +2083,7 @@ impl Simulator {
                 self.module.var_decl_types.remove(name);
             }
         }
+        put(&mut self.module.struct_members, name, saved.struct_members);
         put(
             &mut self.module.packed_struct_fields,
             name,
@@ -2148,6 +2155,11 @@ impl Simulator {
     ) {
         // `clear_formal_metadata` notes `name` before any write.
         self.clear_formal_metadata(name);
+        if let Some(members) = super::elaborate::struct_member_names(dt, &self.module.typedef_types)
+            && !members.is_empty()
+        {
+            self.module.struct_members.insert(name.to_string(), members);
+        }
         self.module
             .var_decl_types
             .insert(name.to_string(), dt.clone());

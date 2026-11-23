@@ -52,7 +52,7 @@ use serde::ser::{SerializeSeq, Serializer};
 // §16.14.6: Simulator::delay_pids and ::delay_resumed, SvaClockedSite::tick_time.
 // §6.21: BlockScopeSave::static_hidden keeps each hidden static's position.
 // Downstream assertion counts and coverage state accompany upstream's scheduler state.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x25";
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x26";
 
 #[derive(Default)]
 struct Session {

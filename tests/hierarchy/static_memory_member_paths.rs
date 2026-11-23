@@ -134,6 +134,37 @@ endmodule
     );
 }
 
+#[test]
+fn finished_function_struct_does_not_shadow_hierarchical_memory() {
+    check(r#"
+package bounds_pkg;
+  typedef struct packed {logic valid; logic [63:0] base;} bounds_t;
+  function automatic logic [63:0] get_base(input logic [63:0] value);
+    bounds_t tb = '{valid:1,base:value};
+    return tb.base;
+  endfunction
+endpackage
+module ram;
+  logic [31:0] mem[128];
+endmodule
+module chip;
+  ram u_ram();
+endmodule
+module tb;
+  chip dut();
+  initial begin
+    if ($bits(tb.dut.u_ram.mem) != 4096) $display("FAIL before");
+    if (bounds_pkg::get_base(42) != 42) $display("FAIL local-field read");
+    if ($bits(tb.dut.u_ram.mem) != 4096) $display("FAIL width after");
+    if ($size(tb.dut.u_ram.mem) != 128) $display("FAIL depth after");
+    if ($bits(tb.dut.u_ram.mem[0]) != 32) $display("FAIL word after");
+    $display("LOCAL_STRUCT_SCOPE_PASS");
+    $finish;
+  end
+endmodule
+"#, "LOCAL_STRUCT_SCOPE_PASS");
+}
+
 const ONCE: &str = r#"
 class selected_bank;
   int memory[4];

@@ -27,6 +27,7 @@ pub(super) struct FormalMetadataSnapshot {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct FormalMetaParts {
     pub(super) declared_type: Option<Rc<DataType>>,
+    pub(super) struct_members: Option<Vec<String>>,
     pub(super) packed_fields: Option<Vec<(String, u32, u32)>>,
     pub(super) packed_element_widths: Vec<(String, u32)>,
     pub(super) packed_dimensions: Option<Vec<(i64, i64)>>,

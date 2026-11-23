@@ -1698,23 +1698,26 @@ impl Simulator {
     /// would — and a body that touches `this`-relative names was never
     /// compilable anyway (the compiler's handle-chain gates require a
     /// class-typed root, which no free-function frame provides).
-    /// Whether a subroutine's formals or body variables declare an explicit
-    /// packed range other than `[N-1:0]` (a non-zero low bound or an
-    /// ascending range), or whose right bound is not a constant.
-    fn declares_offset_packed_range(
+    /// Standalone method bytecode binds locals and formals as flat registers.
+    /// Only a single zero-based descending packed dimension has the same
+    /// index mapping as the declared type.
+    fn declares_unsupported_packed_range(
         &self,
         ports: &[crate::ast::decl::FunctionPort],
         body: &[crate::ast::stmt::Statement],
     ) -> bool {
         use crate::ast::stmt::StatementKind;
         use crate::ast::types::{DataType, PackedDimension};
-        let offset = |dt: &DataType| {
+        let unsupported = |dt: &DataType| {
             let dims = match dt {
                 DataType::IntegerVector { dimensions, .. }
                 | DataType::Implicit { dimensions, .. }
                 | DataType::TypeReference { dimensions, .. } => dimensions,
                 _ => return false,
             };
+            if dims.len() > 1 {
+                return true;
+            }
             dims.iter().any(|d| match d {
                 PackedDimension::Range { left, right, .. } => {
                     let c = |e| {
@@ -1733,13 +1736,11 @@ impl Simulator {
             match &s.kind {
                 StatementKind::VarDecl { data_type, .. }
                 | StatementKind::ParamDecl { data_type, .. } => f(data_type),
-                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
-                    stmts.iter().any(|s| walk(s, f))
-                }
-                _ => false,
+                _ => Simulator::sub_stmts(s).into_iter().any(|child| walk(child, f)),
             }
         }
-        ports.iter().any(|p| offset(&p.data_type)) || body.iter().any(|s| walk(s, &offset))
+        ports.iter().any(|p| unsupported(&p.data_type))
+            || body.iter().any(|s| walk(s, &unsupported))
     }
 
     pub(super) fn try_run_compiled_free_function(
@@ -1908,8 +1909,8 @@ impl Simulator {
             // that is not `[N-1:0]` (`input logic [12:1] a`) is selected by
             // its labels, which the compiled selects do not rebase: `a[i]`
             // read bit i, so a hot function read the wrong bit or x (#650).
-            if self.declares_offset_packed_range(ports, body) {
-                trace_decline("offset-packed-range");
+            if self.declares_unsupported_packed_range(ports, body) {
+                trace_decline("packed-index-layout");
                 self.compiled_method_skip.insert((cid, mid, spec_id));
                 return None;
             }

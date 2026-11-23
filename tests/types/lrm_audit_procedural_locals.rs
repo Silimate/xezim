@@ -16,6 +16,38 @@ fn t_lines(sim: &xezim::compiler::Simulator) -> Vec<String> {
 }
 
 #[test]
+fn hot_functions_preserve_packed_lane_widths() {
+    const SRC: &str = r#"module block #(parameter DataWidth=64, parameter Bytes=$clog2(DataWidth/8)) ();
+ function automatic logic [63:0] tl_align_load(input logic [DataWidth-1:0] value, input logic [Bytes-1:0] addr);
+   logic [DataWidth/64-1:0][63:0] split = value;
+   return split[addr >> 3];
+ endfunction
+endmodule
+module top;
+ block #(64) narrow();
+ block #(128) wide();
+ logic [127:0] data;
+ int nerr;
+ initial begin
+   for(int i=0;i<2048;i++) begin
+     logic [63:0] narrow_word,wide_word;
+     data=128'hcafe000012345678_0000000020001401+i;
+     narrow_word=narrow.tl_align_load(data[63:0],3'h0);
+     wide_word=wide.tl_align_load(data,4'h8);
+     if(narrow_word!==data[63:0] || wide_word!==data[127:64]) begin
+       if(nerr==0)$display("FIRST i=%0d narrow=%h wide=%h input=%h",i,narrow_word,wide_word,data);
+       nerr++;
+     end
+   end
+   $display("T|errors=%0d",nerr);
+   $finish;
+ end
+endmodule"#;
+    let sim = simulate(SRC, 1000).expect("simulate");
+    assert_eq!(t_lines(&sim), ["T|errors=0"]);
+}
+
+#[test]
 fn singleton_packed_function_local_selects_a_whole_lane() {
     const SRC: &str = r#"module probe #(parameter DataWidth=64, parameter Bytes=$clog2(DataWidth/8))(
   input logic [DataWidth-1:0] value,

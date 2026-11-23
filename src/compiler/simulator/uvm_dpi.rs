@@ -1023,6 +1023,14 @@ impl Simulator {
                 bits: None,
             });
         }
+        // The VPI memory handle exists even when only its words have
+        // integral storage. Accessing data still requires a word index.
+        if self.module.arrays.contains_key(name)
+            || self.module.arrays_2d.contains_key(name)
+            || self.module.arrays_nd.contains_key(name)
+        {
+            return HdlLookup::Unsupported(format!("'{name}' is an unpacked array"));
+        }
         if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
             if let Some(obj) = self.uvm_hdl_whole(&base) {
                 return self.uvm_hdl_check_storage(HdlTarget {

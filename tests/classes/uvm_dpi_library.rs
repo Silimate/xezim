@@ -357,10 +357,11 @@ module top;
     uvm_hdl_data_t d;
     int ok;
     #1;
-    $display("T|mem_paths %0d%0d%0d%0d%0d",
+    $display("T|mem_paths %0d%0d%0d%0d%0d%0d%0d%0d",
       uvm_hdl_check_path("top.s.mem"), uvm_hdl_check_path("$root.top.s.plane"),
       uvm_hdl_check_path("top.s.cube"), uvm_hdl_check_path("top.s.mem[5]"),
-      uvm_hdl_check_path("top.s.missing_mem"));
+      uvm_hdl_check_path("top.s.missing_mem"), uvm_hdl_check_path("top.s.mem[16]"),
+      uvm_hdl_check_path("top.s.plane[2][0]"), uvm_hdl_check_path("top.s.cube[0][0][2]"));
     $display("T|check %0d%0d%0d%0d%0d%0d%0d%0d%0d",
       uvm_hdl_check_path("top.s"), uvm_hdl_check_path("top.s.off"),
       uvm_hdl_check_path("$root.top.s.off"), uvm_hdl_check_path("s.off"),
@@ -414,7 +415,7 @@ pub(super) fn uvm_1_2_dpi_hdl_backdoor_paths() {
     assert_lines(
         &out,
         &[
-            "T|mem_paths 11110",
+            "T|mem_paths 11110000",
             "T|check 111001011",
             "T|off 1 00a5",
             "T|off[7:4] 1 0005",

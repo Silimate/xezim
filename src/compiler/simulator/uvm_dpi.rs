@@ -987,7 +987,7 @@ impl Simulator {
         let p = path.trim();
         let p = p.strip_prefix("$root.").unwrap_or(p);
         let top = self.module.name.as_str();
-        if top == "__xezim_multi_top" {
+        let rel = if top == "__xezim_multi_top" {
             let head = p.split(['.', '[']).next().unwrap_or("");
             let is_top = self
                 .module
@@ -997,15 +997,24 @@ impl Simulator {
             if !is_top {
                 return HdlLookup::Missing;
             }
-            return self.uvm_hdl_lookup_rel(p);
-        }
-        if p == top {
+            p
+        } else if p == top {
             return HdlLookup::Scope;
+        } else if let Some(rel) = p.strip_prefix(top).and_then(|r| r.strip_prefix('.')) {
+            rel
+        } else {
+            return HdlLookup::Missing;
+        };
+        // A memory object has a VPI handle even without integral storage.
+        // Only recognize the exact path. A missing word must not inherit
+        // the result for its parent during packed-select resolution.
+        if self.module.arrays.contains_key(rel)
+            || self.module.arrays_2d.contains_key(rel)
+            || self.module.arrays_nd.contains_key(rel)
+        {
+            return HdlLookup::Unsupported(format!("'{rel}' is an unpacked array"));
         }
-        match p.strip_prefix(top).and_then(|r| r.strip_prefix('.')) {
-            Some(rel) => self.uvm_hdl_lookup_rel(rel),
-            None => HdlLookup::Missing,
-        }
+        self.uvm_hdl_lookup_rel(rel)
     }
 
     /// Resolve a top-relative path (the signal table's naming).
@@ -1022,14 +1031,6 @@ impl Simulator {
                 key: name.to_string(),
                 bits: None,
             });
-        }
-        // The VPI memory handle exists even when only its words have
-        // integral storage. Accessing data still requires a word index.
-        if self.module.arrays.contains_key(name)
-            || self.module.arrays_2d.contains_key(name)
-            || self.module.arrays_nd.contains_key(name)
-        {
-            return HdlLookup::Unsupported(format!("'{name}' is an unpacked array"));
         }
         if let Some((base, off, w)) = self.packed_leaf_of_hier(name) {
             if let Some(obj) = self.uvm_hdl_whole(&base) {

@@ -10,6 +10,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A method argument or result declared with a class's packed typedef keeps
+  its width when a class constant sizes the range, including when a derived
+  class inherits the typedef. The Coral RVV model's 128-bit ALU arguments
+  were truncated to one bit. (#474)
+* An imported package enum member hides a same-named compilation-unit
+  parameter in class methods and constant expressions. (#475)
+* A factory-created object in a module instance retains its specialized
+  type parameters. The Coral RVV model now uses the selected 16- and
+  32-bit operand widths in its ALU handlers. (#477)
 * An `always_comb` or `always @*` block that writes a member of an element
   of a packed array of packed structs (`r[0].data.id[i] |= ...`) writes that
   array, and the member it writes is not part of its sensitivity

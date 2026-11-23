@@ -48,6 +48,45 @@ endmodule"#;
 }
 
 #[test]
+fn hot_functions_follow_packed_typedef_dimensions() {
+    const SRC: &str = r#"package lane_types;
+  typedef logic [0:0][63:0] bank_t;
+  typedef bank_t alias_t;
+  typedef logic [63:0] word_t;
+endpackage
+module top;
+  import lane_types::*;
+  function automatic logic [63:0] direct(input bank_t formal);
+    return formal[0];
+  endfunction
+  function automatic logic [63:0] local_alias(input logic [63:0] value);
+    alias_t local_word = value;
+    return local_word[0];
+  endfunction
+  function automatic logic [63:0] qualified(input lane_types::bank_t formal);
+    return formal[0];
+  endfunction
+  function automatic logic [63:0] extra_dim(input word_t [0:0] formal);
+    return formal[0];
+  endfunction
+  int errors;
+  initial begin
+    for(int i=0;i<2048;i++) begin
+      logic [63:0] value = 64'h12345678_20001401 + i;
+      if (direct(value)!==value || local_alias(value)!==value || qualified(value)!==value || extra_dim(value)!==value) begin
+        if (errors==0) $display("first i=%0d direct=%h local=%h qualified=%h extra=%h expected=%h",i,direct(value),local_alias(value),qualified(value),extra_dim(value),value);
+        errors++;
+      end
+    end
+    $display("T|typedef_errors=%0d", errors);
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 1000).expect("simulate typedef formals and locals");
+    assert_eq!(t_lines(&sim), ["T|typedef_errors=0"]);
+}
+
+#[test]
 fn singleton_packed_function_local_selects_a_whole_lane() {
     const SRC: &str = r#"module probe #(parameter DataWidth=64, parameter Bytes=$clog2(DataWidth/8))(
   input logic [DataWidth-1:0] value,

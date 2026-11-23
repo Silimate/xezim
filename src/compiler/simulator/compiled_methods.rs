@@ -1689,15 +1689,6 @@ impl Simulator {
             .any(|s| self.declares_vif_local(std::slice::from_ref(*s)))
     }
 
-    /// class-perf free-function tier: run a package/module-scope FUNCTION
-    /// body as bytecode, reusing `try_run_compiled_method`'s entire plan +
-    /// admission + block-cache machinery under a SYNTHETIC class name. The
-    /// interpreter's frame for this call already holds the bound formals and
-    /// the implicit return cell; the callee runs with `this == 0` (pushed
-    /// null by the caller), so any member access degrades exactly as the interpreter
-    /// would — and a body that touches `this`-relative names was never
-    /// compilable anyway (the compiler's handle-chain gates require a
-    /// class-typed root, which no free-function frame provides).
     /// Standalone method bytecode binds locals and formals as flat registers.
     /// Only a single zero-based descending packed dimension has the same
     /// index mapping as the declared type.
@@ -1709,28 +1700,44 @@ impl Simulator {
         use crate::ast::stmt::StatementKind;
         use crate::ast::types::{DataType, PackedDimension};
         let unsupported = |dt: &DataType| {
-            let dims = match dt {
-                DataType::IntegerVector { dimensions, .. }
-                | DataType::Implicit { dimensions, .. }
-                | DataType::TypeReference { dimensions, .. } => dimensions,
-                _ => return false,
-            };
-            if dims.len() > 1 {
-                return true;
-            }
-            dims.iter().any(|d| match d {
-                PackedDimension::Range { left, right, .. } => {
-                    let c = |e| {
-                        super::elaborate::const_eval_i64_with_params(
-                            e,
-                            Some(&self.module.parameters),
-                        )
-                    };
-                    // `[W-1:0]` keeps compiling whatever `W` is.
-                    c(right) != Some(0) || c(left).is_some_and(|l| l < 0)
+            let mut current = dt;
+            let mut rank = 0;
+            // Dimensions on a typedef use surround the target's dimensions.
+            for _ in 0..64 {
+                let dims = match current {
+                    DataType::IntegerVector { dimensions, .. }
+                    | DataType::Implicit { dimensions, .. }
+                    | DataType::TypeReference { dimensions, .. } => dimensions,
+                    // An integer atom or packed aggregate supplies its own
+                    // element width below any dimensions on the typedef use.
+                    DataType::IntegerAtom { .. } | DataType::Struct(_) | DataType::Enum(_) => {
+                        return rank != 0;
+                    }
+                    _ => return false,
+                };
+                rank += dims.len();
+                if rank > 1 || dims.iter().any(|d| match d {
+                    PackedDimension::Range { left, right, .. } => {
+                        let c = |e| super::elaborate::const_eval_i64_with_params(
+                            e, Some(&self.module.parameters),
+                        );
+                        c(right) != Some(0) || c(left).is_some_and(|l| l < 0)
+                    }
+                    PackedDimension::Unsized(_) => false,
+                }) {
+                    return true;
                 }
-                PackedDimension::Unsized(_) => false,
-            })
+                let DataType::TypeReference { name, .. } = current else {
+                    return false;
+                };
+                let Some(target) = super::elaborate::lookup_scoped_type(
+                    name, &self.module.typedef_types,
+                ) else {
+                    return false;
+                };
+                current = target;
+            }
+            true
         };
         fn walk(s: &crate::ast::stmt::Statement, f: &dyn Fn(&DataType) -> bool) -> bool {
             match &s.kind {
@@ -1743,6 +1750,15 @@ impl Simulator {
             || body.iter().any(|s| walk(s, &unsupported))
     }
 
+    /// class-perf free-function tier: run a package/module-scope FUNCTION
+    /// body as bytecode, reusing `try_run_compiled_method`'s entire plan +
+    /// admission + block-cache machinery under a SYNTHETIC class name. The
+    /// interpreter's frame for this call already holds the bound formals and
+    /// the implicit return cell; the callee runs with `this == 0` (pushed
+    /// null by the caller), so any member access degrades exactly as the interpreter
+    /// would — and a body that touches `this`-relative names was never
+    /// compilable anyway (the compiler's handle-chain gates require a
+    /// class-typed root, which no free-function frame provides).
     pub(super) fn try_run_compiled_free_function(
         &mut self,
         fd: &crate::ast::decl::FunctionDeclaration,

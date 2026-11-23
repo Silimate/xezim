@@ -1012,7 +1012,12 @@ impl Simulator {
     ) -> Option<Value> {
         let handle = self.this_stack.last().copied().flatten()?;
         let lexical_class = self.class_context_stack.last()?.as_deref()?;
-        if !self.class_is_a(lexical_class, scope) {
+        // The parser also uses member access for a dotted object reference.
+        // A visible value declaration supplies that receiver in the usual way.
+        if !self.class_is_a(lexical_class, scope)
+            || self.method_local_shadows(scope)
+            || self.prop_owners(lexical_class).contains_key(scope)
+        {
             return None;
         }
         let owners = self.prop_owners(scope);

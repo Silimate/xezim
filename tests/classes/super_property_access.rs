@@ -106,6 +106,52 @@ endmodule"#;
     assert_eq!(u(&sim, "tag"), 12);
 }
 
+/// Locals, formals and object properties still supply their own dotted receiver.
+#[test]
+fn dotted_receivers_can_share_an_ancestor_name() {
+    let src = r#"
+class store;
+  int depth;
+  function new(int d); depth = d; endfunction
+endclass
+typedef store store_ref;
+class formal_probe extends store;
+  function new(int d); super.new(d); endfunction
+  function int read_arg(store_ref store);
+    return store.depth;
+  endfunction
+  function int read_local(store_ref arg);
+    store_ref store;
+    store = arg;
+    return store.depth;
+  endfunction
+endclass
+class property_probe extends store;
+  store_ref store;
+  function new(int d, store_ref other);
+    super.new(d);
+    store = other;
+  endfunction
+  function int read_prop(); return store.depth; endfunction
+endclass
+module tb;
+  store_ref other;
+  formal_probe a;
+  property_probe b;
+  int via_arg, via_local, via_property;
+  initial begin
+    other = new(23); a = new(11); b = new(17, other);
+    via_arg = a.read_arg(other);
+    via_local = a.read_local(other);
+    via_property = b.read_prop();
+  end
+endmodule"#;
+    let sim = simulate(src, 50).unwrap();
+    for name in ["via_arg", "via_local", "via_property"] {
+        assert_eq!(u(&sim, name), 23, "{name}");
+    }
+}
+
 /// §18.5.7 — a `.size()` constraint nested inside `if/else`. The size solver
 /// only descended into Block/Soft/Inside/Expr items, so a size bound written
 /// under a conditional never reached it: the queue got an arbitrary size and

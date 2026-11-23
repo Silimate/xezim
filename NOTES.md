@@ -8,6 +8,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased (Silimate fork)
 
+- Delayed nonblocking assignments from the same process now take effect in
+  execution order when they mature together (§4.6). A default assignment
+  could previously overwrite a later conditional assignment to the same signal.
+
 **Correctness**
 
 * A method argument or result declared with a class's packed typedef keeps

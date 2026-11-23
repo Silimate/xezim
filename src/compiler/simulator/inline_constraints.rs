@@ -491,11 +491,19 @@ impl Simulator {
         // the package name; the package's collection is stored under its
         // bare name (or its contested `<pkg>::<name>` store).
         // A local or property sharing the package's name is an object.
-        if let ExprKind::MemberAccess { expr: base, .. } = &expr.kind
+        if let ExprKind::MemberAccess { expr: base, member } = &expr.kind
             && matches!(&base.kind, ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h))
             && let Some(e) = self.strip_package_lvalue(expr)
             && let ExprKind::Ident(h) = &e.kind
         {
+            // Unpacked package parameters have qualified element and shape
+            // entries even when an unrelated package declares the same name.
+            if let ExprKind::Ident(pkg) = &base.kind {
+                let scoped = format!("{}::{}", pkg.path[0].name.name, member.name);
+                if self.module.arrays.contains_key(&scoped) {
+                    return Some(scoped);
+                }
+            }
             let nm = &h.path[0].name.name;
             return (self.module.arrays.contains_key(nm) || self.module.dynamic_arrays.contains(nm))
                 .then(|| nm.clone());

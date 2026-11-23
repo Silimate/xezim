@@ -77,3 +77,38 @@ endmodule
         .collect();
     assert_eq!(lines, ["'{1, 2, 9}"]);
 }
+
+#[test]
+fn copy_fixed_package_strings_into_inherited_dynamic_array() {
+    let result = xezim::simulate(
+        r#"
+package alpha;
+  parameter string names[5:3] = '{"amber", "blue", "cyan"};
+endpackage
+package beta;
+  parameter string names[2] = '{"north", "south"};
+endpackage
+class parent;
+  string names[];
+endclass
+class cfg extends parent;
+  function void run();
+    names = alpha::names;
+    $display("alpha %0d %s %s %s", names.size(), names[0], names[1], names[2]);
+    this.names = beta::names;
+    $display("beta %0d %s %s", names.size(), names[0], names[1]);
+  endfunction
+endclass
+module top;
+  initial begin
+    cfg c = new;
+    c.run();
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let output: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(output, ["alpha 3 amber blue cyan", "beta 2 north south"]);
+}

@@ -3724,21 +3724,20 @@ impl Simulator {
                 }
             }
         }
-        // Module-level fixed array (bare Ident). A DYNAMIC array / queue is
-        // registered in `module.arrays` with the (0,-1) queue SENTINEL range
-        // (and in `dynamic_arrays`) — it is NOT a fixed array and must not be
-        // compared element-wise as the empty 0:-1 range: UVM's `val == t` on
-        // two `T`-typed queues would otherwise both resolve to (0,-1) and the
-        // guard falsely reported them equal (skipping the update).
-        if let ExprKind::Ident(h) = &expr.kind
-            && !self.ident_shadowed_by_non_collection(h)
-        {
-            let name = self.resolve_hier_name(h);
-            if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
-                if !self.module.dynamic_arrays.contains(&*name) && !(hi < lo) {
-                    return Some((name.to_string(), lo, hi));
-                }
+        // Procedural scopes retain a package-qualified operand as MemberAccess.
+        // Use the collection resolver there, including its receiver-shadowing
+        // check and its selection of a qualified or hoisted package key.
+        let name = match &expr.kind {
+            ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h) => {
+                self.resolve_hier_name(h)
             }
+            ExprKind::MemberAccess { .. } => self.array_operand_name(expr)?.into(),
+            _ => return None,
+        };
+        let &(lo, hi, _) = self.module.arrays.get(name.as_ref())?;
+        // Dynamic arrays and queues use (0, -1) as a sentinel in this table.
+        if hi >= lo && !self.module.dynamic_arrays.contains(name.as_ref()) {
+            return Some((name.into_owned(), lo, hi));
         }
         None
     }

@@ -86,3 +86,54 @@ endmodule
     );
     assert_eq!(out, ["randstate 1"]);
 }
+
+#[test]
+fn observing_a_partial_dist_schedule_preserves_the_sequence_and_replays_on_a_peer() {
+    let out = lines(
+        r#"
+class C;
+  rand bit [7:0] v;
+  constraint k { v dist { [0:9] := 1, [10:255] :/ 1 }; }
+endclass
+module t;
+  C c = new, control = new, replay = new;
+  string state, again;
+  int errors = 0;
+  initial begin
+    c.srandom(71); control.srandom(71);
+    void'(c.randomize()); void'(control.randomize());
+    state = c.get_randstate(); again = c.get_randstate();
+    replay.set_randstate(state);
+    for (int i = 0; i < 24; i++) begin
+      void'(c.randomize()); void'(control.randomize()); void'(replay.randomize());
+      if (c.v != control.v || replay.v != control.v) errors++;
+    end
+    $display("observed %0d replay-errors %0d", state == again, errors);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(out, ["observed 1 replay-errors 0"]);
+}
+
+#[test]
+fn observing_an_unseeded_object_preserves_its_calling_stream() {
+    let out = lines(
+        r#"
+class C; rand bit [15:0] v; endclass
+module t;
+  C c = new, control = new;
+  process p;
+  string state;
+  int a, b;
+  initial begin
+    p = process::self();
+    p.srandom(39); state = c.get_randstate(); void'(c.randomize()); a = $urandom;
+    p.srandom(39); void'(control.randomize()); b = $urandom;
+    $display("object %0d process %0d", c.v == control.v, a == b);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(out, ["object 1 process 1"]);
+}

@@ -3877,7 +3877,11 @@ impl Simulator {
             .dist_decks
             .get(&key)
             .and_then(|ds| ds.iter().find(|d| d.0 == sig))
-            .is_some_and(|(_, deck, pos)| *pos < deck.len());
+            // State strings are implementation-defined input. Rebuild a deal
+            // whose next card does not name a live item in these weights.
+            .and_then(|(_, deck, pos)| deck.get(*pos))
+            .and_then(|&item| masses.get(item))
+            .is_some_and(|&mass| mass > 0);
         if !live {
             let mut deck = self.build_dist_deck(masses)?;
             // The schedule opens on its heaviest item: start it at a random

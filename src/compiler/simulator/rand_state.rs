@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// For each weight signature, the dealt item indices and the next slot.
+pub(super) type DistSchedules = Vec<(u64, Vec<usize>, usize)>;
+
 /// A random stream (IEEE 1800-2023 §18.14 "Random stability").
 ///
 /// §18.14 requires every *object* and every *process* to own an independent,

@@ -1998,7 +1998,7 @@ pub struct Simulator {
     /// §18.5.4/§18.10 dist schedules, keyed by (instance handle, variable):
     /// one (weight signature, item schedule, next slot) per weight set. See
     /// `pick_dist_value`.
-    dist_decks: HashMap<(usize, String), Vec<(u64, Vec<usize>, usize)>>,
+    dist_decks: HashMap<(usize, String), DistSchedules>,
     /// Built-in semaphores (handle -> current count)
     semaphores: HashMap<usize, i64>,
     /// Covergroup instance heap (index 0 is null).
@@ -2443,19 +2443,11 @@ pub struct Simulator {
     /// Default random number generator — the stream used by any object or
     /// process that has not been given a private one (§18.14).
     rng: SvRng,
-    /// §18.14.1 per-PROCESS random stream. Populated lazily: a process only
-    /// gets a private stream once `process::self().srandom()` /
-    /// `.set_randstate()` / `.get_randstate()` is called on it. Until then it
-    /// draws from `rng`, preserving the historical (entropy) behaviour.
-    /// Keyed by pid, so forked threads are independent of each other and of
-    /// their parent — their `$urandom` sequence no longer depends on the
-    /// scheduling order of the other threads.
+    /// §18.14.1 per-process streams, keyed by pid. A process draws from
+    /// the default stream until explicitly seeded or restored.
     proc_rng: HashMap<usize, SvRng>,
-    /// §18.14.1/§18.14.2 per-OBJECT random stream, keyed by class handle.
-    /// Populated lazily by `obj.srandom(seed)` / `obj.set_randstate(s)` /
-    /// `obj.get_randstate()`; `randomize()` on such an object draws from it, so
-    /// the object's sequence is unaffected by any thread reseeding and vice
-    /// versa.
+    /// §18.14.1/§18.14.2 per-object streams, keyed by class handle. A seeded
+    /// or restored object draws independently of the calling process.
     obj_rng: HashMap<usize, SvRng>,
     /// Handles of the objects whose `randomize()` is currently executing
     /// (a stack — a constraint/post_randomize may randomize another object).

@@ -270,6 +270,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   NPU RVV backend decoder read its UVM testbench package's `EEW8 = 8`, which
   the RTL's 3-bit `EEW_e` truncates to `EEW_NONE`, and discarded every
   instruction. (#471)
+* `super.m()` in a task of a class declared in a module that the top
+  instantiates runs the parent class's `m` (§8.15). The blocking-task
+  inliner took the call for one through the object itself and ran the
+  override again, so a UVM component whose `run_phase` calls
+  `super.run_phase(phase)` recursed at time 0 until the stall check stopped
+  the run. (#462)
+* A static dynamic array, queue or associative array property of a class
+  holds its initializer (`static sew_e set[] = '{SEW8, SEW16};`) before any
+  initial procedure runs (§8.9, §6.8). It started empty, so `Cls::set.size()`
+  read 0 and a constraint `v inside {set}` had no solution; a parameterized
+  class's static collections still start empty. In a queue or dynamic-array
+  initializer, of a static or an instance property, an `N{...}` item gives
+  N elements, its operand evaluated once (§10.9.1, §11.4.12.1); it gave one.
+  (#466)
 
 **Performance**
 

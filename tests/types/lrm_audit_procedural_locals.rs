@@ -94,6 +94,36 @@ endmodule
 }
 
 #[test]
+fn singleton_formal_preserves_caller_selects_and_default_scope() {
+    const SRC: &str = r#"module top;
+  logic [63:0] data;
+  int visits;
+  function automatic logic [63:0] view(input logic [0:0][63:0] data,
+                                        input logic [63:0] later = data[0]);
+    visits++;
+    return data[0] | later;
+  endfunction
+  initial begin
+    data = 64'h123456789abcdef2;
+    $display("T|args=%h", view(data[0],data[1]));
+    $display("T|default=%h", view(data));
+    $display("T|caller=%b%b visits=%0d",data[0],data[1],visits);
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|args=0000000000000001",
+            "T|default=123456789abcdef2",
+            "T|caller=01 visits=2",
+        ]
+    );
+}
+
+#[test]
 fn blocklocal_2state_vector() {
     const SRC: &str = r#"
 module rbs;

@@ -196,59 +196,6 @@ impl Simulator {
         let supplied = normalized
             .as_ref()
             .map(|_| Self::supplied_argument_mask(&fd.ports, args));
-        // The formals' and return variable's metadata are written below.
-        for port in fd.ports.iter() {
-            self.meta_note(&port.name.name);
-        }
-        self.meta_note(&fd.name.name.name);
-        // §7.4.1: packed-of-packed FORMALS (and the return variable) need
-        // their element width registered under the bare formal name, or the
-        // body's `x[i]` reads collapse to single-bit selects (same defect as
-        // the VarDecl path; see the local-declaration twin).
-        for port in fd.ports.iter() {
-            if !port.dimensions.is_empty() {
-                continue;
-            }
-            let w = super::elaborate::resolve_type_width(
-                &port.data_type,
-                Some(&self.module.parameters),
-                Some(&self.module.typedefs),
-            );
-            if let Some(ew) = self.ast_decl_elem_width(&port.data_type) {
-                if ew > 0 && w >= ew && w % ew == 0 {
-                    self.module
-                        .packed_signal_elem_widths
-                        .insert(port.name.name.clone(), ew);
-                } else {
-                    self.module
-                        .packed_signal_elem_widths
-                        .remove(&port.name.name);
-                }
-            } else {
-                self.module
-                    .packed_signal_elem_widths
-                    .remove(&port.name.name);
-            }
-        }
-        {
-            let rw = super::elaborate::resolve_type_width(
-                &fd.return_type,
-                Some(&self.module.parameters),
-                Some(&self.module.typedefs),
-            );
-            let rname = &fd.name.name.name;
-            if let Some(ew) = self.ast_decl_elem_width(&fd.return_type) {
-                if ew > 0 && rw >= ew && rw % ew == 0 {
-                    self.module
-                        .packed_signal_elem_widths
-                        .insert(rname.clone(), ew);
-                } else {
-                    self.module.packed_signal_elem_widths.remove(rname);
-                }
-            } else {
-                self.module.packed_signal_elem_widths.remove(rname);
-            }
-        }
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
         let arg_supplied = |i: usize| {
             i < args.len()
@@ -329,6 +276,9 @@ impl Simulator {
         // path — collect their `(local_key, caller_lvalue)` pairs to copy
         // each member back to the caller's actual on return.
         let struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
+        // Install scalar formal types after supplied arguments have been
+        // evaluated. A caller's variable may have the same bare name.
+        let mut scalar_formals: Vec<usize> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
             let is_out = matches!(
                 port.direction,
@@ -480,8 +430,26 @@ impl Simulator {
                 self.in_subroutine_default_scope(None, None, |sim| {
                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
                     sim.push_pending_formal_dyn(&formal_dyn);
+                    // Defaults may index previously bound formals. Expose
+                    // their types for this expression, then restore the caller.
+                    let prior_types: Vec<_> = scalar_formals
+                        .iter()
+                        .map(|&j| {
+                            let p = &fd.ports[j];
+                            let saved = sim.snapshot_formal_metadata(&p.name.name);
+                            sim.register_formal_type_metadata(
+                                &p.name.name,
+                                &p.data_type,
+                                p.dimensions.is_empty(),
+                            );
+                            saved
+                        })
+                        .collect();
                     let value = sim.eval_formal_default(port, def);
                     let value = sim.vif_argument_value(port, def, value);
+                    for saved in prior_types.into_iter().rev() {
+                        sim.restore_formal_metadata(saved);
+                    }
                     sim.pop_pending_formal_dyn();
                     sim.pop_local_frame();
                     value
@@ -546,13 +514,16 @@ impl Simulator {
                     }
                 }
             }
-            // Same §13.3 metadata registration as the task path.
+            scalar_formals.push(i);
+            locals.insert(port.name.name.clone(), val);
+        }
+        for i in scalar_formals {
+            let port = &fd.ports[i];
             self.register_formal_type_metadata(
                 &port.name.name,
                 &port.data_type,
                 port.dimensions.is_empty(),
             );
-            locals.insert(port.name.name.clone(), val);
         }
         // Initialize return variable (function name). Size it to the
         // declared return type's width so a bit-select write

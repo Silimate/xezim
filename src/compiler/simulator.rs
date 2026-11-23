@@ -5361,6 +5361,7 @@ struct FormalMetadataSnapshot {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct FormalMetaParts {
     declared_type: Option<Rc<DataType>>,
+    struct_members: Option<Vec<String>>,
     packed_fields: Option<Vec<(String, u32, u32)>>,
     packed_element_widths: Vec<(String, u32)>,
     packed_dimensions: Option<Vec<(i64, i64)>>,

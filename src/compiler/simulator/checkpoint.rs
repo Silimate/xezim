@@ -48,7 +48,7 @@ use serde::ser::{SerializeSeq, Serializer};
 // §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
 // §19.5: covergroup instances retain the real-valued coverpoint set.
 // silimate: §16.4.2: DeferredReport::inst and ::tag, tallied when the report matures.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x22";
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x23";
 
 #[derive(Default)]
 struct Session {

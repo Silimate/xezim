@@ -43,6 +43,25 @@ endmodule
 }
 
 #[test]
+fn multidimensional_defaults_follow_array_names_in_generated_scopes() {
+    check(
+        r#"module bank(output wire [3:0] result);
+            bit [1:0] words[2][3];
+            tri [1:0] floating[2][2][2];
+            assign result = {words[1][2], floating[1][0][1]};
+        endmodule"#,
+        r#"wire [7:0] generated;
+           tri1 [7:0] words_hi[2][3];
+           tri0 [7:0] low[2][2][2];
+           for (genvar i = 0; i < 2; i++) begin : g
+             bank u(generated[4*i+:4]);
+           end"#,
+        "{words_hi[1][2], low[1][0][1], generated}",
+        "111111110000000000zz00zz",
+    );
+}
+
+#[test]
 fn two_outputs_resolve_on_one_wire_element() {
     check(
         SOURCE,

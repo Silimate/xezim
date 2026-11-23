@@ -147,11 +147,18 @@ class agent_base #(type SEQ_T=default_seq);
 endclass
 class agent extends agent_base #(.SEQ_T(jtag_seq));
 endclass
+class direct_agent extends agent_base #(.SEQ_T(seq_base #(.ITEM_T(item))));
+endclass
+class plain_agent extends agent_base #(.SEQ_T(default_seq));
+endclass
 module top;
   initial begin
     static agent a=new;
+    static direct_agent b=new;
+    static plain_agent c=new;
     static jtag_seq direct=jtag_seq::type_id::create();
-    a.build();
+    a.build(); b.build(); c.build();
+    $display("BOUND %0d %0d",b.sequencer.marker,c.sequencer.marker);
     $display("JTAG direct=%0d generic=%0d values=%0d/%0d",direct!=null,a.sequencer!=null,direct.marker,a.sequencer.marker);
     $finish;
   end
@@ -161,6 +168,7 @@ endmodule
         100_000,
     )
     .unwrap();
+    assert!(result.output.iter().any(|line| line.message == "BOUND 47 905"), "{:?}", result.output);
     assert!(
         result
             .output

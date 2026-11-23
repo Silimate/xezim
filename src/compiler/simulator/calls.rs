@@ -147,7 +147,14 @@ impl Simulator {
         }
         let bound = self.resolve_type_param_binding(receiver);
         let receiver = bound.as_deref().unwrap_or(receiver);
-        let (base, spec) = self.resolve_typedef_spec(receiver).or_else(|| {
+        // The binding can name a concrete class or carry its own #(args).
+        // Ordinary unbound class names continue through normal static dispatch.
+        let concrete = bound.as_deref().and_then(|name| {
+            self.extract_spec_from_string(name).or_else(|| {
+                self.module.classes.contains_key(name).then(|| (name.to_owned(), String::new()))
+            })
+        });
+        let (base, spec) = concrete.or_else(|| self.resolve_typedef_spec(receiver)).or_else(|| {
             let alias = self.resolve_plain_alias_chain(receiver)?;
             self.resolve_typedef_spec(&alias)
                 .or_else(|| Some((alias, String::new())))

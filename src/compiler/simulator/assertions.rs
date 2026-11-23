@@ -2084,12 +2084,10 @@ impl Simulator {
         }
         let mut var_sels = Vec::new();
         for mut e in sels {
-            // silimate: a whole unpacked array a concurrent assertion reads is sampled
             if matches!(e.kind, ExprKind::Ident(_)) {
                 self.sva_all_cells(&e, &mut sampled_ids);
                 continue;
             }
-            // /silimate
             match Self::sva_sel_kind(&e) {
                 Some(true) => {
                     self.sva_cells(&e, &mut sampled_ids);
@@ -2166,12 +2164,11 @@ impl Simulator {
         // A procedural assertion registers while its procedure runs, which
         // for an edge-triggered procedure is at the tick that starts its
         // first attempt: take that edge as seen (§16.14.6).
-        // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
         // One reached after a delay is not at a tick: its first attempt
-        // waits for the clock's next event.
+        // waits for the clock's next event. A clock sampled at the start of
+        // the time step (`sva_clock_watch`) tells exactly instead.
         let at_tick =
             procedural && (self.settling || !self.delay_resumed.contains(&self.current_pid));
-        // /silimate
         let mut clock_events = Vec::with_capacity(events.len());
         for mut event in events {
             self.sva_fold_scopes(&mut event.expr);
@@ -2191,8 +2188,17 @@ impl Simulator {
                 previous: Value::all_x(1),
             };
             clock_event.previous = self.sva_event_value(&clock_event);
-            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
-            if at_tick {
+            // A watched clock had its event in this time step only if it
+            // moved since the step began, whatever woke the procedure (a
+            // `go` that rises while `clk` is high is no tick of `clk`).
+            let slot_start = if procedural {
+                self.sva_clock_slot_start(&clock_event.event.expr)
+            } else {
+                None
+            };
+            if let Some(bit) = slot_start {
+                clock_event.previous.set_bit(0, bit);
+            } else if at_tick {
                 let bit = clock_event.previous.get_bit(0);
                 let opposite = match (clock_event.event.edge, bit) {
                     (Some(Edge::Posedge), LogicBit::One) => Some(LogicBit::Zero),
@@ -2418,14 +2424,12 @@ impl Simulator {
                 || self.module.arrays_2d.contains_key(n.as_ref())
                 || self.module.arrays_nd.contains_key(n.as_ref())
         });
-        // silimate: a whole unpacked array a concurrent assertion reads is sampled
         // §16.5.1: the whole array (`v inside {m}`, `m == '{default: 0}`)
         // reads every cell, each at its sampled value.
         if array && matches!(e.kind, ExprKind::Ident(_)) {
             out.push(e.clone());
             return;
         }
-        // /silimate
         if chain && array {
             out.push(e.clone());
             let mut cur = e;
@@ -2476,9 +2480,21 @@ impl Simulator {
                 sub(left);
                 sub(right);
             }
-            ExprKind::Concatenation(v)
-            | ExprKind::SystemCall { args: v, .. }
-            | ExprKind::Call { args: v, .. } => v.iter().for_each(&mut sub),
+            ExprKind::Concatenation(v) | ExprKind::SystemCall { args: v, .. } => {
+                v.iter().for_each(&mut sub)
+            }
+            // §7.12: an array method (`m.sum()`, `m.and()`, `m[1].min()`)
+            // reads the cells of its receiver.
+            ExprKind::Call { func, args } => {
+                if let Some(recv) = Self::sva_method_receiver(func) {
+                    sub(&recv);
+                }
+                args.iter().for_each(&mut sub);
+            }
+            ExprKind::WithClause { expr, filter } => {
+                sub(expr);
+                sub(filter);
+            }
             ExprKind::Replication { count, exprs } => {
                 sub(count);
                 exprs.iter().for_each(&mut sub);
@@ -2493,11 +2509,50 @@ impl Simulator {
                 sub(hi);
             }
             ExprKind::SvaClocked { body, .. } => sub(body),
-            // silimate: a whole unpacked array a concurrent assertion reads is sampled
             ExprKind::AssignmentPattern(items) => items.iter().for_each(|it| sub(it.expr())),
             ExprKind::TypedPattern { pattern, .. } => sub(pattern),
-            // /silimate
             _ => {}
+        }
+    }
+
+    /// The receiver of method call `func` (`m` of `m.sum()`, `m[1]` of
+    /// `m[1].min()`) as an expression `collect_sva_sels` can take: a select
+    /// chain over the array's name. `None` when `func` names no receiver.
+    fn sva_method_receiver(func: &Expression) -> Option<Expression> {
+        match &func.kind {
+            ExprKind::MemberAccess { expr, .. } => Some((**expr).clone()),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let segs = &h.path[..h.path.len() - 1];
+                // Selects are allowed on the receiver's own segment only.
+                if segs[..segs.len() - 1].iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                let mut path = segs.to_vec();
+                let selects = std::mem::take(&mut path.last_mut()?.selects);
+                let base = HierarchicalIdentifier {
+                    root: h.root.clone(),
+                    path,
+                    span: h.span,
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
+                };
+                let mut cur = Expression::new(ExprKind::Ident(base), func.span);
+                for sel in selects {
+                    if matches!(sel.kind, ExprKind::Range(..)) {
+                        return None;
+                    }
+                    cur = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(cur),
+                            index: Box::new(sel),
+                        },
+                        func.span,
+                    );
+                }
+                Some(cur)
+            }
+            _ => None,
         }
     }
 
@@ -2610,7 +2665,45 @@ impl Simulator {
         if let Some(id) = self.resolve_signal_id(&name) {
             out.push(id);
         }
+        // A row of a multi-dimensional array (`m2[1] == m`, the receiver of
+        // `m2[1].sum()`) reads each of its cells.
+        if !self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty() {
+            out.extend(self.sva_row_cells(&name));
+        }
         Some(name)
+    }
+
+    /// The signal ids of the cells of row `row` (`m2[1]`, `m3[0][1]`) of a
+    /// fixed-size multi-dimensional unpacked array, in no particular order.
+    /// Empty for any other name.
+    fn sva_row_cells(&self, row: &str) -> Vec<usize> {
+        let Some((root, rest)) = row.split_once('[') else {
+            return Vec::new();
+        };
+        if !rest.ends_with(']') || rest.contains('.') {
+            return Vec::new();
+        }
+        if !self.module.arrays_2d.contains_key(root) && !self.module.arrays_nd.contains_key(root) {
+            return Vec::new();
+        }
+        let Some(dims) = self.module.unpacked_decl_dims.get(root) else {
+            return Vec::new();
+        };
+        let fixed = rest.matches('[').count() + 1;
+        if fixed >= dims.len() {
+            return Vec::new();
+        }
+        let mut names = vec![row.to_string()];
+        for &(l, r) in &dims[fixed..] {
+            names = names
+                .iter()
+                .flat_map(|n| (l.min(r)..=l.max(r)).map(move |i| Self::name_with_index(n, i)))
+                .collect();
+        }
+        names
+            .iter()
+            .filter_map(|n| self.resolve_signal_id(n))
+            .collect()
     }
 
     /// The index range of the unpacked array or sub-array `base` (`a`, or
@@ -2761,7 +2854,6 @@ impl Simulator {
                 self.collect_sva_signal_ids(hi, out);
             }
             ExprKind::SvaClocked { body, .. } => self.collect_sva_signal_ids(body, out),
-            // silimate: a whole unpacked array a concurrent assertion reads is sampled
             // The operands of an assignment pattern (`m == '{a, b}`) are
             // sampled like any other.
             ExprKind::AssignmentPattern(items) => {
@@ -2770,7 +2862,6 @@ impl Simulator {
                 }
             }
             ExprKind::TypedPattern { pattern, .. } => self.collect_sva_signal_ids(pattern, out),
-            // /silimate
             _ => {}
         }
     }
@@ -3271,23 +3362,19 @@ impl Simulator {
             // Only the sites whose clock event was recorded tick. The others
             // check their asynchronous abort conditions (§16.12.14).
             let fired = std::mem::take(&mut self.sva_sites[i].fired);
-            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
             // §16.14.6: an instance maturing in a time step whose tick has
             // passed (one queued after a `#0`) starts its attempt at that
             // tick; the attempts in flight have taken it already.
             let late = !fired
                 && !self.sva_sites[i].matured.is_empty()
                 && self.sva_sites[i].tick_time == Some(self.time);
-            // /silimate
             if !fired && !late {
                 if self.sva_sites[i].async_abort && !self.sva_sites[i].attempts.is_empty() {
                     self.sva_abort_step_site(i);
                 }
                 continue;
             }
-            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
             self.sva_sites[i].tick_time = Some(self.time);
-            // /silimate
             let node = self.sva_sites[i].node.clone();
             // §16.12.14: attempts an abort settled since the last tick come
             // first; a `disable iff` at this tick does not reach them.
@@ -3374,7 +3461,6 @@ impl Simulator {
             let saved = self.install_preponed(&sampled_ids);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
             let mut metas = self.sva_take_meta(i, attempts.len());
-            // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
             // A late start steps only the attempts it started (the last ones;
             // a Kill or Reset from a start callback may have dropped them):
             // the older ones took this tick's step already, and stay where
@@ -3384,7 +3470,6 @@ impl Simulator {
             } else {
                 0
             };
-            // /silimate
             let mut results: Vec<SvaOutcome> = settled;
             let mut result_meta: Vec<SvaAttemptMeta> = settled_meta;
             result_meta.resize(results.len(), new_meta);
@@ -3392,13 +3477,11 @@ impl Simulator {
             let mut live_meta: Vec<SvaAttemptMeta> = Vec::with_capacity(attempts.len());
             let all_matches = self.sva_sites[i].all_matches;
             for (k, (mut st, mut meta)) in attempts.drain(..).zip(metas.drain(..)).enumerate() {
-                // silimate: an instance maturing after its clock's tick in the same time step attempts at that tick
                 if k < skip {
                     live.push(st);
                     live_meta.push(meta);
                     continue;
                 }
-                // /silimate
                 meta.clock_steps += 1;
                 if all_matches {
                     let step = match (&*node, &mut st) {
@@ -4011,7 +4094,7 @@ impl Simulator {
                 .strip_prefix(top)
                 .map(|r| r.trim_start_matches('.'))
                 .unwrap_or(cur);
-            if rel.is_empty() || self.module.instances.iter().any(|i| i.path == rel) {
+            if rel.is_empty() || self.instance_by_path(&*rel).is_some() {
                 return None;
             }
             match cur.rfind('.') {

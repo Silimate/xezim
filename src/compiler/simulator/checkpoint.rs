@@ -47,8 +47,12 @@ use serde::ser::{SerializeSeq, Serializer};
 // §9.2.2.2: Simulator::comb_time0_held, CombEntryCold::time0_effects.
 // §16.4.2: DeferredReport::stat_key, ::stat_kind and ::stat_loc, counted when the report matures.
 // §19.5: covergroup instances retain the real-valued coverpoint set.
-// silimate: §16.4.2: DeferredReport::inst and ::tag, tallied when the report matures.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x23";
+// Arm fanouts may retain the bit masks of their clocked readers.
+// Wide partial NBA profiling retains separate quiet and cloned counts.
+// §16.14.6: Simulator::delay_pids and ::delay_resumed, SvaClockedSite::tick_time.
+// §6.21: BlockScopeSave::static_hidden keeps each hidden static's position.
+// Downstream assertion counts and coverage state accompany upstream's scheduler state.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x26";
 
 #[derive(Default)]
 struct Session {
@@ -1004,6 +1008,8 @@ impl Simulator {
             Ok(())
         })?;
         self.reopen_files(file.files)?;
+        self.unresolved_force_count = self.active_force_exprs.iter()
+            .filter(|entry| entry.has_unresolved_reads).count();
         // §10.6.2: the writers index is built from the restored entry table.
         self.comb_writer_index = None;
         // Caches keyed by an address in the run that wrote the checkpoint.
@@ -1016,6 +1022,9 @@ impl Simulator {
         self.lazy_initial.clear();
         // #1149: the listed-once bits of the restored deferred reads.
         self.rebuild_deferred_proc_seen();
+        // Rebuild the derived edge routes and gate queues together after restore.
+        self.gate_lane_valid = false;
+        self.build_mux_guards();
         self.method_plans.borrow_mut().clear();
         self.fsm_clobber_cache.clear();
         // Annex D.9 / §8.3: this derived index borrows the class table.
@@ -1215,6 +1224,7 @@ checkpoint_state!(
     armed_fast_skips,
     armed_input_bitmap,
     armed_input_blocks,
+    armed_input_masks,
     armed_input_ranges,
     array_elem_ids,
     array_local_packed_dims,
@@ -1315,10 +1325,8 @@ checkpoint_state!(
     deferred_asserts,
     deferred_comb_pool,
     deferred_proc_entries,
-    // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
     delay_pids,
     delay_resumed,
-    // /silimate
     delayed_nba,
     delayed_nba_queue,
     delayed_slice_chains,
@@ -1544,6 +1552,8 @@ checkpoint_state!(
     prof_fallback_insns,
     prof_insns_executed,
     prof_nba_elided,
+    prof_wide_nba_quiet,
+    prof_wide_nba_cloned,
     prof_observed_stores,
     prof_par_blocks,
     prof_par_dispatch_legacy,

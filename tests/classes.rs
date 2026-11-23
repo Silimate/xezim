@@ -402,8 +402,16 @@ mod covergroup_sampling_event;
 mod factory_run_test;
 #[path = "classes/factory_typedef_chain.rs"]
 mod factory_typedef_chain;
+#[path = "classes/foreach_member_elem_packed_dims.rs"]
+mod foreach_member_elem_packed_dims;
 #[path = "classes/foreach_member_multidim.rs"]
 mod foreach_member_multidim;
+#[path = "classes/foreach_member_subarray_elem_bits.rs"]
+mod foreach_member_subarray_elem_bits;
+#[path = "classes/foreach_packed_member_param_range.rs"]
+mod foreach_packed_member_param_range;
+#[path = "classes/foreach_packed_member_single_dim.rs"]
+mod foreach_packed_member_single_dim;
 #[path = "classes/generate_and_class_parameters.rs"]
 mod generate_and_class_parameters;
 #[path = "classes/inherited_static_shared.rs"]
@@ -1378,7 +1386,10 @@ mod static_string_queue_percent_p;
 mod typename_specialized_property;
 #[path = "classes/queue_row_name_collision.rs"]
 mod queue_row_name_collision;
-// silimate: a replicated item with a side effect is evaluated once in a class row store
+#[path = "classes/rand_srandom_reseed_repeats.rs"]
+mod rand_srandom_reseed_repeats;
+#[path = "classes/review_rand_srandom_streams.rs"]
+mod review_rand_srandom_streams;
 #[path = "classes/class_row_replication_once.rs"]
 mod class_row_replication_once;
 #[path = "classes/inherited_packed_typedef_width.rs"]

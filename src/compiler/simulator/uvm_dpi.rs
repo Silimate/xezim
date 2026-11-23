@@ -1013,7 +1013,7 @@ impl Simulator {
         if name.is_empty() {
             return HdlLookup::Missing;
         }
-        if self.module.instances.iter().any(|i| i.path == name) {
+        if self.instance_by_path(&*name).is_some() {
             return HdlLookup::Scope;
         }
         if let Some(obj) = self.uvm_hdl_whole(name) {
@@ -1263,8 +1263,7 @@ impl Simulator {
                 self.unforce_cell(id);
             }
             self.forced_names.remove(&t.key);
-            let key = t.key.clone();
-            self.active_force_exprs.retain(|entry| entry.key != key);
+            self.remove_active_force_expr(&t.key);
         }
         self.uvm_hdl_store(&t.obj, &v);
         if force {

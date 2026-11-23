@@ -414,6 +414,7 @@ fn method_boost_enabled() -> bool {
 // §7.4.5: member collection reads that yield unpacked rows use their row storage.
 // §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
 // silimate: bump the method-cache salt past upstream's for the local-collection element width fix
+// §23.9, §12.7.1: persisted_method_key also versions shared bytecode lowering for packed loops.
 // §11.6.1, §7.10: an element read of a method-local queue or dynamic array has its element's
 // width, so a compare of two of them no longer resizes both to one bit. On an upstream bump,
 // take upstream's value and bump it once more.
@@ -1953,7 +1954,8 @@ struct CombEntryCold {
 // struct is a compiled store.
 // §23.9: an index naming a frame local that hides a parameter is not constant.
 // §7.2: a read of a nested packed-struct member (`s.inner.f`) compiles to a range select.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB081";
+// Packed member accesses can fold a procedural loop index bound by the unroller.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB082";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

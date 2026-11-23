@@ -4045,31 +4045,46 @@ impl Simulator {
                 signal_table[id] = v;
             }
         }
-        // §6.8 again for the 2-D / N-D element storage (named slots).
-        for base in module.two_state_signals.iter() {
-            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
-                continue;
-            }
-            let prefix = format!("{}[", base);
-            for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) && !signal_real_vec[id] {
-                    signal_table[id] = Value::zero(signal_widths_vec[id]);
-                }
-            }
+        // §6.8, §6.6: apply declared defaults after restoring elaborated
+        // values. A generated hierarchy may contain earlier '[' characters,
+        // so consider every bracket boundary, including names below a row.
+        use super::elaborate::ResolvedNetKind;
+        let multidimensional = |base: &str| {
+            module.arrays_2d.contains_key(base) || module.arrays_nd.contains_key(base)
+        };
+        enum ArrayDefault {
+            TwoState,
+            Net(Option<ResolvedNetKind>),
         }
-        for base in module.z_init_signals.iter() {
-            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
-                continue;
-            }
-            let prefix = format!("{}[", base);
+        let mut defaults = HashMap::default();
+        for base in module.two_state_signals.iter().filter(|s| multidimensional(s)) {
+            defaults.insert(base.as_str(), (0, ArrayDefault::TwoState));
+        }
+        for (order, base) in module.z_init_signals.iter()
+            .filter(|s| multidimensional(s))
+            .enumerate()
+        {
+            let kind = module.resolved_net_kinds.get(base.as_str()).copied();
+            defaults.insert(base.as_str(), (order + 1, ArrayDefault::Net(kind)));
+        }
+        if !defaults.is_empty() {
             for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) {
-                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
-                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
-                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
-                        _ => Value::all_z(signal_widths_vec[id]),
-                    };
-                }
+                // Net defaults take precedence over two-state defaults. When
+                // prefixes overlap, retain the declaration visitation order.
+                let init = name
+                    .match_indices('[')
+                    .filter_map(|(i, _)| defaults.get(&name[..i]))
+                    .max_by_key(|(order, _)| *order);
+                let Some((_, init)) = init else { continue };
+                let width = signal_widths_vec[id];
+                signal_table[id] = match init {
+                    ArrayDefault::TwoState if signal_real_vec[id] => continue,
+                    ArrayDefault::TwoState | ArrayDefault::Net(Some(ResolvedNetKind::Tri0)) => {
+                        Value::zero(width)
+                    }
+                    ArrayDefault::Net(Some(ResolvedNetKind::Tri1)) => Value::ones(width),
+                    ArrayDefault::Net(_) => Value::all_z(width),
+                };
             }
         }
         let arrays_other_ms = phase_arrays_other.elapsed().as_secs_f64() * 1000.0;

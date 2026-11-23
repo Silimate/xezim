@@ -57,6 +57,16 @@ static PLI_INT32 start(p_cb_data d) {
     grid = vpi_handle_by_name("top.grid", NULL);
     CHECK(ids && down && grid, "array handles");
     if (!ids || !down || !grid) return 0;
+    vpiHandle short_words = vpi_handle_by_name("top.short_probe.row[2].words", NULL);
+    vpiHandle long_words = vpi_handle_by_name("top.long_probe.row[3].words", NULL);
+    CHECK(short_words && long_words, "generated arrays in both instances");
+    if (short_words && long_words) {
+        CHECK(!vpi_handle_by_name("top.short_probe.row[1]", NULL) &&
+              !vpi_handle_by_name("top.short_probe.row[3]", NULL),
+              "package loop start and instance loop limit");
+        check_bounds(vpi_handle_by_index(short_words, 0), 4, 0, "short generated word");
+        check_bounds(vpi_handle_by_index(long_words, 0), 6, 0, "long generated word");
+    }
     check_bounds(ids, 0, 3, "ids");
     check_bounds(down, 3, 0, "down");
     check_bounds(grid, 0, 1, "grid");

@@ -53,6 +53,10 @@ fn vpi_array_element_ranges_and_error_record() {
     assert!(!text.contains("FAIL:"), "VPI check failed:\n{text}");
     for line in [
         "CHK|array handles",
+        "CHK|generated arrays in both instances",
+        "CHK|package loop start and instance loop limit",
+        "CHK|short generated word [4:0]",
+        "CHK|long generated word [6:0]",
         "CHK|ids [0:3]",
         "CHK|down [3:0]",
         "CHK|grid [0:1]",

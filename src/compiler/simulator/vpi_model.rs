@@ -1135,7 +1135,7 @@ struct Ctx {
     /// Prefix of child instance paths (`module.instances[..].path`).
     inst_prefix: String,
     /// Parameter values visible here (instance parameters and genvars).
-    params: std::rc::Rc<HashMap<String, Value>>,
+    local_params: std::rc::Rc<HashMap<String, Value>>,
     automatic: bool,
     /// Body parameters are local (the definition has a parameter port list).
     body_params_local: bool,
@@ -1467,7 +1467,7 @@ impl<'a> Builder<'a> {
 
     /// Parameter values of the instance whose flat names start `prefix`.
     fn params_for(&self, prefix: &str) -> std::rc::Rc<HashMap<String, Value>> {
-        let mut p = self.global_params.clone();
+        let mut p = HashMap::default();
         if let Some(ParamList(own)) = self.params_by_prefix.get(prefix) {
             for (k, v) in own {
                 p.insert(k.clone(), v.clone());
@@ -1477,7 +1477,17 @@ impl<'a> Builder<'a> {
     }
 
     fn eval(&self, e: &Expression, ctx: &Ctx) -> Option<i64> {
-        xezim_core::elaborate::const_eval_i64_with_params(e, Some(&ctx.params))
+        self.eval_with_locals(e, &ctx.local_params)
+    }
+
+    fn eval_with_locals(&self, e: &Expression, locals: &HashMap<String, Value>) -> Option<i64> {
+        // Every scope shares the package constants. Instance parameters and
+        // generate variables shadow them only within the current scope.
+        let env = xezim_core::elaborate::ParamEnv::Overlay {
+            base: &self.global_params,
+            top: locals,
+        };
+        xezim_core::elaborate::const_eval_i64_with_params_env(e, Some(&env))
     }
 
     /// `(file, line)` of a span in source file `file`, through the file's
@@ -1730,7 +1740,7 @@ impl<'a> Builder<'a> {
             flat_prefix: flat_prefix.clone(),
             flat_suffix: String::new(),
             inst_prefix: flat_prefix.clone(),
-            params: self.params_for(&flat_prefix),
+            local_params: self.params_for(&flat_prefix),
             automatic: lifetime == Some(Lifetime::Automatic),
             body_params_local: !params.is_empty(),
             props,
@@ -1825,7 +1835,7 @@ impl<'a> Builder<'a> {
             flat_prefix: format!("{}::", name),
             flat_suffix: String::new(),
             inst_prefix: String::new(),
-            params: std::rc::Rc::new(self.global_params.clone()),
+            local_params: std::rc::Rc::new(HashMap::default()),
             automatic: p.lifetime == Some(Lifetime::Automatic),
             body_params_local: false,
             props: std::rc::Rc::default(),
@@ -2170,7 +2180,9 @@ impl<'a> Builder<'a> {
                     if let DataType::TypeReference { name, .. } = dt.as_ref() {
                         if name.scopes.is_empty() {
                             if let Some(n) =
-                                ctx.params.get(&name.name.name).and_then(|v| v.to_i64())
+                                ctx.local_params.get(&name.name.name)
+                                    .or_else(|| self.global_params.get(&name.name.name))
+                                    .and_then(|v| v.to_i64())
                             {
                                 if n > 0 && !self.typedefs.contains_key(&name.name.name) {
                                     return UDim::Range(0, n - 1);
@@ -3569,7 +3581,7 @@ impl<'a> Builder<'a> {
         flat_prefix: String,
         flat_suffix: String,
         inst_prefix: String,
-        params: std::rc::Rc<HashMap<String, Value>>,
+        local_params: std::rc::Rc<HashMap<String, Value>>,
         array: u32,
         index: i64,
     ) -> Ctx {
@@ -3609,7 +3621,7 @@ impl<'a> Builder<'a> {
             flat_prefix,
             flat_suffix,
             inst_prefix,
-            params,
+            local_params,
             automatic: ctx.automatic,
             body_params_local: false,
             props: ctx.props.clone(),
@@ -3658,9 +3670,9 @@ impl<'a> Builder<'a> {
     ) -> std::rc::Rc<HashMap<String, Value>> {
         let own = self.params_by_prefix.get(flat_prefix);
         if own.is_none() && genvar.is_none() {
-            return ctx.params.clone();
+            return ctx.local_params.clone();
         }
-        let mut p = (*ctx.params).clone();
+        let mut p = (*ctx.local_params).clone();
         if let Some(ParamList(own)) = own {
             for (k, v) in own {
                 p.insert(k.clone(), v.clone());
@@ -3810,12 +3822,12 @@ impl<'a> Builder<'a> {
         };
         // The iteration values, as the elaborator computed them.
         let mut values: Vec<i64> = Vec::new();
-        let mut i = xezim_core::elaborate::generate_for_start(gf, &ctx.params);
-        let mut p = (*ctx.params).clone();
+        let mut i = gf.init.as_ref().and_then(|e| self.eval(e, ctx)).unwrap_or(gf.init_val);
+        let mut p = (*ctx.local_params).clone();
         let mut ok = true;
         for _ in 0..10000 {
             p.insert(gf.var.clone(), Value::from_u64(i as u64, 32));
-            match xezim_core::elaborate::const_eval_i64_with_params(&gf.cond, Some(&p)) {
+            match self.eval_with_locals(&gf.cond, &p) {
                 Some(0) => break,
                 Some(_) => values.push(i),
                 None => {
@@ -3833,12 +3845,12 @@ impl<'a> Builder<'a> {
                     ..
                 } => i - 1,
                 ExprKind::AssignExpr { rvalue, .. } => {
-                    match xezim_core::elaborate::const_eval_i64_with_params(rvalue, Some(&p)) {
+                    match self.eval_with_locals(rvalue, &p) {
                         Some(v) if v != i => v,
                         _ => i + 1,
                     }
                 }
-                _ => match xezim_core::elaborate::const_eval_i64_with_params(&gf.incr, Some(&p)) {
+                _ => match self.eval_with_locals(&gf.incr, &p) {
                     Some(v) if v != i => v,
                     _ => i + 1,
                 },

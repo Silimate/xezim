@@ -159,6 +159,49 @@ impl Simulator {
         }
     }
 
+    /// §4.5, §9.7.4: after an edge pass, move the parked waiters whose
+    /// condition the woken processes made true to `ready_condition_waiters`,
+    /// so they resume in this Active region, before the NBAs commit. Only an
+    /// ungated waiter (a condition on design variables) is re-checked: a
+    /// gated one is promoted by the write that sets one of its names
+    /// (`check_condition_waiters_for_write`). A blocking write from compiled
+    /// process code to a design variable promotes no waiter, so before this
+    /// a `wait (go)` the edge-woken writer released stayed parked until the
+    /// end-of-tick drain, after the NBA region, and a process woken by one
+    /// of those NBAs ran first. Returns whether a waiter is ready.
+    pub(super) fn promote_true_ungated_waiters(&mut self) -> bool {
+        if self.condition_waiters.is_empty() {
+            return !self.ready_condition_waiters.is_empty();
+        }
+        // §10.3: a condition on a continuously assigned net reads it updated.
+        if self.dirty_any {
+            self.settle_combinatorial();
+        }
+        let mut i = 0;
+        while i < self.condition_waiters.len() {
+            let (pid, _) = self.condition_waiters[i];
+            if matches!(self.cond_waiter_gate.get(&pid), Some(Some(_))) {
+                i += 1;
+                continue;
+            }
+            let Some(cond) = self.cond_waiter_conditions.remove(&pid) else {
+                i += 1;
+                continue;
+            };
+            if self.eval_waiter_condition(pid, &cond) {
+                let (wpid, wcont) = self.condition_waiters.remove(i);
+                self.cond_waiter_gate.remove(&wpid);
+                self.cond_waiter_reads.remove(&wpid);
+                self.cond_read_union_dirty = true;
+                self.ready_condition_waiters.push((wpid, wcont));
+            } else {
+                self.cond_waiter_conditions.insert(pid, cond);
+                i += 1;
+            }
+        }
+        !self.ready_condition_waiters.is_empty()
+    }
+
     /// Settle after a procedural blocking write (outside edge blocks).
     ///
     /// §5.5 + §10.3 say the driven continuous assignments' re-evaluation is a
@@ -307,8 +350,6 @@ impl Simulator {
         // recorded.
         self.drain_edge_exec_rescan();
     }
-
-    // silimate: fork children an edge-woken process starts run before the NBA region
     /// §9.3.2, §4.4.2: run the processes queued for the current time slot
     /// INLINE, before the caller commits the NBA region. A process an edge
     /// resumed inline queues the children it forks here; they start in the
@@ -368,7 +409,6 @@ impl Simulator {
             }
         }
     }
-    // /silimate
 
     pub(super) fn drain_edge_cascade(&mut self, cascade_limit: u32) -> (u64, u64, u64, u64) {
         let (mut t_snap, mut t_nba, mut t_settle, mut t_edges) = (0u64, 0u64, 0u64, 0u64);
@@ -399,11 +439,9 @@ impl Simulator {
             // Inactive region precedes the NBA region (§4.5): `#0`
             // continuations parked by this round's active-region work run
             // before its NBAs commit.
-            // silimate: fork children an edge-woken process starts run before the NBA region
             // So do the processes it queued for this time (fork children), and
             // the Active work those `#0` continuations queue in turn.
             self.drain_pre_nba_regions();
-            // /silimate
             // §9.7.4: `wait(expr)` is a same-delta, same-timestep handoff. A
             // waiter whose condition an ACTIVE-region continuation just made
             // true (an inline edge resume above — e.g. a grant handshake
@@ -417,7 +455,7 @@ impl Simulator {
             // apply_nba below — after the snapshot — so their edges stay
             // detectable; `in_edge_cont` records its blocking signal writes
             // for the §9.2 rescan drain.
-            if !self.ready_condition_waiters.is_empty() {
+            if self.promote_true_ungated_waiters() {
                 let __prev_edge_cont = self.in_edge_cont;
                 self.in_edge_cont = true;
                 self.drain_condition_waiters(true, false);
@@ -1481,6 +1519,20 @@ impl Simulator {
             }
             return Some("re-arming via #0 delay".to_string());
         }
+        // A process FSM parks with an EMPTY continuation: its state is the
+        // frame's resume pc, so there is no AST above to classify. The
+        // instruction before that pc is the wait it suspended on; a delay
+        // wait that re-arms at this same timestamp was a zero delay (an
+        // edge wait is parked as an event waiter, classified below).
+        if let Some(f) = self.proc_fsm.get(&pid) {
+            let waited_on_delay = (f.pc as usize)
+                .checked_sub(1)
+                .and_then(|i| f.compiled.instructions.get(i))
+                .is_some_and(|i| matches!(i, super::bytecode::Insn::WaitDelayReg(_)));
+            if waited_on_delay {
+                return Some("re-arming via #0 delay".to_string());
+            }
+        }
         // Blocked on @(...) — if it is also a top spinner, something keeps
         // re-triggering it at this timestamp.
         if let Some(w) = self.event_waiters.first_of_pid(pid) {
@@ -1664,8 +1716,6 @@ impl Simulator {
         *passes = 0;
         true
     }
-
-    // silimate: a settle that moves a copied clock widens the pre-NBA edge pass
     /// Whether an edge signal other than a clock generator's output was
     /// written since the last edge scan: an `assign c2 = clk;` copy the settle
     /// just moved, which the clocks-only pass would miss (§10.3). The dirty-edge
@@ -1682,7 +1732,6 @@ impl Simulator {
                 .unwrap_or(false)
         })
     }
-    // /silimate
 
     /// Resume level-sensitive `wait(expr)` waiters parked in
     /// `condition_waiters` whose condition has just become true. IEEE
@@ -1750,7 +1799,6 @@ impl Simulator {
                 break;
             }
             let prog_before = self.cond_progress;
-            // silimate: a waiter rechecks its condition against settled continuous assignments
             // §10.3: an `assign` updates its target in the Active region when
             // an operand changes, and a `wait` on that target wakes on the
             // update. Settle before the recheck so `wait (c2)` under
@@ -1759,7 +1807,6 @@ impl Simulator {
             if self.dirty_any {
                 self.settle_combinatorial();
             }
-            // /silimate
             let ready = std::mem::take(&mut self.ready_condition_waiters);
             for (cpid, cont) in ready {
                 self.cond_waiter_gate.remove(&cpid);
@@ -1900,6 +1947,9 @@ impl Simulator {
         // cbReadWriteSynch, or one a later delta raises) samples pre-edge
         // values rather than values written earlier in the slot.
         self.refresh_sva_preponed();
+        if !self.sva_clock_watch.is_empty() {
+            self.refresh_sva_clock_slot();
+        }
         // §38.36 cbAfterDelay (cocotb's `Timer`) fires HERE: after this slot's
         // edge snapshot and before `check_edges`, so a clock the callback
         // drives registers as a real transition. Firing it before the snapshot
@@ -2065,7 +2115,6 @@ impl Simulator {
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
             self.drain_active_driver_updates();
-            // silimate: a condition-waiter drain's settle and writes reach the full edge pass
             // The drain settles the continuous assignments (`assign c2 = clk;`
             // follows a clock there) and runs the waiters it releases. Both are
             // changes to signals other than the toggled clocks, so the slot's
@@ -2079,7 +2128,6 @@ impl Simulator {
             if (dirty && !self.dirty_any) || self.late_resume_epoch != epoch {
                 non_clock_change = true;
             }
-            // /silimate
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
                 // Cont-assign propagation and edge-sensitive blocks are
@@ -2141,8 +2189,6 @@ impl Simulator {
         {
             self.deliver_time0_port_edges();
         }
-
-        // silimate: the processes a clock edge wakes run before the slot's NBA region
         // §4.4.2, §4.5: the NBA region comes once the Active region is empty,
         // and the processes an Active-region write's edge wakes (a clock
         // generator's toggle) run in that region. A process that resumed
@@ -2162,7 +2208,6 @@ impl Simulator {
         {
             if self.dirty_any {
                 self.settle_combinatorial();
-                // silimate: a settle that moves a copied clock widens the pre-NBA edge pass
                 if self.non_clock_edge_changed() {
                     non_clock_change = true;
                 }
@@ -2178,7 +2223,7 @@ impl Simulator {
             }
             // §9.7.4: a `wait` the edge's processes made true resumes in this
             // Active region too, before the NBAs commit (as in the cascade).
-            if !self.ready_condition_waiters.is_empty() {
+            if self.promote_true_ungated_waiters() {
                 let prev = self.in_edge_cont;
                 self.in_edge_cont = true;
                 self.drain_condition_waiters(true, false);
@@ -2188,14 +2233,11 @@ impl Simulator {
                 }
             }
         }
-        // /silimate
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
-        // silimate: fork children an edge-woken process starts run before the NBA region
         // So do the fork children of a process an edge woke before the NBAs
         // (the edge pass above), and the Active work `#0` continuations queue.
         self.drain_pre_nba_regions();
-        // /silimate
         if self.finished {
             return;
         }
@@ -2999,7 +3041,6 @@ impl Simulator {
                 self.drain_deferred_proc_settle();
                 continue;
             }
-            // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
             // §4.5, §16.4.1: a report matures in the Observed region (or
             // Postponed), which the slot reaches only once every region
             // through Post-NBA is empty. A cbNBASynch or cbReadWriteSynch
@@ -3013,7 +3054,6 @@ impl Simulator {
             {
                 continue;
             }
-            // /silimate
             // §16.4: the time slot is over — deferred assertion reports
             // mature. Their actions may schedule same-time work, so look
             // again before advancing.
@@ -3339,6 +3379,12 @@ impl Simulator {
             self.prof_clocks_only_detect,
             self.prof_nba_elided
         );
+        if self.profile_report {
+            eprintln!(
+                "[PROF] wide_partial_nba quiet={} cloned={}",
+                self.prof_wide_nba_quiet, self.prof_wide_nba_cloned
+            );
+        }
         if self.prof_par_ticks > 0 {
             chatter!(
                 "[PROF] parallel_dispatch ticks={} blocks={} (their insns are NOT counted in insns= below — isolated dispatch)",
@@ -3354,6 +3400,9 @@ impl Simulator {
         self.dump_cycle_census();
         self.dump_chain_census();
         self.dump_coact_census();
+        if self.mux_guard_on {
+            chatter!("[CTL-MUX] skipped evaluations={}", self.prof_mux_skipped);
+        }
         chatter!(
             "[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64 / 1e6,
@@ -3705,12 +3754,40 @@ impl Simulator {
                 "other",
             ];
             let mut hist = [0u64; 12];
+            let mut transfer_entries = 0usize;
+            let mut transfer_evals = 0u64;
+            let mut mux_entries = 0usize;
+            let mut mux_evals = 0u64;
             for (e, &c) in self.prof_entry_counts.iter().enumerate() {
                 if c != 0 {
+                    if self
+                        .ts_hdr
+                        .get(e)
+                        .is_some_and(|h| h.kind() == Self::TS_SLICE_TRANSFER)
+                    {
+                        transfer_entries += 1;
+                        transfer_evals += c;
+                    }
+                    if self
+                        .ts_hdr
+                        .get(e)
+                        .is_some_and(|h| h.kind() == Self::TS_MUX_STREAM)
+                    {
+                        mux_entries += 1;
+                        mux_evals += c;
+                    }
                     if let Some(ent) = self.comb_entries.get(e) {
                         hist[Self::entry_hist_kind(&ent.item)] += c;
                     }
                 }
+            }
+            if transfer_entries != 0 {
+                eprintln!(
+                    "[PROF] slice-transfer entries={transfer_entries} entry_evals={transfer_evals}"
+                );
+            }
+            if mux_entries != 0 {
+                eprintln!("[PROF] mux-stream entries={mux_entries} entry_evals={mux_evals}");
             }
             self.prof_entry_hist = hist;
             let tot: u64 = self.prof_entry_hist.iter().sum();

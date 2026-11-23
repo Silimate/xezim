@@ -2,7 +2,7 @@
 // structs (`st.e[1].dw[0].value <= d`), from generate loops, NBA and
 // blocking, in a submodule and in the top module, with a descending and an
 // ascending packed dimension. Each must compile (no interpreter fallback) and
-// land where the reference simulators put it.
+// land where Verilator 5.046 puts it.
 package pms_pkg;
   typedef struct packed { logic [7:0] value; } dw_t;
   typedef struct packed { dw_t [1:0] dw; } nest_t;

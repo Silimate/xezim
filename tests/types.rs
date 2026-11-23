@@ -65,6 +65,10 @@ mod call_result_member_element_select;
 mod callback_typedef_static;
 #[path = "types/callee_local_keeps_caller_type.rs"]
 mod callee_local_keeps_caller_type;
+#[path = "types/case_inside_tolerance.rs"]
+mod case_inside_tolerance;
+#[path = "types/tolerance_ranges.rs"]
+mod tolerance_ranges;
 #[path = "types/cast_class_member_enum_range.rs"]
 mod cast_class_member_enum_range;
 #[path = "types/cast_operand_context.rs"]
@@ -93,6 +97,8 @@ mod constructor_new_not_static;
 mod constructor_new_property_type;
 #[path = "types/constructor_typedef_dispatch.rs"]
 mod constructor_typedef_dispatch;
+#[path = "types/continuous_aggregate_pattern_defaults.rs"]
+mod continuous_aggregate_pattern_defaults;
 #[path = "types/continuous_nested_array_leaves.rs"]
 mod continuous_nested_array_leaves;
 #[path = "types/copy_constructor_decl_init.rs"]
@@ -384,6 +390,10 @@ mod unpacked_array_ports_and_vif_arrays;
 mod unpacked_array_slices_867;
 #[path = "types/unpacked_indexed_slice_size_869.rs"]
 mod unpacked_indexed_slice_size_869;
+#[path = "types/unpacked_struct_array_continuous_copy.rs"]
+mod unpacked_struct_array_continuous_copy;
+#[path = "types/review_struct_array_whole_copies.rs"]
+mod review_struct_array_whole_copies;
 #[path = "types/unpacked_struct_array_members.rs"]
 mod unpacked_struct_array_members;
 #[path = "types/unpacked_struct_func_arg.rs"]
@@ -495,6 +505,8 @@ mod multi_dim_unpacked_arrays;
 mod nettype_nested_struct_drivers;
 #[path = "types/nettype_struct_variable_driver.rs"]
 mod nettype_struct_variable_driver;
+#[path = "types/nettype_stateless_resolver.rs"]
+mod nettype_stateless_resolver;
 #[path = "types/nettype_undriven.rs"]
 mod nettype_undriven;
 #[path = "types/package_data_members_in_subroutine.rs"]
@@ -893,5 +905,9 @@ mod review_packed_slice_partial_range;
 mod review_struct_param_cast_in_instance;
 #[path = "types/shortreal_storage_1463.rs"]
 mod shortreal_storage_1463;
+#[path = "types/nested_member_typedef_sign.rs"]
+mod nested_member_typedef_sign;
+#[path = "types/negative_packed_element_read.rs"]
+mod negative_packed_element_read;
 #[path = "types/unit_member_vs_unimported_package.rs"]
 mod unit_member_vs_unimported_package;

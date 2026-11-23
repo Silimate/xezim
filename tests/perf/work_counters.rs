@@ -256,12 +256,13 @@ module top;
     north_bus[1] = 8'h22;
     north_bus[2] = 8'h33;
     north_bus[3] = 8'h44;
-
-    // silimate: always_comb / always @* blocks wait for the writer to yield too
     // active_slots is another process's output (§9.2.2.2): it stays four
     // until this block suspends, although the first write would make it two.
     // The fill reads a signal as its bound, so it must still stay element-wise;
-    // all four slots are written.
+    // all four slots are written. The `#1` lets always_comb's time-0 run
+    // (§9.2.2.2.2) set the bound first; §9.2.2.2.2 does not order that run
+    // against this block's first writes.
+    #1;
     adaptive_bus = '0;
     for (int slot = 0; slot < active_slots; slot++)
       adaptive_bus[slot] = 8'hff;

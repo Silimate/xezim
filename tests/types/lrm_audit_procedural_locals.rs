@@ -17,6 +17,7 @@ fn t_lines(sim: &xezim::compiler::Simulator) -> Vec<String> {
 
 #[test]
 fn hot_functions_preserve_packed_lane_widths() {
+    // Each instance must cross the default 1,000-call compilation threshold to test its lane widths.
     const SRC: &str = r#"module block #(parameter DataWidth=64, parameter Bytes=$clog2(DataWidth/8)) ();
  function automatic logic [63:0] tl_align_load(input logic [DataWidth-1:0] value, input logic [Bytes-1:0] addr);
    logic [DataWidth/64-1:0][63:0] split = value;
@@ -49,6 +50,8 @@ endmodule"#;
 
 #[test]
 fn hot_functions_follow_packed_typedef_dimensions() {
+    // Exercise the direct, locally aliased, package-qualified, and extra-dimension typedef forms
+    // on both sides of the default 1,000-call compilation threshold.
     const SRC: &str = r#"package lane_types;
   typedef logic [0:0][63:0] bank_t;
   typedef bank_t alias_t;

@@ -71,6 +71,41 @@ endmodule
     );
 }
 
+/// An explicit grandparent qualifier selects that declaration on each receiver.
+#[test]
+fn class_qualified_instance_properties_follow_the_receiver_and_declaration() {
+    let src = r#"
+class storage;
+  int depth;
+  static int shared_tag = 12;
+  function new(int d); depth = d; endfunction
+endclass
+class bank extends storage;
+  int depth;
+  function new(int d); super.new(d); depth = d + 1; endfunction
+endclass
+class rom extends bank;
+  function new(int d); super.new(d); endfunction
+  function int base_depth(); return storage::depth; endfunction
+  function int local_depth(); return bank::depth; endfunction
+  function int tag(); return storage::shared_tag; endfunction
+endclass
+module tb;
+  rom a, b;
+  int a_base, a_local, b_base, b_local, tag;
+  initial begin
+    a = new(16384); b = new(64);
+    a_base = a.base_depth(); a_local = a.local_depth();
+    b_base = b.base_depth(); b_local = b.local_depth();
+    tag = b.tag();
+  end
+endmodule"#;
+    let sim = simulate(src, 50).unwrap();
+    assert_eq!((u(&sim, "a_base"), u(&sim, "a_local")), (16384, 16385));
+    assert_eq!((u(&sim, "b_base"), u(&sim, "b_local")), (64, 65));
+    assert_eq!(u(&sim, "tag"), 12);
+}
+
 /// §18.5.7 — a `.size()` constraint nested inside `if/else`. The size solver
 /// only descended into Block/Soft/Inside/Expr items, so a size bound written
 /// under a conditional never reached it: the queue got an arbitrary size and

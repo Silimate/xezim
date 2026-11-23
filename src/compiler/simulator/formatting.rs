@@ -1003,6 +1003,30 @@ impl Simulator {
         owners
     }
 
+    /// An explicitly class-qualified property in an instance method uses the
+    /// current receiver, with property hiding resolved from the named class.
+    pub(super) fn class_qualified_instance_value(
+        &mut self,
+        scope: &str,
+        name: &str,
+    ) -> Option<Value> {
+        let handle = self.this_stack.last().copied().flatten()?;
+        let lexical_class = self.class_context_stack.last()?.as_deref()?;
+        if !self.class_is_a(lexical_class, scope) {
+            return None;
+        }
+        let owners = self.prop_owners(scope);
+        let (_, decl) = owners.get(name)?;
+        if decl.static_properties.contains(name) {
+            return None;
+        }
+        let shadowed = self.shadowed_prop_key_in(scope, handle, name);
+        let key = shadowed.as_deref().unwrap_or(name);
+        self.read_whole_struct_class_prop(handle, key).or_else(|| {
+            self.heap.get(handle)?.as_ref()?.properties.get(key).cloned()
+        })
+    }
+
     /// Declared width of `prop` on the object `handle` points at, resolved
     /// against the parameters bound on that instance so `box#(16)` and
     /// `box#(8)` each report their own width.

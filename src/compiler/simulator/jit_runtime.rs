@@ -304,6 +304,12 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        // §10.6.2: a forced signal keeps its forced value. The paths below
+        // write the table directly, past `write_sig!`, so check here as the
+        // VM's `BlockingAssignRange` does.
+        if !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id) {
+            return;
+        }
         let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
         let w = high - low + 1;
         let sig_w = self.signal_widths[id];
@@ -603,9 +609,16 @@ impl Simulator {
                 super::bytecode::system_function_result(name).map(|(w, _)| w)
             }
             ExprKind::Number(NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
-            ExprKind::Number(n @ NumberLiteral::Integer { size: None, .. }) => {
-                Some(super::elaborate::number_literal_width(n))
-            }
+            ExprKind::Number(
+                n @ NumberLiteral::Integer {
+                    size: None,
+                    cached_val,
+                    ..
+                },
+            ) => Some(cached_val.get().map_or_else(
+                || super::elaborate::number_literal_width(n),
+                |(_, _, width)| width,
+            )),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
             ExprKind::Ident(h) => {
                 // §23.6: sized as the select chain it reads as.
@@ -772,9 +785,9 @@ impl Simulator {
             ExprKind::Index { .. }
             | ExprKind::RangeSelect { .. }
             | ExprKind::MemberAccess { .. } => {
-                // §11.4.2: a member read through a side-effect select is sized
-                // by a copy that runs none (`member_read_width_probe`).
-                if Self::is_effect_member_read(expr) {
+                // §11.4.2: a read through a side-effect select is sized by a
+                // copy that runs none (`member_read_width_probe`).
+                if Self::is_effect_select_read(expr) {
                     let probe = self.member_read_width_probe(expr);
                     return self.lrm_self_width(&probe);
                 }
@@ -1625,13 +1638,13 @@ impl Simulator {
             // A streaming concatenation pads to the CONTEXT width on the
             // right; a value taken here would be extended on the left.
             ExprKind::StreamOp { .. } => false,
-            // §11.4.2: a member read through a side-effect select is sized
-            // without evaluating it, and then evaluated in its operand order:
-            // taken here, `objs[i++].v * 10 + objs[i++].v` read its right
-            // operand first.
-            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. } => {
-                !Self::is_effect_member_read(expr)
-            }
+            // §11.4.2: a read through a side-effect select (`a[k++]`,
+            // `objs[i++].v`) is sized without evaluating it, and then
+            // evaluated in its operand order: taken here, `objs[i++].v * 10 +
+            // objs[i++].v` read its right operand first.
+            ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::MemberAccess { .. } => !Self::is_effect_select_read(expr),
             _ => true,
         };
         if evaluates {
@@ -1835,10 +1848,13 @@ impl Simulator {
                     (self.eval_expr(expr).width, false)
                 }
             }
-            // §11.4.2: a member read through a side-effect select is sized by
-            // a copy that runs none (`member_read_width_probe`).
-            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } | ExprKind::MemberAccess { .. }
-                if Self::is_effect_member_read(expr) =>
+            // §11.4.2: a read through a side-effect select is sized by a copy
+            // that runs none (`member_read_width_probe`): sized by evaluating
+            // it, `-a[k++] + a[1]` and `(a[k++] + 1) * a[1]` ran `k++` twice.
+            ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::MemberAccess { .. }
+                if Self::is_effect_select_read(expr) =>
             {
                 let probe = self.member_read_width_probe(expr);
                 (self.infer_width_walk(&probe).0, false)

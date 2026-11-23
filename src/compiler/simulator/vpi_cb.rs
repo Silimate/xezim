@@ -716,7 +716,6 @@ impl Simulator {
             self.edge_dispatch_phase = saved;
             let _ = self.drain_edge_cascade(self.cascade_limit);
         }
-        // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
         // §4.5: the Observed region, where the slot's `#0` reports mature,
         // comes before the Reactive one. In the delta a slot-end callback
         // opened they mature once its Active region set is empty, before a
@@ -734,7 +733,6 @@ impl Simulator {
         {
             self.mature_deferred_observed();
         }
-        // /silimate
         // The Reactive work waits while `sva_post_nba` finishes the slot
         // before an assertion clock event (§4.4.2).
         if !self.sva_post_nba_busy {
@@ -970,8 +968,6 @@ impl Simulator {
             self.vpi_open_delta();
         }
     }
-
-    // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
     /// The Post-NBA part of `vpi_slot_end`: the slot's leftover cbNBASynch and
     /// cbReadWriteSynch routines. True when one ran.
     pub(super) fn vpi_slot_post_nba(&mut self) -> bool {
@@ -991,7 +987,6 @@ impl Simulator {
         self.vpi_slot_maturing = false;
         fired
     }
-    // /silimate
 
     /// End of the current time slot: leftover cbNBASynch / cbReadWriteSynch,
     /// cbAtEndOfSimTime (Pre-Postponed), then cbReadOnlySynch (Postponed).

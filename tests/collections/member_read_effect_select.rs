@@ -240,7 +240,12 @@ fn the_read_keeps_the_members_width() {
     );
     assert_eq!(
         lines,
-        ["R wb 271 i=1", "R wcat 0015 i=1", "R wdisp 10 002", "R wdisp i=2"]
+        [
+            "R wb 271 i=1",
+            "R wcat 0015 i=1",
+            "R wdisp 10 002",
+            "R wdisp i=2"
+        ]
     );
 }
 

@@ -16,6 +16,46 @@ fn check(source: &str, marker: &str) {
     assert!(lines.contains(&marker), "missing {marker:?}: {lines:?}");
 }
 
+#[test]
+fn size_of_unpacked_memory_below_generate_and_instance_array() {
+    let source = r#"
+module ram #(parameter int Tag=0) (input logic id);
+  logic [27:0] mem[32];
+  initial begin #1; mem[3]=Tag + id; end
+  logic [4:0] plane[-1:1][6:3];
+  logic [1:0] cube[2][3][4];
+endmodule
+module layer;
+  for (genvar i=0; i<2; ++i) begin : ways
+    ram #(.Tag('h200 + i*16)) u[2](2'b01);
+    ram #(.Tag('h100 + i)) inner(1'b0);
+  end
+endmodule
+module top;
+  layer dut();
+  initial begin
+    logic [27:0] snapshot[32];
+    #2;
+    snapshot = dut.ways[1].inner.mem;
+    if (snapshot[3] !== 28'h101) $display("FAIL whole array from selected way");
+    if (dut.ways[0].inner.mem[3] !== 28'h100) $display("FAIL other way");
+    if (dut.ways[1].u[0].mem[3] !== 28'h210) $display("FAIL first array instance");
+    if (dut.ways[1].u[1].mem[3] !== 28'h211) $display("FAIL second array instance");
+    if ($size(dut.ways[0].inner.mem) != 32) $display("FAIL scalar-instance depth");
+    if ($bits(dut.ways[0].inner.mem) != 896) $display("FAIL scalar instance");
+    if ($bits(dut.ways[0].inner.mem[0]) != 28) $display("FAIL scalar-instance word");
+    if ($bits(dut.ways[1].u[0].mem) != 896) $display("FAIL memory");
+    if ($bits(dut.ways[1].u[0].mem[0]) != 28) $display("FAIL word");
+    if ($bits(dut.ways[0].u[1].plane) != 60) $display("FAIL plane");
+    if ($bits(dut.ways[1].u[1].cube) != 48) $display("FAIL cube");
+    $display("GENERATED_MEMORY_SIZE_PASS");
+    $finish;
+  end
+endmodule
+"#;
+    check(source, "GENERATED_MEMORY_SIZE_PASS");
+}
+
 const BOUNDS: &str = r#"
 module memory_leaf;
   logic [79:0] positive [3:6];
@@ -280,4 +320,35 @@ fn static_module_paths_do_not_repeat_speculative_receiver_lookups() {
         // budget; no wall-clock threshold is used.
         assert!(count <= 4096, "excessive {key}{count}: {text}");
     }
+}
+
+#[test]
+fn nested_memory_words_below_instance_arrays_in_clocked_code() {
+    check(
+        r#"
+module bank;
+  logic [7:0] mem[2][3];
+  initial begin mem[1][2]=8'hb4; mem[0][1]=8'h39; end
+endmodule
+module unit; bank child(); endmodule
+module top;
+  unit lane[2]();
+  logic clk=0;
+  logic [7:0] sample, constant_word;
+  int i=1, j=2;
+  always @(posedge clk) begin
+    sample <= lane[0].child.mem[i][j];
+    constant_word <= lane[0].child.mem[1][2];
+  end
+  initial begin
+    #1; clk=1; #1;
+    if (sample !== 8'hb4 || constant_word !== 8'hb4) $display("FAIL first word");
+    clk=0; i=0; j=1;
+    #1; clk=1; #1;
+    if (sample !== 8'h39 || constant_word !== 8'hb4) $display("FAIL second word");
+    $display("CLOCKED_MEMORY_PASS"); $finish;
+  end
+endmodule"#,
+        "CLOCKED_MEMORY_PASS",
+    );
 }

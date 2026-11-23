@@ -760,10 +760,22 @@ impl Simulator {
 
     #[inline]
     pub(super) fn instance_by_path(&self, path: &str) -> Option<&crate::elaborate::ElabInstance> {
-        self.instance_path_order
-            .binary_search_by(|&idx| self.module.instances[idx].path.as_str().cmp(path))
-            .ok()
-            .map(|pos| &self.module.instances[self.instance_path_order[pos]])
+        self.instance_index_by_path(path)
+            .map(|idx| &self.module.instances[idx])
+    }
+
+    /// The index in `module.instances` of the first instance whose path is
+    /// `path`, as a scan in declaration order finds it: `instance_path_order`
+    /// is sorted by path and then by index, so the first entry not below
+    /// `path` is that instance.
+    #[inline]
+    pub(super) fn instance_index_by_path(&self, path: &str) -> Option<usize> {
+        let order = &self.instance_path_order;
+        let pos = order.partition_point(|&idx| self.module.instances[idx].path.as_str() < path);
+        order
+            .get(pos)
+            .copied()
+            .filter(|&idx| self.module.instances[idx].path == path)
     }
 
     /// §25.5: a modport-qualified hierarchical reference (`inst.mp.var`)
@@ -1717,25 +1729,37 @@ impl Simulator {
                 width,
             } => {
                 let (sv, sx) = self.vector_ref_bits(s, width);
-                let (tv, tx) = self.vector_ref_bits(t, width);
-                let (ev, ex) = self.vector_ref_bits(e, width);
                 let mask = if width == 64 {
                     u64::MAX
                 } else {
                     (1u64 << width) - 1
                 };
+                // Each lane has its own select. Uniform known selects only
+                // need one data slice, including its X/Z plane.
+                if sx == 0 && (sv == 0 || sv == mask) {
+                    let (v, x) = self.vector_ref_bits(if sv == 0 { e } else { t }, width);
+                    return (dst, width, v & mask, x & mask);
+                }
+                let (tv, tx) = self.vector_ref_bits(t, width);
+                let (ev, ex) = self.vector_ref_bits(e, width);
+                if sx == 0 {
+                    return (
+                        dst,
+                        width,
+                        ((sv & tv) | (!sv & ev)) & mask,
+                        ((sv & tx) | (!sv & ex)) & mask,
+                    );
+                }
                 let known_one = sv & !sx & mask;
                 let known_zero = !sv & !sx & mask;
-                let equal = !(tv ^ ev | tx ^ ex) & mask;
-                let unknown_equal = sx & equal;
+                // On an ambiguous select only equal known data bits survive
+                // the conditional merge (Table 11-21), including for Z/Z.
+                let equal_known = !(tv ^ ev | tx | ex) & mask;
                 (
                     dst,
                     width,
-                    (known_one & tv) | (known_zero & ev) | (unknown_equal & tv),
-                    (known_one & tx)
-                        | (known_zero & ex)
-                        | (unknown_equal & tx)
-                        | (sx & !equal & mask),
+                    (known_one & tv) | (known_zero & ev) | (sx & equal_known & tv),
+                    (known_one & tx) | (known_zero & ex) | (sx & !equal_known & mask),
                 )
             }
         };
@@ -1767,7 +1791,8 @@ impl Simulator {
         } else {
             ((1u64 << width) - 1) << dst.lo
         };
-        if (base_v ^ new_v) & mask == 0 && (base_x ^ new_x) & mask == 0 {
+        let changed = ((base_v ^ new_v) | (base_x ^ new_x)) & mask;
+        if changed == 0 {
             return false;
         }
         // §10.6.2: a forced net keeps its forced value against its gate driver.
@@ -1785,7 +1810,7 @@ impl Simulator {
         self.signal_table[id].is_signed = self.signal_signed[id];
         self.sync_mirror(id);
         self.table_modified = true;
-        self.after_signal_write_premirrored(id);
+        self.after_signal_write_premirrored_masked(id, changed);
         true
     }
 }

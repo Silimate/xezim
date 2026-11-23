@@ -3554,6 +3554,7 @@ impl Simulator {
         if id < self.signal_inline_bits.len() {
             self.signal_inline_bits[id] = [v, x];
         }
+        arm_edge_readers!(self, id, self.span_chg_mask(id as u32, lo as u32, piece.width));
         write_sig_done!(self, id, true);
         self.table_modified = true;
         Some(true)
@@ -3765,17 +3766,55 @@ impl Simulator {
     /// to the thread's seeding, so a seeded object is never perturbed by a
     /// sibling's thread reseed.
     pub(super) fn cur_rng(&mut self) -> &mut SvRng {
-        if let Some(&h) = self.obj_rng_stack.last() {
-            if self.obj_rng.contains_key(&h) {
-                return self.obj_rng.get_mut(&h).unwrap();
-            }
-            // No private stream — fall through to the calling process's stream.
+        // A nested object randomized as part of an enclosing object's
+        // randomize() (§18.4.1) draws from the innermost object on the stack
+        // that owns a stream, so reseeding the outer object repeats the
+        // nested members too, as the reference simulator does.
+        if let Some(h) = self
+            .obj_rng_stack
+            .iter()
+            .rev()
+            .copied()
+            .find(|h| self.obj_rng.contains_key(h))
+        {
+            return self.obj_rng.get_mut(&h).unwrap();
         }
+        // No private stream — fall through to the calling process's stream.
         let pid = self.current_pid;
         if self.proc_rng.contains_key(&pid) {
             return self.proc_rng.get_mut(&pid).unwrap();
         }
         &mut self.rng
+    }
+
+    /// §18.5.4: reseeding discards the object's old deals. Restoring a
+    /// snapshot replaces them with the schedules at the saved positions.
+    fn restart_dist_schedules(&mut self, handle: usize) {
+        self.dist_decks.retain(|(h, _), _| *h != handle);
+    }
+
+    /// §18.14.2: the generator alone cannot reproduce an unfinished deal.
+    /// Use property names in stable order so the state can be compared or
+    /// restored to another object. A plain stream keeps its 16-digit format.
+    fn object_randstate(&mut self, handle: usize) -> String {
+        let rng = self
+            .obj_rng
+            .get(&handle)
+            .copied()
+            .unwrap_or_else(|| *self.cur_rng());
+        let schedules: BTreeMap<_, _> = self
+            .dist_decks
+            .iter()
+            .filter(|((owner, _), _)| *owner == handle)
+            .map(|((_, name), deals)| (name, deals))
+            .collect();
+        let state = rng.to_state_string();
+        if schedules.is_empty() {
+            state
+        } else {
+            let json = serde_json::to_string(&schedules).expect("distribution schedules serialize");
+            format!("{state}:dist1:{json}")
+        }
     }
 
     /// §18.14 `srandom` / `get_randstate` / `set_randstate` on a *process*
@@ -3811,31 +3850,22 @@ impl Simulator {
                     self.proc_rng.insert(key, s);
                 } else {
                     self.obj_rng.insert(key, s);
+                    self.restart_dist_schedules(key);
                 }
                 Some(Value::zero(32))
             }
-            // §18.14.2: serialise the stream state. The stream must exist from
-            // now on (otherwise there would be nothing for set_randstate to
-            // restore), so materialise it lazily off the default RNG.
+            // Capture the effective stream without drawing from it or giving
+            // an unseeded receiver a new stream just because it was observed.
             "get_randstate" => {
-                let existing = if is_process {
-                    self.proc_rng.get(&key).copied()
+                let state = if is_process {
+                    self.proc_rng
+                        .get(&key)
+                        .unwrap_or(&self.rng)
+                        .to_state_string()
                 } else {
-                    self.obj_rng.get(&key).copied()
+                    self.object_randstate(key)
                 };
-                let s = match existing {
-                    Some(s) => s,
-                    None => {
-                        let fresh = SvRng::from_seed(rand::RngCore::next_u64(&mut self.rng));
-                        if is_process {
-                            self.proc_rng.insert(key, fresh);
-                        } else {
-                            self.obj_rng.insert(key, fresh);
-                        }
-                        fresh
-                    }
-                };
-                Some(Value::from_string(&s.to_state_string()))
+                Some(Value::from_string(&state))
             }
             // §18.14.2: restore a previously captured state — the stream then
             // replays exactly the sequence it produced after the capture.
@@ -3844,11 +3874,26 @@ impl Simulator {
                     .first()
                     .map(|a| self.eval_expr(a).to_sv_string())
                     .unwrap_or_default();
-                let s = SvRng::from_state_string(&st);
+                let snapshot = st.split_once(":dist1:").and_then(|(state, json)| {
+                    if state.len() != 16 || !state.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return None;
+                    }
+                    let schedules: BTreeMap<String, DistSchedules> =
+                        serde_json::from_str(json).ok()?;
+                    Some((state, schedules))
+                });
+                let (state, schedules) = snapshot.unwrap_or_else(|| (st.as_str(), BTreeMap::new()));
+                let s = SvRng::from_state_string(state);
                 if is_process {
                     self.proc_rng.insert(key, s);
                 } else {
                     self.obj_rng.insert(key, s);
+                    self.restart_dist_schedules(key);
+                    self.dist_decks.extend(
+                        schedules
+                            .into_iter()
+                            .map(|(name, deals)| ((key, name), deals)),
+                    );
                 }
                 Some(Value::zero(32))
             }

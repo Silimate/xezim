@@ -4,6 +4,106 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// A clock fanout's membership in an eight-byte window of armed flags.
+/// One low bit per byte denotes a member. Windows and members follow the
+/// original block order, including when the last window overlaps its neighbor.
+#[derive(Debug, Clone)]
+pub(super) struct EdgeBatch {
+    start: usize,
+    members: u64,
+}
+
+impl EdgeBatch {
+    pub(super) fn build(blocks: &[usize], block_count: usize) -> Vec<Self> {
+        // Preserve scalar accounting for duplicate sensitivity terms and keep
+        // short fanouts on the cheaper per-member path.
+        if blocks.len() < 32 || !blocks.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Vec::new();
+        }
+        let mut batches: Vec<Self> = Vec::new();
+        for &block in blocks {
+            let start = (block & !7).min(block_count - 8);
+            if batches.last().is_none_or(|batch| batch.start != start) {
+                batches.push(Self { start, members: 0 });
+            }
+            batches.last_mut().unwrap().members |= 1 << ((block - start) * 8);
+        }
+        // A sparse list wastes the word loads and mask iteration.
+        if batches.len() <= blocks.len() / 4 {
+            batches
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[inline]
+    fn enqueue(
+        batches: &[Self],
+        fanout_len: usize,
+        armed: &[u8],
+        triggered_bitmap: &mut [bool],
+        triggered: &mut Vec<usize>,
+    ) -> u64 {
+        let mut eligible = 0;
+        for batch in batches {
+            let flags = u64::from_le_bytes(armed[batch.start..][..8].try_into().unwrap());
+            // Either EDGE_ARMED or EDGE_HOLD keeps a lane eligible. Fold the
+            // two bits into its low bit, then visit only eligible members.
+            let mut active = (flags | (flags >> 1)) & batch.members;
+            while active != 0 {
+                let block = batch.start + active.trailing_zeros() as usize / 8;
+                active &= active - 1;
+                eligible += 1;
+                if !triggered_bitmap[block] {
+                    triggered_bitmap[block] = true;
+                    triggered.push(block);
+                }
+            }
+        }
+        // Count eligibility before trigger dedup, as the scalar scan does.
+        (fanout_len - eligible) as u64
+    }
+}
+
+#[cfg(test)]
+mod edge_batch_tests {
+    use super::*;
+
+    #[test]
+    fn dense_fanout_preserves_scalar_order_and_skip_count() {
+        let blocks: Vec<_> = (0..16).chain(19..43).collect();
+        let batches = EdgeBatch::build(&blocks, 43);
+        assert!(!batches.is_empty());
+        let mut flags = [0; 43];
+        for (block, flag) in [
+            (0, EDGE_ARMED),
+            (5, EDGE_HOLD),
+            (8, EDGE_ARMED),
+            (17, EDGE_ARMED), // Outside the fanout.
+            (19, EDGE_ARMED | EDGE_HOLD),
+            (40, EDGE_HOLD),
+            (42, EDGE_ARMED),
+        ] {
+            flags[block] = flag;
+        }
+        let mut triggered = vec![8];
+        let mut bitmap = [false; 43];
+        bitmap[8] = true;
+        let skipped = EdgeBatch::enqueue(&batches, blocks.len(), &flags, &mut bitmap, &mut triggered);
+        assert_eq!(triggered, [8, 0, 5, 19, 40, 42]);
+        assert_eq!(skipped, 34);
+    }
+
+    #[test]
+    fn sparse_and_duplicate_fanouts_use_scalar_path() {
+        let sparse: Vec<_> = (0..32).map(|block| block * 8).collect();
+        assert!(EdgeBatch::build(&sparse, 256).is_empty());
+        let mut duplicate: Vec<_> = (0..32).collect();
+        duplicate.insert(8, 7);
+        assert!(EdgeBatch::build(&duplicate, 32).is_empty());
+    }
+}
+
 impl Simulator {
     /// Group edge-sensitive signals that are exact copies of the same driver.
     ///
@@ -751,11 +851,17 @@ impl Simulator {
                 }
             }
         }
-        // silimate: sampled-value functions of a whole unpacked array track its cells
         // The watch's operand: a whole array's is the concatenation of its
         // cells, read the same way off the clock's tick.
-        let operand = self.sampled_watches[widx].expr.clone();
-        // /silimate
+        if matches!(operand.kind, ExprKind::Ident(_))
+            && matches!(
+                self.sampled_watches[widx].expr.kind,
+                ExprKind::Concatenation(_)
+            )
+        {
+            let cells = self.sampled_watches[widx].expr.clone();
+            return Some(self.sampled_cur_and_past(widx, &cells, n));
+        }
         Some(self.sampled_cur_and_past(widx, &operand, n))
     }
 
@@ -831,11 +937,9 @@ impl Simulator {
         for body in self.module.property_decls.values() {
             Self::sva_expr_names(body, &mut names);
         }
-        // silimate: a procedural assertion in an always process samples its time-0 defaults too
         // An always block with a delay or a nested wait in its body runs as a
         // process, which none of the lists above holds.
         names.extend(std::mem::take(&mut self.always_sva_names));
-        // /silimate
         if names.is_empty() {
             return;
         }
@@ -922,6 +1026,163 @@ impl Simulator {
             | SK::RsAction { body } => Self::sva_stmt_names(body, all, out),
             _ => {}
         }
+    }
+
+    /// §16.14.6: the leaf names of the explicit clocks of the concurrent
+    /// assertions in `st` (`clk` of `assert property (@(posedge clk) p)`),
+    /// and `""` for one without an explicit clock (a named property's, the
+    /// inferred or the default clock).
+    pub(super) fn sva_stmt_clocks(st: &Statement, out: &mut HashSet<String>) {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::Assertion(a) if a.is_property || a.is_sequence => {
+                if !Self::sva_expr_clocks(&a.expr, out) {
+                    out.insert(String::new());
+                }
+            }
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                stmts.iter().for_each(|s| Self::sva_stmt_clocks(s, out))
+            }
+            SK::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::sva_stmt_clocks(then_stmt, out);
+                if let Some(e) = else_stmt {
+                    Self::sva_stmt_clocks(e, out);
+                }
+            }
+            SK::Case { items, .. } => items
+                .iter()
+                .for_each(|it| Self::sva_stmt_clocks(&it.stmt, out)),
+            SK::RandCase { items } => items
+                .iter()
+                .for_each(|(_, s)| Self::sva_stmt_clocks(s, out)),
+            SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => {
+                Self::sva_stmt_clocks(stmt, out)
+            }
+            SK::WaitOrder { pass, fail, .. } => {
+                for s in [pass, fail].into_iter().flatten() {
+                    Self::sva_stmt_clocks(s, out);
+                }
+            }
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::ForeverTail { body }
+            | SK::Foreach { body, .. }
+            | SK::ForeachTail { body, .. }
+            | SK::RsAction { body } => Self::sva_stmt_clocks(body, out),
+            _ => {}
+        }
+    }
+
+    /// The leaf names of the clock events `e` spells as plain names; true
+    /// when it has a clocked body.
+    pub(super) fn sva_expr_clocks(e: &Expression, out: &mut HashSet<String>) -> bool {
+        let mut clocked = false;
+        Self::walk_operands(e, &mut |x| {
+            if let ExprKind::SvaClocked { events, body } = &x.kind {
+                clocked = true;
+                Self::sva_expr_clocks(body, out);
+                for event in events {
+                    if let ExprKind::Ident(h) = &event.expr.kind
+                        && let Some(seg) = h.path.last()
+                    {
+                        out.insert(seg.name.name.clone());
+                    }
+                }
+            }
+        });
+        clocked
+    }
+
+    /// §16.14.6: the signals whose time-step start value tells whether a
+    /// procedural concurrent assertion registered later in the time step is
+    /// at a tick of its clock: every signal named like the clock of such an
+    /// assertion (or of a named property, or the default clocking's, when
+    /// one has no explicit clock). An extra match costs only its sample.
+    pub(super) fn collect_sva_clock_watch(&mut self) {
+        let mut leaves = std::mem::take(&mut self.always_sva_clocks);
+        for b in &self.module.initial_blocks {
+            Self::sva_stmt_clocks(&b.stmt, &mut leaves);
+        }
+        for p in &self.module.pending_initial {
+            Self::sva_stmt_clocks(&p.source, &mut leaves);
+        }
+        if leaves.is_empty() {
+            return;
+        }
+        if leaves.remove("") {
+            for body in self.module.property_decls.values() {
+                Self::sva_expr_clocks(body, &mut leaves);
+            }
+            if let Some((clk, _)) = self.clocking_meta.get("__xz_default_clocking") {
+                let leaf = clk.rsplit(['.', ':']).next().unwrap_or_default();
+                leaves.insert(leaf.to_string());
+            }
+        }
+        let mut watch: Vec<(usize, LogicBit)> = self
+            .signal_name_to_id
+            .iter()
+            .filter(|(name, id)| {
+                !name.contains('[')
+                    && **id < self.signal_table.len()
+                    && leaves.contains(name.rsplit(['.', ':']).next().unwrap_or_default())
+            })
+            .map(|(_, &id)| (id, LogicBit::X))
+            .collect();
+        watch.sort_unstable_by_key(|w| w.0);
+        watch.dedup_by_key(|w| w.0);
+        self.sva_clock_watch = watch;
+    }
+
+    /// Sample the watched clocks at the start of the time step, once.
+    #[inline(never)]
+    pub(super) fn refresh_sva_clock_slot(&mut self) {
+        if self.sva_clock_slot_time == Some(self.time) {
+            return;
+        }
+        self.sva_clock_slot_time = Some(self.time);
+        let mut watch = std::mem::take(&mut self.sva_clock_watch);
+        for (id, bit) in &mut watch {
+            *bit = self
+                .signal_table
+                .get(*id)
+                .map_or(LogicBit::X, |v| v.get_bit(0));
+        }
+        self.sva_clock_watch = watch;
+    }
+
+    /// The bit 0 at the start of the current time step of the clock that
+    /// the resolved event expression `e` reads, if that signal is watched
+    /// and was sampled in this time step.
+    pub(super) fn sva_clock_slot_start(&self, e: &Expression) -> Option<LogicBit> {
+        if self.sva_clock_slot_time != Some(self.time) {
+            return None;
+        }
+        let id = match &e.kind {
+            ExprKind::SystemCall { name, args } if name == SVA_SIG_MARKER && args.len() == 1 => {
+                match &args[0].kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                        value.parse::<usize>().ok()?
+                    }
+                    _ => return None,
+                }
+            }
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => *self
+                .signal_name_to_id
+                .get(self.resolve_hier_name(h).as_ref())?,
+            _ => return None,
+        };
+        let k = self
+            .sva_clock_watch
+            .binary_search_by_key(&id, |w| w.0)
+            .ok()?;
+        Some(self.sva_clock_watch[k].1)
     }
 
     /// Every name segment `e` spells, clocked bodies included.
@@ -1473,14 +1734,39 @@ impl Simulator {
             }
         }
     }
-
-    // silimate: sampled-value functions of a whole unpacked array track its cells
     /// §16.9.3: the operand of `$past`, `$stable` or `$changed` may be a
     /// whole fixed-size unpacked array (`$stable(mem)`), whose name is no
-    /// signal. Its sampled value is the concatenation of its cells, the left
-    /// bound's first, with their signal ids. `None` for any other operand,
-    /// and for an array of the packed arena or with a negative bound.
+    /// signal. Its sampled value is the concatenation of its cells, in
+    /// declared order (each dimension from its left bound, §7.4.6), with
+    /// their signal ids. `None` for any other operand, and for an array of
+    /// the packed arena.
     pub(super) fn whole_array_cells(&self, e: &Expression) -> Option<(Expression, Vec<usize>)> {
+        let (_, indices, ids) = self.whole_array_cell_list(e)?;
+        let cells = indices
+            .iter()
+            .map(|ix| {
+                ix.iter().fold(e.clone(), |base, &i| {
+                    Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(base),
+                            index: Box::new(Self::signed_index_literal(i, e.span)),
+                        },
+                        e.span,
+                    )
+                })
+            })
+            .collect();
+        Some((Expression::new(ExprKind::Concatenation(cells), e.span), ids))
+    }
+
+    /// The cells of the whole fixed-size unpacked array `e` names, in
+    /// declared order: the array's storage name, each cell's indices and
+    /// each cell's signal id. `None` for any other operand, and when a cell
+    /// has no ordinary signal (the packed arena of a large memory).
+    pub(super) fn whole_array_cell_list(
+        &self,
+        e: &Expression,
+    ) -> Option<(String, Vec<Vec<i64>>, Vec<usize>)> {
         let ExprKind::Ident(h) = &e.kind else {
             return None;
         };
@@ -1488,44 +1774,83 @@ impl Simulator {
             return None;
         }
         let name = self.resolve_hier_name(h);
-        let &(first, lo, hi) = self.array_first_id.get(name.as_ref())?;
-        if is_packed_id(first) || lo < 0 || hi < lo {
+        let name = name.as_ref();
+        if self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+        {
             return None;
         }
-        let desc = self.module.descending_arrays.contains(name.as_ref());
-        let order: Vec<i64> = if desc {
-            (lo..=hi).rev().collect()
+        let dims: Vec<(i64, i64)> = if let Some(&(_, lo, hi)) = self.array_first_id.get(name) {
+            if hi < lo {
+                return None;
+            }
+            if self.module.descending_arrays.contains(name) {
+                vec![(hi, lo)]
+            } else {
+                vec![(lo, hi)]
+            }
+        } else if self.module.arrays_2d.contains_key(name)
+            || self.module.arrays_nd.contains_key(name)
+        {
+            self.module.unpacked_decl_dims.get(name)?.clone()
         } else {
-            (lo..=hi).collect()
+            return None;
         };
-        let cells = order
+        let name = name.to_string();
+        let mut indices: Vec<Vec<i64>> = vec![Vec::new()];
+        for &(l, r) in &dims {
+            let order: Vec<i64> = if l <= r {
+                (l..=r).collect()
+            } else {
+                (r..=l).rev().collect()
+            };
+            indices = indices
+                .iter()
+                .flat_map(|ix| {
+                    order.iter().map(move |&i| {
+                        let mut ix = ix.clone();
+                        ix.push(i);
+                        ix
+                    })
+                })
+                .collect();
+        }
+        let ids = indices
             .iter()
-            .map(|&i| {
-                let index = Expression::new(
-                    ExprKind::Number(NumberLiteral::Integer {
-                        size: None,
-                        signed: false,
-                        base: NumberBase::Decimal,
-                        value: i.to_string(),
-                        cached_val: crate::ast::cache::LiteralCache::new(None),
-                    }),
-                    e.span,
-                );
-                Expression::new(
-                    ExprKind::Index {
-                        expr: Box::new(e.clone()),
-                        index: Box::new(index),
-                    },
-                    e.span,
-                )
+            .map(|ix| {
+                let cell = ix
+                    .iter()
+                    .fold(name.clone(), |base, &i| Self::name_with_index(&base, i));
+                self.resolve_signal_id(&cell)
+                    .filter(|&id| !is_packed_id(id) && id < self.signal_table.len())
             })
-            .collect();
-        let ids = (first..=first + (hi - lo) as usize)
-            .filter(|&id| id < self.signal_table.len())
-            .collect();
-        Some((Expression::new(ExprKind::Concatenation(cells), e.span), ids))
+            .collect::<Option<Vec<usize>>>()?;
+        Some((name, indices, ids))
     }
-    // /silimate
+
+    /// The literal of index `i`, negative ones as a negation.
+    fn signed_index_literal(i: i64, span: crate::ast::Span) -> Expression {
+        let lit = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: NumberBase::Decimal,
+                value: i.unsigned_abs().to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        );
+        if i >= 0 {
+            return lit;
+        }
+        Expression::new(
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand: Box::new(lit),
+            },
+            span,
+        )
+    }
 
     /// Get-or-create the sampled watch for a call site. Registers the clock
     /// (and a simple-signal operand) into `edge_signal_ids` so the snapshot
@@ -1550,10 +1875,8 @@ impl Simulator {
             }
             return Some(i);
         }
-        // silimate: sampled-value functions of a whole unpacked array track its cells
         let cells = self.whole_array_cells(operand);
         let operand = cells.as_ref().map_or(operand, |(e, _)| e);
-        // /silimate
         let edge = match edge_code {
             1 => EdgeKind::Posedge,
             2 => EdgeKind::Negedge,
@@ -1616,9 +1939,7 @@ impl Simulator {
                 None => {
                     let mut ids = Vec::new();
                     self.collect_sva_signal_ids(operand, &mut ids);
-                    // silimate: sampled-value functions of a whole unpacked array track its cells
                     ids.extend(cells.iter().flat_map(|(_, c)| c.iter().copied()));
-                    // /silimate
                     if !self.time0_settled {
                         for &id in &ids {
                             if !self.sampled_defaults.contains_key(&id)
@@ -1667,9 +1988,7 @@ impl Simulator {
         });
         let mut sample_ids = Vec::new();
         self.collect_sva_signal_ids(operand, &mut sample_ids);
-        // silimate: sampled-value functions of a whole unpacked array track its cells
         sample_ids.extend(cells.iter().flat_map(|(_, c)| c.iter().copied()));
-        // /silimate
         self.add_sampled_watch_ids(i, &sample_ids);
         let scope = self.sampled_scope();
         self.sampled_watch_site
@@ -2009,6 +2328,7 @@ impl Simulator {
         let stats_on = self.edge_block_stats_enabled;
         let scan_stats = self.edge_scan_stats;
         let clktree_probe = self.clktree_probe;
+        let batch_prefilter = armed_prefilter && !stats_on && !iff_active;
         // Accumulated in registers and folded back after the loop — a `self`
         // counter incremented in the body is another store LLVM has to order
         // against the table loads.
@@ -2282,13 +2602,33 @@ impl Simulator {
                 }};
             }
             if fires_pos {
-                for &block_idx in &fanout.posedge {
-                    dispatch_block!(block_idx, EdgeKind::Posedge);
+                if batch_prefilter && !fanout.posedge_batches.is_empty() {
+                    prefiltered += EdgeBatch::enqueue(
+                        &fanout.posedge_batches,
+                        fanout.posedge.len(),
+                        blk_armed,
+                        triggered_bitmap,
+                        &mut triggered,
+                    );
+                } else {
+                    for &block_idx in &fanout.posedge {
+                        dispatch_block!(block_idx, EdgeKind::Posedge);
+                    }
                 }
             }
             if fires_neg {
-                for &block_idx in &fanout.negedge {
-                    dispatch_block!(block_idx, EdgeKind::Negedge);
+                if batch_prefilter && !fanout.negedge_batches.is_empty() {
+                    prefiltered += EdgeBatch::enqueue(
+                        &fanout.negedge_batches,
+                        fanout.negedge.len(),
+                        blk_armed,
+                        triggered_bitmap,
+                        &mut triggered,
+                    );
+                } else {
+                    for &block_idx in &fanout.negedge {
+                        dispatch_block!(block_idx, EdgeKind::Negedge);
+                    }
                 }
             }
             if fires_any {

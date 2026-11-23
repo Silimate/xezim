@@ -2089,14 +2089,14 @@ impl Simulator {
             ranges.to_vec()
         };
         for _ in 0..64 {
-            let (lo, hi) = full[self.rng.gen_range(0..full.len())];
+            let (lo, hi) = full[self.cur_rng().gen_range(0..full.len())];
             if hi < lo {
                 continue;
             }
             let v = if lo == hi {
                 lo
             } else {
-                self.rng.gen_range(lo..=hi)
+                self.cur_rng().gen_range(lo..=hi)
             };
             if !used.contains(&v) {
                 return Some(v);
@@ -3894,7 +3894,11 @@ impl Simulator {
             .dist_decks
             .get(&key)
             .and_then(|ds| ds.iter().find(|d| d.0 == sig))
-            .is_some_and(|(_, deck, pos)| *pos < deck.len());
+            // State strings are implementation-defined input. Rebuild a deal
+            // whose next card does not name a live item in these weights.
+            .and_then(|(_, deck, pos)| deck.get(*pos))
+            .and_then(|&item| masses.get(item))
+            .is_some_and(|&mass| mass > 0);
         if !live {
             let mut deck = self.build_dist_deck(masses)?;
             // The schedule opens on its heaviest item: start it at a random

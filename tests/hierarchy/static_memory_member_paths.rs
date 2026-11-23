@@ -321,3 +321,34 @@ fn static_module_paths_do_not_repeat_speculative_receiver_lookups() {
         assert!(count <= 4096, "excessive {key}{count}: {text}");
     }
 }
+
+#[test]
+fn nested_memory_words_below_instance_arrays_in_clocked_code() {
+    check(
+        r#"
+module bank;
+  logic [7:0] mem[2][3];
+  initial begin mem[1][2]=8'hb4; mem[0][1]=8'h39; end
+endmodule
+module unit; bank child(); endmodule
+module top;
+  unit lane[2]();
+  logic clk=0;
+  logic [7:0] sample, constant_word;
+  int i=1, j=2;
+  always @(posedge clk) begin
+    sample <= lane[0].child.mem[i][j];
+    constant_word <= lane[0].child.mem[1][2];
+  end
+  initial begin
+    #1; clk=1; #1;
+    if (sample !== 8'hb4 || constant_word !== 8'hb4) $display("FAIL first word");
+    clk=0; i=0; j=1;
+    #1; clk=1; #1;
+    if (sample !== 8'h39 || constant_word !== 8'hb4) $display("FAIL second word");
+    $display("CLOCKED_MEMORY_PASS"); $finish;
+  end
+endmodule"#,
+        "CLOCKED_MEMORY_PASS",
+    );
+}

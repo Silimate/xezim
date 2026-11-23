@@ -1458,7 +1458,7 @@ impl<'a> BytecodeCompiler<'a> {
             return false;
         };
         if !matches!(inner.kind, ExprKind::Index { .. })
-            || !crate::compiler::simulator::Simulator::select_entered_member_shape(inner, false)
+            || !crate::compiler::simulator::Simulator::select_entered_member_shape(inner)
         {
             return false;
         }

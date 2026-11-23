@@ -195,7 +195,7 @@ impl Simulator {
     /// Whether `e` is a select chain over a member reached through a select
     /// (`lane[0].payload`, `lane[0].payload[2]`, `lane[0].nest[1][j]`).
     #[inline]
-    pub(crate) fn select_entered_member_shape(e: &Expression, through_child_scopes: bool) -> bool {
+    pub(crate) fn select_entered_member_shape(e: &Expression) -> bool {
         let mut cur = e;
         loop {
             match &cur.kind {
@@ -203,9 +203,6 @@ impl Simulator {
                 ExprKind::MemberAccess { expr, .. } => {
                     if matches!(expr.kind, ExprKind::Index { .. }) {
                         return true;
-                    }
-                    if !through_child_scopes {
-                        return false;
                     }
                     cur = expr;
                 }
@@ -234,7 +231,7 @@ impl Simulator {
     /// (and a select chain over it) onto the array's stored name. `None`
     /// for any other path.
     pub(super) fn inst_array_member_canon(&self, e: &Expression) -> Option<Expression> {
-        if !self.has_indexed_scopes() || !Self::select_entered_member_shape(e, true) {
+        if !self.has_indexed_scopes() || !Self::select_entered_member_shape(e) {
             return None;
         }
         self.inst_array_member_canon_inner(e)
@@ -282,7 +279,7 @@ impl Simulator {
         member: &crate::ast::Identifier,
     ) -> Option<Expression> {
         if !self.has_indexed_scopes()
-            || !(matches!(base.kind, ExprKind::Index { .. }) || Self::select_entered_member_shape(base, true))
+            || !(matches!(base.kind, ExprKind::Index { .. }) || Self::select_entered_member_shape(base))
         {
             return None;
         }

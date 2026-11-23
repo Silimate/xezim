@@ -2788,26 +2788,25 @@ impl Simulator {
                     // copies `o` back to `a` on return.
                     let val = if port.direction == PortDirection::Output {
                         let name = &port.name.name;
-                        let width = super::elaborate::resolve_type_width(
-                            &data_type,
-                            Some(&self.module.parameters),
-                            Some(&self.module.typedefs),
-                        )
-                        .max(1);
+                        // A class type parameter is bound in the callee. Its
+                        // value set and default can differ even for types of
+                        // the same width (or without an integral width).
+                        let concrete = bound.and_then(|b| self.resolve_type_binding_dt(b));
+                        let dt = concrete.as_ref().unwrap_or(&data_type);
                         let default = if vif_formal_indices.contains(&i)
                             || output_class_indices.contains(&i)
+                            || concrete
+                                .as_ref()
+                                .is_some_and(|dt| self.type_ref_is_class_handle(dt))
                         {
                             Value::zero(32)
-                        } else if let Some(concrete) = bound
-                            && let Some(width) = self.concrete_type_width(concrete)
-                        {
-                            if self.concrete_type_two_state(concrete) {
-                                Value::zero(width)
-                            } else {
-                                Value::new(width)
-                            }
                         } else {
-                            self.formal_type_default(&data_type, width)
+                            let width = super::elaborate::resolve_type_width(
+                                dt,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            );
+                            self.formal_type_default(dt, width.max(1))
                         };
                         // §13.3.2: all invocations of a static task share the
                         // formal. An NBA to it may mature after the copy-out.

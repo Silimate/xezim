@@ -1383,3 +1383,5 @@ mod queue_row_name_collision;
 mod class_row_replication_once;
 #[path = "classes/inherited_packed_typedef_width.rs"]
 mod inherited_packed_typedef_width;
+#[path = "classes/factory_specialization_in_child.rs"]
+mod factory_specialization_in_child;

@@ -3700,7 +3700,8 @@ impl Simulator {
     pub(super) fn fixed_array_operand(&mut self, expr: &Expression) -> Option<(String, i64, i64)> {
         // Class-property fixed array via any collection-resolvable shape
         // (bare `member`, `this.member`, `obj.member`, flattened `obj.member`).
-        if let Some(scoped) = self.expr_assoc_name(expr) {
+        let scoped = self.expr_assoc_name(expr);
+        if let Some(scoped) = scoped.as_ref() {
             if let Some((hstr, member)) = scoped.split_once('#') {
                 if let Ok(h) = hstr.parse::<usize>() {
                     let cn = self
@@ -3714,7 +3715,7 @@ impl Simulator {
                             if let Some(cd) = self.module.classes.get(&c) {
                                 if let Some(&(lo, hi, _)) = cd.array_properties.get(member) {
                                     let (lo, hi) = self.inst_fixed_bounds(cd, h, member, (lo, hi));
-                                    return Some((scoped, lo, hi));
+                                    return Some((scoped.clone(), lo, hi));
                                 }
                                 cur = cd.extends.clone();
                             } else {
@@ -3732,7 +3733,11 @@ impl Simulator {
             ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h) => {
                 self.resolve_hier_name(h)
             }
-            ExprKind::MemberAccess { .. } => self.package_collection_storage(expr)?.into(),
+            ExprKind::MemberAccess { .. } => {
+                // A class-static array also has a qualified storage name.
+                // Preserve its declared bounds without calling the getter again.
+                self.package_collection_storage(expr).or(scoped)?.into()
+            }
             _ => return None,
         };
         let &(lo, hi, _) = self.module.arrays.get(name.as_ref())?;

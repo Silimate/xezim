@@ -147,3 +147,32 @@ endmodule
     let output: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
     assert_eq!(output, ["GETTER match=1 calls=1"]);
 }
+
+/// IEEE 1800-2017 §11.4.5: compare class-static arrays at their declared indices.
+#[test]
+fn class_static_array_comparison_uses_declared_indices() {
+    let result = xezim::simulate(
+        r#"class C;
+  static int a[3:4];
+  static int b[3:4];
+  function void check();
+    C::a[3]=4; C::a[4]=7;
+    C::b[3]=4; C::b[4]=9;
+    $display("different %0d", C::a == C::b);
+    C::b[4]=7;
+    $display("same %0d", C::a == C::b);
+  endfunction
+endclass
+module top;
+  initial begin
+    C c=new;
+    c.check();
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let output: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(output, ["different 0", "same 1"]);
+}

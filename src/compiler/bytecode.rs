@@ -3898,7 +3898,7 @@ impl<'a> BytecodeCompiler<'a> {
                 struct_binds.push((p.name.name.clone(), (slot, fields)));
             }
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
-                if ew > 0 && w > ew && w % ew == 0 {
+                if ew > 0 && w >= ew && w % ew == 0 {
                     if self.decl_outer_dim_unnormalized(&p.data_type) {
                         self.bail("Expr_Call_packed_outer_dim");
                         return None;
@@ -4539,7 +4539,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.local_var_is_string.insert(d.name.name.clone());
         }
         if let Some(ew) = self.decl_elem_width(data_type) {
-            if ew > 0 && w > ew && w % ew == 0 {
+            if ew > 0 && w >= ew && w % ew == 0 {
                 if self.decl_outer_dim_unnormalized(data_type) {
                     self.bail("Expr_Call_packed_outer_dim");
                     return false;

@@ -1955,7 +1955,8 @@ struct CombEntryCold {
 // §23.9: an index naming a frame local that hides a parameter is not constant.
 // §7.2: a read of a nested packed-struct member (`s.inner.f`) compiles to a range select.
 // Packed member accesses can fold a procedural loop index bound by the unroller.
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB082";
+// §7.4.1: selecting a singleton packed dimension retains the element width.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB083";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).

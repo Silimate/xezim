@@ -215,7 +215,7 @@ impl Simulator {
                 Some(&self.module.typedefs),
             );
             if let Some(ew) = self.ast_decl_elem_width(&port.data_type) {
-                if ew > 0 && w > ew && w % ew == 0 {
+                if ew > 0 && w >= ew && w % ew == 0 {
                     self.module
                         .packed_signal_elem_widths
                         .insert(port.name.name.clone(), ew);
@@ -238,7 +238,7 @@ impl Simulator {
             );
             let rname = &fd.name.name.name;
             if let Some(ew) = self.ast_decl_elem_width(&fd.return_type) {
-                if ew > 0 && rw > ew && rw % ew == 0 {
+                if ew > 0 && rw >= ew && rw % ew == 0 {
                     self.module
                         .packed_signal_elem_widths
                         .insert(rname.clone(), ew);

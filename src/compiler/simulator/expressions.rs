@@ -6156,7 +6156,7 @@ impl Simulator {
                                 // packed reads back through this function, so
                                 // delegating recurses forever.
                                 let base_v = self.eval_expr(expr);
-                                if base_v.width as usize > ew as usize {
+                                if base_v.width >= ew {
                                     // §11.5.1: an x/z or out-of-range element
                                     // index reads a whole-x element.
                                     return match self.eval_expr(index).to_index() {

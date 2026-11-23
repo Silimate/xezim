@@ -16,6 +16,84 @@ fn t_lines(sim: &xezim::compiler::Simulator) -> Vec<String> {
 }
 
 #[test]
+fn singleton_packed_function_local_selects_a_whole_lane() {
+    const SRC: &str = r#"module probe #(parameter DataWidth=64, parameter Bytes=$clog2(DataWidth/8))(
+  input logic [DataWidth-1:0] value,
+  input logic [Bytes-1:0] addr,
+  output logic [63:0] lane
+);
+  function automatic logic [63:0] align_load(input logic [DataWidth-1:0] data, input logic [Bytes-1:0] at);
+    logic [DataWidth/64-1:0][63:0] split = data;
+    return split[at >> 3];
+  endfunction
+  assign lane = align_load(value, addr);
+endmodule
+module top;
+  logic [127:0] data;
+  logic [3:0] addr;
+  wire [63:0] a,b;
+  probe #(64) narrow(data[63:0],addr[2:0],a);
+  probe #(128) wide(data,addr,b);
+  initial begin
+    data = 128'hcafeba9876543210_0000000020001401; addr=0;
+    #1 $display("T|low=%h wide_lo=%h",a,b);
+    addr=8; #1 $display("T|wide_hi=%h",b);
+    data[63:0]=64'hff123456789abcde; addr=0;
+    #1 $display("T|next=%h wide_next=%h",a,b);
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|low=0000000020001401 wide_lo=0000000020001401",
+            "T|wide_hi=cafeba9876543210",
+            "T|next=ff123456789abcde wide_next=ff123456789abcde",
+        ]
+    );
+}
+
+#[test]
+fn singleton_packed_formals_and_writes_keep_the_declared_bounds() {
+    const SRC: &str = r#"module top;
+  logic [63:0] from_tb;
+  logic [0:0][63:0] global_bank;
+  int calls;
+  function automatic logic [63:0] selected(input logic [0:0][63:0] formal, input int i);
+    return formal[i];
+  endfunction
+  function automatic logic [63:0] with_side_effect(input logic [63:0] dat, input int idx);
+    logic [2:2][63:0] local_bank = dat;
+    calls++;
+    return local_bank[idx];
+  endfunction
+  function automatic logic [63:0] write_lane(input logic [63:0] dat, input int i);
+    logic [0:0][63:0] local_bank='0;
+    local_bank[i]=dat;
+    return local_bank;
+  endfunction
+  initial begin
+    from_tb=64'h1002040008102040;
+    global_bank[0]=from_tb;
+    $display("T|write=%h formal=%h offset=%h global=%h",write_lane(from_tb,0),selected(from_tb,0),with_side_effect(from_tb,2),global_bank[0]);
+    $display("T|bad_read=%b bad_offset=%b bad_write=%h",$isunknown(selected(from_tb,1)),$isunknown(with_side_effect(from_tb,3)),write_lane(from_tb,1));
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|write=1002040008102040 formal=1002040008102040 offset=1002040008102040 global=1002040008102040",
+            "T|bad_read=1 bad_offset=1 bad_write=0000000000000000",
+        ]
+    );
+}
+
+#[test]
 fn blocklocal_2state_vector() {
     const SRC: &str = r#"
 module rbs;

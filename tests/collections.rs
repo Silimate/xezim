@@ -76,6 +76,8 @@ mod mailbox_handle_named_like_struct;
 mod member_off_handle_collection_elem;
 #[path = "collections/member_read_effect_select.rs"]
 mod member_read_effect_select;
+#[path = "collections/binary_operand_effect_select.rs"]
+mod binary_operand_effect_select;
 #[path = "classes/compiled_method_test_env.rs"]
 mod compiled_method_test_env;
 #[path = "collections/bits_dynamic_operand.rs"]
@@ -234,6 +236,8 @@ mod dyn_row_print_order_597;
 
 #[path = "collections/row_of_2d_array_assign.rs"]
 mod row_of_2d_array_assign;
+#[path = "collections/row_value_into_collection_rows.rs"]
+mod row_value_into_collection_rows;
 
 #[path = "collections/conditional_aggregate_659.rs"]
 mod conditional_aggregate_659;
@@ -421,3 +425,9 @@ mod queue_pop_drain_loop_1210;
 mod unpacked_concat_targets;
 #[path = "collections/concat_operand_effects.rs"]
 mod concat_operand_effects;
+#[path = "collections/review_queue_rows_dollar_pop.rs"]
+mod review_queue_rows_dollar_pop;
+#[path = "collections/real_reduction_with.rs"]
+mod real_reduction_with;
+#[path = "collections/local_coll_elem_compare_1497.rs"]
+mod local_coll_elem_compare_1497;

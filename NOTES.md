@@ -17,7 +17,8 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * A method argument or result declared with a class's packed typedef keeps
   its width when a class constant sizes the range, including when a derived
   class inherits the typedef. The Coral RVV model's 128-bit ALU arguments
-  were truncated to one bit. (#474)
+  were truncated to one bit. Compiled methods also preserve the full argument
+  when a statement such as `$display` reads it before a direct return. (#474)
 * An imported package enum member hides a same-named compilation-unit
   parameter in class methods and constant expressions. (#475)
 * A factory-created object in a module instance retains its specialized
@@ -411,6 +412,57 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   See [docs/release.md](docs/release.md).
 
 ### Unreleased
+
+**Correctness**
+
+- Continuous assignments read negative packed-array element labels with
+  their declared sign (§7.4.5, #1568).
+- An unpacked struct field can hold a virtual interface and use it to
+  read or write the connected interface's array (§25.9, §7.6, #1311).
+
+**Performance**
+
+- A procedural write that changes no signal skips the active-force scan
+  when all force dependencies are known (§10.6.2, #1335).
+- Experimental `XEZIM_ARMED_EDGE_MASKS=1` lets a write to a shared bus
+  skip arming clocked blocks that only read unaffected slices.
+- Experimental switches for the two-state mux evaluator
+  (`XEZIM_TS_MUX_STREAM`), the injected worklist bitmap
+  (`XEZIM_SETTLE_POP_WORD`), and partial-range write masks
+  (`XEZIM_TS_RANGE_DELTA`).
+- Experimental `XEZIM_CTL_MUX=1` skips a compiled continuous mux body when
+  its known selector picks data already present in its output slice.
+- Experimental `XEZIM_ARMED_EDGE_BATCH=1` checks groups of armed blocks at
+  dense clock fanouts and queues only the blocks that need to run.
+- The interpreter skips reference resolution for numeric literals and
+  unary and binary operators while resolving any referenced operands normally.
+- The interpreter reaches logical short-circuit evaluation sooner, skips class
+  collection lookups in class-free designs and reuses the name buffer for
+  indexed nonblocking writes.
+- Interpreted addition and subtraction use a shorter path for plain integer
+  reads paired with known literals, preserving width, signedness and X/Z
+  behavior. Identifier lookup uses a first-byte filter for special names.
+- Interpreted comparisons reuse task-frame type lookups and skip width
+  queries for plain reads compared with known integer literals.
+
+**Command line**
+
+* A `-v`/`-y` library file is preprocessed with the command-line defines
+  (`+define+`, `-D`) only, as in the reference simulator, so library files no
+  longer see source-file macros unless `--carry-src-macros` is given.
+  `--carry-lib-macros` also keeps a library file's macros defined for the
+  library files read after it, which was the default in 0.11.7. A library
+  file that uses such a macro gets a note naming the switch (§22.5.1, §3.12.1,
+  aionhw/xezim-core#279).
+
+**Maintenance**
+
+* The largest sources are split into modules by pure moves, so every file
+  can be read on GitHub: core `elaborate.rs` (2.9 MB) into `src/elaborate/`,
+  the parser's `parse/items.rs`, and the simulator's `bytecode.rs`,
+  `simulator.rs`, `rand_csp.rs`, `expressions.rs`, `statements.rs`,
+  `assignments.rs` and `processes.rs`. Public paths, behavior and the cache
+  formats are unchanged (#961, raised by philipaxer).
 
 ### 0.11.7 — lower elaboration memory, faster event waits and queues, DPI C sources and memory files, array and real-number correctness (November 2026)
 

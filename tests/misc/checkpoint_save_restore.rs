@@ -122,8 +122,6 @@ fn a_restored_run_continues_where_the_saved_one_was() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
-
-// silimate: a procedural concurrent assertion reached after a delay waits for the next tick
 /// §16.14.6: a process saved while it waits on a delay still resumes from a
 /// delay after the restore, so the procedural assertion it then reaches
 /// attempts at the clock's next tick (15), not at once (8).
@@ -157,6 +155,8 @@ endmodule
     assert_eq!(restored, full, "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// silimate: a procedural concurrent assertion reached after a delay waits for the next tick
 // /silimate
 
 #[test]

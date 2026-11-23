@@ -4303,8 +4303,12 @@ impl Simulator {
             .cloned()
             .collect();
         let mut instance_path_order: Vec<usize> = (0..module.instances.len()).collect();
-        instance_path_order
-            .sort_unstable_by(|&a, &b| module.instances[a].path.cmp(&module.instances[b].path));
+        instance_path_order.sort_unstable_by(|&a, &b| {
+            module.instances[a]
+                .path
+                .cmp(&module.instances[b].path)
+                .then(a.cmp(&b))
+        });
         // Sized up front: this ends up with one entry per DISTINCT leaf, and on
         // c906 nearly every one of the 1.56 M names has its own (array elements
         // carry `[idx]` in the leaf). Growing from empty rehashes the table a
@@ -4567,6 +4571,7 @@ impl Simulator {
             forced_names: HashSet::default(),
             static_fn_ret: HashMap::default(),
             active_force_exprs: Vec::new(),
+            unresolved_force_count: 0,
             active_force_signal_epochs: vec![0; signal_table.len()],
             active_force_evals: 0,
             active_force_skips: 0,
@@ -4642,9 +4647,7 @@ impl Simulator {
             sva_owed: false,
             sva_abort_step: false,
             sva_post_nba_busy: false,
-            // silimate: deferred assertion reports mature after the slot's leftover cbReadWriteSynch
             vpi_slot_maturing: false,
-            // /silimate
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),
             clocking_meta: HashMap::default(),
@@ -4776,6 +4779,7 @@ impl Simulator {
             static_vif_bindings: HashMap::default(),
             static_vif_names: HashSet::default(),
             vif_capable_statics: std::cell::OnceCell::new(),
+            vif_member_leaves: std::cell::OnceCell::new(),
             scoped_unpacked_leaves: std::cell::OnceCell::new(),
             may_bind_static_vif: true,
             static_vif_array_names: HashSet::default(),
@@ -4908,9 +4912,7 @@ impl Simulator {
             block_scope_saves: Vec::new(),
             hoisted_scope: (0, 0),
             trampolined_pids: HashSet::default(),
-            // silimate: a continuation of the same activation is no flush point
             cont_pids: HashSet::default(),
-            // silimate: a procedural concurrent assertion reached after a delay waits for the next tick
             delay_pids: HashMap::default(),
             delay_resumed: HashSet::default(),
             local_gen_stack: Vec::new(),
@@ -5365,10 +5367,8 @@ impl Simulator {
             comb_level: Vec::new(),
             comb_has_nba: Vec::new(),
             comb_self_exempt: Vec::new(),
-            // silimate: a level-sensitive block that writes nothing runs once the settle converges
             comb_observer: Vec::new(),
-            comb_observer_any: false,
-            // /silimate
+            comb_has_observer: false,
             comb_par_safe: Vec::new(),
             bsp_buckets: Vec::new(),
             bsp_next_seed: Vec::new(),
@@ -5445,6 +5445,13 @@ impl Simulator {
             ctl_on: !matches!(std::env::var("XEZIM_CTL_MASK").as_deref(), Ok("0"))
                 && std::env::var_os("XEZIM_BSP_SETTLE").is_none()
                 && std::env::var_os("XEZIM_BSP_SHADOW").is_none(),
+            mux_guard_on: std::env::var("XEZIM_CTL_MUX").as_deref() == Ok("1"),
+            mux_guards: Vec::new(),
+            mux_guard_by_entry: Vec::new(),
+            prof_mux_skipped: 0,
+            ts_mux_stream_on: std::env::var("XEZIM_TS_MUX_STREAM").as_deref() == Ok("1"),
+            settle_pop_word: std::env::var("XEZIM_SETTLE_POP_WORD").as_deref() == Ok("1"),
+            ts_range_delta: std::env::var("XEZIM_TS_RANGE_DELTA").as_deref() == Ok("1"),
             ts_rec0: (0, 0),
             ts_rec_n: 0,
             ts_recs: Vec::new(),
@@ -5502,6 +5509,8 @@ impl Simulator {
             is_edge_signal_non_clock: Vec::new(),
             nba_touched_edge_non_clock: false,
             prof_nba_elided: 0,
+            prof_wide_nba_quiet: 0,
+            prof_wide_nba_cloned: 0,
             event_measure: false,
             event_skip: false,
             event_after: 0,
@@ -5546,6 +5555,7 @@ impl Simulator {
             armed_input_bitmap: Vec::new(),
             armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
+            armed_input_masks: Vec::new(),
             edge_block_armed: Vec::new(),
             edge_block_retired: Vec::new(),
             armed_fast_skips: 0,
@@ -5703,6 +5713,9 @@ impl Simulator {
             sampled_site_clock: HashMap::default(),
             proc_sampled_blocks: Vec::new(),
             always_sva_names: HashSet::default(),
+            always_sva_clocks: HashSet::default(),
+            sva_clock_watch: Vec::new(),
+            sva_clock_slot_time: None,
             sampled_registering: false,
             pending_t0_triggers: Vec::new(),
             time0_port_edges: Vec::new(),

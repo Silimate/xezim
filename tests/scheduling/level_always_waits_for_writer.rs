@@ -1,4 +1,3 @@
-// silimate: always_comb / always @* blocks wait for the writer to yield too
 //! §4.5, §9.2.2.2, §9.4.2.2: a level-sensitive `always` block (`always_comb`,
 //! `always @*`) is a process of its own. A blocking write in another process
 //! only schedules it: it runs once that process suspends, after the
@@ -48,8 +47,8 @@ endmodule
 fn level_always_runs_after_the_writer_and_the_assignments() {
     let out = lines(ADDER);
     let failed: Vec<&String> = out.iter().filter(|l| l.contains("failed")).collect();
-    // silimate: always_comb's time-0 run may come before or after the testbench's first writes
-    // §9.2.2.2.2 only puts it after every procedure has started.
+    // §9.2.2.2.2 puts the time-0 run after every procedure has started, but
+    // does not order it against their first writes.
     assert!(failed.is_empty() || failed == ["comb failed at 0"], "{out:#?}");
     for kind in ["comb", "star"] {
         for t in 1..20 {

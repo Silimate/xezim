@@ -74,5 +74,8 @@ fn sampled_value_functions_of_a_whole_unpacked_array() {
         .map(|o| o.message.trim_end().to_string())
         .find(|l| l.starts_with("RESULT"))
         .unwrap_or_default();
-    assert_eq!(line, "RESULT edges=10 changed=0 stable=0 past=0 desc=0 pos=0 sampled=0 offtick=0 wild=0");
+    assert_eq!(
+        line,
+        "RESULT edges=10 changed=0 stable=0 past=0 desc=0 pos=0 sampled=0 offtick=0 wild=0"
+    );
 }

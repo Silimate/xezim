@@ -1493,6 +1493,47 @@ impl Simulator {
         }
     }
 
+    /// §9.2.2.1, §9.4.1: a free-running delay loop body: at least one wait,
+    /// every wait a delay control (no `@`; `wait` is not plain stimulus), and
+    /// plain-stimulus statements only. `always begin #(d); ... end` is the
+    /// same process as the delay-headed `always #(d) ...`, which becomes a
+    /// process FSM by default; so is an `initial forever` of this shape.
+    pub(super) fn stmt_is_delay_loop(&self, stmt: &Statement) -> bool {
+        Self::count_timing_controls(stmt) >= 1
+            && !Self::stmt_contains_event_control(stmt)
+            && self.stmt_is_plain_stimulus(stmt)
+    }
+
+    /// An initial body of untimed set-up followed by a delay-only `forever`
+    /// (§9.2.2.1: the `always` form of the same loop). A delay sequence that
+    /// ends (a reset script, an ordering probe) is not one and keeps the AST
+    /// path its pinned traces rely on.
+    pub(super) fn stmts_end_in_delay_loop(&self, stmts: &[Statement]) -> bool {
+        let Some((last, setup)) = stmts.split_last() else {
+            return false;
+        };
+        matches!(last.kind, StatementKind::Forever { .. })
+            && self.stmt_is_delay_loop(last)
+            && setup
+                .iter()
+                .all(|st| Self::count_timing_controls(st) == 0 && self.stmt_is_plain_stimulus(st))
+    }
+
+    /// The structural half of `stmts_end_in_delay_loop`, for a pending
+    /// initial whose names are not yet its instance's: it must be
+    /// materialized for the full check to see it.
+    pub(super) fn source_ends_in_delay_forever(stmt: &Statement) -> bool {
+        let last = match &stmt.kind {
+            StatementKind::SeqBlock { stmts, .. } => stmts.last(),
+            _ => Some(stmt),
+        };
+        last.is_some_and(|l| {
+            matches!(l.kind, StatementKind::Forever { .. })
+                && Self::count_timing_controls(l) >= 1
+                && !Self::stmt_contains_event_control(l)
+        })
+    }
+
     /// True when an identifier in `e` is a `virtual <iface>` variable: the
     /// compiled path stores through it as a plain signal, while §25.9 makes
     /// the assignment a name alias the interpreter tracks.
@@ -1730,9 +1771,8 @@ impl Simulator {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
-        // silimate: a procedural assertion in an always process samples its time-0 defaults too
         Self::sva_stmt_names(&ab.stmt, false, &mut self.always_sva_names);
-        // /silimate
+        Self::sva_stmt_clocks(&ab.stmt, &mut self.always_sva_clocks);
         // Roadmap 11-12 (opt-in XEZIM_PROC_FSM=1): a MULTI-WAIT always body
         // (an event/delay head plus at least one more wait inside) is served
         // by the edge path only through per-fire AST continuations — compile
@@ -2331,7 +2371,11 @@ impl Simulator {
                 // becomes a bytecode FSM — resumes re-enter at a saved pc
                 // instead of re-walking the AST continuation chain.
                 {
-                    let fsm_on = self.proc_fsm_mode == 1;
+                    // By default (unset), a body whose only waits are delays
+                    // (`always begin #(d); ... end`) is admitted like the
+                    // delay-headed form above (§9.4.1).
+                    let fsm_on = self.proc_fsm_mode == 1
+                        || (self.proc_fsm_mode == 2 && self.stmt_is_delay_loop(&ab.stmt));
                     if fsm_on
                         && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
                     {
@@ -2506,11 +2550,11 @@ impl Simulator {
         // Gate: fallback-free, at least one wait (else it belongs on the
         // comb/edge paths), and no process-local frame reads (the FSM has
         // no AST call frames).
+        // A system task from an inlined function body arrives wrapped in the
+        // function's name for `%m` and carries its formals with it; it is
+        // still only a system task.
         let non_systask_fallback = cb.instructions.iter().any(|i| match i {
-            Insn::StmtFallback(payload) => !matches!(
-                &payload.0.kind,
-                StatementKind::Expr(e) if matches!(&e.kind, ExprKind::SystemCall { .. })
-            ),
+            Insn::StmtFallback(payload) => Self::fallback_system_task(&payload.0).is_none(),
             _ => false,
         });
         if non_systask_fallback
@@ -2985,6 +3029,8 @@ impl Simulator {
             .unwrap_or(false)
         {
             let verbose = std::env::var("XEZIM_JIT_VERBOSE").is_ok();
+            let mut candidates = safe;
+            self.filter_aot_candidates(&blocks, &mut candidates, "comb");
             let mut names: Vec<(usize, String)> = Vec::new();
             let mut fns: Vec<String> = Vec::new();
             // XEZIM_AOT_TEMPLATE=1: emit ONE body per canonical block shape
@@ -3001,7 +3047,7 @@ impl Simulator {
                     .enumerate()
                     .filter_map(|(idx, b)| {
                         let cb = b.as_ref()?;
-                        if !safe[idx] {
+                        if !candidates[idx] {
                             return None;
                         }
                         Some((idx, cb.instructions.clone(), cb.num_regs))
@@ -3063,7 +3109,7 @@ impl Simulator {
                     break;
                 }
                 let Some(cb) = b else { continue };
-                if !safe[idx] {
+                if !candidates[idx] {
                     continue;
                 }
                 let name = format!("xezim_aot_cb_{idx}");
@@ -3123,10 +3169,10 @@ impl Simulator {
                 }
             }
             chatter!(
-                "[AOT] comb entries compiled {}/{} (width-safe candidates {})",
+                "[AOT] comb entries compiled {}/{} (native candidates {})",
                 n,
                 self.comb_entries.len(),
-                safe.iter().filter(|&&x| x).count()
+                candidates.iter().filter(|&&x| x).count()
             );
             return;
         }
@@ -4107,7 +4153,9 @@ impl Simulator {
                         .comb_dep_edges
                         .get(g.pos as usize)
                         .is_some_and(|d| d.mask == 0);
+                    // A mux still depends on its selected data arm.
                     if masked
+                        && matches!(g.op, FusedGate::Bin2 { .. })
                         && self.signal_table[g.other.sig_id as usize]
                             .get_bit_code(g.other.bit as usize)
                             == g.ctl

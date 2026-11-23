@@ -77,3 +77,102 @@ endmodule
         .collect();
     assert_eq!(lines, ["'{1, 2, 9}"]);
 }
+
+/// IEEE 1800-2017 §7.6, §26.3: copy the elements of the selected package array.
+#[test]
+fn copy_fixed_package_strings_into_inherited_dynamic_array() {
+    let result = xezim::simulate(
+        r#"
+package alpha;
+  parameter string names[5:3] = '{"amber", "blue", "cyan"};
+endpackage
+package beta;
+  parameter string names[2] = '{"north", "south"};
+endpackage
+class parent;
+  string names[];
+endclass
+class cfg extends parent;
+  function void run();
+    names = alpha::names;
+    $display("alpha %0d %s %s %s", names.size(), names[0], names[1], names[2]);
+    this.names = beta::names;
+    $display("beta %0d %s %s", names.size(), names[0], names[1]);
+  endfunction
+endclass
+module top;
+  initial begin
+    cfg c = new;
+    c.run();
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let output: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(output, ["alpha 3 amber blue cyan", "beta 2 north south"]);
+}
+
+/// IEEE 1800-2017 §11.3.2: one getter supplies the queue for the entire comparison.
+#[test]
+fn queue_equality_evaluates_its_receiver_once() {
+    let result = xezim::simulate(
+        r#"class holder;
+  int q[$];
+endclass
+module top;
+  holder h, next;
+  int calls;
+  int expected[$] = '{3, 7};
+  function automatic holder get_holder();
+    calls++;
+    if (calls == 1) return h;
+    return next;
+  endfunction
+  initial begin
+    bit matched;
+    h = new;
+    next = new;
+    next.q = '{0};
+    h.q = '{3, 7};
+    matched = get_holder().q == expected;
+    $display("GETTER match=%0b calls=%0d", matched, calls);
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let output: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(output, ["GETTER match=1 calls=1"]);
+}
+
+/// IEEE 1800-2017 §11.4.5: compare class-static arrays at their declared indices.
+#[test]
+fn class_static_array_comparison_uses_declared_indices() {
+    let result = xezim::simulate(
+        r#"class C;
+  static int a[3:4];
+  static int b[3:4];
+  function void check();
+    C::a[3]=4; C::a[4]=7;
+    C::b[3]=4; C::b[4]=9;
+    $display("different %0d", C::a == C::b);
+    C::b[4]=7;
+    $display("same %0d", C::a == C::b);
+  endfunction
+endclass
+module top;
+  initial begin
+    C c=new;
+    c.check();
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let output: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(output, ["different 0", "same 1"]);
+}

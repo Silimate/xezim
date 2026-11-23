@@ -3700,7 +3700,8 @@ impl Simulator {
     pub(super) fn fixed_array_operand(&mut self, expr: &Expression) -> Option<(String, i64, i64)> {
         // Class-property fixed array via any collection-resolvable shape
         // (bare `member`, `this.member`, `obj.member`, flattened `obj.member`).
-        if let Some(scoped) = self.expr_assoc_name(expr) {
+        let scoped = self.expr_assoc_name(expr);
+        if let Some(scoped) = scoped.as_ref() {
             if let Some((hstr, member)) = scoped.split_once('#') {
                 if let Ok(h) = hstr.parse::<usize>() {
                     let cn = self
@@ -3714,7 +3715,7 @@ impl Simulator {
                             if let Some(cd) = self.module.classes.get(&c) {
                                 if let Some(&(lo, hi, _)) = cd.array_properties.get(member) {
                                     let (lo, hi) = self.inst_fixed_bounds(cd, h, member, (lo, hi));
-                                    return Some((scoped, lo, hi));
+                                    return Some((scoped.clone(), lo, hi));
                                 }
                                 cur = cd.extends.clone();
                             } else {
@@ -3725,21 +3726,24 @@ impl Simulator {
                 }
             }
         }
-        // Module-level fixed array (bare Ident). A DYNAMIC array / queue is
-        // registered in `module.arrays` with the (0,-1) queue SENTINEL range
-        // (and in `dynamic_arrays`) — it is NOT a fixed array and must not be
-        // compared element-wise as the empty 0:-1 range: UVM's `val == t` on
-        // two `T`-typed queues would otherwise both resolve to (0,-1) and the
-        // guard falsely reported them equal (skipping the update).
-        if let ExprKind::Ident(h) = &expr.kind
-            && !self.ident_shadowed_by_non_collection(h)
-        {
-            let name = self.resolve_hier_name(h);
-            if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
-                if !self.module.dynamic_arrays.contains(&*name) && !(hi < lo) {
-                    return Some((name.to_string(), lo, hi));
-                }
+        // Procedural scopes retain a package-qualified operand as MemberAccess.
+        // Use the collection resolver there, including its receiver-shadowing
+        // check and its selection of a qualified or hoisted package key.
+        let name = match &expr.kind {
+            ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h) => {
+                self.resolve_hier_name(h)
             }
+            ExprKind::MemberAccess { .. } => {
+                // A class-static array also has a qualified storage name.
+                // Preserve its declared bounds without calling the getter again.
+                self.package_collection_storage(expr).or(scoped)?.into()
+            }
+            _ => return None,
+        };
+        let &(lo, hi, _) = self.module.arrays.get(name.as_ref())?;
+        // Dynamic arrays and queues use (0, -1) as a sentinel in this table.
+        if hi >= lo && !self.module.dynamic_arrays.contains(name.as_ref()) {
+            return Some((name.into_owned(), lo, hi));
         }
         None
     }

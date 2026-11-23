@@ -1344,8 +1344,13 @@ impl<'a> BytecodeCompiler<'a> {
                 if let ExprKind::Ident(h) = &expr.kind {
                     let raw = Self::hier_raw_name(h);
                     if let Some(&ew) = self.local_var_elem.get(&raw) {
-                        if let Some((src, _w)) = self.local_var_reg_of(h) {
+                        if let Some((src, width)) = self.local_var_reg_of(h) {
                             let idx_reg = self.compile_expr(index, 0)?;
+                            let dest = self.alloc_reg();
+                            self.emit(Insn::LoadConst(dest, Box::new(Value::all_x(ew))));
+                            let valid = self.local_lane_in_bounds(idx_reg, width / ew);
+                            let skip = self.insns.len();
+                            self.emit(Insn::BranchIfFalse(valid, 0));
                             let ew_reg = self.alloc_reg();
                             self.emit(Insn::LoadConst(
                                 ew_reg,
@@ -1362,8 +1367,8 @@ impl<'a> BytecodeCompiler<'a> {
                             let hi_reg = self.alloc_reg();
                             self.emit(Insn::Add(hi_reg, lo_reg, ewm1));
                             self.emit(Insn::Resize(hi_reg, 32));
-                            let dest = self.alloc_reg();
                             self.emit(Insn::RangeSelect(dest, src, hi_reg, lo_reg));
+                            self.insns[skip] = Insn::BranchIfFalse(valid, self.insns.len() as u32);
                             return Some(dest);
                         }
                     }

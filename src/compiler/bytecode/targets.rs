@@ -1578,6 +1578,9 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.bail("local_elem_idx");
                                 return false;
                             };
+                            let valid = self.local_lane_in_bounds(idx_reg, yw / ew);
+                            let skip = self.insns.len();
+                            self.emit(Insn::BranchIfFalse(valid, 0));
                             let ew_reg = self.alloc_reg();
                             self.emit(Insn::LoadConst(
                                 ew_reg,
@@ -1612,6 +1615,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::BitOr(merged, cleared, vsh));
                             self.emit(Insn::Move(yreg, merged));
                             self.emit(Insn::Resize(yreg, yw));
+                            self.insns[skip] = Insn::BranchIfFalse(valid, self.insns.len() as u32);
                             return true;
                         }
                     }

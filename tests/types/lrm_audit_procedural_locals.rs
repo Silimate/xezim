@@ -551,3 +551,35 @@ endmodule"#;
         ],
     );
 }
+
+#[test]
+fn packed_lane_offsets_check_the_full_index_before_scaling() {
+    let source = r#"module top;
+  typedef logic [0:0][63:0] bank_t;
+  bank_t bank = 64'hd0c0beef1234fedc;
+  logic [79:0] index;
+  function automatic logic [63:0] load(input bank_t src, input logic [79:0] i);
+    return src[i];
+  endfunction
+  function automatic bank_t store(input bank_t src, input logic [79:0] i);
+    bank_t tmp = src;
+    tmp[i] = 64'h0123456789abcdef;
+    return tmp;
+  endfunction
+  wire [63:0] selected = load(bank, index);
+  wire [63:0] written = store(bank, index);
+  initial begin
+    index = 0; #1;
+    $display("T|valid=%0b", selected === bank && written === 64'h0123456789abcdef);
+    index = 32'h04000000; #1;
+    $display("T|overflow=%0b", selected === 64'bx && written === bank);
+    index = 80'h0100_0000_0000_0000_0000; #1;
+    $display("T|wide=%0b", selected === 64'bx && written === bank);
+    index = 'x; #1;
+    $display("T|unknown=%0b", selected === 64'bx && written === bank);
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(source, 1000).unwrap();
+    assert_eq!(t_lines(&sim), ["T|valid=1", "T|overflow=1", "T|wide=1", "T|unknown=1"]);
+}

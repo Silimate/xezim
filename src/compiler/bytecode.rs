@@ -21424,7 +21424,7 @@ impl<'a> BytecodeCompiler<'a> {
             return false;
         };
         if !matches!(inner.kind, ExprKind::Index { .. })
-            || !crate::compiler::simulator::Simulator::select_entered_member_shape(inner)
+            || !crate::compiler::simulator::Simulator::select_entered_member_shape(inner, false)
         {
             return false;
         }

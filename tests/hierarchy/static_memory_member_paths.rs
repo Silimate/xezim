@@ -16,6 +16,38 @@ fn check(source: &str, marker: &str) {
     assert!(lines.contains(&marker), "missing {marker:?}: {lines:?}");
 }
 
+#[test]
+fn size_of_unpacked_memory_below_generate_and_instance_array() {
+    let source = r#"
+module ram;
+  logic [27:0] mem[32];
+  logic [4:0] plane[-1:1][6:3];
+  logic [1:0] cube[2][3][4];
+endmodule
+module layer;
+  for (genvar i=0; i<2; ++i) begin : ways
+    ram u[2]();
+    ram inner();
+  end
+endmodule
+module top;
+  layer dut();
+  initial begin
+    if ($size(dut.ways[0].inner.mem) != 32) $display("FAIL scalar-instance depth");
+    if ($bits(dut.ways[0].inner.mem) != 896) $display("FAIL scalar instance");
+    if ($bits(dut.ways[0].inner.mem[0]) != 28) $display("FAIL scalar-instance word");
+    if ($bits(dut.ways[1].u[0].mem) != 896) $display("FAIL memory");
+    if ($bits(dut.ways[1].u[0].mem[0]) != 28) $display("FAIL word");
+    if ($bits(dut.ways[0].u[1].plane) != 60) $display("FAIL plane");
+    if ($bits(dut.ways[1].u[1].cube) != 48) $display("FAIL cube");
+    $display("GENERATED_MEMORY_SIZE_PASS");
+    $finish;
+  end
+endmodule
+"#;
+    check(source, "GENERATED_MEMORY_SIZE_PASS");
+}
+
 const BOUNDS: &str = r#"
 module memory_leaf;
   logic [79:0] positive [3:6];

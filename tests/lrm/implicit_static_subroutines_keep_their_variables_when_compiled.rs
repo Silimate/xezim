@@ -126,6 +126,60 @@ endmodule"#
 }
 
 #[test]
+fn output_formals_own_their_initial_value_and_lifetime() {
+    let src = r#"module top;
+  bit [3:0] a = 9, b = 8, rw = 3;
+  logic [7:0] unknowns = '0;
+  chandle handle;
+  task automatic fresh(output bit [3:0] o, output logic [7:0] x, inout bit [3:0] io, output chandle h);
+    $display("fresh %0d %b %0d %b", o, x, io, h == null);
+    o = 4; x = '1; io++;
+  endtask
+  task remember(output bit [3:0] o);
+    $display("static %0d", o);
+    o++;
+  endtask
+  initial begin
+    fresh(a, unknowns, rw, handle);
+    fresh(b, unknowns, rw, handle);
+    remember(a);
+    remember(b);
+    $display("copy %0d %0d %0d", a, b, rw);
+    $finish;
+  end
+endmodule"#;
+    assert_eq!(
+        lines(src),
+        [
+            "fresh 0 xxxxxxxx 3 1",
+            "fresh 0 xxxxxxxx 4 1",
+            "static 0",
+            "static 1",
+            "copy 1 2 5"
+        ]
+    );
+}
+
+#[test]
+fn a_static_task_output_nba_updates_the_formal_after_copyout() {
+    let src = r#"module top;
+  bit a = 1, b = 0;
+  task t(output bit q);
+    #1;
+    q <= 1;
+  endtask
+  initial begin
+    t(a);
+    #1;
+    t(b);
+    $display("copy %b %b", a, b);
+    $finish;
+  end
+endmodule"#;
+    assert_eq!(lines(src), ["copy 0 1"]);
+}
+
+#[test]
 fn a_static_local_is_readable_by_path_after_compiled_calls() {
     let src = format!(
         r#"module top; {CLK}

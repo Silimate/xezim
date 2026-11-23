@@ -8,6 +8,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 ### Unreleased (Silimate fork)
 
+- Delayed nonblocking assignments from the same process now take effect in
+  execution order when they mature together (§4.6). A default assignment
+  could previously overwrite a later conditional assignment to the same signal.
+
 **Correctness**
 
 * An `always_comb` or `always @*` block that writes a member of an element

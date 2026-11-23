@@ -3731,7 +3731,7 @@ impl Simulator {
             ExprKind::Ident(h) if !self.ident_shadowed_by_non_collection(h) => {
                 self.resolve_hier_name(h)
             }
-            ExprKind::MemberAccess { .. } => self.array_operand_name(expr)?.into(),
+            ExprKind::MemberAccess { .. } => self.package_collection_storage(expr)?.into(),
             _ => return None,
         };
         let &(lo, hi, _) = self.module.arrays.get(name.as_ref())?;

@@ -78,6 +78,7 @@ endmodule
     assert_eq!(lines, ["'{1, 2, 9}"]);
 }
 
+/// IEEE 1800-2017 §7.6, §26.3: copy the elements of the selected package array.
 #[test]
 fn copy_fixed_package_strings_into_inherited_dynamic_array() {
     let result = xezim::simulate(
@@ -111,4 +112,38 @@ endmodule
     .unwrap();
     let output: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
     assert_eq!(output, ["alpha 3 amber blue cyan", "beta 2 north south"]);
+}
+
+/// IEEE 1800-2017 §11.3.2: one getter supplies the queue for the entire comparison.
+#[test]
+fn queue_equality_evaluates_its_receiver_once() {
+    let result = xezim::simulate(
+        r#"class holder;
+  int q[$];
+endclass
+module top;
+  holder h, next;
+  int calls;
+  int expected[$] = '{3, 7};
+  function automatic holder get_holder();
+    calls++;
+    if (calls == 1) return h;
+    return next;
+  endfunction
+  initial begin
+    bit matched;
+    h = new;
+    next = new;
+    next.q = '{0};
+    h.q = '{3, 7};
+    matched = get_holder().q == expected;
+    $display("GETTER match=%0b calls=%0d", matched, calls);
+  end
+endmodule
+"#,
+        100_000,
+    )
+    .unwrap();
+    let output: Vec<_> = result.output.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(output, ["GETTER match=1 calls=1"]);
 }

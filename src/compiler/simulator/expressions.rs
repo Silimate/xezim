@@ -4979,6 +4979,23 @@ impl Simulator {
                 let (agg_l, agg_r) = (Self::peel_parens(left), Self::peel_parens(right));
                 let agg_cmp = PatternCmpMode::of(*op)
                     .filter(|_| self.may_be_aggregate(agg_l) && self.may_be_aggregate(agg_r));
+                // §11.3.2: the scalar and collection paths below probe a member
+                // several times. Keep the handle returned by its getter once.
+                let hold_receiver = |sim: &mut Self, e: &Expression| {
+                    if agg_cmp.is_some()
+                        && let ExprKind::MemberAccess { expr: base, .. } = &e.kind
+                        && matches!(Self::peel_parens(base).kind, ExprKind::Call { .. })
+                    {
+                        sim.freeze_side_effect_indices(e)
+                    } else {
+                        None
+                    }
+                };
+                let held_left = hold_receiver(self, agg_l);
+                let held_right = hold_receiver(self, agg_r);
+                let left = held_left.as_ref().unwrap_or(left);
+                let right = held_right.as_ref().unwrap_or(right);
+                let (agg_l, agg_r) = (Self::peel_parens(left), Self::peel_parens(right));
                 if let Some((mode, want_eq)) = agg_cmp
                     && let Some(c) = self.compare_unpacked_structs(agg_l, agg_r, mode)
                 {

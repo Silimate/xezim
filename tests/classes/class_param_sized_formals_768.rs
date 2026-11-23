@@ -89,3 +89,40 @@ endmodule
     );
     assert_eq!(out, ["T randc 16 16 4"], "{out:#?}");
 }
+
+#[test]
+fn class_output_and_inout_use_the_declared_packed_width() {
+    let out = tagged(
+        r#"
+module worker;
+  class mem #(int WIDTH = 32);
+    typedef logic [WIDTH-1:0] word_t;
+    function void load(output word_t data, inout logic [WIDTH-1:0] accum);
+      data = '0;
+      data[0+:8] = 8'h64;
+      data[8+:8] = 8'hc1;
+      accum = accum ^ data;
+    endfunction
+  endclass
+  initial begin
+    mem #(32) wide = new;
+    mem #(12) narrow = new;
+    logic [31:0] w, a;
+    logic [11:0] n, b;
+    int errors;
+    repeat (1010) begin
+      a = 32'h80808080;
+      b = 12'habc;
+      wide.load(w, a);
+      narrow.load(n, b);
+      if (w !== 32'hc164 || a !== 32'h808041e4 ||
+          n !== 12'h164 || b !== 12'hbd8) errors++;
+    end
+    $display("T errors %0d", errors);
+  end
+endmodule
+module tb; worker child(); endmodule
+"#,
+    );
+    assert_eq!(out, ["T errors 0"], "{out:#?}");
+}

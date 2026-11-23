@@ -19,20 +19,28 @@ fn check(source: &str, marker: &str) {
 #[test]
 fn size_of_unpacked_memory_below_generate_and_instance_array() {
     let source = r#"
-module ram;
+module ram #(parameter int Tag=0) (input logic id);
   logic [27:0] mem[32];
+  initial begin #1; mem[3]=Tag + id; end
   logic [4:0] plane[-1:1][6:3];
   logic [1:0] cube[2][3][4];
 endmodule
 module layer;
   for (genvar i=0; i<2; ++i) begin : ways
-    ram u[2]();
-    ram inner();
+    ram #(.Tag('h200 + i*16)) u[2](2'b01);
+    ram #(.Tag('h100 + i)) inner(1'b0);
   end
 endmodule
 module top;
   layer dut();
   initial begin
+    logic [27:0] snapshot[32];
+    #2;
+    snapshot = dut.ways[1].inner.mem;
+    if (snapshot[3] !== 28'h101) $display("FAIL whole array from selected way");
+    if (dut.ways[0].inner.mem[3] !== 28'h100) $display("FAIL other way");
+    if (dut.ways[1].u[0].mem[3] !== 28'h210) $display("FAIL first array instance");
+    if (dut.ways[1].u[1].mem[3] !== 28'h211) $display("FAIL second array instance");
     if ($size(dut.ways[0].inner.mem) != 32) $display("FAIL scalar-instance depth");
     if ($bits(dut.ways[0].inner.mem) != 896) $display("FAIL scalar instance");
     if ($bits(dut.ways[0].inner.mem[0]) != 28) $display("FAIL scalar-instance word");

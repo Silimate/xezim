@@ -1977,12 +1977,13 @@ impl Simulator {
                     // §8.25/§13.5: a packed formal sized by a class value
                     // parameter (`bit [W-1:0] a`, or a class typedef of one)
                     // is as wide as the receiver's specialization makes it.
+                    // Output/inout slots need that width for writes inside the
+                    // callee even though their actuals are not input expressions.
                     let param_w = if plan.ports[i].fixed_width.is_none()
                         && !plain_class
-                        && (Self::actual_ctx_shape(port)
-                            || port.dimensions.is_empty()
-                                && port.direction == PortDirection::Input
-                                && matches!(&port.data_type, DataType::TypeReference { .. }))
+                        && port.dimensions.is_empty()
+                        && (plan.ports[i].plain_scalar
+                            || matches!(&port.data_type, DataType::TypeReference { .. }))
                     {
                         self.method_formal_param_width(handle, cname, &port.data_type)
                     } else {

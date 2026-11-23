@@ -161,6 +161,45 @@ endmodule"#;
 }
 
 #[test]
+fn class_task_output_defaults_follow_the_type_parameter() {
+    let src = r#"module top;
+  class C #(type T = bit);
+    task read_output(input T expected, output T o, output T entry);
+      #1;
+      $display("entry %b", o === expected);
+      entry = o;
+    endtask
+  endclass
+  C #(bit) bits = new;
+  C #(string) strings = new;
+  C #(logic) four_state = new;
+  bit b = 1, before_b = 1;
+  string s = "caller", before_s = "caller";
+  logic l = 1, before_l = 1;
+  initial begin
+    bits.read_output(1'b0, b, before_b);
+    strings.read_output("", s, before_s);
+    four_state.read_output(1'bx, l, before_l);
+    $display("bit %b %b", b, before_b);
+    $display("string %0d %0d", s.len(), before_s.len());
+    $display("logic %b %b", l, before_l);
+    $finish;
+  end
+endmodule"#;
+    assert_eq!(
+        lines(src),
+        [
+            "entry 1",
+            "entry 1",
+            "entry 1",
+            "bit 0 0",
+            "string 0 0",
+            "logic x x"
+        ]
+    );
+}
+
+#[test]
 fn a_static_task_output_nba_updates_the_formal_after_copyout() {
     let src = r#"module top;
   bit a = 1, b = 0;

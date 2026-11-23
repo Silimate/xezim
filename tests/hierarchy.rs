@@ -310,8 +310,12 @@ mod explicit_dollar_root_read_1124;
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
 mod library_dir_on_demand;
+#[path = "hierarchy/library_file_macro_carry.rs"]
+mod library_file_macro_carry;
 #[path = "hierarchy/library_file_macros.rs"]
 mod library_file_macros;
+#[path = "hierarchy/library_file_shared_guarded_header.rs"]
+mod library_file_shared_guarded_header;
 #[path = "hierarchy/library_file_latin1.rs"]
 mod library_file_latin1;
 #[path = "hierarchy/lrm_package_variable_scoping.rs"]
@@ -569,3 +573,11 @@ mod deferred_callable_paths_193;
 mod two_state_scalar_targets;
 #[path = "hierarchy/top_ansi_packed_ports.rs"]
 mod top_ansi_packed_ports;
+#[path = "hierarchy/signed_port_unsigned_actual.rs"]
+mod signed_port_unsigned_actual;
+#[path = "hierarchy/generate_nettype_drivers.rs"]
+mod generate_nettype_drivers;
+#[path = "hierarchy/instance_array_packed_actual_slices_1488.rs"]
+mod instance_array_packed_actual_slices_1488;
+#[path = "hierarchy/package_imports_in_instances_1530.rs"]
+mod package_imports_in_instances_1530;

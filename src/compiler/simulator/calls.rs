@@ -3601,9 +3601,10 @@ impl Simulator {
             }
             // DPI import call — through an instance path (`u_a.c_fn()`), the
             // call runs in that instance's scope (§35.5.3). The prefix is
-            // looked up in the sorted instance index: this runs for every
-            // dotted call that gets here, and a scan of every instance per
-            // call was a few percent of a run on a design with thousands.
+            // looked up in the sorted instance index: every dotted call that
+            // gets this far comes here, a package call `p::f()` among them,
+            // and scanning every instance per call was a measurable part of
+            // a run on a design with thousands.
             let via: Option<String> = (hier.path.len() > 1)
                 .then(|| {
                     hier.path[..hier.path.len() - 1]

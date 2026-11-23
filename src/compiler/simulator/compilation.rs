@@ -1573,11 +1573,46 @@ impl Simulator {
                 }
             }
         }
+        let batch_armed_edges =
+            std::env::var("XEZIM_ARMED_EDGE_BATCH").ok().as_deref() == Some("1");
+        let edge_block_count = self.edge_blocks.len();
         self.edge_blocks_by_sig = self
             .edge_signal_ids
             .iter()
-            .map(|sid| by_sid.remove(sid).unwrap_or_default())
+            .map(|sid| {
+                let mut fanout = by_sid.remove(sid).unwrap_or_default();
+                if batch_armed_edges {
+                    fanout.posedge_batches =
+                        edges::EdgeBatch::build(&fanout.posedge, edge_block_count);
+                    fanout.negedge_batches =
+                        edges::EdgeBatch::build(&fanout.negedge, edge_block_count);
+                }
+                fanout
+            })
             .collect();
+        if batch_armed_edges {
+            let mut fanouts = 0;
+            let mut members = 0;
+            let mut windows = 0;
+            for fanout in &self.edge_blocks_by_sig {
+                for (blocks, batches) in [
+                    (&fanout.posedge, &fanout.posedge_batches),
+                    (&fanout.negedge, &fanout.negedge_batches),
+                ] {
+                    if !batches.is_empty() {
+                        fanouts += 1;
+                        members += blocks.len();
+                        windows += batches.len();
+                    }
+                }
+            }
+            chatter!(
+                "[EVENT-EDGE] Batch plan: {} fanouts, {} members, {} windows",
+                fanouts,
+                members,
+                windows
+            );
+        }
         // Record which edge blocks carry an `iff` guard so check_edges can
         // evaluate it (LRM §9.4.2.3) without scanning every block each tick.
         self.edge_blocks_with_iff = self
@@ -1597,6 +1632,9 @@ impl Simulator {
         // continuously assigned variable. The procedural watches read theirs
         // when they register.
         self.capture_sampled_defaults();
+        // §16.14.6: the clocks whose time-step start a procedural concurrent
+        // assertion's registration reads.
+        self.collect_sva_clock_watch();
         // §16.9.3: pre-register sampled-value watches BEFORE the initial
         // blocks are consumed into scheduled processes, so clock-edge
         // history accumulates from the first edge.
@@ -1916,6 +1954,7 @@ impl Simulator {
                 return false;
             }
             !Self::stmt_contains_event_control(&p.source)
+                && !Self::source_ends_in_delay_forever(&p.source)
                 && !Self::stmt_has_call_statement(&p.source)
         };
         let (deferred_pending, direct_pending): (Vec<_>, Vec<_>) =
@@ -2024,11 +2063,16 @@ impl Simulator {
                                 // per-statement waiter and UDP evaluation order
                                 // their pinned traces rely on. A labeled block is
                                 // a hierarchical scope (`disable lbl`, `lbl.v`)
-                                // the FSM does not model.
+                                // the FSM does not model. A delay-only
+                                // `forever` after untimed set-up is not such a
+                                // sequence but a free-running loop, the
+                                // `always` form that compiles by default
+                                // (§9.2.2.1).
                                 std::env::var_os("XEZIM_VALUE_TRACE").is_none()
                                     && block_label.is_none()
-                                    && stmts.iter().any(Self::stmt_contains_event_control)
-                                    && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st))
+                                    && ((stmts.iter().any(Self::stmt_contains_event_control)
+                                        && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st)))
+                                        || self.stmts_end_in_delay_loop(stmts))
                             }
                         };
                     if admit {

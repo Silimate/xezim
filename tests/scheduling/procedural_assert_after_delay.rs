@@ -153,3 +153,27 @@ fn a_time0_attempt_reads_the_default_sampled_values() {
         .collect();
     assert_eq!(got, ["F|t0|0", "T|t0|10", "T|t0|20"]);
 }
+
+/// §16.14.6: a procedure that another event wakes (`@(posedge go)`) reaches
+/// the assertion while its clock is high, at 6, and after a falling edge, at
+/// 26. Neither time is an event of the clock, so each attempt starts at the
+/// clock's next event. The clock's level at registration is no edge.
+#[test]
+fn a_procedure_another_event_wakes_attempts_at_the_next_tick() {
+    let src = r#"
+module top;
+  logic clk = 0, go = 0;
+  always #5 clk = ~clk;
+  initial begin #6 go = 1; #10 go = 0; #10 go = 1; #10 $finish; end
+  always @(posedge go) a: assert property (@(posedge clk) 1) $display("T|a|%0t", $time);
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    let got: Vec<String> = sim
+        .output
+        .iter()
+        .map(|o| o.message.trim_end().to_string())
+        .filter(|l| l.starts_with("T|"))
+        .collect();
+    assert_eq!(got, ["T|a|15", "T|a|35"]);
+}

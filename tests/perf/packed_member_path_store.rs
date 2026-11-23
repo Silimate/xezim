@@ -319,4 +319,3 @@ endmodule
         .collect();
     assert_eq!(lines, ["R s=000000000"]);
 }
-

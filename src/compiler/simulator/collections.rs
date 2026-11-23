@@ -3554,6 +3554,7 @@ impl Simulator {
         if id < self.signal_inline_bits.len() {
             self.signal_inline_bits[id] = [v, x];
         }
+        arm_edge_readers!(self, id, self.span_chg_mask(id as u32, lo as u32, piece.width));
         write_sig_done!(self, id, true);
         self.table_modified = true;
         Some(true)
@@ -3766,17 +3767,33 @@ impl Simulator {
     /// to the thread's seeding, so a seeded object is never perturbed by a
     /// sibling's thread reseed.
     pub(super) fn cur_rng(&mut self) -> &mut SvRng {
-        if let Some(&h) = self.obj_rng_stack.last() {
-            if self.obj_rng.contains_key(&h) {
-                return self.obj_rng.get_mut(&h).unwrap();
-            }
-            // No private stream — fall through to the calling process's stream.
+        // A nested object randomized as part of an enclosing object's
+        // randomize() (§18.4.1) draws from the innermost object on the stack
+        // that owns a stream, so reseeding the outer object repeats the
+        // nested members too, as the reference simulator does.
+        if let Some(h) = self
+            .obj_rng_stack
+            .iter()
+            .rev()
+            .copied()
+            .find(|h| self.obj_rng.contains_key(h))
+        {
+            return self.obj_rng.get_mut(&h).unwrap();
         }
+        // No private stream — fall through to the calling process's stream.
         let pid = self.current_pid;
         if self.proc_rng.contains_key(&pid) {
             return self.proc_rng.get_mut(&pid).unwrap();
         }
         &mut self.rng
+    }
+
+    /// §18.5.4, §18.13: the `dist` schedules of an object are dealt from its
+    /// stream, so they start over whenever the stream is seeded, captured or
+    /// restored. The draws that follow are then a function of that stream
+    /// state alone, and a reseed or `set_randstate` repeats them.
+    fn restart_dist_schedules(&mut self, handle: usize) {
+        self.dist_decks.retain(|(h, _), _| *h != handle);
     }
 
     /// §18.14 `srandom` / `get_randstate` / `set_randstate` on a *process*
@@ -3812,6 +3829,7 @@ impl Simulator {
                     self.proc_rng.insert(key, s);
                 } else {
                     self.obj_rng.insert(key, s);
+                    self.restart_dist_schedules(key);
                 }
                 Some(Value::zero(32))
             }
@@ -3836,6 +3854,9 @@ impl Simulator {
                         fresh
                     }
                 };
+                if !is_process {
+                    self.restart_dist_schedules(key);
+                }
                 Some(Value::from_string(&s.to_state_string()))
             }
             // §18.14.2: restore a previously captured state — the stream then
@@ -3850,6 +3871,7 @@ impl Simulator {
                     self.proc_rng.insert(key, s);
                 } else {
                     self.obj_rng.insert(key, s);
+                    self.restart_dist_schedules(key);
                 }
                 Some(Value::zero(32))
             }

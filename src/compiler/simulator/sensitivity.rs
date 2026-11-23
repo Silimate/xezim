@@ -3175,8 +3175,6 @@ impl Simulator {
                     Self::collect_select_operands(index, out);
                 }
             }
-            // A member name is no operand; the element it is read from is.
-            ExprKind::MemberAccess { expr, .. } => Self::collect_select_operands(expr, out),
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
@@ -4626,6 +4624,13 @@ impl Simulator {
     pub(super) fn expr_reads_frame_local(&self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Ident(h) => self.frame_bound_bare_name(h).is_some(),
+            // §9.4.2: an argument of a call (`$signed(sa[k].a)`) reads the
+            // local like an operand does.
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                args.iter().any(|a| self.expr_reads_frame_local(a))
+            }
+            // §9.4.2: a member of a selected element (`sa[k].a`) reads the
+            // index `k` like the select does.
             ExprKind::Paren(x)
             | ExprKind::Unary { operand: x, .. }
             | ExprKind::MemberAccess { expr: x, .. } => self.expr_reads_frame_local(x),
@@ -4676,6 +4681,11 @@ impl Simulator {
             return;
         }
         match &mut e.kind {
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    self.freeze_frame_locals(a);
+                }
+            }
             ExprKind::Paren(x)
             | ExprKind::Unary { operand: x, .. }
             | ExprKind::MemberAccess { expr: x, .. } => self.freeze_frame_locals(x),

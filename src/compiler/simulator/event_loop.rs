@@ -221,7 +221,7 @@ impl Simulator {
     /// `XEZIM_LAZY_PROC_SETTLE=1` opts into the LRM/reference ordering so a
     /// design that depends on it can be run (and diffed) without a rebuild.
     pub(super) fn settle_after_proc_write(&mut self) {
-        if self.in_edge_block {
+        if self.in_edge_block || self.in_pre_time0_init {
             return;
         }
         static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1092,7 +1092,7 @@ impl Simulator {
                 .instances
                 .iter()
                 .find(|inst| inst.path == scope)
-                .map(|inst| inst.def_name.clone()),
+                .map(|inst| inst.def_name.to_string()),
         }
     }
 
@@ -1174,14 +1174,20 @@ impl Simulator {
             },
             _ => u32::MAX,
         };
-        let ix = (a.span.start, a.span.end, tag, sid, class);
+        let ix = (
+            a.span.start as usize,
+            a.span.end as usize,
+            tag,
+            sid,
+            class,
+        );
         if let Some(&i) = self.assert_imm_ix.get(&ix) {
             return i;
         }
         let src = self.current_src_file();
         let m = self.m_path();
         let label = a.label.as_ref().map(|l| l.name.as_str());
-        let i = self.assert_inst(kind, (src, a.span.start), &m, label, a.is_property);
+        let i = self.assert_inst(kind, (src, a.span.start as usize), &m, label, a.is_property);
         self.assert_imm_ix.insert(ix, i);
         i
     }
@@ -1320,7 +1326,7 @@ impl Simulator {
         src_file: Option<u32>,
     ) -> Option<(String, usize)> {
         let texts = &self.module.source_texts;
-        let i = self.src_text_index(span.start, src_file)?;
+        let i = self.src_text_index(span.start as usize, src_file)?;
         if let Some(loc) = self
             .module
             .source_line_maps
@@ -1330,7 +1336,7 @@ impl Simulator {
         {
             return Some((loc.file, loc.line as usize));
         }
-        let line = 1 + texts[i].as_bytes()[..span.start]
+        let line = 1 + texts[i].as_bytes()[..span.start as usize]
             .iter()
             .filter(|&&b| b == b'\n')
             .count();
@@ -1362,14 +1368,14 @@ impl Simulator {
         let texts = &self.module.source_texts;
         let i = match src_file
             .map(|s| s as usize)
-            .filter(|&s| texts.get(s).is_some_and(|t| span.start < t.len()))
+            .filter(|&s| texts.get(s).is_some_and(|t| (span.start as usize) < t.len()))
         {
             Some(i) => i,
             None => {
                 // Exact-fit fallback: unambiguous only.
                 let mut hit: Option<usize> = None;
                 for (i, t) in texts.iter().enumerate() {
-                    if span.start < t.len() {
+                    if (span.start as usize) < t.len() {
                         if hit.is_some() {
                             return None; // ambiguous across files
                         }
@@ -1390,7 +1396,7 @@ impl Simulator {
         {
             return Some(loc.short());
         }
-        let line = 1 + texts[i].as_bytes()[..span.start]
+        let line = 1 + texts[i].as_bytes()[..span.start as usize]
             .iter()
             .filter(|&&b| b == b'\n')
             .count();
@@ -1434,13 +1440,13 @@ impl Simulator {
         let texts = &self.module.source_texts;
         let i = match src_file
             .map(|s| s as usize)
-            .filter(|&s| texts.get(s).is_some_and(|t| span.end <= t.len()))
+            .filter(|&s| texts.get(s).is_some_and(|t| span.end as usize <= t.len()))
         {
             Some(i) => i,
             None => {
                 let mut hit: Option<usize> = None;
                 for (i, t) in texts.iter().enumerate() {
-                    if span.end <= t.len() {
+                    if span.end as usize <= t.len() {
                         if hit.is_some() {
                             return None;
                         }
@@ -1450,7 +1456,7 @@ impl Simulator {
                 hit?
             }
         };
-        let raw = texts[i].get(span.start..span.end)?;
+        let raw = texts[i].get(span.start as usize..span.end as usize)?;
         let mut s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
         if s.len() > 60 {
             s.truncate(57);
@@ -2090,7 +2096,9 @@ impl Simulator {
             if self.time == 0
                 && (!self.edge_t0_pending.is_empty()
                     || !self.time0_port_edges.is_empty()
-                    || !self.time0_alias_edges.is_empty())
+                    || !self.time0_wide_port_edges.is_empty()
+                    || !self.time0_alias_edges.is_empty()
+                    || !self.time0_wide_alias_edges.is_empty())
             {
                 self.deliver_time0_port_edges();
                 if self.event_queue.next_time() == Some(self.time) {
@@ -2185,7 +2193,9 @@ impl Simulator {
         if self.time == 0
             && (!self.edge_t0_pending.is_empty()
                 || !self.time0_port_edges.is_empty()
-                || !self.time0_alias_edges.is_empty())
+                || !self.time0_wide_port_edges.is_empty()
+                || !self.time0_alias_edges.is_empty()
+                || !self.time0_wide_alias_edges.is_empty())
         {
             self.deliver_time0_port_edges();
         }

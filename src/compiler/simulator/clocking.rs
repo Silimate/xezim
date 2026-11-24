@@ -943,6 +943,11 @@ impl Simulator {
                 for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
                     waiter.captured_prev[i] = self.term_raw_bits(sid.signal_id);
                     if let Some(v) = self.term_wide_value(sid.signal_id) {
+                        if waiter.captured_prev_wide.len() < waiter.resolved_sensitivities.len() {
+                            waiter
+                                .captured_prev_wide
+                                .resize(waiter.resolved_sensitivities.len(), None);
+                        }
                         waiter.captured_prev_wide[i] = Some(v);
                     }
                 }
@@ -1489,7 +1494,7 @@ impl Simulator {
                         .instances
                         .iter()
                         .filter(|i| i.def_name == enc)
-                        .map(|i| i.path.clone())
+                        .map(|i| i.path.to_string())
                         .collect::<Vec<_>>();
                     // §8.3 / §23.6: canonical module-class names already
                     // include their owner. Adding it again made reads miss
@@ -1624,7 +1629,7 @@ impl Simulator {
                     .chain(m.dynamic_arrays.iter())
                     .chain(m.queue_vars.iter())
                     .chain(m.struct_members.keys())
-                    .chain(m.instances.iter().map(|i| &i.path))
+                    .chain(m.instances.iter().map(|i| &*i.path))
                     .filter_map(|k| k.strip_prefix(pre.as_str()))
                     .filter(|r| !r.contains('.') && !r.contains('['))
                     .map(str::to_string)

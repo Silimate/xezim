@@ -126,7 +126,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
     /// Source span of the system task call statement being executed; read
     /// back when that task turns out to be a registered `$systf`.
-    static TASK_CALL_SPAN: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static TASK_CALL_SPAN: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
 }
 
 /// Remember the span of the system-task statement about to execute.
@@ -154,7 +154,12 @@ pub(super) fn systf_site(sim: &Simulator, name: &str, span: crate::ast::Span) ->
     } else {
         sim.current_scope.clone()
     };
-    let key = (name.to_string(), span.start, span.end, scope);
+    let key = (
+        name.to_string(),
+        span.start as usize,
+        span.end as usize,
+        scope,
+    );
     SITES.with(|t| {
         let mut t = t.borrow_mut();
         let next = t.sites.len();
@@ -1076,7 +1081,7 @@ fn array_dims(sim: &Simulator, base: &str) -> Option<Vec<(i64, i64)>> {
                 if d.len() == norm.len()
                     && d.iter().zip(&norm).all(|(&a, &b)| dim_len(a) == dim_len(b)) =>
             {
-                d.clone()
+                d.to_vec()
             }
             _ => norm,
         }
@@ -1184,7 +1189,7 @@ fn packed_dims(sim: &Simulator, decl: &str, w: u32) -> Vec<(i64, i64)> {
     use xezim_core::ast::types::{DataType, PackedDimension};
     if let Some(d) = sim.module.packed_full_dims.get(decl) {
         if d.iter().map(|&x| dim_len(x)).product::<usize>() == w as usize {
-            return d.clone();
+            return d.to_vec();
         }
     }
     if let Some(&(lo, hi)) = sim.module.ascending_packed.get(decl) {
@@ -1855,7 +1860,7 @@ fn delay_obj_def(sim: &Simulator, obj: &DelayObj) -> String {
             .instances
             .iter()
             .find(|i| i.path == scope)
-            .map_or_else(|| sim.module.name.clone(), |i| i.def_name.clone())
+            .map_or_else(|| sim.module.name.clone(), |i| i.def_name.to_string())
     };
     match obj {
         DelayObj::Net(id) | DelayObj::ModPath(id, _) | DelayObj::InterMod(id) => {

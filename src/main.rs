@@ -251,6 +251,7 @@ fn print_usage() {
         eprintln!("  --relax-{}  Accept, with a warning: {}.", f.name, f.help);
         eprintln!("                   Also enabled by {}=1.", f.env);
     }
+    eprintln!("  --verilog-2005-initializers  Run .v module variable declaration assignments at time zero.");
     eprintln!("  --keywords <ver> Keyword set outside `begin_keywords` regions (§22.14):");
     eprintln!("                   1364-1995 ... 1800-2023, each also with -noconfig.");
     eprintln!("                   Also XEZIM_KEYWORDS=<ver>.");
@@ -794,13 +795,18 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
 }
 
 /// The opt-in relaxations (`--relax-<name>`, one per `xezim::relax_flags()`
-/// entry: the parser's and the lint's), `--no-config-keywords` and `--keywords=<ver>`
+/// entry: the parser's and the lint's), `--no-config-keywords`, `--keywords=<ver>`,
+/// and legacy Verilog initializers.
 /// (#608, #622-#629). True when `flag` is one of them.
 fn handle_relax_flag(flag: &str) -> bool {
     if let Some(name) = flag.strip_prefix("--relax-")
         && let Some(f) = xezim::relax_flags().find(|f| f.name == name)
     {
         f.set(true);
+        return true;
+    }
+    if flag == "--verilog-2005-initializers" {
+        xezim_core::elaborate::set_verilog_2005_initializers(true);
         return true;
     }
     if flag == "--no-config-keywords" {
@@ -1888,13 +1894,14 @@ fn strip_duplicate_unit_typedefs(
         if td.forward || matches!(td.data_type, xezim::ast::types::DataType::Void(_)) {
             continue;
         }
+        let (start, end) = (td.span.start as usize, td.span.end as usize);
         if !seen.insert(td.name.name.clone())
-            && td.span.start < td.span.end
-            && td.span.end <= text.len()
-            && text.is_char_boundary(td.span.start)
-            && text.is_char_boundary(td.span.end)
+            && start < end
+            && end <= text.len()
+            && text.is_char_boundary(start)
+            && text.is_char_boundary(end)
         {
-            spans.push((td.span.start, td.span.end, td.name.name.clone()));
+            spans.push((start, end, td.name.name.clone()));
         }
     }
     if spans.is_empty() {
@@ -4495,21 +4502,25 @@ suppressed but the explicit SDF annotation still applies."
                     print_design_summary(&_defs, &elab);
                     print_resource_usage(compile_wall_start);
                 }
+                if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+                    xezim::print_elab_census(&elab);
+                }
                 emit_run_stats(report_mode, compile_wall_start, None);
                 // §6.21: keep compiled artifacts consistent with the simulate
                 // path — re-issue static initializers that call simulation-time
                 // system functions as time-0 assignments (issue #26).
                 xezim::defer_static_syscall_inits(&_defs, &mut elab);
                 if let Some(ref out) = _output_file {
-                    // The serialized artifact format flattens always_blocks /
-                    // initial_blocks / continuous_assigns; pending_* are
-                    // `#[serde(skip)]` and would be silently dropped.
-                    // Materialize before serialize so the artifact is complete.
-                    elab.materialize_pending();
                     // The language choice (`-sv`) is part of the design: a
                     // `.v` file's declaration assignments become time-0
                     // processes now, and the loaded artifact keeps them.
                     xezim::compiler::Simulator::seal_verilog_decl_inits(&mut elab);
+                    // Release the parsed AST before streaming the elaborated
+                    // module into the artifact; `ElaboratedModule`'s serializer
+                    // streams `pending_*` and deferred callable bodies one item
+                    // at a time without materializing them in memory (#721).
+                    drop(_defs);
+                    xezim_core::release_free_memory();
                     match xezim::write_compiled(&elab, out) {
                         Ok(()) => println!("Wrote compiled artifact to {}", out),
                         Err(e) => {

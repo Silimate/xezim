@@ -409,14 +409,14 @@ pub(crate) fn is_packed(ty: &DataType, r: &mut dyn PatternTypeResolver) -> bool 
 pub(crate) fn declared_type<'t>(
     name: &str,
     types: &'t xezim_core::decl_types::DeclTypeMap,
-    aliases: Option<&std::collections::HashMap<String, String, impl std::hash::BuildHasher>>,
+    aliases: Option<&xezim_core::shared_names::SharedNameMap<xezim_core::shared_names::SharedName>>,
 ) -> Option<&'t DataType> {
     let mut cur = name;
     for _ in 0..64 {
         if let Some(dt) = types.get(cur) {
             return Some(dt);
         }
-        cur = aliases?.get(cur)?;
+        cur = aliases?.get(cur)?.as_str();
     }
     None
 }
@@ -1385,7 +1385,11 @@ impl PlanBuilder<'_> {
                         .collect();
                     return Some(TypeSig {
                         dims,
-                        leaf: TypeSigLeaf::Struct(su.span.start, su.span.end, members),
+                        leaf: TypeSigLeaf::Struct(
+                            su.span.start as usize,
+                            su.span.end as usize,
+                            members,
+                        ),
                     });
                 }
                 DataType::Enum(e) if e.dimensions.is_empty() => {
@@ -1395,7 +1399,11 @@ impl PlanBuilder<'_> {
                     let members = e.members.iter().map(|m| m.name.name.clone()).collect();
                     return Some(TypeSig {
                         dims,
-                        leaf: TypeSigLeaf::Enum(e.span.start, e.span.end, members),
+                        leaf: TypeSigLeaf::Enum(
+                            e.span.start as usize,
+                            e.span.end as usize,
+                            members,
+                        ),
                     });
                 }
                 // A packed array: its outer dimension, then its element.

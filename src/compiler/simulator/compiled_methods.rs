@@ -3486,6 +3486,7 @@ impl Simulator {
                             | I::StmtFallback(..)
                             | I::EvalExprFallback(..)
                             | I::LoadDynElem(..)
+                            | I::QueuePop(..)
                     )
                 };
                 let reentrant_static =
@@ -4925,7 +4926,7 @@ impl Simulator {
         }
         self.push_local_frame(locals);
         self.method_local_base.push(self.local_stack.len() - 1);
-        self.local_iface_aliases.push(HashMap::default());
+        self.local_iface_aliases.push(None);
         let saved_m_scope = std::mem::take(&mut self.m_scope_stack);
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -5662,17 +5663,17 @@ impl Simulator {
             if let Some((_, cd)) = owners.get(prop) {
                 if let Some(sig) = cd.properties.get(prop) {
                     if let Some(t) = &sig.type_name {
-                        if self.module.classes.contains_key(t)
-                            || self.module.enum_members.contains_key(t)
+                        if self.module.classes.contains_key(t.as_str())
+                            || self.module.enum_members.contains_key(t.as_str())
                             // A covergroup-typed property (the implicit
                             // variable a class-body covergroup declares).
-                            || self.module.covergroups.contains_key(t)
+                            || self.module.covergroups.contains_key(t.as_str())
                             // §6.20.3: a TYPE-parameter name passes through —
                             // the caller resolves it to the bound concrete
                             // type via the instance's type_bindings.
                             || cd.type_param_names.iter().any(|p| p == t)
                         {
-                            return Some(t.clone());
+                            return Some(t.to_string());
                         }
                         // A class-local typedef (e.g. `this_type` =
                         // `Self#(T)`): resolve it to the concrete class so a
@@ -5685,7 +5686,7 @@ impl Simulator {
                         let tn = crate::ast::types::TypeName {
                             scopes: Vec::new(),
                             name: crate::ast::Identifier {
-                                name: t.clone(),
+                                name: t.to_string(),
                                 span: crate::ast::Span::dummy(),
                             },
                             span: crate::ast::Span::dummy(),

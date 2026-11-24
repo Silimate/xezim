@@ -61,3 +61,88 @@ endmodule
         ]
     );
 }
+
+#[test]
+fn compiled_queue_pop_resolves_each_instance_queue() {
+    let source = r#"
+module worker(input bit clk);
+  int q[$];
+  int result[2];
+  always @(posedge clk) begin
+    q.push_back(7);
+    q.push_back(9);
+    for (int i = 0; i < 2; i++) result[i] = q.pop_front();
+  end
+endmodule
+module top;
+  bit clk;
+  int q[$];
+  worker w(clk);
+  initial begin
+    q.push_back(31);
+    #1 clk = 1;
+    #1 $display("RESULT %0d %0d %0d %0d", w.result[0], w.result[1], w.q.size(), q[0]);
+    $finish;
+  end
+endmodule
+"#;
+    let dir = std::env::temp_dir().join(format!("xezim_queue_pop_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temporary directory");
+    let path = dir.join("design.sv");
+    std::fs::write(&path, source).expect("write queue design");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--simulate", "--no-cache"])
+        .arg(&path)
+        .env("XEZIM_BC_DUMP", "1")
+        .env_remove("XEZIM_BC_DUMP_FULL")
+        .output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = run.expect("run xezim");
+    let output = String::from_utf8_lossy(&run.stdout);
+    let trace = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{output}\n{trace}");
+    assert!(
+        output.lines().any(|line| line == "RESULT 7 9 0 31"),
+        "{output}"
+    );
+    assert!(
+        trace
+            .lines()
+            .any(|line| line.starts_with("[BC-DUMP]") && line.contains("QueuePop")),
+        "{trace}"
+    );
+}
+
+#[test]
+fn compiled_queue_pop_four_state_value_drops_xz_on_two_state_local() {
+    let source = r#"
+module top;
+  bit clk;
+  logic [7:0] q[$];
+  logic [7:0] four_state_out;
+  bit   [7:0] two_state_out;
+  always @(posedge clk) begin
+    int tmp;
+    tmp = 8'h5a;
+    tmp = q.pop_front() + 8'd1;
+    two_state_out = tmp[7:0];
+    four_state_out = q.pop_front() + 8'd1;
+  end
+  initial begin
+    q.push_back(8'h1x);
+    q.push_back(8'h2z);
+    #1 clk = 1;
+    #1 $display("OUT two=%b four=%b sz=%0d", two_state_out, four_state_out, q.size());
+    $finish;
+  end
+endmodule
+"#;
+    let sim = xezim::simulate(source, 100).expect("simulate");
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| line.message == "OUT two=00000000 four=xxxxxxxx sz=0"),
+        "{:?}",
+        sim.output
+    );
+}

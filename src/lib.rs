@@ -237,6 +237,9 @@ fn design_cache_key_for(
     hash.text("packed-struct-member-array-defaults-v1");
     // §6.10/§26.3: cached instance port connections retain their enum label binding.
     hash.text("port-actual-enum-labels-v1");
+    // §26.3: cached expressions retain the scope of imported enum members.
+    hash.text("imported-enum-value-scope-v1");
+    hash.text("unpacked-concat-packed-elements-v1");
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.bytes(&xezim_core::elaborate::max_packed_width().to_le_bytes());
@@ -252,6 +255,7 @@ fn design_cache_key_for(
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
     // §6.21: the accepted initializer's lifetime changes elaboration.
     hash.bytes(&[xezim_core::elaborate::relax_implicit_static() as u8]);
+    hash.bytes(&[xezim_core::elaborate::verilog_2005_initializers() as u8]);
     // An opt-in relaxation or keyword set accepts other source.
     for f in relax_flags() {
         hash.bytes(&[f.get() as u8]);
@@ -924,7 +928,7 @@ pub fn defer_static_syscall_inits(
     //     is not an AST item in its host, so an AST walk never sees them;
     //   * `program` instances (§24), which are not `SourceDefinition::Module`.
     for inst in &elab.instances {
-        let items = match defs.get(&inst.def_name) {
+        let items = match defs.get(inst.def_name.as_str()) {
             Some(SourceDefinition::Module(m)) => &m.items,
             Some(SourceDefinition::Interface(i)) => &i.items,
             Some(SourceDefinition::Program(p)) => &p.items,
@@ -1199,6 +1203,13 @@ pub(crate) fn serialized_len<T: serde::Serialize>(v: &T) -> usize {
 /// `XEZIM_MEM_CENSUS`: the elaborated design as elaboration hands it over —
 /// serialized size per field (a stand-in for heap size that ranks them) and
 /// the sizes of the AST node types that make up most of it.
+///
+/// Emits only internal table names, counts, and byte sizes — no proprietary
+/// source paths, module names, or signal identifiers.
+pub fn print_elab_census(elab: &elaborate::ElaboratedModule) {
+    elab_census(elab);
+}
+
 fn elab_census(elab: &elaborate::ElaboratedModule) {
     fn ser<T: serde::Serialize>(v: &T) -> usize {
         serialized_len(v)
@@ -1212,30 +1223,48 @@ fn elab_census(elab: &elaborate::ElaboratedModule) {
         ("tasks", ser(&elab.tasks)),
         ("classes", ser(&elab.classes)),
         ("var_decl_types", ser(&elab.var_decl_types)),
+        ("typedef_types", ser(&elab.typedef_types)),
         ("parameters", ser(&elab.parameters)),
         ("instances", ser(&elab.instances)),
         ("nets", ser(&elab.nets)),
+        ("vector_nets", ser(&elab.vector_nets)),
+        ("resolved_net_kinds", ser(&elab.resolved_net_kinds)),
         ("port_aliases", ser(&elab.port_aliases)),
+        ("input_port_actuals", ser(&elab.input_port_actuals)),
         ("decl_sites", ser(&elab.decl_sites)),
         ("source_texts", ser(&elab.source_texts)),
         ("arrays", ser(&elab.arrays)),
+        ("unpacked_decl_dims", ser(&elab.unpacked_decl_dims)),
+        ("packed_full_dims", ser(&elab.packed_full_dims)),
+        ("packed_struct_fields", ser(&elab.packed_struct_fields)),
+        (
+            "packed_signal_elem_widths",
+            ser(&elab.packed_signal_elem_widths),
+        ),
+        ("property_decls", ser(&elab.property_decls)),
+        ("property_params", ser(&elab.property_params)),
         ("two_state_signals", ser(&elab.two_state_signals)),
     ];
     rows.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
     eprintln!(
-        "[MEM-CENSUS] === elaborated design (serialized MB) — {} signals, {} always, {} pending always, {} pending initial, {} pending CA ===",
+        "[MEM-CENSUS] === elaborated design (serialized MB) — {} signals, {} CA, {} always, {} pending always, {} pending initial, {} pending CA, {} deferred fns, {} deferred tasks ===",
         elab.signals.len(),
+        elab.continuous_assigns.len(),
         elab.always_blocks.len(),
         elab.pending_always.len(),
         elab.pending_initial.len(),
-        elab.pending_cont_assign.len()
+        elab.pending_cont_assign.len(),
+        elab.deferred_function_bodies.len(),
+        elab.deferred_task_bodies.len(),
     );
-    for (name, b) in rows.iter().take(12) {
-        eprintln!("[MEM-CENSUS] {:>9.1} MB  {}", *b as f64 / 1048576.0, name);
+    for (name, b) in rows.iter().take(16) {
+        if *b > 0 {
+            eprintln!("[MEM-CENSUS] {:>9.1} MB  {}", *b as f64 / 1048576.0, name);
+        }
     }
     use std::mem::size_of;
     eprintln!(
-        "[MEM-CENSUS] node sizes: Expression={} ExprKind={} HierarchicalIdentifier={} HierPathSegment={} Identifier={} Statement={} StatementKind={} Span={} Signal={} Value={}",
+        "[MEM-CENSUS] node sizes: Expression={} ExprKind={} HierarchicalIdentifier={} HierPathSegment={} Identifier={} Statement={} StatementKind={} Span={} ContinuousAssignment={} PendingContAssign={} ElabInstance={} Signal={} Value={}",
         size_of::<ast::expr::Expression>(),
         size_of::<ast::expr::ExprKind>(),
         size_of::<ast::expr::HierarchicalIdentifier>(),
@@ -1244,6 +1273,9 @@ fn elab_census(elab: &elaborate::ElaboratedModule) {
         size_of::<ast::stmt::Statement>(),
         size_of::<ast::stmt::StatementKind>(),
         size_of::<ast::Span>(),
+        size_of::<elaborate::ContinuousAssignment>(),
+        size_of::<elaborate::PendingContAssign>(),
+        size_of::<elaborate::ElabInstance>(),
         size_of::<elaborate::Signal>(),
         size_of::<xezim_core::Value>(),
     );
@@ -1624,10 +1656,9 @@ fn simulate_multi_inner(
         phase("parsed AST dropped");
 
         if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
-            // Pending rewrite contexts are intentionally omitted from the
-            // artifact format; materialize them before publishing a complete
-            // elaborated design.
-            elab.materialize_pending();
+            // `ElaboratedModule`'s serializer streams pending bodies directly
+            // into the cache artifact without eagerly materializing them in
+            // memory, so `Simulator::new` keeps lazy pending drains too (#721).
             // Fold the captured elaboration diagnostics into the artifact so a
             // later warm hit replays them instead of running silent.
             diags_through_lint.extend(xezim_core::elab_diag_capture_take());

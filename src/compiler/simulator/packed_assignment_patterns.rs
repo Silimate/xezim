@@ -117,7 +117,7 @@ impl Simulator {
         if plan.uncovered
             && self
                 .warned_uncovered_patterns
-                .insert((e.span.start, e.span.end))
+                .insert((e.span.start as usize, e.span.end as usize))
         {
             eprintln!(
                 "[xezim][warning] assignment pattern leaves an element or member uncovered; \
@@ -258,7 +258,10 @@ impl Simulator {
             _ => return ReturnPatternType::NotPacked,
         };
         let name = fd.name.name.name.as_str();
-        let entries = self.fn_ret_types.entry((span.start, span.end)).or_default();
+        let entries = self
+            .fn_ret_types
+            .entry((span.start as usize, span.end as usize))
+            .or_default();
         if let Some((_, t)) = entries.iter().find(|(n, _)| n == name) {
             return ReturnPatternType::Func(t.clone());
         }
@@ -445,7 +448,7 @@ impl Simulator {
             self.lookup_signal_width(&name)?
         };
         let dims = match self.module.packed_full_dims.get(&name) {
-            Some(d) if !d.is_empty() => d.clone(),
+            Some(d) if !d.is_empty() => d.to_vec(),
             _ => vec![(i64::from(total) - 1, 0)],
         };
         let bits: i64 = dims
@@ -478,7 +481,7 @@ impl Simulator {
                 let prefix = flat.get(split + 1..).unwrap_or("");
                 let full = &self.module.packed_full_dims;
                 return packed_assignment_pattern_plan::layout_struct_type(layout, prefix, &|p| {
-                    full.get(&format!("{base}.{p}")).cloned()
+                    full.get(&format!("{base}.{p}")).map(|d| d.to_vec())
                 });
             }
             split = flat[..split].rfind('.')?;

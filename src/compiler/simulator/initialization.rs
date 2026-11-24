@@ -1412,18 +1412,10 @@ impl Simulator {
                         );
                         let alias = allocate_edge_alias();
                         new_signals.push((alias.clone(), width));
-                        new_assigns.push(super::elaborate::ContinuousAssignment {
-                            gate_delay_fall: None,
-                            delay_select: None,
-                            origin: None,
-                            lhs: mk_ident(&alias, span),
+                        new_assigns.push(super::elaborate::ContinuousAssignment::plain(
+                            mk_ident(&alias, span),
                             rhs,
-                            delay_exprs: None,
-                            delay: 0,
-                            rhs_parent_scoped: false,
-                            delay_fall: None,
-                            delay_off: None,
-                        });
+                        ));
                         alias
                     });
                     if dbg {
@@ -1573,18 +1565,10 @@ impl Simulator {
                 let alias = aliases.entry(canon).or_insert_with(|| {
                     let alias = allocate_edge_alias();
                     new_signals.push((alias.clone(), 1));
-                    new_assigns.push(super::elaborate::ContinuousAssignment {
-                        delay_exprs: None,
-                        gate_delay_fall: None,
-                        delay_select: None,
-                        origin: None,
-                        lhs: mk_ident(&alias, span),
+                    new_assigns.push(super::elaborate::ContinuousAssignment::plain(
+                        mk_ident(&alias, span),
                         rhs,
-                        delay: 0,
-                        rhs_parent_scoped: false,
-                        delay_fall: None,
-                        delay_off: None,
-                    });
+                    ));
                     alias
                 });
                 if dbg {
@@ -2282,7 +2266,7 @@ impl Simulator {
         // class-local aliases. A generic `typedef C#(N) own_type` is not a
         // reference to C's DEFAULT specialization; resolve it only when its
         // declaring class has concrete parameter bindings.
-        let generic_alias_spans: HashSet<(&str, usize, usize)> = module
+        let generic_alias_spans: HashSet<(&str, u32, u32)> = module
             .classes
             .values()
             .filter(|cd| !cd.param_order.is_empty() || !cd.type_param_names.is_empty())
@@ -2927,18 +2911,10 @@ impl Simulator {
                     });
                 module
                     .continuous_assigns
-                    .push(super::elaborate::ContinuousAssignment {
-                        delay_exprs: None,
-                        gate_delay_fall: None,
-                        delay_select: None,
-                        origin: None,
-                        lhs: mk_ident(&nm, rhs.span),
+                    .push(super::elaborate::ContinuousAssignment::plain(
+                        mk_ident(&nm, rhs.span),
                         rhs,
-                        delay: 0,
-                        rhs_parent_scoped: false,
-                        delay_fall: None,
-                        delay_off: None,
-                    });
+                    ));
             }
         }
         // The passes over always-block headers are done: keep only the
@@ -3211,9 +3187,11 @@ impl Simulator {
                 if sig.is_real {
                     val.is_real = true;
                     let declared = module.var_decl_types.get(name).or_else(|| {
-                        sig.type_name.as_ref().and_then(|ty| module.typedef_types.get(ty))
+                        sig.type_name
+                            .as_ref()
+                            .and_then(|ty| module.typedef_types.get(ty.as_str()))
                     });
-                    if sig.type_name.as_deref() == Some("shortreal")
+                    if sig.type_name.as_deref().map(String::as_str) == Some("shortreal")
                         || declared.is_some_and(|dt| matches!(
                             super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
                             DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
@@ -3246,7 +3224,7 @@ impl Simulator {
                 signal_signed_vec.push(sig.is_signed);
                 signal_real_vec.push(sig.is_real);
                 if let Some(ref tn) = sig.type_name {
-                    signal_type_names.insert(id, tn.clone());
+                    signal_type_names.insert(id, tn.to_string());
                 }
             } else if let Some(val) = module.parameters.get(name) {
                 sim_dbg_eprintln!(
@@ -4788,6 +4766,7 @@ impl Simulator {
             tb_cache: task_suspend::CycleMemo::default(),
             ts: task_suspend::TsState::default(),
             local_iface_aliases: Vec::new(),
+            prop_vif_bindings: HashMap::default(),
             viface_var_aliases: HashMap::default(),
             last_vif_return: None,
             item_alias: None,
@@ -5086,6 +5065,7 @@ impl Simulator {
             t0_timing_free: HashSet::default(),
             t0_event_led: HashSet::default(),
             t0_decl_init_pids: HashSet::default(),
+            t0_event_heads: HashSet::default(),
             t0_pid_ord: HashMap::default(),
             fast_delay_always: HashMap::default(),
             lazy_initial: HashMap::default(),
@@ -5159,7 +5139,6 @@ impl Simulator {
             method_receiver_cache: HashMap::default(),
             hint_key_scratch: std::cell::RefCell::new(String::new()),
             decl_param_scope_cache: std::cell::RefCell::default(),
-            vif_key_scratch: std::cell::RefCell::new(String::new()),
             spec_frag_fold_cache: RefCell::new(HashMap::default()),
             param_leaf_names: std::cell::OnceCell::new(),
             unpacked_typedef_reps: std::cell::OnceCell::new(),
@@ -5183,7 +5162,6 @@ impl Simulator {
             pending_struct_coll_wb: Vec::new(),
             pending_ret_struct: None,
             class_member_names_cell: std::cell::OnceCell::new(),
-            vif_local_names: HashSet::default(),
             method_def_cache: std::cell::RefCell::new(HashMap::default()),
             string_keyed_member_cache: std::cell::RefCell::new(HashMap::default()),
             nonvirtual_target_cache: std::cell::RefCell::new(HashMap::default()),
@@ -5596,7 +5574,7 @@ impl Simulator {
             forever_cont_cache: HashMap::default(),
             settle_inject_bits: Vec::new(),
             settle_inject_sum: Vec::new(),
-            vif_return_pending: false,
+            pending_vif_return: None,
             lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
             share_task_frames,
@@ -5719,10 +5697,14 @@ impl Simulator {
             sampled_registering: false,
             pending_t0_triggers: Vec::new(),
             time0_port_edges: Vec::new(),
+            time0_wide_port_edges: Vec::new(),
             time0_alias_edges: Vec::new(),
+            time0_wide_alias_edges: Vec::new(),
+            t0_deferred_ran: HashSet::default(),
             edge_t0_pending: Vec::new(),
             edge_forced_fire: Vec::new(),
             in_pre_process_settle: false,
+            in_pre_time0_init: false,
             comb_direct_eval: false,
         };
         sim.unpacked_struct_leaves = sim.build_unpacked_struct_leaves();

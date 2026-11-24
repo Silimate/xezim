@@ -1177,7 +1177,7 @@ pub struct BytecodeCompiler<'a> {
     /// the default bit-select-write (`BlockingAssignBitDyn`) which only sets
     /// bit `i` and silently drops the upper bits. Set via
     /// `set_packed_elem_widths`.
-    packed_elem_widths: Option<&'a HashMap<String, u32>>,
+    packed_elem_widths: Option<&'a xezim_core::shared_names::SharedNameMap<u32>>,
     /// Declared element width of each associative array (§10.7). Without it an
     /// assoc lvalue fell through `infer_lhs_width` to the 1-bit "bit-select on
     /// a plain packed signal" default, so a compiled `aa[k] <= v` truncated the
@@ -1197,7 +1197,7 @@ pub struct BytecodeCompiler<'a> {
     /// `(idx - low_bound) * elem_w` for a DESCENDING range — the plain
     /// `idx * elem_w` is only correct for a normalized `[N-1:0]` range and
     /// mis-places (or drops) elements of e.g. `[2:1]` or an ascending `[0:1]`.
-    packed_full_dims: Option<&'a HashMap<String, Vec<(i64, i64)>>>,
+    packed_full_dims: Option<&'a xezim_core::shared_names::SharedSliceMap<(i64, i64)>>,
     /// Declared variable types, for the type a pattern assigned to a
     /// variable takes (§10.8).
     var_decl_types: Option<&'a xezim_core::decl_types::DeclTypeMap>,
@@ -1207,7 +1207,7 @@ pub struct BytecodeCompiler<'a> {
     /// Declared types of explicitly typed value parameters.
     param_decl_types: Option<&'a xezim_core::decl_types::ParamDeclTypeMap>,
     /// Ports collapsed onto the nets they connect, formal to actual.
-    port_aliases: Option<&'a HashMap<String, String>>,
+    port_aliases: Option<&'a xezim_core::shared_names::SharedNameMap<xezim_core::shared_names::SharedName>>,
     /// Stack of pending `break` jump-target patches, one entry per enclosing
     /// loop. When the loop's end address is known we rewrite each `Jump(0)`
     /// at these insn-indices to the loop-exit address. LRM §12.7.
@@ -1289,7 +1289,7 @@ pub struct BytecodeCompiler<'a> {
     /// its read dependency would resolve bare-first to the wrong (top-scope)
     /// input and never re-trigger when the real scoped input changes. Set via
     /// `set_packed_struct_fields`.
-    packed_struct_fields: Option<&'a HashMap<String, Vec<(String, u32, u32)>>>,
+    packed_struct_fields: Option<&'a xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>>,
 }
 
 /// Where `packed_path_dyn_range` places a store in its root signal.
@@ -1484,7 +1484,10 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    pub fn set_packed_struct_fields(&mut self, f: &'a HashMap<String, Vec<(String, u32, u32)>>) {
+    pub fn set_packed_struct_fields(
+        &mut self,
+        f: &'a xezim_core::shared_names::SharedSliceMap<(String, u32, u32)>,
+    ) {
         self.packed_struct_fields = Some(f);
     }
 
@@ -1536,7 +1539,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.param_leaf_idx = Some(idx);
     }
 
-    pub fn set_packed_elem_widths(&mut self, w: &'a HashMap<String, u32>) {
+    pub fn set_packed_elem_widths(
+        &mut self,
+        w: &'a xezim_core::shared_names::SharedNameMap<u32>,
+    ) {
         self.packed_elem_widths = Some(w);
     }
 
@@ -1581,7 +1587,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.assoc_arrays = Some(a);
     }
 
-    pub fn set_packed_full_dims(&mut self, d: &'a HashMap<String, Vec<(i64, i64)>>) {
+    pub fn set_packed_full_dims(
+        &mut self,
+        d: &'a xezim_core::shared_names::SharedSliceMap<(i64, i64)>,
+    ) {
         self.packed_full_dims = Some(d);
     }
 
@@ -1589,7 +1598,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.var_decl_types = Some(t);
     }
 
-    pub fn set_port_aliases(&mut self, a: &'a HashMap<String, String>) {
+    pub fn set_port_aliases(
+        &mut self,
+        a: &'a xezim_core::shared_names::SharedNameMap<xezim_core::shared_names::SharedName>,
+    ) {
         self.port_aliases = Some(a);
     }
 

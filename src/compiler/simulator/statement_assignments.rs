@@ -996,7 +996,7 @@ impl Simulator {
         // A struct-typed property (declared via typedef) is a real struct
         // copy target, not an integral scalar.
         if let Some(tn) = prop.type_name.as_ref() {
-            if self.module.typedef_types.get(tn).is_some_and(|dt| {
+            if self.module.typedef_types.get(tn.as_str()).is_some_and(|dt| {
                 matches!(
                     Self::resolve_type_ref(dt, &self.module.typedef_types),
                     crate::ast::types::DataType::Struct(_)
@@ -1771,6 +1771,21 @@ impl Simulator {
                 self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
                 return;
             }
+        }
+        // §7.6, §11.3.2: parentheses preserve an unpacked row operand.
+        // Resolve the copy before scalar probes can consume its selector.
+        let rvalue = Self::unparen(rvalue);
+        let row_source = (!self.module.arrays_2d.is_empty() || !self.module.arrays_nd.is_empty())
+            && self.is_fixed_row_select(rvalue);
+        let frozen_rhs = if row_source && Self::is_effect_select_read(rvalue) {
+            self.rewrite_lvalue_index_side_effects(rvalue)
+        } else {
+            None
+        };
+        let rvalue = frozen_rhs.as_ref().unwrap_or(rvalue);
+        if row_source && self.copy_multi_dim_array(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
         }
         if self.assign_class_scalar_row(lvalue, rvalue) {
             self.settle_after_proc_write();
@@ -2651,7 +2666,7 @@ impl Simulator {
                                 if let Some(tn) = cd
                                     .properties
                                     .get(&member_name)
-                                    .and_then(|s| s.type_name.clone())
+                                    .and_then(|s| s.type_name.as_deref().cloned())
                                 {
                                     mtn = Some(tn);
                                     decl_cn = Some(cn);
@@ -2776,7 +2791,7 @@ impl Simulator {
                                         if let Some(tn) = cd
                                             .properties
                                             .get(&bname)
-                                            .and_then(|sig| sig.type_name.clone())
+                                            .and_then(|sig| sig.type_name.as_deref().cloned())
                                         {
                                             break Some(tn);
                                         }
@@ -2810,8 +2825,10 @@ impl Simulator {
                             }
                             match self.module.classes.get(&cn) {
                                 Some(cd) => {
-                                    if let Some(tn) =
-                                        cd.properties.get(&bname).and_then(|s| s.type_name.clone())
+                                    if let Some(tn) = cd
+                                        .properties
+                                        .get(&bname)
+                                        .and_then(|s| s.type_name.as_deref().cloned())
                                     {
                                         found = Some(tn);
                                         break;
@@ -2876,8 +2893,10 @@ impl Simulator {
                             let mut cur = self.class_context_stack.last().cloned().flatten();
                             while let Some(cn) = cur {
                                 if let Some(cd) = self.module.classes.get(&cn) {
-                                    if let Some(tn) =
-                                        cd.properties.get(&bname).and_then(|s| s.type_name.clone())
+                                    if let Some(tn) = cd
+                                        .properties
+                                        .get(&bname)
+                                        .and_then(|s| s.type_name.as_deref().cloned())
                                     {
                                         return Some(tn);
                                     }
@@ -2913,8 +2932,10 @@ impl Simulator {
                             let mut cur = hcn;
                             while let Some(cn) = cur {
                                 if let Some(cd) = self.module.classes.get(&cn) {
-                                    if let Some(tn) =
-                                        cd.properties.get(&member).and_then(|s| s.type_name.clone())
+                                    if let Some(tn) = cd
+                                        .properties
+                                        .get(&member)
+                                        .and_then(|s| s.type_name.as_deref().cloned())
                                     {
                                         found = Some(tn);
                                         break;
@@ -4360,9 +4381,7 @@ impl Simulator {
                     // A conditional or cast item can stand for a row too.
                     nested |= matches!(
                         Self::unparen(part).kind,
-                        ExprKind::Concatenation(_)
-                            | ExprKind::Conditional { .. }
-                            | ExprKind::SystemCall { .. }
+                        ExprKind::Conditional { .. } | ExprKind::SystemCall { .. }
                     );
                     self.fixed_row_concat_shape(part).map(|row| (part, row))
                 });

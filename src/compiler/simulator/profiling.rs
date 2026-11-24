@@ -972,6 +972,7 @@ impl Simulator {
                             | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
                             | Insn::LoadDynElem(..)
+                            | Insn::QueuePop(..)
                             | Insn::BlockingAssignArray(..)
                             | Insn::BlockingAssignArrayRange(..)
                             | Insn::BlockingAssignRangeDyn(..) => unsupported = true,
@@ -2987,7 +2988,7 @@ impl Simulator {
         for (i, ai) in insts.iter().enumerate() {
             let kind = ["assert", "assume", "cover"][ai.kind.min(2) as usize];
             let (src, off) = ai.loc;
-            let place = self.span_file_and_line(crate::ast::Span::new(off, off + 1), src);
+            let place = self.span_file_and_line(crate::ast::Span::from_usize(off, off + 1), src);
             let leaf = match (ai.labeled, ai.concurrent) {
                 (true, _) => String::new(),
                 (false, true) => {
@@ -3341,7 +3342,7 @@ impl Simulator {
             let (off, place) = match st.loc {
                 Some((src, off)) => (
                     off,
-                    self.span_file_and_line(crate::ast::Span::new(off, off + 1), src)
+                    self.span_file_and_line(crate::ast::Span::from_usize(off, off + 1), src)
                         .map(|(f, l)| {
                             format!("\"file\": \"{}\", \"line\": {}, ", json_escape(&f), l)
                         })
@@ -3605,6 +3606,7 @@ impl Simulator {
             Insn::InitLocalColl(..) => "InitLocalColl",
             Insn::EvalExprFallback(..) => "EvalExprFallback",
             Insn::LoadDynElem(..) => "LoadDynElem",
+            Insn::QueuePop(..) => "QueuePop",
             Insn::ClearSigned(..) => "ClearSigned",
             Insn::Pow(..) => "Pow",
             Insn::SetSigned(..) => "SetSigned",

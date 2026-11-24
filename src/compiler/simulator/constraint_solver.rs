@@ -734,6 +734,7 @@ impl Simulator {
         // `dist` geometry memoized under a stable constraint-item pointer.
         self.dist_geometry_memo.borrow_mut().clear();
         self.push_local_frame(HashMap::default());
+        self.local_iface_aliases.push(None);
         self.method_local_base.push(self.local_stack.len() - 1);
         let scopes = std::mem::take(&mut self.constraint_scopes);
         // §18.5.9: a sub-object's solve extends the chain of the call that
@@ -773,6 +774,7 @@ impl Simulator {
         }
         self.constraint_scopes = scopes;
         self.method_local_base.pop();
+        self.local_iface_aliases.pop();
         self.pop_local_frame();
         r
     }
@@ -875,7 +877,7 @@ impl Simulator {
                     let enum_t = class_def
                         .properties
                         .get(prop)
-                        .and_then(|sig| sig.type_name.clone())
+                        .and_then(|sig| sig.type_name.as_deref().cloned())
                         .filter(|tn| self.module.enum_members.contains_key(tn));
                     // A member typed by a class (a handle, or a collection of
                     // handles) holds object references, not random values.
@@ -960,7 +962,7 @@ impl Simulator {
                             }
                         }
                         if let Some(tn) = &sig.type_name {
-                            prop_type_names.insert(prop.clone(), tn.clone());
+                            prop_type_names.insert(prop.clone(), tn.to_string());
                             // §7.4.1: the DECLARED type keeps the packed
                             // dimensions written before the declarator
                             // (`cand_t [0:2] a`); the type name alone is one
@@ -2557,7 +2559,7 @@ impl Simulator {
                     let rank = if con.name.name == "__inline__" {
                         (0, usize::MAX, ii)
                     } else {
-                        (constraint_depth[bi], con.span.start, ii)
+                        (constraint_depth[bi], con.span.start as usize, ii)
                     };
                     let wins = match soft_rank.get(&v) {
                         None => true,
@@ -4427,7 +4429,7 @@ impl Simulator {
             || ps
                 .type_name
                 .as_ref()
-                .is_some_and(|t| self.module.classes.contains_key(t))
+                .is_some_and(|t| self.module.classes.contains_key(t.as_str()))
             || cd.queue_properties.contains_key(prop)
             || cd.assoc_properties.contains_key(prop)
             || cd.array_properties.contains_key(prop)

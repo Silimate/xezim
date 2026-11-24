@@ -634,3 +634,20 @@ mod review_foreach_hides_static;
 mod forced_partial_stores;
 #[path = "scheduling/array_write_feedback.rs"]
 mod array_write_feedback;
+
+#[path = "scheduling/comb_indexed_member_writes.rs"]
+mod comb_indexed_member_writes;
+
+#[path = "scheduling/delayed_unpacked_array_drive.rs"]
+mod delayed_unpacked_array_drive;
+
+#[path = "scheduling/timed_star_and_time_zero.rs"]
+mod timed_star_and_time_zero;
+
+#[path = "scheduling/runtime_var_init_no_time0_event_1533.rs"]
+mod runtime_var_init_no_time0_event_1533;
+
+#[path = "scheduling/star_timing_and_self_read_1539.rs"]
+mod star_timing_and_self_read_1539;
+#[path = "scheduling/time0_always_event_prearm_1545.rs"]
+mod time0_always_event_prearm_1545;

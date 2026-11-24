@@ -686,7 +686,7 @@ impl Ctx<'_> {
     fn source(&self, e: &Expression, src: Option<u32>) -> Option<String> {
         let span = e.span;
         let texts = &self.module.source_texts;
-        let fits = |t: &String| span.start < span.end && span.end <= t.len();
+        let fits = |t: &String| span.start < span.end && (span.end as usize) <= t.len();
         let text = match src
             .map(|s| s as usize)
             .filter(|&s| texts.get(s).is_some_and(fits))
@@ -700,7 +700,7 @@ impl Ctx<'_> {
                 }
             }
         };
-        text.and_then(|t| t.get(span.start..span.end))
+        text.and_then(|t| t.get(span.start as usize..span.end as usize))
             .map(squeeze)
             .filter(|s| !s.is_empty())
     }
@@ -2114,7 +2114,7 @@ impl Instr<'_> {
     fn always(&mut self, s: Statement, kind: &'static str) -> Statement {
         let span = s.span;
         let mut v = Vec::new();
-        let top = (combinational(kind, &s) == Some(true)).then_some(span.start);
+        let top = (combinational(kind, &s) == Some(true)).then_some(span.start as usize);
         match s.kind {
             StatementKind::TimingControl {
                 control,
@@ -3405,14 +3405,14 @@ impl Lines<'_> {
         let texts = &self.module.source_texts;
         let i = match src
             .map(|s| s as usize)
-            .filter(|&s| texts.get(s).is_some_and(|t| span.start < t.len()))
+            .filter(|&s| texts.get(s).is_some_and(|t| (span.start as usize) < t.len()))
         {
             Some(i) => i,
             None => {
                 let mut fits = texts
                     .iter()
                     .enumerate()
-                    .filter(|(_, t)| span.start < t.len());
+                    .filter(|(_, t)| (span.start as usize) < t.len());
                 let (i, _) = fits.next()?;
                 if fits.next().is_some() {
                     return None;
@@ -3428,7 +3428,7 @@ impl Lines<'_> {
                 .map(|(p, _)| p)
                 .collect()
         });
-        let out_line = nl.partition_point(|&p| p < span.start);
+        let out_line = nl.partition_point(|&p| p < span.start as usize);
         if let Some(m) = self.module.source_line_maps.get(i).and_then(|m| m.as_ref()) {
             if let Some((f, l)) = m.file_line(out_line) {
                 return Some((f.to_string(), l));
@@ -4213,7 +4213,7 @@ impl Simulator {
             .module
             .instances
             .iter()
-            .map(|i| i.path.clone())
+            .map(|i| i.path.to_string())
             .collect();
         let mut cov = CodeCov {
             kinds,
@@ -4334,13 +4334,13 @@ impl Simulator {
                     .chain(tasks.iter().map(|(k, t)| (k, t.span)))
                     .filter_map(|(k, sp)| {
                         let (_, leaf) = k.rsplit_once('.')?;
-                        Some((leaf.to_string(), sp.start))
+                        Some((leaf.to_string(), sp.start as usize))
                     })
                     .collect();
                 let copy = |k: &str, sp: Span| {
                     !k.contains('.')
                         && !k.contains("::")
-                        && dotted.contains(&(k.to_string(), sp.start))
+                        && dotted.contains(&(k.to_string(), sp.start as usize))
                 };
                 for (key, fd) in functions.iter_mut() {
                     if copy(key, fd.span) && !self.module.pkg_subr_owner.contains_key(key.as_str())
@@ -4477,7 +4477,7 @@ impl Simulator {
     ) -> Option<u32> {
         let cov = code_cov.as_mut()?;
         let kinds = cov.kinds;
-        let (span, scope, port) = match ca.origin.clone() {
+        let (span, scope, port) = match ca.origin().cloned() {
             Some((span, scope)) if scope.is_empty() => {
                 let scope = Self::cov_lhs_base(&ca.lhs)
                     .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
@@ -4536,7 +4536,7 @@ impl Simulator {
             ins.value(&mut ca.rhs, &ca.lhs, "assign", true);
             // In block granularity a continuous assignment is no block.
             (kinds & KIND_STATEMENT != 0 && !ins.cov.blockwise).then(|| {
-                let key = (span.start, span.end, scope.clone());
+                let key = (span.start as usize, span.end as usize, scope.clone());
                 match ins.cov.ca_counter.get(&key) {
                     Some(&c) => c,
                     None => {
@@ -4628,7 +4628,7 @@ impl Simulator {
                 .instances
                 .iter()
                 .find(|i| i.path == inst)
-                .map(|i| i.def_name.clone())
+                .map(|i| i.def_name.to_string())
                 .unwrap_or_default()
         };
         let src = module.src_file_of_module.get(&unit).copied();
@@ -5078,7 +5078,7 @@ impl Simulator {
         let scope = entry.cold.scope_hint.as_deref().unwrap_or("");
         if let Some(&b) = c
             .blocks
-            .get(&entry.cold.span.start)
+            .get(&(entry.cold.span.start as usize))
             .and_then(|m| m.get(scope))
         {
             c.ran[b as usize] += 1;
@@ -5412,7 +5412,7 @@ impl Simulator {
                     Some(true) => {
                         always[w] = true;
                         let scope = e.cold.scope_hint.clone().unwrap_or_default();
-                        cov.writers.insert(w, (scope, e.cold.span.start));
+                        cov.writers.insert(w, (scope, e.cold.span.start as usize));
                     }
                     None => {}
                 }
@@ -5721,7 +5721,9 @@ impl Simulator {
                     return false;
                 }
                 if let Some(t) = &sig.type_name {
-                    if module.classes.contains_key(t) || module.interfaces.contains(t) {
+                    if module.classes.contains_key(t.as_str())
+                        || module.interfaces.contains(t.as_str())
+                    {
                         return false;
                     }
                     // Instances and generate blocks are scopes, not signals
@@ -5769,7 +5771,7 @@ impl Simulator {
                 });
                 (
                     name.clone(),
-                    types.of(name, sig.type_name.as_deref()),
+                    types.of(name, sig.type_name.as_deref().map(|s| s.as_str())),
                     var.then(|| init && !nested(n)),
                 )
             })
@@ -5876,8 +5878,7 @@ impl Simulator {
             .collect();
         for ca in m.continuous_assigns.iter().chain(&pending) {
             let scope = ca
-                .origin
-                .as_ref()
+                .origin()
                 .map(|(_, s)| &**s)
                 .filter(|s| !s.is_empty());
             let lhs = self
@@ -6368,7 +6369,7 @@ impl Simulator {
             reports[s.scope as usize].stmts.push(StmtRow {
                 file,
                 line,
-                start: s.span.start,
+                start: s.span.start as usize,
                 kind: s.kind,
                 count: count(s.counter),
                 excluded: s.excluded,
@@ -6394,7 +6395,7 @@ impl Simulator {
             reports[b.scope as usize].branches.push(BranchRow {
                 file,
                 line,
-                start: b.span.start,
+                start: b.span.start as usize,
                 kind: b.kind,
                 arms,
                 excluded: b.excluded,
@@ -6417,7 +6418,7 @@ impl Simulator {
             let item = ItemRow {
                 file,
                 line,
-                start: x.span.start,
+                start: x.span.start as usize,
                 kind: x.kind,
                 block: x.block.clone(),
                 copy: x.copy.clone(),

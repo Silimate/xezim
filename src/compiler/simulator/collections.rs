@@ -612,7 +612,7 @@ impl Simulator {
             )
         };
         let fields = if let Some(f) = self.module.packed_struct_fields.get(arr) {
-            Some(f.clone())
+            Some(f.to_vec())
         } else if let Some((h, prop)) = arr.split_once('#')
             && let Ok(handle) = h.parse::<usize>()
         {
@@ -1484,7 +1484,7 @@ impl Simulator {
                                 .filter(|s| {
                                     s.type_name
                                         .as_ref()
-                                        .map(|t| sim.module.classes.contains_key(t))
+                                        .map(|t| sim.module.classes.contains_key(t.as_str()))
                                         .unwrap_or(false)
                                 })
                                 .is_some());
@@ -3363,6 +3363,8 @@ impl Simulator {
                 let val = if base == "__xz_ret_coll__" {
                     // A return snapshot carries the callee's values. Its registered
                     // consumer type may still belong to the preceding call.
+                    // §13.4.1: the shared snapshot holds values already converted by
+                    // the callee. Its consumer metadata may describe an earlier call.
                     val
                 } else if !self.signed_class_colls.is_empty()
                     && !val.is_real
@@ -4317,6 +4319,13 @@ impl Simulator {
     pub(super) fn set_loop_var(&mut self, name: &str, v: Value) {
         if let Some(frame) = self.local_stack.last_mut() {
             frame.insert(name.to_string(), v);
+            if let Some(aliases) = self
+                .local_iface_aliases
+                .last_mut()
+                .and_then(Option::as_deref_mut)
+            {
+                aliases.bindings.remove(name);
+            }
         } else {
             self.set_signal_value_by_name(name, v);
         }
@@ -4360,15 +4369,21 @@ impl Simulator {
                     has_frame,
                     self.var_typedef_types.get(n).cloned(),
                     self.fe_trusted_types.contains(n),
-                    self.module.packed_struct_fields.get(n).cloned(),
+                    self.module.packed_struct_fields.get(n).map(|f| f.to_vec()),
                     (self.widths.get(n).copied(), self.signed_signals.contains(n)),
+                    if has_frame {
+                        self.local_vif_frame()
+                            .and_then(|f| f.bindings.get(n).cloned())
+                    } else {
+                        None
+                    },
                 )
             })
             .collect()
     }
 
     pub(super) fn restore_loop_vars(&mut self, saved: &[LoopVarSnapshot]) {
-        for (n, _cur, _had_frame, prior_td, was_trusted, prior_ps, _) in saved {
+        for (n, _cur, _had_frame, prior_td, was_trusted, prior_ps, _, _) in saved {
             self.meta_note(n);
             match prior_td {
                 Some(t) => {
@@ -4383,7 +4398,9 @@ impl Simulator {
             } else {
                 self.fe_trusted_types.remove(n);
             }
-            if self.module.packed_struct_fields.get(n) != prior_ps.as_ref() {
+            if self.module.packed_struct_fields.get(n).map(|f| f.as_slice())
+                != prior_ps.as_deref()
+            {
                 match prior_ps {
                     Some(f) => {
                         self.module
@@ -4396,7 +4413,7 @@ impl Simulator {
                 }
             }
         }
-        for (n, _, _, _, _, _, (width, signed)) in saved {
+        for (n, _, _, _, _, _, (width, signed), _) in saved {
             match width {
                 Some(w) => {
                     self.widths.insert(n.clone(), *w);
@@ -4411,7 +4428,7 @@ impl Simulator {
                 self.signed_signals.remove(n);
             }
         }
-        for (n, cur, had_frame, _, _, _, _) in saved {
+        for (n, cur, had_frame, _, _, _, _, prior_vif) in saved {
             if *had_frame {
                 if let Some(m) = self.local_stack.last_mut() {
                     match cur {
@@ -4420,6 +4437,22 @@ impl Simulator {
                         }
                         None => {
                             m.remove(n);
+                        }
+                    }
+                }
+                match prior_vif {
+                    Some(bound) => {
+                        if let Some(aliases) = self.local_vif_frame_mut() {
+                            aliases.bindings.insert(n.clone(), bound.clone());
+                        }
+                    }
+                    None => {
+                        if let Some(aliases) = self
+                            .local_iface_aliases
+                            .last_mut()
+                            .and_then(Option::as_deref_mut)
+                        {
+                            aliases.bindings.remove(n);
                         }
                     }
                 }

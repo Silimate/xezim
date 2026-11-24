@@ -2824,7 +2824,10 @@ impl Simulator {
         if !matches!(port.direction, PortDirection::Output) {
             return None;
         }
-        let dt = &port.data_type;
+        Some(self.formal_type_default(&port.data_type, w))
+    }
+
+    pub(super) fn formal_type_default(&self, dt: &DataType, w: u32) -> Value {
         let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
         if matches!(
             resolved,
@@ -2833,15 +2836,24 @@ impl Simulator {
                 ..
             }
         ) {
-            return Some(Value::from_string(""));
+            return Value::from_string("");
+        }
+        if matches!(
+            resolved,
+            DataType::Simple {
+                kind: crate::ast::types::SimpleType::Chandle,
+                ..
+            }
+        ) {
+            return Value::zero(w);
         }
         if self.dt_is_real(dt) {
-            return Some(Value::from_f64(0.0));
+            return Value::from_f64(0.0);
         }
         if super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types) {
-            Some(Value::zero(w))
+            Value::zero(w)
         } else {
-            Some(Value::new(w))
+            Value::new(w)
         }
     }
 
@@ -2948,14 +2960,26 @@ impl Simulator {
         &mut self,
         e: &Expression,
     ) -> Option<(String, Vec<String>, bool)> {
-        // `c.m` through a class handle: the object's own store.
-        if let ExprKind::Ident(h) = &e.kind
-            && h.path.len() >= 2
-            && h.path.iter().all(|s| s.selects.is_empty())
-            && let Some(store) = self.class_nd_store(e, "")
+        // Class-property storage wins over a module array of the same
+        // name. This also covers a one-dimensional destination (a row copy
+        // to `r` in a method) under its per-instance key (§8.10, §7.6).
+        let unselected = match &e.kind {
+            ExprKind::Ident(h) => h.path.iter().all(|seg| seg.selects.is_empty()),
+            ExprKind::MemberAccess { .. } => true,
+            _ => false,
+        };
+        if unselected
+            && !self.no_class_objects()
+            && let Some(store) = self.expr_assoc_name(e)
+            && !self.module.dynamic_arrays.contains(&store)
         {
-            let sfx = self.nd_formal_suffixes(&store)?;
-            return Some((store, sfx, true));
+            if let Some(suffixes) = self.nd_formal_suffixes(&store) {
+                return Some((store, suffixes, true));
+            }
+            if let Some(&(lo, hi, _)) = self.module.arrays.get(&store) {
+                let suffixes = self.nd_ordered_suffixes(&store, &[(lo, hi)], 0);
+                return Some((store, suffixes, false));
+            }
         }
         match &e.kind {
             ExprKind::Ident(h)
@@ -2990,7 +3014,9 @@ impl Simulator {
                 let name: String = match &expr.kind {
                     ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
                         let n = self.resolve_hier_name(h).into_owned();
-                        if self.module.arrays_2d.contains_key(&n)
+                        if let Some(store) = self.class_nd_store(expr, &n) {
+                            store
+                        } else if self.module.arrays_2d.contains_key(&n)
                             || self.module.arrays_nd.contains_key(&n)
                         {
                             n
@@ -3011,7 +3037,7 @@ impl Simulator {
                                 true,
                             ));
                         } else {
-                            self.class_nd_store(expr, &n)?
+                            return None;
                         }
                     }
                     ExprKind::MemberAccess { .. } => self.class_nd_store(expr, "")?,
@@ -3067,6 +3093,31 @@ impl Simulator {
         .then_some(store)
     }
 
+    /// Whether a single index selects a fixed unpacked row (§7.6)
+    /// without evaluating that index or an effectful receiver.
+    pub(super) fn is_fixed_row_select(&mut self, expr: &Expression) -> bool {
+        let ExprKind::Index { expr: base, .. } = &expr.kind else {
+            return false;
+        };
+        if Self::recv_chain_call(base).is_some() || Self::lvalue_has_incdec_index(base) {
+            return false;
+        }
+        if self.class_nd_store(base, "").is_some() {
+            return true;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return false;
+        };
+        if h.path.iter().any(|seg| !seg.selects.is_empty())
+            || self.ident_shadowed_by_non_collection(h)
+        {
+            return false;
+        }
+        let name = self.resolve_hier_name(h);
+        self.module.arrays_2d.contains_key(name.as_ref())
+            || self.module.arrays_nd.contains_key(name.as_ref())
+    }
+
     /// `w = v` / `r = v[1]` / `v[1] = r` over multi-dimensional unpacked
     /// arrays. Returns true when it performed the copy.
     pub(super) fn copy_multi_dim_array(
@@ -3088,8 +3139,11 @@ impl Simulator {
         let Some((rbase, rsfx, r_nd)) = self.nd_array_operand(rvalue) else {
             return false;
         };
-        if !(l_nd || r_nd) || (lbase == rbase && lsfx == rsfx) {
+        if !(l_nd || r_nd) {
             return false;
+        }
+        if lbase == rbase && lsfx == rsfx {
+            return true;
         }
         // §7.2: an element of an unpacked-struct array is its member leaves.
         let elem_su = self

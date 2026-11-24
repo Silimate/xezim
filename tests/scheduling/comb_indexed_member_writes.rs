@@ -6,7 +6,7 @@
 //! block wrote nothing as far as the scheduler knew and stayed sensitive to
 //! all of `r`. Two of them building disjoint elements of one array woke each
 //! other after every write and exhausted the settle limit in every time
-//! slot (#464). A read of another element's member (`r[1].tag`) still wakes the
+//! slot (#1566). A read of another element's member (`r[1].tag`) still wakes the
 //! block that reads it: the read is outside every prefix the block writes.
 //! The first test's values agree with Verilator 5.046. The second follows
 //! §9.2.2.2.1; Verilator 5.046 leaves the whole variable out of the block's

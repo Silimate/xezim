@@ -415,6 +415,41 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Time-zero changes on collapsed nets and tied input ports reach their
+  event and combinational readers (§10.3, §23.3.3, #1532).
+- Runtime SystemVerilog declaration initializers execute before time zero
+  (§6.8, #1533).
+
+- Nested braces in unpacked array concatenations contribute one packed or
+  string element. Outer array and queue operands still contribute their
+  elements (§10.10.3, #1544).
+
+- Timed `always @*` blocks wait on inferred inputs, and event-headed
+  `always` blocks with unguarded events arm before time-zero procedural
+  writes (#1539, #1545).
+
+- Class-scoped task calls keep their receiver during waits, and writes to
+  selected packed members update the owning class array element (#1570, #1569).
+- Delayed continuous assignments drive each net in an unpacked array (#1584).
+- A compilation-unit parameter keeps precedence over an unimported package
+  enum member when elaborating bounds and generate conditions (#1591).
+- Collection literals use their declared element type, and factory-created
+  objects retain their class specialization inside module instances
+  (#1581, #1582, #1583).
+
+- A cross's `iff` no longer gates the implicit coverpoint of a crossed
+  variable, and that coverpoint takes one hit per `sample()` however many
+  crosses name it (§19.6, #1603).
+- Real-valued `inside` constraints and weighted `dist` ranges retain
+  fractional bounds during randomization (§18.5.3, #1485).
+- `$typename` of a packed vector declared through a typedef lists the outer
+  dimensions before the typedef's own dimensions (§20.6.1, #1312).
+- Parenthesized unpacked array rows retain their shape, and their
+  side-effecting selectors run once (§7.6, §11.3.2, §11.4.2, #1552, #1555).
+- `%p` formats selected rows of class arrays and queues in declared order
+  (§21.2.1.7, #1562).
+- Nested two-state members of packed structs read X and Z as zero
+  (§7.2.1, #1560).
 - Continuous assignments read negative packed-array element labels with
   their declared sign (§7.4.5, #1568).
 - An unpacked struct field can hold a virtual interface and use it to
@@ -422,6 +457,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Performance**
 
+- Edge fanouts use compact entries and event waiters allocate wide-value
+  storage only when needed.
+
+- Delay loops with a delayed nonblocking assignment compile their surrounding
+  code and retain the assignment's scheduling semantics (§9.4.5, #1327).
+- Bytecode queue pops call the collection runtime directly for known module
+  queues (§7.10.2, #1210).
 - A procedural write that changes no signal skips the active-force scan
   when all force dependencies are known (§10.6.2, #1335).
 - Experimental `XEZIM_ARMED_EDGE_MASKS=1` lets a write to a shared bus
@@ -446,6 +488,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   queries for plain reads compared with known integer literals.
 
 **Command line**
+
+- `--verilog-2005-initializers` schedules module variable declaration
+  assignments in `.v` inputs as time-zero procedures (#1545).
 
 * A `-v`/`-y` library file is preprocessed with the command-line defines
   (`+define+`, `-D`) only, as in the reference simulator, so library files no

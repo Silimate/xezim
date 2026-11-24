@@ -635,9 +635,6 @@ mod forced_partial_stores;
 #[path = "scheduling/array_write_feedback.rs"]
 mod array_write_feedback;
 
-#[path = "scheduling/comb_indexed_member_writes.rs"]
-mod comb_indexed_member_writes;
-
 #[path = "scheduling/delayed_unpacked_array_drive.rs"]
 mod delayed_unpacked_array_drive;
 

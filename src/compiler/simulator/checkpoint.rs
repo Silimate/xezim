@@ -52,7 +52,8 @@ use serde::ser::{SerializeSeq, Serializer};
 // §16.14.6: Simulator::delay_pids and ::delay_resumed, SvaClockedSite::tick_time.
 // §6.21: BlockScopeSave::static_hidden keeps each hidden static's position.
 // Downstream assertion counts and coverage state accompany upstream's scheduler state.
-const MAGIC: &[u8; 8] = b"XZCKPT\x00\x25";
+// Per-frame VifAliasFrame, prop_vif_bindings, pending_vif_return, and LoopVarSnapshot replace flat vif keys.
+const MAGIC: &[u8; 8] = b"XZCKPT\x00\x27";
 
 #[derive(Default)]
 struct Session {
@@ -165,6 +166,22 @@ fn restored(n: u32) -> Option<Arc<[Statement]>> {
     with(|s| s.restored.get(n as usize).map(|(l, _)| l.clone()))
 }
 
+/// Pack a 64-bit runtime `ForeachTail` body pointer id into the two `u32`
+/// halves of a synthetic `StatementKind::Null` marker's `Span` (#721).
+pub(in crate::compiler::simulator) fn encode_foreach_body_id(id: usize) -> crate::ast::Span {
+    let raw = id as u64;
+    crate::ast::Span {
+        start: raw as u32,
+        end: (raw >> 32) as u32,
+    }
+}
+
+/// Unpack a 64-bit runtime `ForeachTail` body pointer id from its synthetic
+/// `StatementKind::Null` marker's `Span`.
+pub(in crate::compiler::simulator) fn decode_foreach_body_id(span: crate::ast::Span) -> usize {
+    (((span.end as u64) << 32) | (span.start as u64)) as usize
+}
+
 /// §12.7.3: a `foreach` loop suspended in its body resumes through a
 /// `ForeachTail` whose body is a marker holding the address of the loop's
 /// body statement (see `run_process_stmts`). Point the markers of a list read
@@ -176,10 +193,10 @@ fn rewrite_markers(list: &mut Arc<[Statement]>) {
     for st in stmts.iter_mut() {
         if let StatementKind::ForeachTail { body, .. } = &mut st.kind
             && matches!(body.kind, StatementKind::Null)
-            && body.span.end == 0
         {
-            match with(|s| s.remap.get(&body.span.start).copied()) {
-                Some(new) => body.span.start = new,
+            let old = decode_foreach_body_id(body.span);
+            match with(|s| s.remap.get(&old).copied()) {
+                Some(new) => body.span = encode_foreach_body_id(new),
                 None => with(|s| s.unresolved += 1),
             }
         }
@@ -1578,6 +1595,7 @@ checkpoint_state!(
     program_pid_scope,
     program_pids,
     prop_raw_ty_cache,
+    prop_vif_bindings,
     prop_width_memo,
     queue_elem_moves,
     queue_frame_saves,
@@ -1719,9 +1737,7 @@ checkpoint_state!(
     var_type_args,
     var_typedef_types,
     vc_saved,
-    vif_key_scratch,
-    vif_local_names,
-    vif_return_pending,
+    pending_vif_return,
     vif_tokens_stored,
     viface_var_aliases,
     virtual_iface_bindings,

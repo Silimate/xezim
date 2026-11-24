@@ -274,6 +274,29 @@ impl Simulator {
                     .collect(),
             }
         }
+        fn pick_shared<T: Clone, W>(
+            map: &xezim_core::shared_names::SharedSliceMap<T>,
+            name: &str,
+            pfx: &str,
+            members: bool,
+            known: Option<&[(String, W)]>,
+        ) -> Vec<(String, Vec<T>)> {
+            let bare = map.get(name).map(|v| (name.to_string(), v.to_vec()));
+            match known {
+                _ if !members => bare.into_iter().collect(),
+                Some(keys) => bare
+                    .into_iter()
+                    .chain(keys.iter().filter(|(k, _)| k != name).filter_map(|(k, _)| {
+                        map.get(k.as_str()).map(|v| (k.clone(), v.to_vec()))
+                    }))
+                    .collect(),
+                None => map
+                    .iter()
+                    .filter(|(k, _)| *k == name || k.starts_with(pfx))
+                    .map(|(k, v)| (k.clone(), v.to_vec()))
+                    .collect(),
+            }
+        }
         LocalMeta {
             members,
             typedef: self.var_typedef_types.get(name).cloned(),
@@ -296,28 +319,39 @@ impl Simulator {
                     known.map(|k| &k.decl_types[..]),
                 )
             },
-            struct_members: pick(
+            struct_members: pick_shared(
                 &m.struct_members,
                 name,
                 &pfx,
                 members,
                 known.map(|k| &k.struct_members[..]),
             ),
-            packed_fields: pick(
+            packed_fields: pick_shared(
                 &m.packed_struct_fields,
                 name,
                 &pfx,
                 members,
                 known.map(|k| &k.packed_fields[..]),
             ),
-            elem_widths: pick(
-                &m.packed_signal_elem_widths,
-                name,
-                &pfx,
-                members,
-                known.map(|k| &k.elem_widths[..]),
-            ),
-            full_dims: pick(
+            elem_widths: {
+                let map = &m.packed_signal_elem_widths;
+                let bare = map.get(name).map(|v| (name.to_string(), *v));
+                match known.map(|k| &k.elem_widths[..]) {
+                    _ if !members => bare.into_iter().collect(),
+                    Some(keys) => bare
+                        .into_iter()
+                        .chain(keys.iter().filter(|(k, _)| k != name).filter_map(|(k, _)| {
+                            map.get(k.as_str()).map(|v| (k.clone(), *v))
+                        }))
+                        .collect(),
+                    None => map
+                        .iter()
+                        .filter(|(k, _)| *k == name || k.starts_with(&pfx))
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect(),
+                }
+            },
+            full_dims: pick_shared(
                 &m.packed_full_dims,
                 name,
                 &pfx,
@@ -351,18 +385,6 @@ impl Simulator {
                 set.remove(k);
             }
         }
-        fn keyed<V: Clone>(
-            map: &mut HashMap<String, V>,
-            name: &str,
-            out: &[(String, V)],
-            v: &[(String, V)],
-        ) {
-            map.remove(name);
-            for (k, _) in out {
-                map.remove(k.as_str());
-            }
-            map.extend(v.iter().cloned());
-        }
         put(&mut self.var_typedef_types, name, &meta.typedef);
         put(&mut self.var_class_types, name, &meta.class);
         put(&mut self.var_container_types, name, &meta.container);
@@ -383,25 +405,38 @@ impl Simulator {
         for (key, ty) in &meta.decl_types {
             m.var_decl_types.insert_shared(key.clone(), ty.clone());
         }
-        keyed(
+        fn keyed_shared<T: Clone + Eq + std::hash::Hash>(
+            map: &mut xezim_core::shared_names::SharedSliceMap<T>,
+            name: &str,
+            out: &[(String, Vec<T>)],
+            v: &[(String, Vec<T>)],
+        ) {
+            map.remove(name);
+            for (k, _) in out {
+                map.remove(k.as_str());
+            }
+            map.extend(v.iter().cloned());
+        }
+        keyed_shared(
             &mut m.struct_members,
             name,
             &out.struct_members,
             &meta.struct_members,
         );
-        keyed(
+        keyed_shared(
             &mut m.packed_struct_fields,
             name,
             &out.packed_fields,
             &meta.packed_fields,
         );
-        keyed(
-            &mut m.packed_signal_elem_widths,
-            name,
-            &out.elem_widths,
-            &meta.elem_widths,
-        );
-        keyed(
+        m.packed_signal_elem_widths.remove(name);
+        for (k, _) in &out.elem_widths {
+            m.packed_signal_elem_widths.remove(k.as_str());
+        }
+        for (k, v) in &meta.elem_widths {
+            m.packed_signal_elem_widths.insert(k.clone(), *v);
+        }
+        keyed_shared(
             &mut m.packed_full_dims,
             name,
             &out.full_dims,
@@ -440,7 +475,7 @@ impl Simulator {
             return;
         };
         let origin = MetaOrigin {
-            span: (stmt.span.start, stmt.span.end),
+            span: (stmt.span.start as usize, stmt.span.end as usize),
             class: self.class_context_stack.last().cloned().flatten(),
             spec: self.current_spec.clone(),
         };
@@ -1196,8 +1231,8 @@ impl Simulator {
         }
         if let Some(sig) = self.module.signals.get(vname) {
             if let Some(tn) = &sig.type_name {
-                if self.module.classes.contains_key(tn) {
-                    return Some(tn.clone());
+                if self.module.classes.contains_key(tn.as_str()) {
+                    return Some(tn.to_string());
                 }
             }
         }
@@ -1392,7 +1427,7 @@ impl Simulator {
         }
         if let Some(sig) = self.module.signals.get(dotted.as_str()) {
             if let Some(tn) = &sig.type_name {
-                if self.module.classes.contains_key(tn) {
+                if self.module.classes.contains_key(tn.as_str()) {
                     return true;
                 }
             }
@@ -1502,7 +1537,7 @@ impl Simulator {
                         }
                         if let Some(sig) = self.module.signals.get(flat.as_str()) {
                             if let Some(tn) = &sig.type_name {
-                                if self.module.classes.contains_key(tn) {
+                                if self.module.classes.contains_key(tn.as_str()) {
                                     return true;
                                 }
                             }

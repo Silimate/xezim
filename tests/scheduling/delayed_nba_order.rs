@@ -24,10 +24,11 @@ fn conditional_load_overrides_default_after_the_same_delay() {
         1000,
     )
     .unwrap();
-    assert!(sim
-        .output
-        .iter()
-        .any(|line| line.message == "load=1 busy=1 ready=1"));
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| line.message == "load=1 busy=1 ready=1")
+    );
 }
 
 #[test]

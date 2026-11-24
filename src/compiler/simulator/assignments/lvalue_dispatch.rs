@@ -41,16 +41,7 @@ impl Simulator {
         // the FIRST assignment target after the call — `value = r.read(c)`
         // in uvm_config_db::get (issue #113). One-shot; also cleared at the
         // next function-call entry so it cannot leak further than that.
-        // The marker is probed only when a `return <vif>` left one: the
-        // signal-map lookup was a string hash on EVERY assignment.
-        if self.vif_return_pending
-            && let Some(nm) = self
-                .signals
-                .remove("__vif_return__")
-                .map(|x| x.to_sv_string())
-                .filter(|s| !s.is_empty())
-        {
-            self.vif_return_pending = false;
+        if let Some(nm) = self.pending_vif_return.take().filter(|s| !s.is_empty()) {
             let synth = Expression::new(
                 ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                     root: None,
@@ -1314,7 +1305,12 @@ impl Simulator {
                         };
                         let name = self.resolve_hier_name(h);
                         self.is_associative_array(&name)
-                            .then(|| self.module.packed_full_dims.get(&*name).cloned())
+                            .then(|| {
+                                self.module
+                                    .packed_full_dims
+                                    .get(&*name)
+                                    .map(|d| d.to_vec())
+                            })
                             .flatten()
                     })
                     .filter(|d| d.len() > 1);

@@ -4562,7 +4562,7 @@ impl Simulator {
         for (lhs_name, rhs_name) in &port_candidates {
             let (child, parent): (&str, &str) = (lhs_name, rhs_name);
             if self.module.sampled_input_ports.contains(child)
-                || self.module.port_aliases.get(child).map(String::as_str) != Some(parent)
+                || self.module.port_aliases.get(child).map(|s| s.as_str()) != Some(parent)
                 || ca_driver_counts.get(child).copied().unwrap_or(0) != 1
                 || self.module.events.contains(child)
                 || self.module.events.contains(parent)
@@ -4854,8 +4854,8 @@ impl Simulator {
             .filter(|ca| {
                 ca.rhs_parent_scoped
                     && ca.delay == 0
-                    && ca.delay_fall.is_none()
-                    && ca.delay_off.is_none()
+                    && ca.delay_fall().is_none()
+                    && ca.delay_off().is_none()
                     && matches!(ca.lhs.kind, ExprKind::Index { .. })
             })
             .filter_map(|ca| {
@@ -5069,6 +5069,7 @@ impl Simulator {
                 Insn::StmtFallback(..)
                     | Insn::EvalExprFallback(..)
                     | Insn::LoadDynElem(..)
+                    | Insn::QueuePop(..)
                     | Insn::NbaAssignArray(..)
                     | Insn::BlockingAssignArray(..)
                     | Insn::NbaAssignArrayRange(..)
@@ -6231,6 +6232,7 @@ impl Simulator {
                             | super::bytecode::Insn::CovHit(..)
                             | super::bytecode::Insn::EvalExprFallback(..)
                             | super::bytecode::Insn::LoadDynElem(..)
+                            | super::bytecode::Insn::QueuePop(..)
                     )
                 })
             });
@@ -6262,6 +6264,7 @@ impl Simulator {
                         | BcInsn::CovHit(..)
                         | BcInsn::EvalExprFallback(..)
                         | BcInsn::LoadDynElem(..)
+                        | BcInsn::QueuePop(..)
                         | BcInsn::BlockingAssign(..)
                         | BcInsn::BlockingAssignRange(..)
                         | BcInsn::BlockingAssignRangeDyn(..)
@@ -6369,7 +6372,9 @@ impl Simulator {
                 for insn in &cb.instructions {
                     let c = match insn {
                         Insn::StmtFallback(..) => 0,
-                        Insn::EvalExprFallback(..) | Insn::LoadDynElem(..) => 0,
+                        Insn::EvalExprFallback(..) | Insn::LoadDynElem(..) | Insn::QueuePop(..) => {
+                            0
+                        }
                         Insn::BlockingAssign(..) => 1,
                         Insn::BlockingAssignRange(..)
                         | Insn::BlockingAssignRangeDyn(..)
@@ -6459,6 +6464,7 @@ impl Simulator {
                             | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
                             | Insn::LoadDynElem(..)
+                            | Insn::QueuePop(..)
                             | Insn::BlockingAssign(..)
                             | Insn::BlockingAssignRange(..)
                             | Insn::BlockingAssignRangeDyn(..)

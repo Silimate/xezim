@@ -141,13 +141,13 @@ impl Simulator {
         }
         if let Some(&(r0, r1, ew)) = self.module.arrays_2d.get(name) {
             return Some(match self.module.unpacked_decl_dims.get(name) {
-                Some(d) if d.len() == 2 => (d.clone(), ew),
+                Some(d) if d.len() == 2 => (d.to_vec(), ew),
                 _ => (vec![r0, r1], ew),
             });
         }
         let (shape, ew) = self.module.arrays_nd.get(name)?;
         Some(match self.module.unpacked_decl_dims.get(name) {
-            Some(d) if d.len() == shape.len() => (d.clone(), *ew),
+            Some(d) if d.len() == shape.len() => (d.to_vec(), *ew),
             _ => (shape.clone(), *ew),
         })
     }
@@ -712,17 +712,7 @@ impl Simulator {
         if self.get_signal_value_by_name(first).is_none() {
             return false;
         }
-        fn flatten<'a>(parts: &'a [Expression], out: &mut Vec<&'a Expression>) {
-            for e in parts {
-                match &e.kind {
-                    ExprKind::Concatenation(inner) => flatten(inner, out),
-                    _ => out.push(e),
-                }
-            }
-        }
-        let mut items = Vec::with_capacity(parts.len());
-        flatten(parts, &mut items);
-        let values = self.unpacked_concat_operand_values(items, true, None);
+        let values = self.unpacked_concat_operand_values(parts.iter().collect(), true, None);
         for (name, v) in dst.names.iter().zip(values) {
             if let Some(name) = name {
                 self.set_signal_value_by_name(name, v);

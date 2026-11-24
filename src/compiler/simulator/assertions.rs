@@ -247,7 +247,7 @@ impl Simulator {
             .module
             .property_params
             .get(key)
-            .map_or(&[], |v| v.as_slice());
+            .map_or(&[], |v| v.as_ref());
         let mut map: HashMap<String, Expression> = HashMap::default();
         for (i, a) in args.iter().enumerate() {
             match &a.kind {
@@ -312,7 +312,7 @@ impl Simulator {
                 if let Some(key) = self.sva_named_key(e) =>
             {
                 let name = key.as_str();
-                if self.module.sequences.contains(name)
+                if self.module.has_named_sva(name)
                     && self
                         .module
                         .property_params
@@ -326,7 +326,7 @@ impl Simulator {
                 }
                 // §16.8: an instance without an argument list takes every
                 // default actual argument.
-                if self.module.sequences.contains(name)
+                if self.module.has_named_sva(name)
                     && self.module.property_param_defaults.contains_key(name)
                     && let Some(body) = self.sva_body_with_defaults(name)
                 {
@@ -2030,7 +2030,7 @@ impl Simulator {
         label: Option<&str>,
     ) {
         use crate::ast::stmt::AssertionKind;
-        let span_key = a.span.start;
+        let span_key = a.span.start as usize;
         let kind: u8 = match a.kind {
             AssertionKind::Assert => 0,
             AssertionKind::Assume => 1,

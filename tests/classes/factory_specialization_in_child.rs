@@ -4,6 +4,9 @@ use xezim::simulate;
 
 #[test]
 fn factory_preserves_method_local_type_in_child_module() {
+    if !super::compiled_method_test_env::policies(&[("0", "1000"), ("1", "0")]) {
+        return;
+    }
     let sim = simulate(
         r#"
 module child;

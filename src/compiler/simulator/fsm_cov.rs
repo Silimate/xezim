@@ -1811,7 +1811,7 @@ impl Simulator {
                     let Some(&to) = index.get(&r.value) else {
                         continue;
                     };
-                    let rank = (r.ctx.specific(), r.direct, r.span.start);
+                    let rank = (r.ctx.specific(), r.direct, r.span.start as usize);
                     for (&v, &from) in &index {
                         if v == r.value || !r.ctx.holds(v) {
                             continue;
@@ -2049,7 +2049,7 @@ impl Simulator {
         let mut by: HashMap<String, Vec<Option<usize>>> = HashMap::default();
         let mut tested = HashSet::default();
         for ca in &self.module.continuous_assigns {
-            if let (Some(n), Some(_)) = (whole(&ca.lhs), &ca.origin) {
+            if let (Some(n), Some(_)) = (whole(&ca.lhs), ca.origin()) {
                 by.entry(n.to_string()).or_default().push(None);
             }
             tests(&ca.rhs, "", &mut tested);
@@ -2077,14 +2077,14 @@ impl Simulator {
                 .module
                 .continuous_assigns
                 .iter()
-                .find(|ca| whole(&ca.lhs) == Some(n) && ca.origin.is_some())
-                .map(|ca| (ca.rhs.clone(), ca.origin.as_ref().unwrap().0)),
+                .find(|ca| whole(&ca.lhs) == Some(n) && ca.origin().is_some())
+                .map(|ca| (ca.rhs.clone(), ca.origin().unwrap().0)),
             [Some(k)] => {
                 let ca = self.module.pending_cont_assign[*k]
                     .clone()
                     .materialize(&self.module.parameters);
                 (whole(&ca.lhs) == Some(n)).then_some(())?;
-                let span = ca.origin.as_ref()?.0;
+                let span = ca.origin()?.0;
                 Some((ca.rhs, span))
             }
             _ => None,
@@ -2506,7 +2506,7 @@ impl Simulator {
                 next: f.next.clone(),
                 file,
                 line,
-                start: f.span.start,
+                start: f.span.start as usize,
                 states: f
                     .states
                     .iter()

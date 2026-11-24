@@ -2171,7 +2171,7 @@ impl Simulator {
                     name: crate::ast::types::TypeName {
                         scopes: Vec::new(),
                         name: crate::ast::Identifier {
-                            name: tn,
+                            name: tn.to_string(),
                             span: crate::ast::Span::dummy(),
                         },
                         span: crate::ast::Span::dummy(),
@@ -2855,17 +2855,13 @@ impl Simulator {
                 // (`AliasT::get()` where `AliasT` is
                 // `typedef Common#(int,"alpha") AliasT;`): the bare `new()`
                 // carries no type_args, but current_spec holds the bindings.
-                if is_leaf && arg_map.get(pname).is_none() {
-                    let spec_matches = self
-                        .current_spec
-                        .as_ref()
-                        .is_some_and(|(b, _)| *b == class_name_owned);
-                    if spec_matches {
-                        if let Some(v) = self.resolve_value_param_from_spec(pname) {
-                            instance.properties.insert(pname.clone(), v);
-                            continue;
-                        }
-                    }
+                if is_leaf
+                    && active_targets_leaf
+                    && arg_map.get(pname).is_none()
+                    && let Some(v) = self.resolve_value_param_from_spec(pname)
+                {
+                    instance.properties.insert(pname.clone(), v);
+                    continue;
                 }
                 // An ancestor's parameter supplied by the `extends B#(..)`
                 // clause wins over its declared default.

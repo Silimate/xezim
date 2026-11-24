@@ -246,7 +246,7 @@ impl Simulator {
     /// `c.m[1]` / `c.m[1][2]` (either parse shape) as the unselected member
     /// expression and its index selects, outermost first. Range selects and
     /// anything else come back whole, with no selects.
-    fn split_row_selects(e: &Expression) -> (Expression, Vec<Expression>) {
+    pub(super) fn split_row_selects(e: &Expression) -> (Expression, Vec<Expression>) {
         let is_range =
             |x: &Expression| matches!(x.kind, ExprKind::Range(..) | ExprKind::RangeSelect { .. });
         let mut sels: Vec<Expression> = Vec::new();
@@ -807,7 +807,7 @@ impl Simulator {
                     }
                 }
                 let expand_rows = self.concat_has_non_array_elements(name);
-                let vals = self.unpacked_concat_operand_values(flat, expand_rows, None);
+                let vals = self.unpacked_concat_operand_values(exprs.iter().collect(), expand_rows, None);
                 self.set_queue_size(name, vals.len() as u64);
                 for (i, v) in vals.into_iter().enumerate() {
                     let v = self.fit_queue_push_elem(name, v);
@@ -1993,12 +1993,12 @@ impl Simulator {
                     let mut ts: HashSet<String> = HashSet::default();
                     Self::collect_two_state_leaves(self, &su, "", &mut ts);
                     let mut changed = false;
-                    for (fname, off, w) in fields {
-                        if !ts.contains(&fname) {
+                    for (fname, off, w) in &fields {
+                        if !ts.contains(fname) {
                             continue;
                         }
-                        for i in 0..w {
-                            let idx = (off + i) as usize;
+                        for i in 0..*w {
+                            let idx = (*off + i) as usize;
                             if idx < cur.width as usize
                                 && !matches!(cur.get_bit(idx), LogicBit::Zero | LogicBit::One)
                             {
@@ -2430,13 +2430,13 @@ impl Simulator {
         }
         if let Some(&(r0, r1, _)) = self.module.arrays_2d.get(name) {
             return Some(match self.module.unpacked_decl_dims.get(name) {
-                Some(d) if d.len() == 2 => d.clone(),
+                Some(d) if d.len() == 2 => d.to_vec(),
                 _ => vec![r0, r1],
             });
         }
         let (shape, _) = self.module.arrays_nd.get(name)?;
         Some(match self.module.unpacked_decl_dims.get(name) {
-            Some(d) if d.len() == shape.len() => d.clone(),
+            Some(d) if d.len() == shape.len() => d.to_vec(),
             _ => shape.clone(),
         })
     }
@@ -6901,7 +6901,7 @@ impl Simulator {
     /// (`<handle>#prop`). A dynamic dimension may be listed or left out.
     pub(super) fn unpacked_decl_dims_of(&self, name: &str) -> Option<Vec<(i64, i64)>> {
         if let Some(d) = self.module.unpacked_decl_dims.get(name) {
-            return Some(d.clone());
+            return Some(d.to_vec());
         }
         let (h, prop) = name.split_once('#')?;
         let handle = h.parse::<usize>().ok()?;

@@ -80,6 +80,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--relax-unconnected-interface-port` | Elaborate an instance that leaves an interface port unconnected (§25.3, §23.3.3), with a warning naming the port and the instance; the port's members are then signals of the instance that read x until written — for testbenches written against tools that accept it |
 | `--relax-use-before-decl` | Accept a reference to module data before its declaration (§6.5), including in call arguments, with a warning naming the module and data |
 | `--relax-wildcard-import-conflict` | Resolve a name that two wildcard-imported packages both declare, which §26.3 makes invisible, to the first of those imports in source order, with a warning naming both packages — for sources written against tools that accept it |
+| `--verilog-2005-initializers` | Treat module variable declaration assignments in `.v` inputs as time-zero procedures (IEEE 1364-2005 §6.2.1). Without this flag, variable declaration initialization uses SystemVerilog semantics. |
 | `--keywords <ver>` | Keyword set outside `` `begin_keywords `` regions (§22.14): `1364-1995`, `1364-2001`, `1364-2005`, `1800-2005` … `1800-2023`, each also with `-noconfig`; an explicit region still wins |
 | `--no-config-keywords` | Read the ten configuration keywords (`instance`, `cell`, `use`, `library`, …) as names outside `` `begin_keywords `` regions |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |

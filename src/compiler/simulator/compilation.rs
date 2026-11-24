@@ -1659,7 +1659,8 @@ impl Simulator {
         // synthesized top-level runtime declaration initializers BEFORE time 0
         // (`capture_sampled_defaults`, edge snapshots, and process start) so
         // variables hold their initialized values before any `always` process
-        // observes or snapshots them, generating no time-0 event.
+        // observes or snapshots them, generating no time-0 event. Verilog
+        // declaration assignments are the exception, split out just below.
         {
             let init_blocks = std::mem::take(&mut self.module.initial_blocks);
             for ib in &init_blocks {
@@ -1667,7 +1668,18 @@ impl Simulator {
             }
             self.module.initial_blocks = init_blocks;
         }
-        let mut pre_inits = std::mem::take(&mut self.module.static_init_blocks);
+        let mut pre_inits = Vec::new();
+        // IEEE 1364-2005 §6.2.1: a Verilog declaration assignment is a time-0
+        // update, after the always processes that arm first. Those blocks
+        // stay in `static_init_blocks` for the scheduler below. Every other
+        // static initializer takes effect before time 0 and generates no event.
+        for ib in std::mem::take(&mut self.module.static_init_blocks) {
+            if Self::verilog_decl_block(&ib.stmt).is_some() {
+                self.module.static_init_blocks.push(ib);
+            } else {
+                pre_inits.push(ib);
+            }
+        }
         pre_inits.extend(
             self.module
                 .initial_blocks

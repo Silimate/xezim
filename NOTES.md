@@ -415,6 +415,9 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+- Wide products use hard bounds when a conflicting soft constraint is
+  discarded (§18.5.14).
+
 - Time-zero changes on collapsed nets and tied input ports reach their
   event and combinational readers (§10.3, §23.3.3, #1532).
 - Runtime SystemVerilog declaration initializers execute before time zero
